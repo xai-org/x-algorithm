@@ -7,17 +7,18 @@ import urllib.error
 import urllib.request
 import uuid
 
-from grox.core.lib.utils import detect_image_content_type
+from monitor.metrics import Metrics
+
 from grox.core.data_loaders.data_types import Image, Post, Video
+from grox.core.lib.utils import detect_image_content_type
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
 from grox.flows.ptos.state import (
     SafetyPolicyCategory,
     SafetyPolicyType,
     SafetyPtosState,
 )
-from grox.core.schedules.types import TaskContext
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
-from monitor.metrics import Metrics
-from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
 
 logger = logging.getLogger(__name__)
 
@@ -210,15 +211,13 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             ("checkpoint_gcs", _CHECKPOINT_GCS),
         ]:
             parts.append(
-                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode(
-                    "utf-8"
-                )
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode()
             )
         file_header = (
             f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="image"\r\nContent-Type: {content_type}\r\n\r\n'
-        ).encode("utf-8")
+        ).encode()
         parts.append(file_header + payload_bytes)
-        closing = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        closing = f"\r\n--{boundary}--\r\n".encode()
         body = b"\r\n".join(parts) + closing
 
         last_error_reason = "exception"

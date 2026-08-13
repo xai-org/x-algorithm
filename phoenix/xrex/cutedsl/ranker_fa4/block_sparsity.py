@@ -31,7 +31,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Callable, NamedTuple, Tuple
+from collections.abc import Callable
+from typing import NamedTuple
 
 import cutlass.cute as cute
 import torch
@@ -197,7 +198,7 @@ def get_sparse_q_block_size(
 
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
-    expected_shape: Tuple[int, ...],
+    expected_shape: tuple[int, ...],
     tensor_name: str,
     context: str | None,
     hint: str | Callable[[], str] | None,
@@ -221,11 +222,11 @@ def _check_and_expand_block(
     name: str,
     cnt: torch.Tensor | None,
     idx: torch.Tensor | None,
-    expected_count_shape: Tuple[int, ...],
-    expected_index_shape: Tuple[int, ...],
+    expected_count_shape: tuple[int, ...],
+    expected_index_shape: tuple[int, ...],
     context: str | None,
     hint: str | Callable[[], str] | None,
-) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if (cnt is None) != (idx is None):
         raise ValueError(
             f"{name}_block_cnt and {name}_block_idx must both be provided or both be None"
@@ -252,7 +253,7 @@ def _check_and_expand_block(
 def _check_and_expand_metadata_tensor(
     name: str,
     tensor: torch.Tensor | None,
-    expected_shape: Tuple[int, ...],
+    expected_shape: tuple[int, ...],
     context: str | None,
     hint: str | Callable[[], str] | None,
     device: torch.device,
@@ -276,7 +277,7 @@ def get_block_sparse_expected_shapes(
     m_block_size: int,
     n_block_size: int,
     q_stage: int,
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
+) -> tuple[tuple[int, int, int], tuple[int, int, int, int]]:
     m_block_size_effective = q_stage * m_block_size
     expected_m_blocks = ceildiv(seqlen_q, m_block_size_effective)
     expected_n_blocks = ceildiv(seqlen_k, n_block_size)
@@ -298,7 +299,7 @@ def infer_block_sparse_expected_shapes(
     context: str,
     sparse_block_size_q: int | None = None,
     sparse_block_size_kv: int | None = None,
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], int]:
+) -> tuple[tuple[int, int, int], tuple[int, int, int, int], int]:
     base_m_block = q_stage * m_block_size
     base_n_block = n_block_size
     if sparse_block_size_kv is None:
@@ -374,7 +375,7 @@ def get_block_sparse_expected_shapes_bwd(
     m_block_size: int,
     n_block_size: int,
     subtile_factor: int,
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
+) -> tuple[tuple[int, int, int], tuple[int, int, int, int]]:
     sparse_block_size_q = subtile_factor * m_block_size
     expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
     expected_n_blocks = ceildiv(seqlen_k, n_block_size)
@@ -386,8 +387,8 @@ def get_block_sparse_expected_shapes_bwd(
 def normalize_block_sparse_tensors(
     tensors: BlockSparseTensorsTorch,
     *,
-    expected_count_shape: Tuple[int, ...],
-    expected_index_shape: Tuple[int, ...],
+    expected_count_shape: tuple[int, ...],
+    expected_index_shape: tuple[int, ...],
     context: str | None = None,
     hint: str | Callable[[], str] | None = None,
 ) -> BlockSparseTensorsTorch:
@@ -486,7 +487,7 @@ def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
 
 def get_block_sparse_broadcast_pattern(
     tensors: BlockSparseTensorsTorch,
-) -> Tuple[Tuple[bool, ...], ...] | None:
+) -> tuple[tuple[bool, ...], ...] | None:
     if not is_block_sparsity_enabled(tensors):
         return None
 
@@ -518,7 +519,7 @@ def normalize_block_sparse_config(
     seqlen_k: int,
     block_size: tuple[int, int],
     q_stage: int,
-) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None, int]:
+) -> tuple[BlockSparseTensorsTorch, tuple[tuple[bool, ...], ...] | None, int]:
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
         sparse_block_size_q, sparse_block_size_kv = None, n_block_size
@@ -577,7 +578,7 @@ def normalize_block_sparse_config_bwd(
     seqlen_k: int,
     block_size: tuple[int, int],
     subtile_factor: int,
-) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None]:
+) -> tuple[BlockSparseTensorsTorch, tuple[tuple[bool, ...], ...] | None]:
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
         sparse_block_size_q, sparse_block_size_kv = subtile_factor * m_block_size, n_block_size

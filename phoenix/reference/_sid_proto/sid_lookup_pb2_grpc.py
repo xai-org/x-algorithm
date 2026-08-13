@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import grpc
-
 import sid_lookup_pb2 as sid__lookup__pb2
 
 GRPC_GENERATED_VERSION = "1.66.0"
@@ -25,7 +24,7 @@ if _version_not_supported:
     )
 
 
-class SidLookupServiceStub(object):
+class SidLookupServiceStub:
     def __init__(self, channel):
         self.LookupSids = channel.unary_unary(
             "/sid_lookup.SidLookupService/LookupSids",
@@ -35,7 +34,7 @@ class SidLookupServiceStub(object):
         )
 
 
-class SidLookupServiceServicer(object):
+class SidLookupServiceServicer:
     def LookupSids(self, request, context):
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
@@ -57,7 +56,7 @@ def add_SidLookupServiceServicer_to_server(servicer, server):
     server.add_registered_method_handlers("sid_lookup.SidLookupService", rpc_method_handlers)
 
 
-class SidLookupService(object):
+class SidLookupService:
     @staticmethod
     def LookupSids(
         request,

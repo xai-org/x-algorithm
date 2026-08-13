@@ -4,9 +4,10 @@ import collections
 import functools
 import inspect
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import haiku as hk
 import jax

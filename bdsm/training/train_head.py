@@ -13,16 +13,15 @@ import time
 _RUNTIME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime")
 sys.path.insert(0, os.path.abspath(_RUNTIME))
 
+import heads
 import jax
 import jax.numpy as jnp
+import labels
+import loss as task_loss
 import numpy as np
 import optax
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-import heads
-import labels
-import loss as task_loss
 from metrics import average_precision
 from task_heads import SEED, head_logits, init_head_params
 
@@ -78,7 +77,7 @@ def head_scores(params: dict, x: np.ndarray) -> np.ndarray:
 
 def evaluate(params: dict, holdout: dict) -> dict:
     scores = head_scores(params, holdout["x"])
-    out = {"n_eval_users": int(len(scores))}
+    out = {"n_eval_users": len(scores)}
     for h in heads.HEADS:
         out[f"pr_auc/{h.name}"] = average_precision(holdout["y"][:, h.index], scores[:, h.index])
         out[f"pos/{h.name}"] = int(holdout["y"][:, h.index].sum())
@@ -208,8 +207,8 @@ def main() -> int:
         "reverse_ce_weight": reverse_ce_weight,
         "head_hidden_dims": list(hidden_dims),
         "n_trainable_params": int(n_trainable),
-        "n_train_users": int(len(train["x"])),
-        "n_holdout_users": int(len(holdout["x"])),
+        "n_train_users": len(train["x"]),
+        "n_holdout_users": len(holdout["x"]),
         "backbone_npz": os.path.join(args.backbone_dir, "backbone.npz"),
         "backbone_sha256": manifest["file_sha256"],
         "head_registry_hash": heads.registry_hash(),

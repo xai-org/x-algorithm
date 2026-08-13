@@ -1,13 +1,14 @@
 import asyncio
-import httpx
 import logging
 import random
 import socket
-
 from dataclasses import dataclass
 from time import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import quote
+
+import httpx
+
 from wily_cli.config import WilyConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class Instance:
     hostname: str
     port: int
     weight: float = 1.0
-    shard_id: Optional[str] = None
+    shard_id: str | None = None
 
     def __str__(self):
         return f"WilyNS.Instance({', '.join(f'{k}={v}' for k, v in self.__dict__.items())})"
@@ -73,7 +74,7 @@ class WilyNs:
     def _ensure_startswith(self, s: str, prefix: str) -> str:
         return f"{prefix}{s}" if s and not s.startswith(prefix) else s
 
-    def _entry_to_instance(self, entry: Dict[str, Any]) -> Instance:
+    def _entry_to_instance(self, entry: dict[str, Any]) -> Instance:
         return Instance(
             address=entry["addr"],
             hostname=entry["hostname"],
@@ -86,15 +87,15 @@ class WilyNs:
         return f"/p/static/{wily_config.zone}/{wily_config.role}/{wily_config.client_name}/{socket.gethostname()}/{int(time())}"
 
     def _make_url(
-        self, path: str, dtab: str = "", endpoint: Optional[str] = None
+        self, path: str, dtab: str = "", endpoint: str | None = None
     ) -> str:
         final_endpoint = endpoint or self.endpoint
         path = self._ensure_startswith(self._ensure_startswith(path, "/"), "/lookups")
         return f"https://{final_endpoint}{quote(path)}?context={self.context}&dtab={quote(dtab)}"
 
     async def _resolve(
-        self, wily_path: str, dtab: str = "", endpoint: Optional[str] = None
-    ) -> List[Instance]:
+        self, wily_path: str, dtab: str = "", endpoint: str | None = None
+    ) -> list[Instance]:
         if self.config.jitter:
             await asyncio.sleep(random.random() * self.config.jitter)
 
@@ -105,7 +106,7 @@ class WilyNs:
             for entry in response.json().get("entries", [])
         ]
 
-    async def resolve(self, wily_path: str, dtab: str = "") -> List[Instance]:
+    async def resolve(self, wily_path: str, dtab: str = "") -> list[Instance]:
         if self.config.allow_alternative_zones:
             other_endpoints = list(set(WILYNS_ENDPOINTS.values()) - {self.endpoint})
             ordered_endpoints = [self.endpoint] + other_endpoints

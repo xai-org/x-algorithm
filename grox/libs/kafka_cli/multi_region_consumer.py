@@ -6,10 +6,11 @@ from aiokafka import AIOKafkaConsumer
 from aiokafka.coordinator.assignors.sticky.sticky_assignor import (
     StickyPartitionAssignor,
 )
-from kafka_cli.config import KafkaMessage
-from kafka_cli.mtls import create_mtls_ssl_context
 from monitor.metrics import Metrics
 from pydantic import BaseModel, Field, model_validator
+
+from kafka_cli.config import KafkaMessage
+from kafka_cli.mtls import create_mtls_ssl_context
 
 logger = logging.getLogger(__name__)
 

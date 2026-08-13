@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Dict, Optional
 
 from xrex.eval.eval_utils import EvaluationTaskNew, ForwardEvalNew
 from xrex.eval.metrics_recsys import RecsysRCEMetrics, merge_report_extras
@@ -8,8 +7,8 @@ from xrex.utils.utils import flatten_dict
 
 
 def report_forward_eval_results(
-    results: Dict[str, ForwardEvalNew | EvaluationTaskNew], step: Optional[int] = None
-) -> Dict[str, float]:
+    results: dict[str, ForwardEvalNew | EvaluationTaskNew], step: int | None = None
+) -> dict[str, float]:
     del step
     all_metrics = {}
     for eval_name, eval in results.items():

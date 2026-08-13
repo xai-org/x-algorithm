@@ -2,7 +2,8 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 EXTRA_MODEL_CFGS: dict[str, Any] = {}
 

@@ -1,27 +1,25 @@
 import os
 import tempfile
 
+import numpy as np
 from twitter.clip.config import ClipConfig
 from twitter.clip.keras_model import TwitterCLIPKeras
 from twitter.clip.modules import ImageCLIP, TextCLIP
 from twitter.clip.utils import io_utils, model_utils, train_utils
 
-import numpy as np
-
-
 train_utils.set_memory_growth()
 
-from PIL import Image
-import clip
-from com.twitter.media_understanding.common.dbv2_utils.keras_export import (
-    DBV2ExportWrapper,
-    DEFAULT_IMAGE_FEATURE_NAME,
-)
 import onnx
-from onnx_tf.backend import prepare
 import tensorflow as tf
 import torch
+from com.twitter.media_understanding.common.dbv2_utils.keras_export import (
+    DEFAULT_IMAGE_FEATURE_NAME,
+    DBV2ExportWrapper,
+)
+from onnx_tf.backend import prepare
+from PIL import Image
 
+import clip
 
 DEFAULT_CLIP_MODEL_TYPE = "Twitter-ViT-B/32-256"
 DEFAULT_FINAL_EMBEDDING_DIM = ClipConfig.DEFAULT_FINAL_EMBEDDING_DIM

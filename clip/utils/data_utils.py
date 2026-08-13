@@ -2,14 +2,12 @@ import os
 import re
 import time
 
-from twitter.image_classification.utils import parallel_file_access
-from twitter.magicpony.common import file_access
-
 import numpy as np
 import tensorflow as tf
-from tensorflow_models_official_resnet import vgg_preprocessing
 import tqdm
-
+from tensorflow_models_official_resnet import vgg_preprocessing
+from twitter.image_classification.utils import parallel_file_access
+from twitter.magicpony.common import file_access
 
 PRETRAINED_MEANS = (0.48145466, 0.4578275, 0.40821073)
 PRETRAINED_STDEVS = (0.26862954, 0.26130258, 0.27577711)

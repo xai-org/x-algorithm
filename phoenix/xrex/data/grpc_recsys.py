@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from queue import Queue
 from threading import Thread
-from typing import Iterator
 
 import numpy as np
-
 from xai_configlib import configclass
+
 from xrex.data import rust_ext
 from xrex.data.parquet_recsys import DataPosition, PhoenixDataset
 from xrex.data.recsys.recsys_batch import (

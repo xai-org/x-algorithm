@@ -220,7 +220,7 @@ def _running_on_a_devbox() -> bool:
 
 def _get_max_clocks() -> tuple[int, int]:
     out = subprocess.check_output(
-        "nvidia-smi -q -d SUPPORTED_CLOCKS".split(), stderr=subprocess.STDOUT, text=True
+        ["nvidia-smi", "-q", "-d", "SUPPORTED_CLOCKS"], stderr=subprocess.STDOUT, text=True
     )
     pattern = re.compile(r"Memory.+?(?P<memory>\d+).+?Graphics.+?(?P<graphics>\d+)", re.DOTALL)
     match = pattern.search(out)

@@ -11,7 +11,6 @@ import time
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 from sid_io import mlp_forward_np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

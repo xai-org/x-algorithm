@@ -2,12 +2,11 @@ import logging
 import os
 import time
 import traceback
-from dataclasses import dataclass, field
 from asyncio import get_running_loop
+from dataclasses import dataclass, field
 
 import grpc.aio
 from monitor.metrics import Metrics
-
 from xai_sdk import AsyncClient
 from xai_sdk.proto import chat_pb2
 from xai_sdk.tools import web_search
@@ -119,8 +118,8 @@ class EapiSampler:
         logger.info(f"inputs: {msg}")
 
     async def _sample_raw(self, prompt: list[chat_pb2.Message], **kwargs):
-        conversation_id = kwargs.get("conversation_id", None)
-        search_allowed_domains = kwargs.get("search_allowed_domains", None)
+        conversation_id = kwargs.get("conversation_id")
+        search_allowed_domains = kwargs.get("search_allowed_domains")
         attributes = {"model_name": self.model}
         Metrics.counter("llm.sample.count").add(1, attributes=attributes)
         if kwargs.get("log_prompt", False):

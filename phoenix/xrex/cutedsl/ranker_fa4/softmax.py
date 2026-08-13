@@ -34,7 +34,6 @@
 import math
 import operator
 from dataclasses import dataclass
-from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -218,7 +217,7 @@ class SoftmaxSm100(Softmax):
         self,
         row_max_new: Float32,
         is_first: Boolean,
-    ) -> Tuple[Float32, Float32]:
+    ) -> tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
@@ -236,7 +235,7 @@ class SoftmaxSm100(Softmax):
         return row_max_safe, acc_scale
 
     @cute.jit
-    def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
+    def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):
             row_max_new = self._compute_row_max(acc_S_row)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0

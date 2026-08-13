@@ -10,10 +10,10 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
+from xai_gimmick import contract
 
 from xai_checkpointing import common
 from xai_checkpointing.tree_util import tree_to_dict
-from xai_gimmick import contract
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")

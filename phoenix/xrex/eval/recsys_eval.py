@@ -5,10 +5,10 @@ import functools
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +18,8 @@ import pyarrow.parquet as pq
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from xai_configlib import configclass
+
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
 from xrex.eval.eval_utils import EvaluationTaskNew
 from xrex.eval.metrics_recsys import (
@@ -27,8 +29,6 @@ from xrex.eval.metrics_recsys import (
     build_post_id_sorter,
     lookup_post_indices,
 )
-
-from xai_configlib import configclass
 
 if TYPE_CHECKING:
     from xrex.inference.sid_post_index import SidBeamResolver
@@ -55,12 +55,10 @@ def _make_gather_in_batch_jit(mesh: jax.sharding.Mesh):
 
 @configclass
 class RecsysTwoTowerEval(EvaluationTaskNew):
-    metrics: Optional[
-        List[Tuple[str, RecsysAccumulatedLossMetrics | RecsysRecallMetrics | RecsysSumMetrics]]
-    ] = None
+    metrics: list[tuple[str, RecsysAccumulatedLossMetrics | RecsysRecallMetrics | RecsysSumMetrics]] | None = None
 
-    train_metrics: Optional[Dict[str, float]] = None
-    metric_groups: List[str] = field(
+    train_metrics: dict[str, float] | None = None
+    metric_groups: list[str] = field(
         default_factory=lambda: [
             "all",
         ]
@@ -69,30 +67,30 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
     target_dataset_type: RetrievalDataset = RetrievalDataset.HOME
     recall_ema_half_life_reports: float = 50.0
 
-    positive_actions: List[int] = field(default_factory=lambda: list())
-    implicit_negative_actions: List[int] = field(default_factory=lambda: list())
-    explicit_negative_actions: List[int] = field(default_factory=lambda: list())
+    positive_actions: list[int] = field(default_factory=lambda: list())
+    implicit_negative_actions: list[int] = field(default_factory=lambda: list())
+    explicit_negative_actions: list[int] = field(default_factory=lambda: list())
     metadata_path: Path = PHOENIX_INDEX_BASE / "post_author_pairs_metadata/metadata_1day.parquet"
-    metadata_stats_unique_groups: List[str] = field(
+    metadata_stats_unique_groups: list[str] = field(
         default_factory=lambda: [
             "author_id",
         ]
     )
-    metadata_stats_median_groups: List[str] = field(
+    metadata_stats_median_groups: list[str] = field(
         default_factory=lambda: [
             "fav_count",
             "reply_count",
             "author_followers_count",
         ]
     )
-    metadata_stats_mean_groups: List[str] = field(
+    metadata_stats_mean_groups: list[str] = field(
         default_factory=lambda: [
             "has_video",
         ]
     )
 
     @property
-    def metadata_stats(self) -> List[str]:
+    def metadata_stats(self) -> list[str]:
         return (
             self.metadata_stats_unique_groups
             + self.metadata_stats_median_groups
@@ -119,11 +117,11 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
         **kwargs,
     ):
         self.metric_groups = kwargs.get("metric_groups", self.metric_groups)
-        candidate_tower_forward_fn = kwargs.get("candidate_tower_forward_fn", None)
+        candidate_tower_forward_fn = kwargs.get("candidate_tower_forward_fn")
         assert candidate_tower_forward_fn is not None
-        all_post_embeddings = kwargs.get("all_post_embeddings", None)
-        dataset_types = kwargs.get("dataset_types", None)
-        all_post_ids = kwargs.get("all_post_ids", None)
+        all_post_embeddings = kwargs.get("all_post_embeddings")
+        dataset_types = kwargs.get("dataset_types")
+        all_post_ids = kwargs.get("all_post_ids")
         assert all_post_embeddings is not None and all_post_ids is not None
         sorted_post_ids, post_id_sort_idx = build_post_id_sorter(all_post_ids)
         _force_validate = os.environ.get("XAI_EVAL_VALIDATE_MEMBERSHIP") == "1"
@@ -246,7 +244,7 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 in_batch_embeddings_global = _gather_in_batch_embeddings(
                     all_post_embeddings, in_batch_post_indices_global
                 )
-                _user_emb_fn = kwargs.get("user_emb_fn", None)
+                _user_emb_fn = kwargs.get("user_emb_fn")
                 assert _user_emb_fn is not None, "user_emb_fn required for in-batch recall"
                 _user_emb = _user_emb_fn(jax_batch)
                 _local_start = jax.process_index() * local_batch_size
@@ -585,10 +583,10 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
 class RecsysSIDRetrievalEval(EvaluationTaskNew):
     num_levels: int = 6
     beam_width: int = 128
-    positive_actions: List[int] = field(default_factory=lambda: list())
-    hard_negative_actions: List[int] = field(default_factory=lambda: list())
+    positive_actions: list[int] = field(default_factory=lambda: list())
+    hard_negative_actions: list[int] = field(default_factory=lambda: list())
 
-    train_metrics: Optional[Dict[str, float]] = None
+    train_metrics: dict[str, float] | None = None
 
     _sid_resolver: Optional["SidBeamResolver"] = None
     _beam_depth_hits: Any = None
@@ -641,7 +639,7 @@ class RecsysSIDRetrievalEval(EvaluationTaskNew):
         **kwargs,
     ):
         del forward_fn, loss_fn, rng
-        beam_forward_fn = kwargs.get("beam_forward_fn", None)
+        beam_forward_fn = kwargs.get("beam_forward_fn")
         if beam_forward_fn is None:
             raise ValueError("RecsysSIDRetrievalEval requires beam_forward_fn")
         if kwargs.get("sid_resolver") is not None:
@@ -840,7 +838,7 @@ class RecsysSIDRetrievalEval(EvaluationTaskNew):
             return float(np.asarray(multihost_utils.process_allgather(local, tiled=True)).sum())
         return float(value)
 
-    def collect_metrics(self) -> Dict[str, float]:
+    def collect_metrics(self) -> dict[str, float]:
         num_batches = float(self._actual_batches)
         beam_num_valid = self._multihost_sum_scalar(self._beam_num_valid)
         depth_hits = np.array(
@@ -857,7 +855,7 @@ class RecsysSIDRetrievalEval(EvaluationTaskNew):
         resolve_n_collision = self._multihost_sum_scalar(self._resolve_n_collision)
         resolve_n_filled = self._multihost_sum_scalar(self._resolve_n_filled)
 
-        metrics: Dict[str, float] = {
+        metrics: dict[str, float] = {
             "eval/sid/num_batches": num_batches,
             "eval/sid/beam_num_valid_users": beam_num_valid,
         }
@@ -925,7 +923,7 @@ def finalize_sid_eval_metrics(
     total_wall_s: float,
     sid_resolver: "SidBeamResolver",
     eval_bs_per_device: int,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     metrics = eval_task.collect_metrics()
     metrics["eval/sid/corpus_load_s"] = float(corpus_load_s)
     metrics["eval/sid/corpus_num_posts"] = float(sid_resolver.num_posts)
@@ -938,7 +936,7 @@ def finalize_sid_eval_metrics(
 
 
 def log_sid_eval_summary(
-    metrics: Dict[str, float],
+    metrics: dict[str, float],
     *,
     label: str,
     soft_step: int | None = None,
@@ -976,13 +974,13 @@ def log_sid_eval_summary(
 
 
 def run_recsys_evals(
-    evals: List[Tuple[str, RecsysTwoTowerEval]],
+    evals: list[tuple[str, RecsysTwoTowerEval]],
     train_dataset: Iterable,
     forward_fn: Callable,
     loss_fn: Callable,
     mesh: jax.sharding.Mesh,
     **kwargs,
-) -> Dict[str, EvaluationTaskNew]:
+) -> dict[str, EvaluationTaskNew]:
     return {
         name: conf.run(train_dataset, forward_fn, loss_fn, mesh, name=name, **kwargs)
         for name, conf in evals

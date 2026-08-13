@@ -2,7 +2,6 @@
 # Copyright 2026 X.AI Corp.
 import logging
 import struct
-from typing import List, Tuple, Union
 
 import zstandard as zstd
 
@@ -10,7 +9,7 @@ logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
 
 
-def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
     val = 0
     shift = 0
     while True:
@@ -25,7 +24,7 @@ def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
 
 def _read_names(
     data: bytes, pos: int, base_paths_present: bool
-) -> Tuple[List[str], int, List[int]]:
+) -> tuple[list[str], int, list[int]]:
     num_values, pos = _read_varint(data, pos)
 
     prefix_lens = [0]
@@ -79,7 +78,7 @@ def _load_node(
     fname: str,
     offset: int,
     size: int,
-    shard_sources: List[Union[Tuple[str, str, int, int], Tuple[str, bytes]]],
+    shard_sources: list[tuple[str, str, int, int] | tuple[str, bytes]],
 ) -> None:
     with open(f"{ocdbt_path}/{fname}", "rb") as f:
         f.seek(offset)
@@ -154,7 +153,7 @@ def _load_node(
 
 def load_shard_sources(
     ocdbt_path: str, prefix: str = ""
-) -> List[Union[Tuple[str, str, int, int], Tuple[str, bytes]]]:
+) -> list[tuple[str, str, int, int] | tuple[str, bytes]]:
     zd = zstd.ZstdDecompressor()
 
     with open(f"{ocdbt_path}/manifest.ocdbt", "rb") as f:

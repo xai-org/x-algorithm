@@ -2,30 +2,30 @@ import asyncio
 import logging
 import traceback
 
-from grox.core.tasks.task import Task
 from monitor.metrics import Metrics
+from strato_http.queries.apply_label_from_grox import (
+    SafetyLabelType,
+    StratoApplyLabelFromGrox,
+)
+from strato_http.queries.data_types import (
+    ReplyRankingScore,
+    ReplyRankingScoreKafka,
+)
+from strato_http.queries.is_test_user import StratoIsTestUser
+
+from grox.core.data_loaders.data_types import (
+    Post,
+)
+from grox.core.data_loaders.strato_loader import UserStratoLoader
 from grox.core.schedules.types import TaskContext
+from grox.core.tasks.disable_rules import DisableTaskForNonProd
+from grox.core.tasks.task import Task
 from grox.flows.reply_spam.state_coordinated_spam import CoordinatedSpamState
 from grox.flows.reply_spam.state_reply_ranking import (
     ReplyRankingState,
     ReplyScoreResult,
 )
-from grox.core.tasks.disable_rules import DisableTaskForNonProd
-from strato_http.queries.apply_label_from_grox import (
-    SafetyLabelType,
-    StratoApplyLabelFromGrox,
-)
-from strato_http.queries.is_test_user import StratoIsTestUser
-from grox.core.data_loaders.data_types import (
-    Post,
-)
-from grox.core.data_loaders.strato_loader import UserStratoLoader
-from strato_http.queries.data_types import (
-    ReplyRankingScore,
-    ReplyRankingScoreKafka,
-)
 from grox.flows.reply_spam.strato_loader import ReplyRankingScoreStratoLoader
-
 
 logger = logging.getLogger(__name__)
 

@@ -3,11 +3,12 @@ import time
 
 import numpy as np
 from embed.embed_http import ChatTemplate, XaiEmbeddingClientHttp
+from monitor.metrics import Metrics
+
 from grox.config.config import grox_config
 from grox.core.data_loaders.data_types import Post, Video
-from grox.flows.mm_emb.renderer import V5EmbedPostRenderer
-from monitor.metrics import Metrics
 from grox.flows.mm_emb.constants import RECSYS_V5_EMBED
+from grox.flows.mm_emb.renderer import V5EmbedPostRenderer
 
 logger = logging.getLogger(__name__)
 

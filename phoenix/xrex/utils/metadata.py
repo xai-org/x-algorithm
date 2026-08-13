@@ -16,7 +16,7 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from serde import serde
 from serde.json import from_dict, from_json, to_json
@@ -85,7 +85,7 @@ def read_metadata_file(checkpoint_path: Path) -> MetadataFromCheckpoint | None:
         try:
             return read_checkpoint_metadata(metadata_path)
         except Exception as e:
-            logger.error(f"Unable to read checkpoint completion file: {str(e)}")
+            logger.error(f"Unable to read checkpoint completion file: {e!s}")
 
     completion_path = checkpoint_path / COMPLETED_FILENAME
     try:
@@ -94,7 +94,7 @@ def read_metadata_file(checkpoint_path: Path) -> MetadataFromCheckpoint | None:
         elapsed_tokens = None
         return MetadataFromCheckpoint(elapsed_samples, checkpoint_index, elapsed_tokens)
     except Exception as e:
-        logger.error(f"Unable to read checkpoint completion file: {str(e)}")
+        logger.error(f"Unable to read checkpoint completion file: {e!s}")
         return None
 
 
@@ -122,14 +122,14 @@ def write_metadata_file(
 class Run:
     name: str
     run_id: str
-    parent_id: Optional[str]
+    parent_id: str | None
     fork_id: str
     lineage_id: str
     user: str
     commit_hash: str
     created_at: datetime.datetime
     reuse_run_id: bool = False
-    config_name: Optional[str] = None
+    config_name: str | None = None
 
     @classmethod
     def new_from_scratch(cls, name: str, reuse_run_id: bool = False) -> Run:
@@ -146,7 +146,7 @@ class Run:
             lineage_id=run_id,
             user=XAI_USER,
             commit_hash=_commit_hash(),
-            created_at=datetime.datetime.now(datetime.timezone.utc),
+            created_at=datetime.datetime.now(datetime.UTC),
             reuse_run_id=reuse_run_id,
         )
 
@@ -170,7 +170,7 @@ class Run:
             lineage_id=self.lineage_id,
             user=XAI_USER,
             commit_hash=_commit_hash(),
-            created_at=datetime.datetime.now(datetime.timezone.utc),
+            created_at=datetime.datetime.now(datetime.UTC),
             reuse_run_id=reuse_run_id,
         )
 
@@ -186,7 +186,7 @@ class Run:
                 lineage_id=self.lineage_id,
                 user=self.user,
                 commit_hash=self.commit_hash,
-                created_at=datetime.datetime.now(datetime.timezone.utc),
+                created_at=datetime.datetime.now(datetime.UTC),
                 reuse_run_id=reuse_run_id,
             )
         )
@@ -246,8 +246,8 @@ def guess_checkpoint_format(path):
 class MetadataProvider(ABC):
     @abstractmethod
     def discover_checkpoint(
-        self, run_name: Optional[str], load: Optional[str] = None
-    ) -> Optional[CheckpointMeta]: ...
+        self, run_name: str | None, load: str | None = None
+    ) -> CheckpointMeta | None: ...
 
     @abstractmethod
     def get_run_info(self, checkpoint: CheckpointMeta) -> Run: ...
@@ -305,7 +305,7 @@ def _search_for_latest_path_manual(search_dir: Path):
     return None
 
 
-def _search_for_latest_path(search_dir: Path) -> Optional[tuple[str, Path, int]]:
+def _search_for_latest_path(search_dir: Path) -> tuple[str, Path, int] | None:
     if not search_dir.exists() or not search_dir.is_dir():
         return None
 
@@ -334,11 +334,11 @@ def _search_for_latest_path(search_dir: Path) -> Optional[tuple[str, Path, int]]
 class FileSystemProvider(MetadataProvider):
     def __init__(self, checkpoint_dir: str | Path):
         self.checkpoint_dir = Path(checkpoint_dir)
-        self.current_config: Optional[Jsonable] = None
+        self.current_config: Jsonable | None = None
 
     def discover_checkpoint(
-        self, run_name: Optional[str], load: Optional[str] = None
-    ) -> Optional[CheckpointMeta]:
+        self, run_name: str | None, load: str | None = None
+    ) -> CheckpointMeta | None:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         found = None
@@ -413,7 +413,7 @@ class FileSystemProvider(MetadataProvider):
                 f.write(self.current_config.to_json())
 
         checkpoint_expiry = (
-            datetime.datetime.now(datetime.timezone.utc)
+            datetime.datetime.now(datetime.UTC)
             + datetime.timedelta(seconds=checkpoint_ttl)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -434,21 +434,21 @@ class FileSystemProvider(MetadataProvider):
 @dataclass
 class MetadataManager:
     providers: list[MetadataProvider]
-    __init_load: Optional[str] = field(init=False, default=None)
-    __init_config: Optional[Jsonable] = field(init=False, default=None)
-    __current_run: Optional[Run] = field(init=False, default=None)
-    __checkpoint: Optional[CheckpointMeta] = field(init=False, default=None)
+    __init_load: str | None = field(init=False, default=None)
+    __init_config: Jsonable | None = field(init=False, default=None)
+    __current_run: Run | None = field(init=False, default=None)
+    __checkpoint: CheckpointMeta | None = field(init=False, default=None)
 
     def init_or_restart(
-        self, run_name: str, config: Jsonable, load: Optional[str] = None
-    ) -> tuple[Run, Optional[CheckpointMeta]]:
+        self, run_name: str, config: Jsonable, load: str | None = None
+    ) -> tuple[Run, CheckpointMeta | None]:
         if self.__current_run is None:
             return self.init_run(run_name, config, load)
         return self.restart_run()
 
     def init_run(
-        self, run_name: str, config: Jsonable, load: Optional[str] = None
-    ) -> tuple[Run, Optional[CheckpointMeta]]:
+        self, run_name: str, config: Jsonable, load: str | None = None
+    ) -> tuple[Run, CheckpointMeta | None]:
         self.__init_load = load
         self.__init_config = config
         found = self.discover_checkpoint(run_name, load)
@@ -471,12 +471,12 @@ class MetadataManager:
         self._record_run(self.__current_run, config)
         return self.__current_run, None
 
-    def checkpoint(self) -> Optional[CheckpointMeta]:
+    def checkpoint(self) -> CheckpointMeta | None:
         return self.__checkpoint
 
     def discover_checkpoint(
-        self, run_name: Optional[str] = None, load: Optional[str] = None
-    ) -> Optional[tuple[CheckpointMeta, MetadataProvider]]:
+        self, run_name: str | None = None, load: str | None = None
+    ) -> tuple[CheckpointMeta, MetadataProvider] | None:
         if run_name is None and load is None:
             raise ValueError(
                 "Either `run_name` or `load` need to be specified to discover a checkpoint."
@@ -495,7 +495,7 @@ class MetadataManager:
             raise FileNotFoundError(f"User specified checkpoint load={load} not found!")
         return None
 
-    def restart_run(self) -> tuple[Run, Optional[CheckpointMeta]]:
+    def restart_run(self) -> tuple[Run, CheckpointMeta | None]:
         if self.__current_run is None:
             raise RuntimeError("No run was initialized, did you call `init_run` first?")
         if self.__init_config is None:
@@ -568,7 +568,7 @@ def build_metadata_manager(checkpoint_dir: str | None) -> MetadataManager:
 
 
 def _new_run_id() -> str:
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%y%m%d%H%M%S")
+    ts = datetime.datetime.now(datetime.UTC).strftime("%y%m%d%H%M%S")
     chars = string.ascii_uppercase + string.digits
     rand_chars = "".join(random.choice(chars) for _ in range(8))
     restart_count = 0

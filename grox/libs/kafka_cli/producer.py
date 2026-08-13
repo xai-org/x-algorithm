@@ -6,9 +6,10 @@ import traceback
 from datetime import datetime
 
 from aiokafka import AIOKafkaProducer
-from kafka_cli.config import KafkaProducerConfig
 from wily_cli.config import WilyConfig
 from wily_cli.wily_client import WilyNs
+
+from kafka_cli.config import KafkaProducerConfig
 
 logger = logging.getLogger(__name__)
 

@@ -1,12 +1,13 @@
 import logging
 
-from grox.core.tasks.task import TaskWithPost, TaskStopExecution
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
+
 from grox.core.data_loaders.data_types import Post, Video
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import TaskStopExecution, TaskWithPost
 from grox.flows.mm_emb.embedder import MultimodalPostEmbedderV5
 from grox.flows.mm_emb.embedder_v82 import MultimodalPostEmbedderV82
+from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
 
 logger = logging.getLogger(__name__)
 

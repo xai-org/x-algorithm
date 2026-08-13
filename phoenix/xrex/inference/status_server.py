@@ -6,9 +6,9 @@ import logging
 import os
 import secrets
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ def shutdown_request_authorized(client_ip: str, authorization: str, token: str |
         return False
     if not token:
         return False
-    return hmac.compare_digest(authorization.encode("utf-8"), f"Bearer {token}".encode("utf-8"))
+    return hmac.compare_digest(authorization.encode("utf-8"), f"Bearer {token}".encode())
 
 
 @dataclass(frozen=True, slots=True)

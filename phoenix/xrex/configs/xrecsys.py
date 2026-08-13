@@ -4,8 +4,8 @@ import itertools
 import warnings
 from dataclasses import replace
 
-import xrex.configs.data_feeds
 from xai_proto import recsys_pb2
+
 from xrex.configs import config_registry
 from xrex.data.parquet_recsys import (
     PhoenixDataset,

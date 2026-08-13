@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from typing import Optional
 
 import requests
 
@@ -27,7 +26,7 @@ def _local_cache_put(uid: int, counter_ms: int) -> None:
     _LOCAL_CACHE[uid] = (counter_ms, time.time())
 
 
-def _local_cache_get(uid: int) -> Optional[int]:
+def _local_cache_get(uid: int) -> int | None:
     entry = _LOCAL_CACHE.get(uid)
     if entry is None:
         return None
@@ -38,7 +37,7 @@ def _local_cache_get(uid: int) -> Optional[int]:
     return counter_ms
 
 
-def _fetch_counter_ms(user_id: int) -> Optional[int]:
+def _fetch_counter_ms(user_id: int) -> int | None:
     try:
         resp = requests.post(
             STRATO_URL,
@@ -60,8 +59,8 @@ def _fetch_counter_ms(user_id: int) -> Optional[int]:
 def get_login_pack_age_minutes(
     user_id: int,
     redis_client=None,
-    metrics: Optional[dict] = None,
-) -> Optional[int]:
+    metrics: dict | None = None,
+) -> int | None:
     now_msec = int(time.time() * 1000)
 
     cached = _local_cache_get(user_id)

@@ -1,10 +1,10 @@
 import io
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
-
 
 MIN_WIDTH = 8
 MIN_HEIGHT = 8
@@ -35,9 +35,8 @@ def _resize_and_pad(
 
 
 def resize_tile(image_bytes: bytes, tile_size: int) -> bytes:
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        with img.convert("RGB") as image:
-            return _resize_and_pad(image, tile_size)
+    with Image.open(io.BytesIO(image_bytes)) as img, img.convert("RGB") as image:
+        return _resize_and_pad(image, tile_size)
 
 
 def _has_transparency(img: Image.Image) -> bool:
@@ -89,15 +88,14 @@ def _adaptive_brightness_correction(
 
 
 def enhance_image_with_clahe(image_bytes: bytes, tile_size: int | None) -> bytes:
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        with img.convert("RGB") as rgb_img:
-            enhanced = _apply_clahe_pil(rgb_img)
-            enhanced = _adaptive_brightness_correction(enhanced)
-            enhanced = _boost_saturation(enhanced, factor=1.5)
-            enhanced = _sharpen(enhanced)
-            if tile_size is None:
-                return _padded_image(enhanced, high_quality_jpeg=True)
-            return _resize_and_pad(enhanced, tile_size, high_quality_jpeg=True)
+    with Image.open(io.BytesIO(image_bytes)) as img, img.convert("RGB") as rgb_img:
+        enhanced = _apply_clahe_pil(rgb_img)
+        enhanced = _adaptive_brightness_correction(enhanced)
+        enhanced = _boost_saturation(enhanced, factor=1.5)
+        enhanced = _sharpen(enhanced)
+        if tile_size is None:
+            return _padded_image(enhanced, high_quality_jpeg=True)
+        return _resize_and_pad(enhanced, tile_size, high_quality_jpeg=True)
 
 
 def process_image_bytes(image_bytes: bytes, tile_size: int) -> ProcessedImage:
@@ -149,6 +147,5 @@ def _padded_image(image: Image.Image, high_quality_jpeg: bool = False) -> bytes:
 
 
 def pad_image(image_bytes: bytes) -> bytes:
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        with img.convert("RGB") as image:
-            return _padded_image(image)
+    with Image.open(io.BytesIO(image_bytes)) as img, img.convert("RGB") as image:
+        return _padded_image(image)

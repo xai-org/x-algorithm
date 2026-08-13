@@ -1,16 +1,17 @@
-import time
 import logging
+import time
 from typing import override
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
+from strato_http.queries.grok_topics import StratoGrokTopics
+
 from grox.core.data_loaders.data_types import Post
-from grox.flows.upa.state_initial_banger import InitialBangerState
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.flows.upa.classifier_banger_initial_screen_gemma import (
     BangerInitialScreenGemmaClassifier,
 )
-from strato_http.queries.grok_topics import StratoGrokTopics
+from grox.flows.upa.state_initial_banger import InitialBangerState
 
 logger = logging.getLogger(__name__)
 

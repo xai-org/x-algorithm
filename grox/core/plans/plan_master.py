@@ -4,7 +4,7 @@ import time
 import grox.core.loading
 from grox.core.plans.plan import Plan
 from grox.core.plans.registry import registered_plans
-from grox.core.schedules.types import TaskResult, TaskPayload
+from grox.core.schedules.types import TaskPayload, TaskResult
 
 
 class PlanMaster:

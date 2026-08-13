@@ -32,7 +32,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -48,8 +47,8 @@ class BlockInfo:
     is_causal: cutlass.Constexpr[bool]
     is_local: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
-    window_size_left: Optional[Int32] = None
-    window_size_right: Optional[Int32] = None
+    window_size_left: Int32 | None = None
+    window_size_right: Int32 | None = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
 
     @cute.jit
@@ -59,7 +58,7 @@ class BlockInfo:
         m_block: Int32,
         split_idx: Int32 = 0,
         num_splits: Int32 = 1,
-    ) -> Tuple[Int32, Int32]:
+    ) -> tuple[Int32, Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             m_idx_max = (m_block + 1) * self.tile_m
@@ -87,7 +86,7 @@ class BlockInfo:
         return n_block_min, n_block_max
 
     @cute.jit
-    def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
+    def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> tuple[Int32, Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
@@ -109,7 +108,7 @@ class BlockInfo:
         m_block: Int32,
         split_idx: Int32 = 0,
         num_splits: Int32 = 1,
-    ) -> Tuple[Int32, Int32]:
+    ) -> tuple[Int32, Int32]:
         n_block_min, n_block_max = self.get_n_block_min_max(
             seqlen_info,
             m_block,

@@ -2,14 +2,14 @@
 # Copyright 2026 X.AI Corp.
 import logging
 from dataclasses import dataclass, field
-from typing import Any, List, NamedTuple, Union
+from typing import Any, NamedTuple
 
 import jax
 import numba
 import numpy as np
 from jax.sharding import NamedSharding
-
 from xai_configlib import Config, configclass
+
 from xrex.models.model_utils import Parameter
 
 
@@ -23,12 +23,12 @@ rank_logger = logging.getLogger("rank")
 
 @dataclass
 class RecsysEmbeddingsParameter:
-    user_embeddings: Union[Parameter, EmbTable, None]
-    history_post_embeddings: Union[Parameter, EmbTable, None]
-    candidate_post_embeddings: Union[Parameter, EmbTable, None]
-    history_author_embeddings: Union[Parameter, EmbTable]
-    candidate_author_embeddings: Union[Parameter, EmbTable]
-    user_ip_embeddings: Union[Parameter, EmbTable, None] = None
+    user_embeddings: Parameter | EmbTable | None
+    history_post_embeddings: Parameter | EmbTable | None
+    candidate_post_embeddings: Parameter | EmbTable | None
+    history_author_embeddings: Parameter | EmbTable
+    candidate_author_embeddings: Parameter | EmbTable
+    user_ip_embeddings: Parameter | EmbTable | None = None
 
 
 @dataclass
@@ -175,24 +175,24 @@ def _hash_ids_batch(
 @configclass
 class HashKeys(Config):
     user_id_table_size: int = 100_000
-    user_hash_scales: List[int] = field(default_factory=lambda: [196742702, 1852108266])
-    user_biases: List[int] = field(default_factory=lambda: [1935840681, 167407236])
+    user_hash_scales: list[int] = field(default_factory=lambda: [196742702, 1852108266])
+    user_biases: list[int] = field(default_factory=lambda: [1935840681, 167407236])
     user_modulus: int = 2_859_568_897
 
     item_id_table_size: int = 100_000
     item_hash_vocab_size: int = 0
-    item_hash_scales: List[int] = field(default_factory=lambda: [2161410491, 1754358832])
-    item_biases: List[int] = field(default_factory=lambda: [1935840681, 167407236])
+    item_hash_scales: list[int] = field(default_factory=lambda: [2161410491, 1754358832])
+    item_biases: list[int] = field(default_factory=lambda: [1935840681, 167407236])
     item_modulus: int = 2_361_375_383
 
     author_id_table_size: int = 10_000
-    author_hash_scales: List[int] = field(default_factory=lambda: [371965780, 328930218])
-    author_biases: List[int] = field(default_factory=lambda: [139686260, 37755056])
+    author_hash_scales: list[int] = field(default_factory=lambda: [371965780, 328930218])
+    author_biases: list[int] = field(default_factory=lambda: [139686260, 37755056])
     author_modulus: int = 631_860_353
 
     ip_id_table_size: int = 0
-    ip_hash_scales: List[int] = field(default_factory=lambda: [529_482_163, 1_327_604_891])
-    ip_biases: List[int] = field(default_factory=lambda: [742_961_053, 318_205_477])
+    ip_hash_scales: list[int] = field(default_factory=lambda: [529_482_163, 1_327_604_891])
+    ip_biases: list[int] = field(default_factory=lambda: [742_961_053, 318_205_477])
     ip_modulus: int = 1_073_741_789
 
     def __post_init__(self):

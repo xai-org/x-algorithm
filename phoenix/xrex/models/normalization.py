@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from collections import abc
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 import haiku as hk
 import jax
@@ -59,12 +59,12 @@ def all_heads_qk_norm_fn(
 class RMSNorm(hk.Module):
     def __init__(
         self,
-        axis: Union[int, Sequence[int], slice],
+        axis: int | Sequence[int] | slice,
         eps: float = 1e-5,
-        scale_init: Optional[hk.initializers.Initializer] = None,
-        name: Optional[str] = None,
+        scale_init: hk.initializers.Initializer | None = None,
+        name: str | None = None,
         create_scale: bool = True,
-        pspec: Optional[P] = P(None),
+        pspec: P | None = P(None),
         lr_multiplier: float = 1.0,
         weight_decay_mask: float = 0.0,
     ):

@@ -2,9 +2,10 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp

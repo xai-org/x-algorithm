@@ -8,8 +8,8 @@ from dataclasses import field
 
 import haiku as hk
 import jax
-
 from xai_configlib import configclass
+
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.recsys_embedding import RecsysEmbeddingsParameter
 from xrex.models.recsys_sid_retrieval_model import RecsysSIDRetrievalConfig
@@ -65,7 +65,7 @@ class SidRetrievalTrainer(RecsysTrainer):
     def eval(self, soft_step: int):
         if isinstance(self.model_config, RecsysSIDRetrievalConfig):
             return self.eval_sid_retrieval(soft_step)
-        return super(SidRetrievalTrainer, self).eval(soft_step)
+        return super().eval(soft_step)
 
     def _reload_sid_beam_resolver(self) -> tuple[object, float]:
         from xrex.data.retrieval_dataset import RetrievalDataset

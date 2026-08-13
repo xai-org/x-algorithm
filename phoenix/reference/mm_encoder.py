@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 
@@ -61,7 +61,7 @@ class LegacyCard:
 class UnifiedCard:
     title: str | None = None
     description: str | None = None
-    media: "Image | Video | None" = None
+    media: Image | Video | None = None
 
 
 @dataclass
@@ -74,7 +74,7 @@ class CardV2:
 class ArticleMetadata:
     title: str | None = None
     cover_media: Image | None = None
-    media: list["Image | Video"] | None = None
+    media: list[Image | Video] | None = None
 
 
 @dataclass
@@ -82,10 +82,10 @@ class Post:
     id: int | None = None
     text: str | None = None
     author: Author | None = None
-    media: list["Image | Video"] | None = None
+    media: list[Image | Video] | None = None
     cards: list[CardV2] | None = None
     article: ArticleMetadata | None = None
-    quoted_post: "Post | None" = None
+    quoted_post: Post | None = None
 
 
 def remove_tco_links(text: str) -> str:

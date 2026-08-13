@@ -35,8 +35,9 @@ import hashlib
 import inspect
 import math
 import os
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Optional, Tuple, Type, overload
+from typing import overload
 
 import cutlass
 import cutlass.cute as cute
@@ -133,7 +134,7 @@ def _compute_base_hash(func: Callable) -> str:
 
 
 def hash_callable(
-    func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
+    func: Callable, mixer_attrs: tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
 ) -> str:
     if hasattr(func, "__cute_hash__"):
         base_hash = func.__cute_hash__
@@ -292,7 +293,7 @@ def mma_make_fragment_B(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int], element_type: type[cute.Numeric], transpose: bool = False
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -526,7 +527,7 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(val: cutlass.Int32, lane: cutlass.Int32 | None = None) -> cutlass.Int32:
     if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
@@ -539,7 +540,7 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
 
 @dsl_user_op
 def cvt_f16x2_f32(
-    a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None
+    a: float | Float32, b: float | Float32, to_dtype: type, *, loc=None, ip=None
 ) -> cutlass.Int32:
     assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
     return cutlass.Int32(
@@ -560,7 +561,7 @@ def cvt_f16(src: cute.Tensor, dst: cute.Tensor) -> None: ...
 
 
 @overload
-def cvt_f16(src: cute.Tensor, dtype: Type[cute.Numeric]) -> cute.Tensor: ...
+def cvt_f16(src: cute.Tensor, dtype: type[cute.Numeric]) -> cute.Tensor: ...
 
 
 @cute.jit
@@ -587,7 +588,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
 
 @dsl_user_op
 @cute.jit
-def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
+def evaluate_polynomial(x: Float32, poly: tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
     deg = len(poly) - 1
     out = poly[deg]
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
@@ -598,8 +599,8 @@ def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=N
 @dsl_user_op
 @cute.jit
 def evaluate_polynomial_2(
-    x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
+    x: Float32, y: Float32, poly: tuple[Float32, ...], *, loc=None, ip=None
+) -> tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
@@ -662,7 +663,7 @@ def ex2_emulation(x: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Flo
 @dsl_user_op
 def ex2_emulation_2(
     x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
+) -> tuple[Float32, Float32]:
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
@@ -677,7 +678,7 @@ def ex2_emulation_2(
 
 
 @dsl_user_op
-def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
     out_f32x2 = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Float32(x).ir_value(loc=loc, ip=ip), Float32(y, loc=loc, ip=ip).ir_value()],

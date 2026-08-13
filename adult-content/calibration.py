@@ -5,11 +5,10 @@ import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import confusion_matrix
 
-
 logger = logging.getLogger(__name__)
 
 
-class Metrics(object):
+class Metrics:
     def __init__(self, df, thresholds=None):
         self.df = df
         self.y_true = df["label"] == 1

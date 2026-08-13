@@ -1,29 +1,32 @@
-import os
 import asyncio
 import logging
+import os
 import traceback
 from urllib.parse import urlparse
-from tenacity import retry, wait_fixed, stop_after_attempt
-from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
-from monitor.metrics import Metrics
-from video_tools.image import process_image_bytes, resize_tile, enhance_image_with_clahe
-from grox.config.config import grox_config
-from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
-from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
-from grox.core.clients.nightowl_client import NightOwlClient
+
+from blobstore_http.cdn_downloader import CDNDownloader
 from grox_fetcher_client import GroxFetcherClient
+from html_render.tweet_render_for_grox import TweetRenderForGrox
+from monitor.metrics import Metrics
+from strato_http.queries.video_subtitle import StratoVideoSubtitle
+from tenacity import retry, stop_after_attempt, wait_fixed
+from video_tools.image import enhance_image_with_clahe, process_image_bytes, resize_tile
 from video_tools.subtitles import SubtitleAligner
 from video_tools.video_frames import VideoFramesExtractor
-from grox.core.data_loaders.data_types import Post, Image, Video, BroadcastMetadata
-from blobstore_http.cdn_downloader import CDNDownloader
-from html_render.tweet_render_for_grox import TweetRenderForGrox
-from strato_http.queries.video_subtitle import StratoVideoSubtitle
+
+from grox.config.config import grox_config
+from grox.core.clients.nightowl_client import NightOwlClient
+from grox.core.data_loaders.data_types import BroadcastMetadata, Image, Post, Video
+from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
+from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
+from grox.core.lm.convo import Image as ConvoImage
+from grox.core.lm.convo import Video as ConvoVideo
 
 logger = logging.getLogger(__name__)
 
 _VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm")
 _VIDEO_DURATION_LIMIT_MINUTES = 360
-_VIDEO_MAX_ESTIMATED_BYTES = int(2 * 1024**3)
+_VIDEO_MAX_ESTIMATED_BYTES = 2 * 1024**3
 _MAX_URL_VIDEOS_PER_POST = 7
 
 

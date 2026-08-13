@@ -32,7 +32,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from dataclasses import dataclass
-from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -51,8 +50,8 @@ class SeqlenInfo:
     def create(
         batch_idx: Int32,
         seqlen_static: Int32,
-        cu_seqlens: Optional[cute.Tensor] = None,
-        seqused: Optional[cute.Tensor] = None,
+        cu_seqlens: cute.Tensor | None = None,
+        seqused: cute.Tensor | None = None,
         tile: cutlass.Constexpr[int] = 128,
     ):
         offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
@@ -108,12 +107,12 @@ class SeqlenInfoQK:
         batch_idx: Int32,
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: cute.Tensor | None = None,
+        mCuSeqlensK: cute.Tensor | None = None,
+        mSeqUsedQ: cute.Tensor | None = None,
+        mSeqUsedK: cute.Tensor | None = None,
+        mCuTotalMBlocks: cute.Tensor | None = None,
+        mCuBlockIdxOffsets: cute.Tensor | None = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
@@ -254,13 +253,13 @@ class SeqlenInfoQKNewK:
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
         shape_K_new_0: Int32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mCuSeqlensKNew: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mLeftpadK: Optional[cute.Tensor] = None,
-        mSeqlensRotary: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: cute.Tensor | None = None,
+        mCuSeqlensK: cute.Tensor | None = None,
+        mCuSeqlensKNew: cute.Tensor | None = None,
+        mSeqUsedQ: cute.Tensor | None = None,
+        mSeqUsedK: cute.Tensor | None = None,
+        mLeftpadK: cute.Tensor | None = None,
+        mSeqlensRotary: cute.Tensor | None = None,
     ):
         leftpad_k = 0 if const_expr(mLeftpadK is None) else mLeftpadK[batch_idx]
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]

@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from typing import Optional, Tuple
 
 import jax
 import jax.experimental.pallas as pl
@@ -431,7 +430,7 @@ def attention(
     v,
     config: TuningConfig,
     save_residuals: bool = False,
-    bound: Optional[Tuple[int, int, int, int]] = None,
+    bound: tuple[int, int, int, int] | None = None,
     sm_scale: float = 1.0,
     cap: float = -1.0,
     cap_method: str = "tanh",
@@ -1186,7 +1185,7 @@ def attention_reference(
     q,
     k,
     v,
-    bound: Optional[Tuple[int, int, int, int]] = None,
+    bound: tuple[int, int, int, int] | None = None,
     save_residuals=False,
     sm_scale: float = 1.0,
     cap: float = -1.0,

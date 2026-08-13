@@ -2,9 +2,9 @@ import abc
 import logging
 from collections.abc import AsyncGenerator
 
-from grox.core.schedules.types import TaskResult, TaskPayload
-from grox.core.generators.task_generator import TaskGenerator
 from grox.core.data_loaders.message_queue_loader import MessageQueueLoader
+from grox.core.generators.task_generator import TaskGenerator
+from grox.core.schedules.types import TaskPayload, TaskResult
 
 logger = logging.getLogger(__name__)
 

@@ -32,7 +32,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from dataclasses import dataclass
-from typing import Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -62,8 +61,8 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
 def make_packgqa_tiled_tma_atom(
     op: cute.atom.CopyOp,
     gmem_tensor: cute.Tensor,
-    smem_layout: Union[cute.Layout, cute.ComposedLayout],
-    cta_tiler: Tuple[int, int],
+    smem_layout: cute.Layout | cute.ComposedLayout,
+    cta_tiler: tuple[int, int],
     qhead_per_kvhead: int,
     head_idx: int,
 ):

@@ -4,12 +4,13 @@ from typing import Any
 
 import numpy as np
 from embed.embed_http import XaiEmbeddingClientHttp
-from grox.config.config import grox_config
-from grox.core.data_loaders.data_types import Post, User, Video
-from grox.flows.mm_emb.renderer_v82 import V82EmbedPostRenderer
 from monitor.metrics import Metrics
 from strato_http.queries.user_core import StratoUserCore
+
+from grox.config.config import grox_config
+from grox.core.data_loaders.data_types import Post, User, Video
 from grox.flows.mm_emb.constants import RECSYS_V82_MM_EMBED
+from grox.flows.mm_emb.renderer_v82 import V82EmbedPostRenderer
 
 logger = logging.getLogger(__name__)
 

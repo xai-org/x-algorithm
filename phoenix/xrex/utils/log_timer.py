@@ -2,7 +2,8 @@
 # Copyright 2026 X.AI Corp.
 import logging
 import time
-from typing import Any, Callable, Protocol, TypeVar, overload
+from collections.abc import Callable
+from typing import Any, Protocol, TypeVar, overload
 
 logger = logging.getLogger(__name__)
 

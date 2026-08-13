@@ -4,7 +4,6 @@ import itertools
 import os
 from pathlib import Path
 
-import xrex.configs.data_feeds
 from xrex import settings
 from xrex.configs import config_registry
 from xrex.data.parquet_recsys import PhoenixDataset

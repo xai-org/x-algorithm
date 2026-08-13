@@ -8,12 +8,11 @@ import json
 import logging
 import os
 import pickle
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 
 import numpy as np
-
 from pipeline_security import kafka_ssl_config, safe_pickle_loads
 from score_layout import HEAD_ORDER, to_score_row
 
@@ -118,11 +117,10 @@ def main() -> int:
 
     import jax
     import jax.numpy as jnp
-    import zstandard as zstd
-    from confluent_kafka import Consumer, KafkaError, Producer
-
     import load_backbone
     import model as bdsm_model
+    import zstandard as zstd
+    from confluent_kafka import Consumer, KafkaError, Producer
     from task_heads import head_logits, load_head_params
 
     cfg = manifest["source_config"]

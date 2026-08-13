@@ -6,15 +6,15 @@ import logging
 import math
 import os
 import time
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
-
 import xai_recsys_engine
 from xai_checkpointing.common import _unsafe_jax2np
+
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class H2DState(NamedTuple):
     multimodal_embeddings: MultimodalEmbeddingBuffer | None = None
 
 
-def _create_aligned_array(shape: Tuple[int, ...], itemsize: int, dtype):
+def _create_aligned_array(shape: tuple[int, ...], itemsize: int, dtype):
     _buffer_size_bytes = functools.reduce(lambda x, y: x * y, shape) * itemsize
     buffer_size_bytes = _buffer_size_bytes + AVX_512_ALIGNMENT
     buffer = np.zeros(buffer_size_bytes, dtype=np.uint8)
@@ -89,7 +89,7 @@ def _create_mm_embedding_buffer_views(
 
 
 def open_shared_emb_table(
-    shape: Tuple[int, int],
+    shape: tuple[int, int],
     dtype: type = np.uint16,
     path: str | None = None,
 ) -> np.memmap:
@@ -106,7 +106,7 @@ def open_shared_emb_table(
 
 def create_memmap_emb_table(
     path: str,
-    emb_table_shape: Tuple[int, int],
+    emb_table_shape: tuple[int, int],
     embedding_dtype,
     prefault: bool = True,
 ) -> np.memmap:
@@ -162,7 +162,7 @@ def parallel_copyto(dst: np.ndarray, src: np.ndarray) -> None:
 
 def open_existing_memmap_emb_table(
     path: str,
-    emb_table_shape: Tuple[int, int],
+    emb_table_shape: tuple[int, int],
     embedding_dtype,
 ) -> np.memmap:
     match embedding_dtype.dtype.name:
@@ -183,15 +183,15 @@ def open_existing_memmap_emb_table(
 
 def create_h2d_state(
     embedding_dtype,
-    emb_table_shape: Tuple[int, int],
-    user_embeddings_shape: Tuple[int, int],
-    history_post_embeddings_shape: Tuple[int, int],
-    history_author_embeddings_shape: Tuple[int, int],
-    candidate_post_embeddings_shape: Tuple[int, int],
-    candidate_author_embeddings_shape: Tuple[int, int],
+    emb_table_shape: tuple[int, int],
+    user_embeddings_shape: tuple[int, int],
+    history_post_embeddings_shape: tuple[int, int],
+    history_author_embeddings_shape: tuple[int, int],
+    candidate_post_embeddings_shape: tuple[int, int],
+    candidate_author_embeddings_shape: tuple[int, int],
     data_sharding,
-    candidate_multimodal_embeddings_shape: Tuple[int, int, int] | None = None,
-    user_ip_embeddings_shape: Tuple[int, int] | None = None,
+    candidate_multimodal_embeddings_shape: tuple[int, int, int] | None = None,
+    user_ip_embeddings_shape: tuple[int, int] | None = None,
     shared_emb_table_path: str | None = None,
     hotswap_emb_table_path: str | None = None,
     emb_table: npt.NDArray[np.uint16] | None = None,

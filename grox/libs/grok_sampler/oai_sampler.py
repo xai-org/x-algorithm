@@ -3,9 +3,8 @@ import logging
 import time
 import traceback
 
-from openai import AsyncOpenAI
-
 from monitor.metrics import Metrics
+from openai import AsyncOpenAI
 
 from grok_sampler.config import OaiModelConfig
 

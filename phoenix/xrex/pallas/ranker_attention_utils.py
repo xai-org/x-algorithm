@@ -2,7 +2,7 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +22,7 @@ def history_candidate_mask(
     history_upper_bound: jax.Array | int,
     candidate_lower_bound: jax.Array | int,
     candidate_upper_bound: jax.Array | int,
-    broadcasted_iota_fn: Optional[Callable[..., jax.Array]] = None,
+    broadcasted_iota_fn: Callable[..., jax.Array] | None = None,
     layout: object | None = None,
 ) -> jax.Array:
     q_seq_base = jnp.asarray(q_seq_base, dtype=jnp.int32)
@@ -65,7 +65,7 @@ def history_candidate_mask_kv_q(
     history_upper_bound: jax.Array | int,
     candidate_lower_bound: jax.Array | int,
     candidate_upper_bound: jax.Array | int,
-    broadcasted_iota_fn: Optional[Callable[..., jax.Array]] = None,
+    broadcasted_iota_fn: Callable[..., jax.Array] | None = None,
     layout: object | None = None,
 ) -> jax.Array:
     q_seq_base = jnp.asarray(q_seq_base, dtype=jnp.int32)

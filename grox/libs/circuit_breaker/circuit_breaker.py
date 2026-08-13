@@ -1,11 +1,12 @@
-import time
 import asyncio
 import logging
-from enum import Enum
+import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, TypeVar
+from enum import Enum
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
 

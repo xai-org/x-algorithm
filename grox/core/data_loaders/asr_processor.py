@@ -12,12 +12,12 @@ from queue import Empty
 
 import aiohttp
 from cachetools import TTLCache
+from monitor.logging import Logging
+from monitor.metrics import Metrics
 from pydantic import BaseModel
 
 from grox.config.config import grox_config
 from grox.core.schedules.init import init_proc
-from monitor.logging import Logging
-from monitor.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 

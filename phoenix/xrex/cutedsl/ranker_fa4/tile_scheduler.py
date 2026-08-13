@@ -33,7 +33,7 @@
 # Copyright 2026 X.AI Corp.
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Optional, Protocol, Tuple, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 try:
     from typing import override
@@ -141,10 +141,10 @@ class TileSchedulerArguments(ParamsBase):
     headdim: Int32
     headdim_v: Int32
     total_q: Int32
-    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
-    cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
-    mCuSeqlensQ: Optional[cute.Tensor] = None
-    mSeqUsedQ: Optional[cute.Tensor] = None
+    tile_shape_mn: cutlass.Constexpr[tuple[int, int]]
+    cluster_shape_mn: cutlass.Constexpr[tuple[int, int]] = (1, 1)
+    mCuSeqlensQ: cute.Tensor | None = None
+    mSeqUsedQ: cute.Tensor | None = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
@@ -163,7 +163,7 @@ class SingleTileScheduler:
         num_splits: Int32
         num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
-        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        cluster_shape_mn: cutlass.Constexpr[tuple[int, int]] = (1, 1)
         use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
@@ -217,7 +217,7 @@ class SingleTileScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
+    ) -> tuple[Int32, Int32, Int32]:
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
         if const_expr(params.use_cluster_idx):
             grid_x = params.num_block * params.cluster_shape_mn[0]
@@ -325,7 +325,7 @@ class StaticPersistentTileScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
+    ) -> tuple[Int32, Int32, Int32]:
         hardware_info = cutlass.utils.HardwareInfo()
         sm_count = hardware_info.get_device_multiprocessor_count()
         max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
@@ -503,7 +503,7 @@ class SingleTileLPTScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
+    ) -> tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
         return (params.total_blocks, params.num_splits, Int32(1))
@@ -612,7 +612,7 @@ class SingleTileLPTBwdScheduler:
         l2_major_divmod: FastDivmodDivisor
         l2_minor_residual_divmod: FastDivmodDivisor
         num_hb_quotient: Int32
-        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        cluster_shape_mn: cutlass.Constexpr[tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
 
         @staticmethod
@@ -675,7 +675,7 @@ class SingleTileLPTBwdScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
+    ) -> tuple[Int32, Int32, Int32]:
         return (params.total_blocks, Int32(1), Int32(1))
 
     @cute.jit
@@ -732,9 +732,9 @@ class SingleTileVarlenScheduler:
         total_q: Int32
         num_splits: Int32
         max_kvblock_in_l2: Int32
-        tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
-        mCuSeqlensQ: Optional[cute.Tensor] = None
-        mSeqUsedQ: Optional[cute.Tensor] = None
+        tile_shape_mn: cutlass.Constexpr[tuple[int, int]]
+        mCuSeqlensQ: cute.Tensor | None = None
+        mSeqUsedQ: cute.Tensor | None = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
@@ -850,7 +850,7 @@ class SingleTileVarlenScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[Int32, Int32, Int32]:
+    ) -> tuple[Int32, Int32, Int32]:
         total_blocks_max = (
             params.total_q
             + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)
@@ -1174,9 +1174,9 @@ class Sm100FmhaStaticTileScheduler:
 
 def compute_sm100_fmha_grid(
     o_shape: cute.Shape,
-    cta_tiler: Tuple[int, int, int],
+    cta_tiler: tuple[int, int, int],
     is_persistent: bool,
-) -> Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+) -> tuple[Sm100FmhaStaticTileSchedulerParams, tuple[int, int, int]]:
     tile_sched_params = Sm100FmhaStaticTileSchedulerParams(
         is_persistent,
         (
@@ -1238,7 +1238,7 @@ class Sm100FmhaClcDynamicTileSchedulerParams:
             values_copy = values_copy[n_items:]
         return Sm100FmhaClcDynamicTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
 
-    def get_grid_shape(self, *, loc=None, ip=None) -> Tuple[int, int, int]:
+    def get_grid_shape(self, *, loc=None, ip=None) -> tuple[int, int, int]:
         return cute.round_up(self.problem_shape_ntile_mnl, self._cluster_shape_mnk)
 
     def clc_hw_params(self) -> ClcDynamicPersistentTileSchedulerParams:
@@ -1255,7 +1255,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         cta_id_in_cluster: cute.Coord,
         num_tiles_executed: Int32,
         clc_response_ptr: cute.Pointer,
-        block_idx: Tuple,
+        block_idx: tuple,
         clc: ClcState = None,
         *,
         loc=None,
@@ -1299,8 +1299,8 @@ class Sm100FmhaClcDynamicTileScheduler:
     @staticmethod
     def create(
         params: Sm100FmhaClcDynamicTileSchedulerParams,
-        block_idx: Tuple,
-        grid_dim: Tuple,
+        block_idx: tuple,
+        grid_dim: tuple,
         clc_response_ptr: cute.Pointer,
         clc: ClcState = None,
         *,
@@ -1332,7 +1332,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> Tuple[int, int, int]:
+    ) -> tuple[int, int, int]:
         return params.get_grid_shape(loc=loc, ip=ip)
 
     def work_tile_info_from_clc_response(self, result_addr: cute.Pointer, *, loc=None, ip=None):
@@ -1380,9 +1380,9 @@ class Sm100FmhaClcDynamicTileScheduler:
 
 def compute_sm100_fmha_grid_clc(
     o_shape: cute.Shape,
-    cta_tiler: Tuple[int, int, int],
-    cluster_shape_mnk: Tuple[int, int, int],
-) -> Tuple[Sm100FmhaClcDynamicTileSchedulerParams, Tuple[int, int, int]]:
+    cta_tiler: tuple[int, int, int],
+    cluster_shape_mnk: tuple[int, int, int],
+) -> tuple[Sm100FmhaClcDynamicTileSchedulerParams, tuple[int, int, int]]:
     problem_shape_mbh = (
         cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
         cute.size(o_shape[2][0]),

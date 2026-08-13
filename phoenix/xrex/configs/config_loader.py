@@ -8,6 +8,7 @@ from typing import Any
 
 import xai_configlib
 from xai_configlib import Config
+
 from xrex import settings
 
 logger = logging.getLogger(__name__)

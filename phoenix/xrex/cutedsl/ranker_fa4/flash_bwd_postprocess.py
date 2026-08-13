@@ -32,7 +32,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import math
-from typing import Callable, Optional, Type
+from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -65,7 +65,7 @@ from xrex.cutedsl.ranker_fa4.tile_scheduler import (
 class FlashAttentionBackwardPostprocess:
     def __init__(
         self,
-        dtype: Type[cutlass.Numeric],
+        dtype: type[cutlass.Numeric],
         head_dim: int,
         arch: int,
         tile_m: int = 128,
@@ -213,8 +213,8 @@ class FlashAttentionBackwardPostprocess:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
-        mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
+        mCuSeqlensQ: cute.Tensor | None,
+        mSeqUsedQ: cute.Tensor | None,
         stream: cuda.CUstream = None,
     ):
         if const_expr(mdQ.element_type not in [cutlass.Float16, cutlass.BFloat16]):
@@ -288,8 +288,8 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
-        mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
+        mCuSeqlensQ: cute.Tensor | None,
+        mSeqUsedQ: cute.Tensor | None,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,

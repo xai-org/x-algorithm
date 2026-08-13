@@ -1,7 +1,8 @@
-from aiokafka.structs import TopicPartition
 from dataclasses import dataclass
-from pydantic import BaseModel, Field
 from typing import Any
+
+from aiokafka.structs import TopicPartition
+from pydantic import BaseModel, Field
 from wily_cli.config import WilyConfig
 
 

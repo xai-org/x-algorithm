@@ -17,9 +17,9 @@ import numpy.typing as npt
 from jax import shard_map
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
+
 from xrex.cuda.top_k_by_key import top_k_by_key
 from xrex.data.recsys.constants import action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType

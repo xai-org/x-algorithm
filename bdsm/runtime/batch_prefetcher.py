@@ -5,11 +5,11 @@ import logging
 import os
 import pickle
 import queue
-import time
 import threading
+import time
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from pipeline_security import kafka_ssl_config
 
@@ -771,7 +771,7 @@ def prefetcher_loop(
                 except queue.Full:
                     metrics["parquet_drops"] = metrics.get("parquet_drops", 0) + 1
 
-        if B < batch_size:
+        if batch_size > B:
             merged = _pad_batch(merged, batch_size)
 
         extract_ms = (time.time() - t1) * 1000

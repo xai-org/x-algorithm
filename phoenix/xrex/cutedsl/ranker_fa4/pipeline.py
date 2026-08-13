@@ -32,7 +32,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from dataclasses import dataclass
-from typing import Optional
 
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
@@ -126,7 +125,7 @@ class _PipelineIndexPhaseMixin:
         self,
         index: Int32,
         phase: Int32,
-        try_acquire_token: Optional[Boolean] = None,
+        try_acquire_token: Boolean | None = None,
         *,
         loc=None,
         ip=None,
@@ -144,7 +143,7 @@ class _PipelineIndexPhaseMixin:
         self,
         index: Int32,
         phase: Int32,
-        try_wait_token: Optional[Boolean] = None,
+        try_wait_token: Boolean | None = None,
         *,
         loc=None,
         ip=None,
@@ -270,7 +269,7 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
     def producer_acquire(
         self,
         state: PipelineState,
-        try_acquire_token: Optional[Boolean] = None,
+        try_acquire_token: Boolean | None = None,
         extra_tx_count: int = 0,
         *,
         loc=None,
@@ -298,7 +297,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
     def producer_acquire(
         self,
         state: PipelineState,
-        try_acquire_token: Optional[Boolean] = None,
+        try_acquire_token: Boolean | None = None,
         extra_tx_count: int = 0,
         *,
         loc=None,

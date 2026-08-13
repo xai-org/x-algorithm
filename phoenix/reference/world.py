@@ -8,7 +8,6 @@ import dataclasses
 
 import numpy as np
 
-
 TOPIC_NAMES = (
     "space",
     "cooking",

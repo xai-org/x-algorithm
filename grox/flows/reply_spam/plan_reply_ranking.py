@@ -1,12 +1,12 @@
 from grox.core.plans.plan import Plan
 from grox.core.registry import register
-from grox.flows.reply_spam.task_write import TaskWriteReplyRankingManhattan
 from grox.core.tasks.task_media import TaskMediaHydration
 from grox.flows.reply_spam.task_filter import TaskReplyRankingFilter
 from grox.flows.reply_spam.task_rank_replies import TaskRankReplies
 from grox.flows.reply_spam.task_rate_limit import (
     TaskRateLimitReplyRankingAnnotationWithPost,
 )
+from grox.flows.reply_spam.task_write import TaskWriteReplyRankingManhattan
 
 
 @register

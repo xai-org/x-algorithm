@@ -6,8 +6,8 @@ import itertools
 from dataclasses import replace
 from pathlib import Path
 
-import xrex.configs.xrecsys_two_tower_evals
 from xai_proto import recsys_pb2
+
 from xrex.configs import config_registry, data_feeds
 from xrex.data.parquet_recsys import (
     PhoenixDataset,

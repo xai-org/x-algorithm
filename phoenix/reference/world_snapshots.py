@@ -20,7 +20,6 @@ from world import (
     generate_world,
 )
 
-
 _SID_NUM_LEVELS = 6
 _SID_CODEBOOK_SIZE = 256
 

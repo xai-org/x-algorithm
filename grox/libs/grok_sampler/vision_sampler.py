@@ -1,7 +1,8 @@
 import logging
 
-from grok_sampler.llm import LiteLLM
 from protos.sampler.sampler_pb2 import PromptInput, SampleSettings, SampleTextRequest
+
+from grok_sampler.llm import LiteLLM
 
 logger = logging.getLogger(__name__)
 
@@ -10,17 +11,17 @@ class VisionSampler(LiteLLM[list[str | bytes]]):
     async def _get_sample_request(
         self, query: list[str | bytes], separator: str, **kwargs
     ) -> SampleTextRequest:
-        conversation_id = kwargs.get("conversation_id", None)
+        conversation_id = kwargs.get("conversation_id")
         max_resp_len = kwargs.get("max_resp_len", self.model_config.max_resp_len)
         output_logits = kwargs.get("output_logits", False)
         nucleus_p = kwargs.get("nucleus_p", 0.95)
         temperature = kwargs.get("temperature", self.model_config.temperature)
-        rng_seed = kwargs.get("rng_seed", None)
-        json_schema = kwargs.get("json_schema", None)
-        structural_tag = kwargs.get("structural_tag", None)
-        structural_pattern = kwargs.get("structural_pattern", None)
-        structural_pattern_v2 = kwargs.get("structural_pattern_v2", None)
-        ebnf = kwargs.get("ebnf", None)
+        rng_seed = kwargs.get("rng_seed")
+        json_schema = kwargs.get("json_schema")
+        structural_tag = kwargs.get("structural_tag")
+        structural_pattern = kwargs.get("structural_pattern")
+        structural_pattern_v2 = kwargs.get("structural_pattern_v2")
+        ebnf = kwargs.get("ebnf")
         priority = kwargs.get("priority", self.model_config.priority)
 
         inputs: list[PromptInput] = []

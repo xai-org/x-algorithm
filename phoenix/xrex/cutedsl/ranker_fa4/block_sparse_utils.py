@@ -32,8 +32,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import math
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -51,13 +51,13 @@ def _get_curr_blocksparse_tensors_varlen(
     m_block: cutlass.Int32,
     blocksparse_tensors: BlockSparseTensors,
     seqlen_info: SeqlenInfoQK,
-) -> Tuple[
+) -> tuple[
     cutlass.Int32,
     cute.Tensor,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
 ]:
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
     mask_block_idx = blocksparse_tensors.mask_block_idx
@@ -101,13 +101,13 @@ def _get_curr_blocksparse_tensors(
     head_idx: cutlass.Int32,
     m_block: cutlass.Int32,
     blocksparse_tensors: BlockSparseTensors,
-) -> Tuple[
+) -> tuple[
     cutlass.Int32,
     cute.Tensor,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
 ]:
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
     mask_block_idx = blocksparse_tensors.mask_block_idx
@@ -146,13 +146,13 @@ def get_curr_blocksparse_tensors(
     m_block: cutlass.Int32,
     blocksparse_tensors: BlockSparseTensors,
     seqlen_info: SeqlenInfoQK,
-) -> Tuple[
+) -> tuple[
     cutlass.Int32,
     cute.Tensor,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
     cutlass.Int32,
-    Optional[cute.Tensor],
+    cute.Tensor | None,
 ]:
     if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
         return _get_curr_blocksparse_tensors_varlen(
@@ -762,9 +762,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
     softmax_scale_log2: Float32,
     max_offset: Float32,
     max_offset_scale: Float32,
-    mO_cur: Optional[cute.Tensor] = None,
-    gO: Optional[cute.Tensor] = None,
-    gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+    mO_cur: cute.Tensor | None = None,
+    gO: cute.Tensor | None = None,
+    gmem_tiled_copy_O: cute.TiledCopy | None = None,
 ):
     LOG2_E = Float32(math.log2(math.e))
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -843,7 +843,7 @@ def softmax_block_sparse_sm100(
     softmax_step: Callable,
     mask_fn: Callable,
     mask_fn_none: Callable,
-    mask_fn_diag: Optional[Callable],
+    mask_fn_diag: Callable | None,
     mma_si_consumer_phase: Int32,
     si_corr_producer_phase: Int32,
     s0_s1_sequence_phase: Int32,
@@ -1204,9 +1204,9 @@ def get_m_block_from_iter_bwd(
     curr_q_cnt,
     curr_q_idx: cute.Tensor,
     curr_full_cnt,
-    curr_full_idx: Optional[cute.Tensor],
+    curr_full_idx: cute.Tensor | None,
     curr_diag_cnt=Int32(0),
-    curr_diag_idx: Optional[cute.Tensor] = None,
+    curr_diag_idx: cute.Tensor | None = None,
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):

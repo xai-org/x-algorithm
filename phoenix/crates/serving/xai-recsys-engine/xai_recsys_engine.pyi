@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from datetime import timedelta
-from typing import List, Literal, Tuple, overload
+from typing import Literal, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -35,7 +35,7 @@ class RankingBatchPrep:
         candidate_post_hashes: npt.NDArray[np.int32],
         candidate_auth_hashes: npt.NDArray[np.int32],
         candidate_product_surfaces: npt.NDArray[np.int32],
-        candidate_embeddings: Tuple[npt.NDArray[np.float16], ...] | None,
+        candidate_embeddings: tuple[npt.NDArray[np.float16], ...] | None,
         candidate_search_query_embeddings: npt.NDArray[np.float32] | None = None,
         user_categorical_features: npt.NDArray[np.int16] | None = None,
         user_bool_features: npt.NDArray[np.bool_] | None = None,
@@ -80,7 +80,7 @@ class RankingBatchPrep:
     candidate_post_hashes: npt.NDArray[np.int32]
     candidate_auth_hashes: npt.NDArray[np.int32]
     candidate_product_surfaces: npt.NDArray[np.int32]
-    candidate_embeddings: Tuple[npt.NDArray[np.float16], ...] | None
+    candidate_embeddings: tuple[npt.NDArray[np.float16], ...] | None
     candidate_search_query_embeddings: npt.NDArray[np.float32] | None
     history_categorical_features: npt.NDArray[np.int16] | None
     candidate_categorical_features: npt.NDArray[np.int16] | None
@@ -138,21 +138,21 @@ class RetrieveRequestBatch:
     def is_empty(self) -> bool: ...
     def reply(
         self,
-        dataset_types: List[int],
-        all_top_k_indices: List[npt.NDArray[np.int32]],
-        all_top_k_scores: List[npt.NDArray[np.float32]],
+        dataset_types: list[int],
+        all_top_k_indices: list[npt.NDArray[np.int32]],
+        all_top_k_scores: list[npt.NDArray[np.float32]],
         all_post_ids: npt.NDArray[np.int64],
         all_author_ids: npt.NDArray[np.int64],
         large_k: int,
         orig_batch_size: int,
     ) -> None: ...
-    def get_top_ks(self) -> List[int]: ...
-    def get_topic_entity_ids(self) -> List[List[int]]: ...
+    def get_top_ks(self) -> list[int]: ...
+    def get_topic_entity_ids(self) -> list[list[int]]: ...
     def get_topic_filter_mode(self) -> int: ...
     def get_pre_fetched_seed_embeddings(
         self,
         emb_dim: int,
-    ) -> List[tuple[List[int], npt.NDArray[np.float32]]]: ...
+    ) -> list[tuple[list[int], npt.NDArray[np.float32]]]: ...
 
 class PredictRequestBatch:
     def get_candidate_sets(self, max_num_cands: int) -> ReqCandidateSequence: ...
@@ -244,12 +244,12 @@ class RecsysPredictorServer:
     def wait(self, timeout: timedelta | None) -> None: ...
     def dequeue(self) -> PredictRequestBatch | None: ...
     def set_serving_prefix(self, prefix: str) -> None: ...
-    def take_reload_directive(self) -> Tuple[List[str], str] | None: ...
+    def take_reload_directive(self) -> tuple[list[str], str] | None: ...
     def publish_peer_manifest(
         self,
         prefix: str,
-        entries: List[Tuple[str, str, int, int]],
-        blobs: List[Tuple[str, bytes]],
+        entries: list[tuple[str, str, int, int]],
+        blobs: list[tuple[str, bytes]],
     ) -> bool: ...
     def revoke_peer_manifest(self, drain_timeout_secs: float = 10.0) -> bool: ...
     def hash_user_id(self, user_id: int, index: int) -> int: ...
@@ -344,12 +344,12 @@ class RecsysRetrievalPredictorServer:
     def wait(self, timeout: timedelta | None) -> None: ...
     def dequeue(self) -> RetrieveRequestBatch | None: ...
     def set_serving_prefix(self, prefix: str) -> None: ...
-    def take_reload_directive(self) -> Tuple[List[str], str] | None: ...
+    def take_reload_directive(self) -> tuple[list[str], str] | None: ...
     def publish_peer_manifest(
         self,
         prefix: str,
-        entries: List[Tuple[str, str, int, int]],
-        blobs: List[Tuple[str, bytes]],
+        entries: list[tuple[str, str, int, int]],
+        blobs: list[tuple[str, bytes]],
     ) -> bool: ...
     def revoke_peer_manifest(self, drain_timeout_secs: float = 10.0) -> bool: ...
     def hash_user_id(self, user_id: int, index: int) -> int: ...
@@ -371,14 +371,14 @@ def madvise_hugepage(arr: npt.NDArray[np.uint8]): ...
 def embedding_gather(
     table: npt.NDArray[np.uint8],
     row_indexes: npt.NDArray[np.uint32],
-    rows: Tuple[npt.NDArray[np.uint8], ...],
+    rows: tuple[npt.NDArray[np.uint8], ...],
     row_size: int,
     num_threads: int,
 ): ...
 def load_tensor(
     path: str,
     urls: str,
-    shard_sources: List[Tuple[str, str, int, int]],
+    shard_sources: list[tuple[str, str, int, int]],
     tensor: npt.NDArray[np.uint8],
     row_size: int,
     num_row_segments: int,
@@ -392,7 +392,7 @@ def load_tensor_no_resharding(
     rate_limit_bytes_per_sec: int | None = None,
     max_concurrent_downloads: int | None = None,
     collect_layout: Literal[False] = False,
-) -> Tuple[int]: ...
+) -> tuple[int]: ...
 @overload
 def load_tensor_no_resharding(
     path: str,
@@ -403,30 +403,30 @@ def load_tensor_no_resharding(
     max_concurrent_downloads: int | None = None,
     *,
     collect_layout: Literal[True],
-) -> Tuple[int, int, int]: ...
+) -> tuple[int, int, int]: ...
 @overload
 def maybe_load_fully_replicated_tensors(
     elapsed_samples: int,
     urls: str,
-    tensors: List[Tuple[str, npt.NDArray[np.uint8]]],
+    tensors: list[tuple[str, npt.NDArray[np.uint8]]],
     rate_limit_bytes_per_sec: int | None = None,
     max_concurrent_downloads: int | None = None,
     target_prefix: str | None = None,
     collect_entry_names: Literal[False] = False,
-) -> Tuple[str, str, float]: ...
+) -> tuple[str, str, float]: ...
 @overload
 def maybe_load_fully_replicated_tensors(
     elapsed_samples: int,
     urls: str,
-    tensors: List[Tuple[str, npt.NDArray[np.uint8]]],
+    tensors: list[tuple[str, npt.NDArray[np.uint8]]],
     rate_limit_bytes_per_sec: int | None = None,
     max_concurrent_downloads: int | None = None,
     target_prefix: str | None = None,
     *,
     collect_entry_names: Literal[True],
-) -> Tuple[str, str, float, List[Tuple[str, str]]]: ...
+) -> tuple[str, str, float, list[tuple[str, str]]]: ...
 def upload_files_to_storage(
-    local_base_dir: str, relative_paths: List[str], storage_url: str
+    local_base_dir: str, relative_paths: list[str], storage_url: str
 ) -> None: ...
 def download_prefix_to_local(
     storage_url: str,
@@ -436,21 +436,21 @@ def download_prefix_to_local(
 ) -> int: ...
 def download_files_from_storage(
     storage_url: str,
-    relative_paths: List[str],
+    relative_paths: list[str],
     local_dir: str,
     max_concurrent: int | None = None,
 ) -> int: ...
 def upload_inline_data_to_storage(
-    data_entries: List[Tuple[str, bytes]],
+    data_entries: list[tuple[str, bytes]],
     output_url: str,
 ) -> None: ...
 def copy_chunks_to_storage(
-    chunks: List[Tuple[str, int, int, str]],
+    chunks: list[tuple[str, int, int, str]],
     output_url: str,
     num_threads: int,
 ) -> None: ...
 def reshard_col_to_row_and_upload(
-    col_shard_info: List[Tuple[str, int, int]],
+    col_shard_info: list[tuple[str, int, int]],
     output_url: str,
     tensor_name: str,
     num_rows: int,
@@ -460,7 +460,7 @@ def reshard_col_to_row_and_upload(
 ) -> None: ...
 def load_reshard_row_to_col(
     base_path: str,
-    shard_keys: List[Tuple[int, str]],
+    shard_keys: list[tuple[int, str]],
     output_dir: str,
     tensor_name: str,
     num_rows: int,
@@ -468,19 +468,19 @@ def load_reshard_row_to_col(
     num_col_shards: int,
     num_threads: int,
 ) -> None: ...
-def list_storage_objects(storage_url: str) -> List[str]: ...
+def list_storage_objects(storage_url: str) -> list[str]: ...
 def find_latest_storage_checkpoint(
     base_url: str,
-    name_size_pairs: List[Tuple[str, int]],
+    name_size_pairs: list[tuple[str, int]],
     fixed_prefix: str | None = None,
-) -> Tuple[str, int] | None: ...
+) -> tuple[str, int] | None: ...
 def load_arrays_from_storage(
     storage_url: str,
-    name_array_pairs: List[Tuple[str, npt.NDArray[np.uint8]]],
+    name_array_pairs: list[tuple[str, npt.NDArray[np.uint8]]],
     max_concurrent_downloads: int | None = None,
 ) -> None: ...
 def remove_old_from_storage(
-    storage_url: str, n: int, name_size_pairs: List[Tuple[str, int]]
+    storage_url: str, n: int, name_size_pairs: list[tuple[str, int]]
 ) -> None: ...
 def adler32_parallel(data: npt.NDArray[np.uint8]) -> int: ...
 def adler32_combine_py(checksum1: int, checksum2: int, len2: int) -> int: ...

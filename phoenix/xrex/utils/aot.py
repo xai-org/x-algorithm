@@ -11,11 +11,12 @@ import pickle
 import socket
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any
 
 import cloudpickle
 import filelock
@@ -451,13 +452,13 @@ def RetryFileLock(lock_file: Path, *, poll_interval: float):
 
 
 def compile_or_load_all_traced(
-    all_traced: Dict[str, TracedWithOptions],
+    all_traced: dict[str, TracedWithOptions],
     aot_cache_dir: str | Path,
-    fdo_profile_dir: Optional[str] = None,
-    run_dir: Optional[str] = None,
+    fdo_profile_dir: str | None = None,
+    run_dir: str | None = None,
     aot_dump: bool = False,
     devices: Sequence[xc.Device] | None = None,
-) -> tuple[Dict[str, Compiled], Dict[str, Dict[str, float]]]:
+) -> tuple[dict[str, Compiled], dict[str, dict[str, float]]]:
     if devices is None:
         devices = []
 
@@ -479,7 +480,7 @@ def compile_or_load_all_traced(
     if rank == 0:
         aot_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _compile_or_load(name, traced_with_options, metrics: Dict[str, Dict[str, float]]):
+    def _compile_or_load(name, traced_with_options, metrics: dict[str, dict[str, float]]):
         profile = read_fdo_profile(name, fdo_profile_dir)
         traced, options, add_location_info = (
             traced_with_options.traced,
@@ -655,13 +656,13 @@ def compile_or_load_all_traced(
 
         return compiled
 
-    metrics: Dict[str, Dict[str, float]] = {}
+    metrics: dict[str, dict[str, float]] = {}
     all_compiled = {n: _compile_or_load(n, t, metrics) for n, t in all_traced.items()}
     return all_compiled, metrics
 
 
 class JittedOrCompiled(Wrapped):
-    __slots__: tuple[str, ...] = ("jitted", "fun_name")
+    __slots__: tuple[str, ...] = ("fun_name", "jitted")
 
     def __init__(self, jitted, name=None):
         self.fun_name = name

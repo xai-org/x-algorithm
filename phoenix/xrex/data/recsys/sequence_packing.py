@@ -6,8 +6,8 @@ from typing import cast
 
 import jax
 import numpy as np
-
 from xai_configlib import Config, configclass
+
 from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 
 

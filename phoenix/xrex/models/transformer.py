@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+from collections.abc import Callable
 from dataclasses import (
     dataclass,
     replace,
 )
 from functools import partial
-from typing import Callable, Optional, Tuple, TypeAlias, Union
+from typing import TypeAlias
 
 import chex
 import haiku as hk
@@ -15,8 +16,8 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.lax import with_sharding_constraint
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
+
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
 from xrex.models.attention import AttentionConfig
 from xrex.models.layers import (
@@ -67,12 +68,12 @@ class TransformerConfig(Config):
     num_layers: int
     sequence_len: int
     ffn_config: FeedForwardConfig
-    attn_config: Optional[AttentionConfig] = None
+    attn_config: AttentionConfig | None = None
     scale_config: ScaleConfig = ScaleConfig()
     pre_norm: bool = True
     primer_norm: bool = False
     layer_norm_eps: float = 1e-5
-    output_vocab_size: Optional[int] = None
+    output_vocab_size: int | None = None
 
     use_layer_stack: bool = False
     unroll_layer_stack: bool = False
@@ -82,12 +83,12 @@ class TransformerConfig(Config):
     prevent_cse: bool = True
     remat_boundary: str = "block"
 
-    data_axis: Union[str, Tuple[str, ...]] = ("expert", "replica", "data")
+    data_axis: str | tuple[str, ...] = ("expert", "replica", "data")
 
-    debug_tensor_dump_output_folder: Optional[str] = None
+    debug_tensor_dump_output_folder: str | None = None
     debug_tensor_dump_only_target_logprobs: bool = False
-    debug_tensor_dump_n_tokens: Optional[int] = None
-    debug_tensor_dump_n_layers: Optional[int] = None
+    debug_tensor_dump_n_tokens: int | None = None
+    debug_tensor_dump_n_layers: int | None = None
     debug_tensor_dump_num_dumps: int = 1
     debug_tensor_dump_start_pos: int = 0
 
@@ -132,7 +133,7 @@ class TransformerConfig(Config):
         return round(total_flops_per_second, 2)
 
     def compute_mfu(
-        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None
+        self, num_seq_per_sec: float, S: int, peak_tflops_override: float | None = None
     ) -> float:
         if peak_tflops_override is None:
             peak_tflops_override = peak_tflops()
@@ -157,7 +158,7 @@ class MHABlock(hk.Module):
         inputs: jax.Array,
         mask: jax.Array,
         segment_ids: jax.Array,
-        segment_ids_k: Optional[jax.Array] = None,
+        segment_ids_k: jax.Array | None = None,
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
     ) -> MultiHeadAttentionOutput:
@@ -173,7 +174,7 @@ class MHABlock(hk.Module):
             input_to_value: jax.Array,
             mask: jax.Array,
             segment_ids: jax.Array,
-            segment_ids_k: Optional[jax.Array] = None,
+            segment_ids_k: jax.Array | None = None,
         ) -> MultiHeadAttentionOutput:
             def softmax_attn() -> MultiHeadAttentionOutput:
                 return MultiHeadAttention(
@@ -218,7 +219,7 @@ class MHABlock(hk.Module):
 class DenseBlock(hk.Module):
     config: FeedForwardConfig
     scale_config: ScaleConfig
-    data_axis: Union[str, Tuple[str, ...]]
+    data_axis: str | tuple[str, ...]
     widening_factor: float = 1
     sharding_context: ShardingContext = None
     checkpoint_name_prefix: str = "dense_"
@@ -393,9 +394,9 @@ class DecoderLayer(hk.Module):
     pre_norm: bool = True
     primer_norm: bool = False
     sharding_context: ShardingContext = None
-    name: Optional[str] = None
-    debug_tensor_dump_output_folder: Optional[str] = None
-    debug_tensor_dump_n_tokens: Optional[int] = None
+    name: str | None = None
+    debug_tensor_dump_output_folder: str | None = None
+    debug_tensor_dump_n_tokens: int | None = None
     layer_norm_eps: float = 1e-5
     num_layers: int = None
     pre_attn_norm_name: str = "pre_attn_norm"
@@ -406,12 +407,12 @@ class DecoderLayer(hk.Module):
         inputs: DecoderInput,
         mask: jax.Array,
         segment_ids: jax.Array,
-        segment_ids_k: Optional[jax.Array] = None,
+        segment_ids_k: jax.Array | None = None,
         is_training: bool = True,
-        global_layer_index: Optional[jax.Array] = None,
+        global_layer_index: jax.Array | None = None,
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
-        remat_fn: Optional[Callable[[Callable], Callable]] = None,
+        remat_fn: Callable[[Callable], Callable] | None = None,
     ) -> DecoderOutput:
         layer_norm = partial(
             rms_norm_fn,
@@ -586,7 +587,7 @@ def layer_stack_block(
 class Transformer(hk.Module):
     config: TransformerConfig
     sharding_context: ShardingContext
-    name: Optional[str] = None
+    name: str | None = None
 
     summarizer_prefix: str = ""
 
@@ -598,8 +599,8 @@ class Transformer(hk.Module):
         self,
         embeddings: jax.Array,
         mask: jax.Array,
-        segment_ids: Optional[jax.Array] = None,
-        segment_ids_k: Optional[jax.Array] = None,
+        segment_ids: jax.Array | None = None,
+        segment_ids_k: jax.Array | None = None,
         *,
         is_training: bool = True,
         decoding: bool = False,
@@ -646,9 +647,9 @@ class Transformer(hk.Module):
             h,
             mask,
             segment_ids,
-            segment_ids_k: Optional[jax.Array] = None,
-            name: Optional[str] = None,
-            global_layer_index: Optional[jax.Array] = None,
+            segment_ids_k: jax.Array | None = None,
+            name: str | None = None,
+            global_layer_index: jax.Array | None = None,
             seqpack_layout: SequencePackedLayout | None = None,
         ) -> DecoderOutput:
             return block_remat_fn(

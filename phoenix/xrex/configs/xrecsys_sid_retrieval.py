@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-import xrex.configs.xrecsys_sid_variants
 from xrex.configs import config_registry
 from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.recsys.feature_config import CategoricalFeature

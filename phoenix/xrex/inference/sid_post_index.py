@@ -82,7 +82,7 @@ class SidPostIndex:
         *,
         sid_num_levels: int = 6,
         codebook_size: int = 256,
-    ) -> "SidPostIndex":
+    ) -> SidPostIndex:
         t0 = time.time()
         post_ids, author_ids, dataset_types, post_sids = RetrievalDataset.load_datasets(
             datasets,
@@ -151,7 +151,7 @@ class SidBeamResolver:
         index: SidPostIndex,
         *,
         prefix_len: int | None = None,
-    ) -> "SidBeamResolver":
+    ) -> SidBeamResolver:
         sids = index.sids
         plen = int(prefix_len) if prefix_len else int(sids.shape[1])
         if plen <= 0 or plen > sids.shape[1]:
@@ -185,7 +185,7 @@ class SidBeamResolver:
         sid_num_levels: int = 6,
         codebook_size: int = 256,
         prefix_len: int | None = None,
-    ) -> "SidBeamResolver":
+    ) -> SidBeamResolver:
         index = SidPostIndex.from_datasets(
             datasets,
             sid_num_levels=sid_num_levels,

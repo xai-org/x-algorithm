@@ -13,13 +13,14 @@ import signal
 import subprocess
 import time
 import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from math import isfinite
 from pathlib import Path
 from threading import Thread
-from typing import Any, Mapping, Optional
+from typing import Any
 
 import numpy as np
 
@@ -62,7 +63,6 @@ _CLICKHOUSE_RUN_URL = settings.CLICKHOUSE_RUN_URL
 
 
 def _import_wandb():
-    import setuptools
     import wandb
 
     return wandb
@@ -185,7 +185,7 @@ def write_wandb_log(metrics: Mapping[str, Any]):
 
 @dataclass
 class MetricsFileHook(DriverHook):
-    path: Optional[Path] = None
+    path: Path | None = None
 
     def __post_init__(self):
         self.threadpool = concurrent.futures.ThreadPoolExecutor(
@@ -317,7 +317,7 @@ class PrometheusHook(DriverHook):
 @dataclass
 class WandbHook(DriverHook):
     project: str
-    entity: Optional[str] = None
+    entity: str | None = None
 
     def __post_init__(self):
         self.threadpool = concurrent.futures.ThreadPoolExecutor(
@@ -451,7 +451,7 @@ class WandbHook(DriverHook):
 
 class ClickhouseHook(DriverHook):
     def __init__(self, driver_config: Any = None):
-        self.run: Optional[Run] = None
+        self.run: Run | None = None
         self.threadpool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="clickhouse_hook"
         )

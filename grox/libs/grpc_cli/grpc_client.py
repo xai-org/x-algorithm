@@ -1,10 +1,10 @@
-import grpc
 import logging
-
 from asyncio import get_running_loop
 from contextlib import asynccontextmanager
 from functools import cache
 from pathlib import Path
+
+import grpc
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)

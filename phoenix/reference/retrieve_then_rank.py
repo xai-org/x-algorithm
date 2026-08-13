@@ -58,7 +58,7 @@ def _iter_sessions(data_dir: Path, n: int):
         }
 
 
-def _session_to_user_action_sequence(sess) -> "object":
+def _session_to_user_action_sequence(sess) -> object:
     from xai_proto import recsys_pb2
 
     uid = int(sess["user_id"])

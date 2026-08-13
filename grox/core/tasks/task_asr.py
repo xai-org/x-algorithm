@@ -1,12 +1,13 @@
 import logging
 import traceback
 
+from monitor.metrics import Metrics
+from strato_http.queries.media_asr_transcript import StratoMediaAsrTranscript
+
 from grox.core.data_loaders.asr_processor import ASRProcessor
 from grox.core.data_loaders.data_types import Post, Video
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import TaskWithPost
-from monitor.metrics import Metrics
-from strato_http.queries.media_asr_transcript import StratoMediaAsrTranscript
 
 logger = logging.getLogger(__name__)
 

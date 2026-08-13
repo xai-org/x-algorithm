@@ -17,7 +17,7 @@ class GeLU(torch.nn.Module):
 
 class LayerNorm(torch.nn.Module):
     def __init__(self, features, eps=1e-6):
-        super(LayerNorm, self).__init__()
+        super().__init__()
         self.a_2 = torch.nn.Parameter(torch.ones(features))
         self.b_2 = torch.nn.Parameter(torch.zeros(features))
         self.eps = eps
@@ -30,7 +30,7 @@ class LayerNorm(torch.nn.Module):
 
 class PositionwiseFeedForward(torch.nn.Module):
     def __init__(self, d_in, d_h, d_out, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
+        super().__init__()
         self.w_1 = torch.nn.Linear(d_in, d_h)
         self.w_2 = torch.nn.Linear(d_h, d_out)
         self.dropout = torch.nn.Dropout(dropout)
@@ -43,7 +43,7 @@ class PositionwiseFeedForward(torch.nn.Module):
 
 class ImageCLIP(torch.nn.Module):
     def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):
-        super(ImageCLIP, self).__init__()
+        super().__init__()
         self.model = model
         self.embedding_dim = model.visual.output_dim
         self.top_feedforward = top_feedforward
@@ -63,7 +63,7 @@ class ImageCLIP(torch.nn.Module):
 
 class TextCLIP(torch.nn.Module):
     def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):
-        super(TextCLIP, self).__init__()
+        super().__init__()
         self.model = model
         self.embedding_dim = model.transformer.width
         self.top_feedforward = top_feedforward

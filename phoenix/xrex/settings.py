@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 
-
 KAFKA_CLUSTER: str = os.environ.get("XREX_KAFKA_CLUSTER", "phoenix")
 
 KAFKA_RUST_BOOTSTRAP: str = os.environ.get("XREX_KAFKA_RUST_BOOTSTRAP", "phoenix")

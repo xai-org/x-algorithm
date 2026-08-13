@@ -4,8 +4,8 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
+
 from xrex.data.recsys.feature_config import UserCategoricalFeature, UserFloatFeature
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.layers import Linear, get_parameter

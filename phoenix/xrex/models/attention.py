@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import functools
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.lax import with_sharding_constraint
-
 from xai_configlib import Config, configclass
+
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
 
@@ -28,7 +29,7 @@ class AttentionConfig(Config):
     fa_version: str = "3"
     qk_norm: bool = False
     rotary: bool = False
-    rope_type: Optional[str] = "1d"
+    rope_type: str | None = "1d"
     rope_base_exponent: int = 10000
     temperature_scaling_const: int = -1
     qkv_merge: bool = False
@@ -43,7 +44,7 @@ class Attention(hk.Module):
         self,
         config: AttentionConfig,
         scale_config: ScaleConfig,
-        name: Optional[str] = None,
+        name: str | None = None,
         sharding_context: ShardingContext = None,
     ):
         super().__init__(name=name)
@@ -54,11 +55,11 @@ class Attention(hk.Module):
     def __call__(
         self,
         query: jax.Array,
-        key: Optional[jax.Array],
-        value: Optional[jax.Array],
-        segment_ids: Optional[jax.Array],
-        segment_ids_k: Optional[jax.Array],
-        temp: Optional[jax.Array],
+        key: jax.Array | None,
+        value: jax.Array | None,
+        segment_ids: jax.Array | None,
+        segment_ids_k: jax.Array | None,
+        temp: jax.Array | None,
         **kwargs,
     ):
         return self.call_attn(query, key, value, segment_ids, segment_ids_k, temp, **kwargs)
@@ -66,11 +67,11 @@ class Attention(hk.Module):
     def call_attn(
         self,
         query: jax.Array,
-        key: Optional[jax.Array],
-        value: Optional[jax.Array],
-        segment_ids: Optional[jax.Array],
-        segment_ids_k: Optional[jax.Array],
-        temp: Optional[jax.Array],
+        key: jax.Array | None,
+        value: jax.Array | None,
+        segment_ids: jax.Array | None,
+        segment_ids_k: jax.Array | None,
+        temp: jax.Array | None,
         **kwargs,
     ):
         raise NotImplementedError("Please override this method for specific attention impl.")
@@ -93,7 +94,7 @@ class CustomAttention(Attention):
         extra_args = []
         extra_arg_shapes = []
         for n, shape_fn in extra_arg_shape_fns:
-            arg = kwargs.get(n, None)
+            arg = kwargs.get(n)
             assert arg is not None, "Attempted getting arg with name {n} but got None."
             extra_args.append(arg)
             extra_arg_shapes.append(shape_fn(arg.shape))
@@ -239,14 +240,14 @@ class JaxAttention(Attention):
     def call_attn(
         self,
         query: jax.Array,
-        key: Optional[jax.Array],
-        value: Optional[jax.Array],
-        segment_ids: Optional[jax.Array],
-        segment_ids_k: Optional[jax.Array],
-        temp: Optional[jax.Array],
+        key: jax.Array | None,
+        value: jax.Array | None,
+        segment_ids: jax.Array | None,
+        segment_ids_k: jax.Array | None,
+        temp: jax.Array | None,
         **kwargs,
     ):
-        mask = kwargs.get("masks", None)
+        mask = kwargs.get("masks")
         b, t, h, d = query.shape
         _, _, kv_h, _ = key.shape
         assert h % kv_h == 0, f"query_heads {h} must be a multiple of kv_heads {kv_h}"

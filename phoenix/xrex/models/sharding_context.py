@@ -2,8 +2,9 @@
 # Copyright 2026 X.AI Corp.
 import logging
 import math
+from collections.abc import Callable
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 import jax
 

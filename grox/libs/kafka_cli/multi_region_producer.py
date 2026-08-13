@@ -4,9 +4,10 @@ import random
 import time
 
 from aiokafka import AIOKafkaProducer
-from kafka_cli.mtls import create_mtls_ssl_context
 from monitor.metrics import Metrics
 from pydantic import BaseModel, Field, model_validator
+
+from kafka_cli.mtls import create_mtls_ssl_context
 
 logger = logging.getLogger(__name__)
 

@@ -1,19 +1,20 @@
 import logging
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
-from grox.flows.mm_emb.disable_rules import DisableTaskForNonMmEmbProd
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
-from grox.core.data_loaders.data_types import Post
-from tenacity import retry, wait_chain, wait_fixed, stop_after_attempt
 from strato_http.queries.post_multimodal_embedding_mh_searchai import (
-    TweetEmbedding,
     StratoPostMultimodalEmbeddingMhSearchAiNoCache,
+    TweetEmbedding,
 )
+from tenacity import retry, stop_after_attempt, wait_chain, wait_fixed
+
+from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.flows.mm_emb.disable_rules import DisableTaskForNonMmEmbProd
+from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
 from grox.flows.mm_emb.task_embedding_pub import (
-    TaskPublishEmbeddingV5Kafka,
     TaskPublishEmbeddingV5AllKafka,
+    TaskPublishEmbeddingV5Kafka,
     TaskPublishEmbeddingV82Kafka,
 )
 

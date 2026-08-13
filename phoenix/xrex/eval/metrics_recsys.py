@@ -3,17 +3,17 @@
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 from jax.nn import sigmoid
+from xai_configlib import configclass
+
 from xrex.data.recsys.constants import engagement_to_ids
 from xrex.eval.metrics import ForwardMetrics, SimpleSumAccumulator
-
-from xai_configlib import configclass
 
 _CLAMP_EPS = 1e-7
 
@@ -478,8 +478,8 @@ class RecsysRecallMetrics(ForwardMetrics):
         topk_post_ids: np.ndarray,
         target_post_ids: np.ndarray,
         actions: np.ndarray,
-        positive_actions: List[int],
-        negative_actions: List[int],
+        positive_actions: list[int],
+        negative_actions: list[int],
         global_post_ids: np.ndarray,
         is_in_global_posts: np.ndarray | None = None,
     ):
@@ -510,7 +510,7 @@ class RecsysRecallMetrics(ForwardMetrics):
         scores,
         is_in_global_posts,
         actions: np.ndarray,
-        positive_actions: List[int],
+        positive_actions: list[int],
     ):
         B = scores.shape[0]
         assert scores.shape[1] % B == 0, f"scores.shape: {scores.shape}, B: {B}"

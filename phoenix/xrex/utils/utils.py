@@ -11,12 +11,12 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from types import TracebackType
 from typing import (
     Any,
-    Callable,
     ClassVar,
-    Optional,
+    Self,
     TypeVar,
 )
 
@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.xla_metadata import set_xla_metadata
-from typing_extensions import Self
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -274,7 +273,7 @@ def unroll_layer_dumps(layer_dumps):
     return unrolled_layer_dumps
 
 
-def dump_block_outputs(config, layer_dumps, total_num_layers: int, n_layers: Optional[int] = None):
+def dump_block_outputs(config, layer_dumps, total_num_layers: int, n_layers: int | None = None):
     if config.debug_tensor_dump_only_target_logprobs:
         return
 

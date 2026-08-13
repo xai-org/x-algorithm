@@ -1,8 +1,8 @@
-import signal
 import logging
-from typing import Any
+import signal
 from multiprocessing import Manager
 from multiprocessing.managers import DictProxy, SyncManager
+from typing import Any
 
 type ScheduleContext = DictProxy[str, Any]
 logger = logging.getLogger(__name__)

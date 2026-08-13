@@ -3,12 +3,13 @@ import gc
 import logging
 import random
 import time
+
 import setproctitle
+from monitor.logging import Logging
+from monitor.metrics import Metrics
 
 from grox.config.config import grox_config
 from grox.core.schedules.context import prevent_default
-from monitor.logging import Logging
-from monitor.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 

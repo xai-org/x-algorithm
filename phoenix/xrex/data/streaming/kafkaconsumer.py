@@ -13,7 +13,8 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
@@ -891,7 +892,7 @@ async def _consumer_poll_loop(
                 if total_fetched % GC_INTERVAL == 0:
                     gc.collect()
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except Exception as e:
                 rank_logger.error(f"Consumer c{consumer_index} poll error: {e}")
@@ -931,7 +932,7 @@ async def _round_robin_merger(
             finally:
                 q.task_done()
             consecutive_empty = 0
-        except asyncio.TimeoutError:
+        except TimeoutError:
             consecutive_empty += 1
             if consecutive_empty >= num_queues:
                 await asyncio.sleep(0.01)
@@ -1339,11 +1340,11 @@ async def consume_messages(
 
                 if _consumer_poll_latency is not None:
                     _consumer_poll_latency.record(poll_latency, metric_attrs)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 rank_logger.info("Polling timeout")
                 continue
             except Exception as e:
-                rank_logger.error(f"Error while polling: {str(e)}")
+                rank_logger.error(f"Error while polling: {e!s}")
                 raise
             else:
                 if not messages:

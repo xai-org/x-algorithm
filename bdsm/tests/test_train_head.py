@@ -1,7 +1,6 @@
+import heads
 import numpy as np
 import pytest
-
-import heads
 from metrics import average_precision
 
 
@@ -31,7 +30,6 @@ def test_head_param_count_under_spec_cap():
 def test_head_logits_shapes_and_cap():
     pytest.importorskip("jax")
     import jax.numpy as jnp
-
     from task_heads import head_logits, init_head_params
 
     x = jnp.zeros((5, 1024), jnp.float32)
@@ -58,7 +56,6 @@ def test_load_cached_drops_nonfinite_rows(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
     import pyarrow.parquet as pq
-
     import train_head
 
     cls = np.zeros((3, 4), dtype=np.float32)

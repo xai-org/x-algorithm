@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
@@ -86,7 +86,6 @@ def _self_check() -> None:
 
     import pyarrow as pa
     import pyarrow.parquet as pq
-
     import sid_index_server
 
     num_levels, codebook_size, seed = 6, 256, 0

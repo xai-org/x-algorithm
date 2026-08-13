@@ -6,8 +6,8 @@ from typing import Literal, NamedTuple, Protocol
 import haiku as hk
 import jax
 import optax
-
 from xai_configlib import Config, configclass
+
 from xrex.models.model_utils import Parameter
 
 

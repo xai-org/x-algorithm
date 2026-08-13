@@ -1,11 +1,12 @@
 import logging
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.reply_spam.state_coordinated_spam import CoordinatedSpamState
+
 from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.flows.reply_spam.classifier_coordinated_spam import CoordinatedSpamScorer
+from grox.flows.reply_spam.state_coordinated_spam import CoordinatedSpamState
 
 logger = logging.getLogger(__name__)
 

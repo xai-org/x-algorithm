@@ -1,9 +1,7 @@
-from grox.core.tasks.task import TaskWithPost
-
-from grox.core.schedules.types import TaskContext
 from grox.core.data_loaders.data_types import Post
 from grox.core.data_loaders.strato_loader import TweetStratoLoader
-from grox.core.tasks.task import TaskStopExecution
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import TaskStopExecution, TaskWithPost
 
 
 class TaskLoadPost(TaskWithPost):

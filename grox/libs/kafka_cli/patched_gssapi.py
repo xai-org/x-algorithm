@@ -1,5 +1,4 @@
 import gssapi
-
 from gssapi.raw.types import NameType
 
 

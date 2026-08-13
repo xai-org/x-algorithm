@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from typing import Optional
 
 import requests
 
@@ -26,7 +25,7 @@ def _local_cache_put(uid: int, pack_count: int) -> None:
     _LOCAL_CACHE[uid] = (pack_count, time.time())
 
 
-def _local_cache_get(uid: int) -> Optional[int]:
+def _local_cache_get(uid: int) -> int | None:
     entry = _LOCAL_CACHE.get(uid)
     if entry is None:
         return None
@@ -37,7 +36,7 @@ def _local_cache_get(uid: int) -> Optional[int]:
     return pack_count
 
 
-def _fetch_pack_count(user_id: int) -> Optional[int]:
+def _fetch_pack_count(user_id: int) -> int | None:
     try:
         resp = requests.post(
             STRATO_URL,
@@ -59,8 +58,8 @@ def _fetch_pack_count(user_id: int) -> Optional[int]:
 def get_followed_pack_count(
     user_id: int,
     redis_client=None,
-    metrics: Optional[dict] = None,
-) -> Optional[int]:
+    metrics: dict | None = None,
+) -> int | None:
     cached = _local_cache_get(user_id)
     if cached is not None:
         if metrics is not None:

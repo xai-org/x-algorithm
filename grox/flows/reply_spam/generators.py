@@ -1,8 +1,5 @@
 from grox.core.data_loaders.kafka_loader import KafkaPostLoader
 from grox.core.generators.stream_generator import StreamTaskGenerator
-from grox.flows.reply_spam.plan_spam_comment import PlanSpamComment
-from grox.flows.reply_spam.plan_reply_ranking import PlanReplyRanking
-from grox.flows.reply_spam.plan_coordinated_spam import PlanCoordinatedSpam
 from grox.core.registry import register
 from grox.flows.reply_spam.constants import (
     POST_STREAM,
@@ -10,6 +7,9 @@ from grox.flows.reply_spam.constants import (
     TOPIC_REPLY_RANKING_RECOVERY,
     TOPIC_UNIFIED_POSTS,
 )
+from grox.flows.reply_spam.plan_coordinated_spam import PlanCoordinatedSpam
+from grox.flows.reply_spam.plan_reply_ranking import PlanReplyRanking
+from grox.flows.reply_spam.plan_spam_comment import PlanSpamComment
 
 
 @register

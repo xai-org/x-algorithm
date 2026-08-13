@@ -1,12 +1,13 @@
 import logging
 from abc import abstractmethod
-from typing import Awaitable, override
+from collections.abc import Awaitable
+from typing import override
 
 from cachetools import TTLCache
-
-from grox.core.tasks.task import Task, TaskContext, TaskStopExecution
 from monitor.metrics import Metrics
+
 from grox.core.data_loaders.data_types import Post
+from grox.core.tasks.task import Task, TaskContext, TaskStopExecution
 
 logger = logging.getLogger(__name__)
 

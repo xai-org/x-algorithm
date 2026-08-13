@@ -9,18 +9,18 @@ import os
 import sys
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from serde.json import to_json
 from tabulate import tabulate
-
 from xai_configlib import Config
+
 from xrex.train.trainer import TrainerContext
 from xrex.utils import metadata
 from xrex.utils.gpu import (
-    NUM_PHYSICAL_DEVICES_PER_NODE,
     set_gpu_clocks_to_max,
 )
 from xrex.utils.log_util import configure_logging

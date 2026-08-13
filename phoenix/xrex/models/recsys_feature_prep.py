@@ -10,8 +10,8 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
+
 from xrex.data.recsys.feature_config import (
     CategoricalFeature,
     UserCategoricalFeature,

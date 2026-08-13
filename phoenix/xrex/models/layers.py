@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from dataclasses import fields as dc_fields
-from typing import Optional, Type, TypeAlias
+from typing import TypeAlias
 
 import haiku as hk
 import jax
@@ -20,7 +20,6 @@ from xrex.models.attention import (
     import_attention_fa3,
 )
 from xrex.models.linear_layer import LinearConfig, LinearImpl
-from xrex.models.model_utils import get_parameter
 from xrex.models.normalization import all_heads_qk_norm_fn
 from xrex.models.recsys_attention import (
     CutedslRankerAttention,
@@ -38,7 +37,7 @@ class RotaryEmbedding(hk.Module):
     def __init__(
         self,
         dim: int,
-        name: Optional[str] = None,
+        name: str | None = None,
         base_exponent: int = 10000,
     ):
         super().__init__(name)
@@ -51,7 +50,7 @@ class RotaryEmbedding(hk.Module):
         x: jax.Array,
         seq_dim: int,
         offset: int | jax.Array,
-        t: Optional[jax.Array] = None,
+        t: jax.Array | None = None,
     ) -> jax.Array:
         fprop_dtype = x.dtype
         x = x.astype(jnp.float32)
@@ -81,15 +80,15 @@ class Linear(LinearImpl):
     def __init__(
         self,
         output_size: int,
-        rms_clip_axes: Optional[tuple] = (-2, -1),
+        rms_clip_axes: tuple | None = (-2, -1),
         with_bias: bool = False,
-        w_init: Optional[hk.initializers.Initializer] = None,
-        b_init: Optional[hk.initializers.Initializer] = None,
-        pspec: Optional[P] = None,
+        w_init: hk.initializers.Initializer | None = None,
+        b_init: hk.initializers.Initializer | None = None,
+        pspec: P | None = None,
         lr_multiplier: float = 1.0,
         init_scale: float = 1.0,
         sharding_context: ShardingContext | None = None,
-        name: Optional[str] = None,
+        name: str | None = None,
     ):
         assert sharding_context is not None
 
@@ -119,10 +118,10 @@ class MultiHeadAttention(hk.Module):
         self,
         config: AttentionConfig,
         scale_config: ScaleConfig,
-        w_init: Optional[hk.initializers.Initializer] = None,
-        model_size: Optional[int] = None,
+        w_init: hk.initializers.Initializer | None = None,
+        model_size: int | None = None,
         sharding_context: ShardingContext | None = None,
-        name: Optional[str] = None,
+        name: str | None = None,
         name_suffix: str = "",
     ):
         super().__init__(name=name)
@@ -147,11 +146,11 @@ class MultiHeadAttention(hk.Module):
     def __call__(
         self,
         input_to_query: jax.Array,
-        input_to_key: Optional[jax.Array],
-        input_to_value: Optional[jax.Array],
-        mask: Optional[jax.Array] = None,
-        segment_ids: Optional[jax.Array] = None,
-        segment_ids_k: Optional[jax.Array] = None,
+        input_to_key: jax.Array | None,
+        input_to_value: jax.Array | None,
+        mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
+        segment_ids_k: jax.Array | None = None,
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
     ) -> MultiHeadAttentionOutput:
@@ -387,7 +386,7 @@ class MultiHeadAttention(hk.Module):
         *,
         mask: jax.Array | None,
         seqpack_layout: SequencePackedLayout | None,
-    ) -> tuple[Type[Attention], dict[str, jax.Array | None]]:
+    ) -> tuple[type[Attention], dict[str, jax.Array | None]]:
         match self.config.attn_impl:
             case "jax_attn" | "jax_attn_interleaved":
                 extra_attn_kwargs["masks"] = mask
@@ -446,10 +445,10 @@ class MultiHeadAttention(hk.Module):
         self,
         x: jax.Array,
         output_size: int,
-        pspec: Optional[P] = None,
+        pspec: P | None = None,
         lr_multiplier: float = 1.0,
         init_scale: float = 1.0,
-        name: Optional[str] = None,
+        name: str | None = None,
         rms_clip_axes=(-2, -1),
         with_bias: bool = False,
         w_init=None,
@@ -477,10 +476,10 @@ class MultiHeadAttention(hk.Module):
         x: jax.Array,
         head_size: int,
         num_heads: int,
-        pspec: Optional[P] = None,
+        pspec: P | None = None,
         lr_multiplier: float = 1.0,
         init_scale: float = 1.0,
-        name: Optional[str] = None,
+        name: str | None = None,
         rms_clip_axes=(-2, -1),
         with_bias=False,
         w_init=None,

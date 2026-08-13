@@ -1,7 +1,8 @@
 import time
 from typing import Any
 
-from pydantic import Field, BaseModel
+from pydantic import BaseModel, Field
+
 from grox.core.data_loaders.data_types import (
     Post,
     User,

@@ -1,26 +1,27 @@
 import logging
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
+from strato_http.queries.safety_post_annotations_result import (
+    StratoSafetyPostAnnotationsResultDirectMh,
+)
+
+from grox.config.config import ModelName
 from grox.core.data_loaders.data_types import Post
 from grox.core.lm.post import PostRenderer
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.flows.ptos.classifier import (
+    SafetyPtosChildSafetyPolicyClassifier,
+    SafetyPtosPolicyClassifier,
+)
+from grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD
+from grox.flows.ptos.mode import SafetyPtosMode
 from grox.flows.ptos.state import (
     SafetyPolicy,
     SafetyPolicyCategory,
     SafetyPolicyType,
     SafetyPtosState,
     SafetyPtosViolatedPolicy,
-)
-from grox.flows.ptos.classifier import (
-    SafetyPtosChildSafetyPolicyClassifier,
-    SafetyPtosPolicyClassifier,
-)
-from grox.config.config import ModelName
-from grox.flows.ptos.mode import SafetyPtosMode
-from grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD
-from strato_http.queries.safety_post_annotations_result import (
-    StratoSafetyPostAnnotationsResultDirectMh,
 )
 
 logger = logging.getLogger(__name__)

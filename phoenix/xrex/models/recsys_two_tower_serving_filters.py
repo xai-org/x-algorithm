@@ -2,7 +2,6 @@
 # Copyright 2026 X.AI Corp.
 import os
 
-import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax import shard_map

@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import logging
-from typing import List, Optional
 
 import httpx
 import numpy as np
@@ -51,12 +50,12 @@ class EmbeddingModelConfig(BaseModel):
 class XaiEmbeddingClientHttp:
     def __init__(
         self,
-        http_server: Optional[str] = None,
+        http_server: str | None = None,
         max_concurrent_requests: int = 10000,
         max_qps: int = 10000,
-        config: Optional[EmbeddingModelConfig] = None,
-        system_prompt: Optional[str] = None,
-        chat_template: Optional[ChatTemplate] = None,
+        config: EmbeddingModelConfig | None = None,
+        system_prompt: str | None = None,
+        chat_template: ChatTemplate | None = None,
     ):
         if config:
             self.http_server = config.endpoint
@@ -104,8 +103,8 @@ class XaiEmbeddingClientHttp:
     async def encode_async(
         self,
         text: str,
-        images: Optional[List[bytes]] = None,
-        timeout: Optional[float] = None,
+        images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> np.ndarray:
         async with self._semaphore, self._rate_limiter:
             num_images = len(images) if images else 0
@@ -116,8 +115,8 @@ class XaiEmbeddingClientHttp:
     async def encode_with_embedded_pads_async(
         self,
         text_with_pads: str,
-        images: Optional[List[bytes]] = None,
-        timeout: Optional[float] = None,
+        images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> np.ndarray:
         import time
 
@@ -145,13 +144,13 @@ class XaiEmbeddingClientHttp:
     async def embed_openai_async(
         self,
         text: str,
-        image: Optional[bytes] = None,
-        images: Optional[List[bytes]] = None,
-        timeout: Optional[float] = None,
+        image: bytes | None = None,
+        images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> np.ndarray:
         import time
 
-        img_list: Optional[List[bytes]] = (
+        img_list: list[bytes] | None = (
             images if images else ([image] if image is not None else None)
         )
 
@@ -207,8 +206,8 @@ class XaiEmbeddingClientHttp:
     async def _send_encode_request(
         self,
         prompt: str,
-        images: Optional[List[bytes]],
-        timeout: Optional[float],
+        images: list[bytes] | None,
+        timeout: float | None,
     ) -> np.ndarray:
         import time
 
