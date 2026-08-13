@@ -7,6 +7,7 @@ use crate::params::{
     PhoenixMoeCodivertViewerIsControl, PhoenixMoeCodivertViewerIsTreatment,
 };
 use crate::util::author_rules::AuthorRulesEvaluator;
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
@@ -186,8 +187,7 @@ fn cold_start_target(query: &ScoredPostsQuery, scores: &[f64]) -> Option<f64> {
     if lo >= hi {
         return None;
     }
-    // Pick a deterministic slot so identical requests produce identical scores.
-    Some(ranked[lo])
+    Some(ranked[rand::rng().random_range(lo..hi)])
 }
 
 fn cold_start_corpus_eligible(arm: ViewerArm, c: &PostCandidate, corpus: AuthorCorpus) -> bool {
@@ -591,18 +591,6 @@ rust_home_mixer:
         assert_eq!(threshold_confidence(1001, 1000, 0, true), 0.0);
         assert_eq!(follower_confidence(-1, -1, 0), 1.0);
         assert_eq!(follower_confidence(0, -1, 0), 0.0);
-    }
-
-    #[test]
-    fn deterministic_target_uses_first_configured_slot() {
-        let mut query = base_query();
-        let mut results = query.params.0.expect("params set");
-        results.override_fs("rust_home_mixer_cold_start_slot_min".to_string(), "0");
-        results.override_fs("rust_home_mixer_cold_start_slot_max".to_string(), "2");
-        query.params = results.into();
-
-        assert_eq!(cold_start_target(&query, &[10.0, 30.0, 20.0]), Some(30.0));
-        assert_eq!(cold_start_target(&query, &[10.0, 30.0, 20.0]), Some(30.0));
     }
 
     #[test]
