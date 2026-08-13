@@ -141,7 +141,7 @@ lazy_static! {
     pub static ref DPP_EMBEDDING_MISS_RATIO: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_embedding_miss_ratio",
-            "Fraction of DPP candidate pool items with missing embeddings (zero vector)"
+            "Fraction of DPP candidate pool items using deterministic fallback embeddings"
         )
         .buckets(vec![
             0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0
