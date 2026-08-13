@@ -175,6 +175,88 @@ val accountLabels = Map(
   },
 )
 
+val timelineHomeRecommendationsSurface = "TIMELINE_HOME_RECOMMENDATIONS"
+val ageRestrictedViewerSurface = "TIMELINE_HOME_AGE_RESTRICTED"
+val loggedOutSurface = "TIMELINE_HOME_LOGGED_OUT"
+
+def accountLabelAffectedSurfaces(code: String): Seq[String] =
+  resolveAccountKey(code) match {
+    case Some("NsfwAdmin") =>
+      Seq(
+        timelineHomeRecommendationsSurface,
+        ageRestrictedViewerSurface,
+        loggedOutSurface
+      )
+    case Some(_) => Seq(timelineHomeRecommendationsSurface)
+    case None => Seq.empty
+  }
+
+def accountLabelReassessmentStatus(code: String): String =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => "BOUNDED_EVENT_DRIVEN_EXPIRY"
+    case Some("NsfwAdmin") => "PUBLISHED_WRITER_AND_REVIEW_WORKFLOW_UNAVAILABLE"
+    case Some(_) => "NOT_DESCRIBED_BY_PUBLISHED_PRODUCER"
+    case None => "UNKNOWN_LABEL"
+  }
+
+def accountLabelEvidencePolicySource(code: String): String =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => "PUBLISHED_DEFAULT_AUTOMATED_PRODUCER"
+    case Some("NsfwAdmin") => "NOT_AVAILABLE_IN_PUBLISHED_REPOSITORY"
+    case Some(_) => "NOT_DESCRIBED_BY_PUBLISHED_PRODUCER"
+    case None => "UNKNOWN_LABEL"
+  }
+
+def accountLabelEvidencePolicyNote(code: String): String =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") =>
+      "These are the checked-in defaults. A runtime feature-switch configuration can override them within the published validation bounds. The producer scans at most 4 times the evidence window so repost-heavy timelines fail closed when too few original posts are available."
+    case Some("NsfwAdmin") =>
+      "NsfwAdmin is a Gizmoduck safety flag, not an output of the published automated account-label producer."
+    case Some(_) => ""
+    case None => ""
+  }
+
+def accountLabelEvidenceMinimumPosts(code: String): Option[Int] =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => Some(10)
+    case _ => None
+  }
+
+def accountLabelEvidenceWindowPosts(code: String): Option[Int] =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => Some(20)
+    case _ => None
+  }
+
+def accountLabelEvidenceMaxAgeDays(code: String): Option[Int] =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => Some(60)
+    case _ => None
+  }
+
+def accountLabelEvidenceMinimumProportion(code: String): Option[String] =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => Some("50%")
+    case _ => None
+  }
+
+def accountLabelExpiryDays(code: String): Option[Int] =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") => Some(7)
+    case _ => None
+  }
+
+def accountLabelNextReview(code: String): String =
+  resolveAccountKey(code) match {
+    case Some("NsfwHighPrecision") =>
+      "No scheduled review is published; the label expires 7 days after application and can be reapplied after expiry by a later qualifying post-label event."
+    case Some("NsfwAdmin") =>
+      "No next-review timestamp is available because the NsfwAdmin writer and removal workflow are not published."
+    case Some(_) => "No next-review timestamp is available in the published data."
+    case None => ""
+  }
+
 val underscore = Regex.compile("_")
 
 def normalizeLabel(code: String): String =
@@ -276,6 +358,16 @@ Library({
     accountLabelAbout = accountLabelAbout,
     postLabelEffect = postLabelEffect,
     accountLabelEffect = accountLabelEffect,
+    accountLabelAffectedSurfaces = accountLabelAffectedSurfaces,
+    accountLabelReassessmentStatus = accountLabelReassessmentStatus,
+    accountLabelEvidencePolicySource = accountLabelEvidencePolicySource,
+    accountLabelEvidencePolicyNote = accountLabelEvidencePolicyNote,
+    accountLabelEvidenceMinimumPosts = accountLabelEvidenceMinimumPosts,
+    accountLabelEvidenceWindowPosts = accountLabelEvidenceWindowPosts,
+    accountLabelEvidenceMaxAgeDays = accountLabelEvidenceMaxAgeDays,
+    accountLabelEvidenceMinimumProportion = accountLabelEvidenceMinimumProportion,
+    accountLabelExpiryDays = accountLabelExpiryDays,
+    accountLabelNextReview = accountLabelNextReview,
   },
   description = PlainText(
     "Under the Hood public label allowlists (canonical name -> about/effect) and helpers."

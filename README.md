@@ -426,6 +426,15 @@ The focus of the repository is transparency into the code that affects post visi
 
 We're piloting a new transparency tool that lets people see aggregate statistics about the visibility-impacting labels on their account and posts. Paired with the code in this repository, we believe this gives people valuable insight into the visibility of their posts.
 
+The published automated producer for `NsfwHighPrecision` account labels requires at least 10 of
+the 20 most recent original posts to carry a qualifying NSFW label, with every matching post no
+more than 60 days old. Its account label expires 7 days after application and can be reapplied
+after expiry by a later qualifying post-label event. Under the Hood reports these
+published-default criteria, affected surfaces, and the event-driven expiry semantics.
+`NsfwAdmin` is a separate Gizmoduck safety flag: its writer,
+removal workflow, evidence threshold, and next-review timestamp are not included in this public
+repository, so the report identifies those fields as unavailable rather than inferring them.
+
 The tool is [available here](https://x.com/i/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/).
 
 ---
