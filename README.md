@@ -279,7 +279,7 @@ These produce the scores and labels that Visibility Filtering reads.
 | [`clip/`](clip/)                           | Trains the image and text embedding model whose media embeddings the classifiers above take as input.                                                                                 |
 | [`agatha/`](agatha/)                       | Offline batch jobs that label an account from how others respond to its posts: blocks, reports and spam reports relative to favorites, plus spam-suspension and adult-content labels. |
 | [`bdsm/`](bdsm/)                           | Reads the sequence of actions an account takes over time to identify signs of inauthentic or abusive behavior.                                                                        |
-| [`user-cred-v2/`](user-cred-v2/)           | Runs PageRank over the follow graph and engagement edges, and turns the resulting mass into a per-account score.                                                                      |
+| [`user-cred-v2/`](user-cred-v2/)           | Runs PageRank over the follow graph and engagement edges, using a verification-neutral uniform teleport prior across all eligible non-near-zero accounts, and turns the resulting mass into a per-account score.                                    |
 | [`adult-content/`](adult-content/)         | Trains and calibrates a classifier for adult media.                                                                                                                                   |
 | [`pnsfwmedia/`](pnsfwmedia/)               | An adult-media classifier that combines CLIP media embeddings with account-level scores, including the calibrated score from `agatha`.                                                |
 
