@@ -1,10 +1,10 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    AuthorIsControl, AuthorIsTreatment, ColdStartFollowerCap, ColdStartImpressionThreshold,
-    ColdStartMaxPostAgeSecs, ColdStartSlotMax, ColdStartSlotMin, EnableViewerColdStart,
-    LowImpressionsMaxPositionRatio, PhoenixMoeCodivertViewerIsControl,
-    PhoenixMoeCodivertViewerIsTreatment,
+    AuthorIsControl, AuthorIsTreatment, ColdStartFollowerCap, ColdStartFollowerDecayWidth,
+    ColdStartImpressionDecayWidth, ColdStartImpressionThreshold, ColdStartMaxPostAgeSecs,
+    ColdStartSlotMax, ColdStartSlotMin, EnableViewerColdStart, LowImpressionsMaxPositionRatio,
+    PhoenixMoeCodivertViewerIsControl, PhoenixMoeCodivertViewerIsTreatment,
 };
 use crate::util::author_rules::AuthorRulesEvaluator;
 use rand::Rng;
@@ -83,11 +83,63 @@ fn is_phoenix_moe(c: &PostCandidate) -> bool {
     c.served_type == Some(pb::ServedType::ForYouPhoenixRetrievalMoe)
 }
 
-pub(crate) fn cold_start_base_eligible(c: &PostCandidate, follower_cap: i64) -> bool {
+/// Returns a smooth, bounded confidence that is full through `threshold` and
+/// decays to zero over `decay_width`. A zero-width rollout preserves the prior
+/// binary comparison.
+fn threshold_confidence(
+    value: u64,
+    threshold: u64,
+    decay_width: u64,
+    legacy_threshold_inclusive: bool,
+) -> f64 {
+    if decay_width == 0 {
+        return if value < threshold || (legacy_threshold_inclusive && value == threshold) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    if value <= threshold {
+        return 1.0;
+    }
+    let end = threshold.saturating_add(decay_width);
+    if value >= end {
+        return 0.0;
+    }
+    let progress = (value - threshold) as f64 / decay_width as f64;
+    let smoothstep = progress * progress * (3.0 - 2.0 * progress);
+    (1.0 - smoothstep).clamp(0.0, 1.0)
+}
+
+fn follower_confidence(followers: i32, follower_cap: i64, decay_width: u32) -> f64 {
+    if decay_width == 0 {
+        return if (followers as i64) <= follower_cap {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    if follower_cap < 0 {
+        return 0.0;
+    }
+    threshold_confidence(
+        followers.max(0) as u64,
+        follower_cap as u64,
+        decay_width as u64,
+        true,
+    )
+}
+
+pub(crate) fn cold_start_base_eligible(
+    c: &PostCandidate,
+    follower_cap: i64,
+    follower_decay_width: u32,
+) -> bool {
     c.in_reply_to_tweet_id.is_none()
         && c.retweeted_tweet_id.is_none()
-        && c.author_followers_count
-            .is_some_and(|followers| (followers as i64) <= follower_cap)
+        && c.author_followers_count.is_some_and(|followers| {
+            follower_confidence(followers, follower_cap, follower_decay_width) > 0.0
+        })
 }
 
 fn author_corpus(
@@ -162,7 +214,9 @@ fn apply_cold_start(
     target: f64,
 ) -> Vec<f64> {
     let follower_cap = query.params.get(ColdStartFollowerCap);
+    let follower_decay_width = query.params.get(ColdStartFollowerDecayWidth);
     let threshold = query.params.get(ColdStartImpressionThreshold) as u64;
+    let impression_decay_width = query.params.get(ColdStartImpressionDecayWidth) as u64;
     let max_post_age = Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs));
     let (positions, nonzero) = positions_among_nonzero(scores);
     let max_cold_start_slot =
@@ -171,22 +225,36 @@ fn apply_cold_start(
     let best = candidates
         .iter()
         .enumerate()
-        .filter(|(i, c)| {
-            cold_start_base_eligible(c, follower_cap)
-                && cold_start_corpus_eligible(arm, c, corpus[*i])
-                && cold_start_freshness_eligible(arm, c, max_post_age)
-                && positions[*i] < max_cold_start_slot
-                && c.view_count.is_some_and(|imp| imp < threshold)
+        .filter_map(|(i, c)| {
+            if !cold_start_base_eligible(c, follower_cap, follower_decay_width)
+                || !cold_start_corpus_eligible(arm, c, corpus[i])
+                || !cold_start_freshness_eligible(arm, c, max_post_age)
+                || positions[i] >= max_cold_start_slot
+            {
+                return None;
+            }
+            let impression_confidence = c.view_count.map_or(0.0, |impressions| {
+                threshold_confidence(impressions, threshold, impression_decay_width, false)
+            });
+            let author_confidence = c.author_followers_count.map_or(0.0, |followers| {
+                follower_confidence(followers, follower_cap, follower_decay_width)
+            });
+            let confidence = (impression_confidence * author_confidence).clamp(0.0, 1.0);
+            if confidence > 0.0 {
+                Some((i, confidence))
+            } else {
+                None
+            }
         })
-        .map(|(i, _)| i)
-        .max_by(|&i, &j| scores[i].total_cmp(&scores[j]));
+        .max_by(|(i, _), (j, _)| scores[*i].total_cmp(&scores[*j]));
 
-    let Some(best_idx) = best else {
+    let Some((best_idx, confidence)) = best else {
         return scores.to_vec();
     };
 
     let mut effective = scores.to_vec();
-    effective[best_idx] = effective[best_idx].max(target);
+    let boost = (target - effective[best_idx]).max(0.0) * confidence;
+    effective[best_idx] += boost;
     record_cold_started_posts(is_phoenix_moe(&candidates[best_idx]), arm.as_str(), 1);
     effective
 }
@@ -350,11 +418,19 @@ rust_home_mixer:
             "rust_home_mixer_cold_start_impression_threshold".to_string(),
             "100",
         );
+        results.override_fs(
+            "rust_home_mixer_cold_start_impression_decay_width".to_string(),
+            "100",
+        );
         results.override_fs("rust_home_mixer_cold_start_slot_min".to_string(), "0");
         results.override_fs("rust_home_mixer_cold_start_slot_max".to_string(), "1");
         results.override_fs(
             "rust_home_mixer_cold_start_follower_cap".to_string(),
             "1000",
+        );
+        results.override_fs(
+            "rust_home_mixer_cold_start_follower_decay_width".to_string(),
+            "100",
         );
         results.override_fs(
             "rust_home_mixer_cold_start_max_post_age_secs".to_string(),
@@ -490,5 +566,71 @@ rust_home_mixer:
 
         let result = author_cold_start.apply(&query, &candidates, &[10.0, 40.0, 30.0, 20.0]);
         assert_eq!(result, vec![10.0, 40.0, 30.0, 20.0]);
+    }
+
+    #[test]
+    fn threshold_confidence_is_exact_at_boundaries_and_monotonic() {
+        assert_eq!(threshold_confidence(999, 1000, 200, false), 1.0);
+        assert_eq!(threshold_confidence(1000, 1000, 200, false), 1.0);
+        assert_eq!(threshold_confidence(1100, 1000, 200, false), 0.5);
+        assert_eq!(threshold_confidence(1200, 1000, 200, false), 0.0);
+        assert_eq!(threshold_confidence(1201, 1000, 200, false), 0.0);
+
+        let confidences: Vec<f64> = (900..=1250)
+            .map(|value| threshold_confidence(value, 1000, 200, false))
+            .collect();
+        assert!(confidences.windows(2).all(|pair| pair[0] >= pair[1]));
+        assert!(confidences.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn zero_decay_width_preserves_legacy_threshold_comparisons() {
+        assert_eq!(threshold_confidence(99, 100, 0, false), 1.0);
+        assert_eq!(threshold_confidence(100, 100, 0, false), 0.0);
+        assert_eq!(threshold_confidence(1000, 1000, 0, true), 1.0);
+        assert_eq!(threshold_confidence(1001, 1000, 0, true), 0.0);
+        assert_eq!(follower_confidence(-1, -1, 0), 1.0);
+        assert_eq!(follower_confidence(0, -1, 0), 0.0);
+    }
+
+    #[test]
+    fn impression_decay_applies_a_partial_bounded_boost() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
+        let candidates = vec![
+            cold_start_candidate(1, minutes(10), 150),
+            cold_start_candidate(2, minutes(10), 1000),
+        ];
+
+        let result =
+            author_cold_start.apply(&codivert_query(true, false), &candidates, &[20.0, 100.0]);
+
+        assert_eq!(result, vec![60.0, 100.0]);
+    }
+
+    #[test]
+    fn follower_decay_applies_a_partial_bounded_boost() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
+        let mut partial = cold_start_candidate(1, minutes(10), 3);
+        partial.author_followers_count = Some(1050);
+        let candidates = vec![partial, cold_start_candidate(2, minutes(10), 1000)];
+
+        let result =
+            author_cold_start.apply(&codivert_query(true, false), &candidates, &[20.0, 100.0]);
+
+        assert_eq!(result, vec![60.0, 100.0]);
+    }
+
+    #[test]
+    fn decay_reaches_zero_without_crossing_target_or_lowering_score() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
+        let candidates = vec![
+            cold_start_candidate(1, minutes(10), 200),
+            cold_start_candidate(2, minutes(10), 1000),
+        ];
+
+        let result =
+            author_cold_start.apply(&codivert_query(true, false), &candidates, &[20.0, 100.0]);
+
+        assert_eq!(result, vec![20.0, 100.0]);
     }
 }

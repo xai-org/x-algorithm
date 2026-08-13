@@ -152,6 +152,8 @@ Ranking sets the order. Whether a post can be shown at all is decided separately
 
 Stages can be switched on and off individually, with defaults in [`home-mixer/params/param.rs`](home-mixer/params/param.rs) — see [Experiments and Configuration](#experiments-and-configuration) for how those defaults relate to what runs in production.
 
+Cold-start exploration uses continuous, bounded confidence decay beyond the configured impression and follower thresholds. This avoids abrupt eligibility loss at exactly 1,000 impressions or followers while retaining the existing experiment arms, original-post, freshness, ranking-position, and target-slot constraints. Setting either decay width to `0` restores that threshold's previous binary behavior.
+
 ### Labeling Path
 
 <pre>
