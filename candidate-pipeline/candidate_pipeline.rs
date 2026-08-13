@@ -90,6 +90,13 @@ where
     fn post_selection_filters(&self) -> &[Box<dyn Filter<Q, C>>];
     fn side_effects(&self) -> Arc<Vec<Box<dyn SideEffect<Q, C>>>>;
     fn result_size(&self) -> usize;
+    /// Whether `Selector::non_selected` is a ranked reserve that is safe to hydrate and serve.
+    ///
+    /// Custom selectors may use `non_selected` for side-effect accounting or placeholders, so
+    /// backfill must be explicitly enabled by pipelines whose selector guarantees real candidates.
+    fn enable_post_selection_backfill(&self) -> bool {
+        false
+    }
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
 
     #[xai_stats_macro::receive_stats(latency=Bucket500To2500)]
@@ -126,7 +133,7 @@ where
             filtered: post_selection_filtered_candidates,
             non_selected: non_selected_candidates,
         } = self
-            .post_selection_with_backfill(
+            .post_selection(
                 &hydrated_query,
                 selected_candidates,
                 non_selected_candidates,
@@ -152,6 +159,33 @@ where
             filtered_candidates,
             selected_candidates: final_candidates,
             query: arc_hydrated_query,
+        }
+    }
+
+    async fn post_selection(
+        &self,
+        query: &Q,
+        selected_candidates: Vec<C>,
+        mut non_selected_candidates: Vec<C>,
+    ) -> PostSelectionResult<C> {
+        if self.enable_post_selection_backfill() {
+            return self
+                .post_selection_with_backfill(query, selected_candidates, non_selected_candidates)
+                .await;
+        }
+
+        // Preserve the original single-pass contract for selectors whose `non_selected` output
+        // is not a serveable reserve (for example, synthetic side-effect placeholders).
+        let hydrated = self
+            .hydrate_post_selection(query, selected_candidates)
+            .await;
+        let (mut selected, filtered) = self.filter_post_selection(query, hydrated);
+        let truncated = selected.split_off(self.result_size().min(selected.len()));
+        non_selected_candidates.extend(truncated);
+        PostSelectionResult {
+            selected,
+            filtered,
+            non_selected: non_selected_candidates,
         }
     }
 
@@ -600,6 +634,25 @@ mod tests {
         }
     }
 
+    struct PlaceholderSelector;
+
+    impl Selector<TestQuery, TestCandidate> for PlaceholderSelector {
+        fn select(
+            &self,
+            _query: &TestQuery,
+            candidates: Vec<TestCandidate>,
+        ) -> SelectResult<TestCandidate> {
+            SelectResult {
+                selected: candidates,
+                non_selected: vec![TestCandidate::new(999), TestCandidate::new(1000)],
+            }
+        }
+
+        fn score(&self, candidate: &TestCandidate) -> f64 {
+            -(candidate.id as f64)
+        }
+    }
+
     struct TestPipeline {
         query_hydrators: Vec<Box<dyn QueryHydrator<TestQuery>>>,
         sources: Vec<Box<dyn Source<TestQuery, TestCandidate>>>,
@@ -611,6 +664,7 @@ mod tests {
         post_selection_filters: Vec<Box<dyn Filter<TestQuery, TestCandidate>>>,
         side_effects: Arc<Vec<Box<dyn SideEffect<TestQuery, TestCandidate>>>>,
         result_size: usize,
+        enable_backfill: bool,
     }
 
     impl CandidatePipeline<TestQuery, TestCandidate> for TestPipeline {
@@ -653,6 +707,10 @@ mod tests {
         fn result_size(&self) -> usize {
             self.result_size
         }
+
+        fn enable_post_selection_backfill(&self) -> bool {
+            self.enable_backfill
+        }
     }
 
     fn pipeline(
@@ -685,6 +743,7 @@ mod tests {
             post_selection_filters,
             side_effects: Arc::new(vec![]),
             result_size,
+            enable_backfill: true,
         };
         (pipeline, batches)
     }
@@ -695,6 +754,34 @@ mod tests {
 
     fn ids(candidates: &[TestCandidate]) -> Vec<usize> {
         candidates.iter().map(|candidate| candidate.id).collect()
+    }
+
+    #[tokio::test]
+    async fn default_pipeline_never_hydrates_or_promotes_non_selected_placeholders() {
+        let (mut pipeline, batches) = pipeline(3, [0]);
+        pipeline.enable_backfill = false;
+        pipeline.selector = Box::new(PlaceholderSelector);
+        let selector_result = pipeline.select(&TestQuery::default(), candidates(0..3));
+        let placeholders = selector_result.non_selected.clone();
+
+        let result = pipeline
+            .post_selection(
+                &TestQuery::default(),
+                selector_result.selected,
+                selector_result.non_selected,
+            )
+            .await;
+
+        assert_eq!(ids(&result.selected), vec![1, 2]);
+        assert_eq!(ids(&result.filtered), vec![0]);
+        assert_eq!(result.non_selected, placeholders);
+        assert_eq!(*batches.lock().unwrap(), vec![vec![0, 1, 2]]);
+        assert!(
+            result
+                .non_selected
+                .iter()
+                .all(|candidate| !candidate.hydrated)
+        );
     }
 
     #[tokio::test]

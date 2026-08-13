@@ -956,6 +956,10 @@ impl CandidatePipeline<ScoredPostsQuery, PostCandidate> for PhoenixCandidatePipe
     fn result_size(&self) -> usize {
         params::RESULT_SIZE
     }
+
+    fn enable_post_selection_backfill(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
