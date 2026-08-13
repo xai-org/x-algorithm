@@ -3,6 +3,8 @@ rules:
   - id: post_allowlisted
     when: post_allowlist.is_allowlisted || user_allowlist.is_allowlisted
     then: { kind: skip, reason: post_allowlisted }
+  # Parser fixture only: retain a legacy credibility expression to verify that
+  # dynamic rules using the existing CEL contract remain compatible.
   - id: author_cred_skip
     when: cred.is_high
     then: { kind: skip, reason: author_cred_skip }

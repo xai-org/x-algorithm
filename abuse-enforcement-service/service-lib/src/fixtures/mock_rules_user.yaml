@@ -6,6 +6,8 @@ rules:
   - id: not_present
     when: "!user.present"
     then: { kind: skip, reason: not_present }
+  # Parser fixture only: retain a legacy credibility expression to verify that
+  # dynamic rules using the existing CEL contract remain compatible.
   - id: cred_skip
     when: cred.is_high || cred.follower_count >= 1234 || cred.score >= 7.5
     then: { kind: skip, reason: cred_skip }
