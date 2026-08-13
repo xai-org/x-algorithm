@@ -624,6 +624,12 @@ param!(
     1000
 );
 param!(
+    ColdStartImpressionDecayWidth,
+    u32,
+    "rust_home_mixer_cold_start_impression_decay_width",
+    250
+);
+param!(
     ColdStartSlotMin,
     u32,
     "rust_home_mixer_cold_start_slot_min",
@@ -640,6 +646,12 @@ param!(
     i64,
     "rust_home_mixer_cold_start_follower_cap",
     1000
+);
+param!(
+    ColdStartFollowerDecayWidth,
+    u32,
+    "rust_home_mixer_cold_start_follower_decay_width",
+    250
 );
 param!(
     ColdStartMaxPostAgeSecs,

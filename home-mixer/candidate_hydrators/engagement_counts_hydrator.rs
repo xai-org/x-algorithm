@@ -1,7 +1,10 @@
 use crate::clients::engagement_counts_client::EngagementCountsClient;
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{ColdStartFollowerCap, EnableEngagementCountsHydration, EnableViewerColdStart};
+use crate::params::{
+    ColdStartFollowerCap, ColdStartFollowerDecayWidth, EnableEngagementCountsHydration,
+    EnableViewerColdStart,
+};
 use crate::scorers::author_cold_start::cold_start_base_eligible;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +12,7 @@ use std::time::Duration;
 use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::utils::{
-    build_moka_cache, MokaCache, MokaCacheConfig,
+    MokaCache, MokaCacheConfig, build_moka_cache,
 };
 use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
 use xai_proto::engagement_counter::EngagementCounts;
@@ -116,8 +119,10 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrato
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
         let follower_cap = query.params.get(ColdStartFollowerCap);
+        let follower_decay_width = query.params.get(ColdStartFollowerDecayWidth);
         let fetch_counts = |c: &PostCandidate| {
-            !query.has_cached_posts || cold_start_base_eligible(c, follower_cap)
+            !query.has_cached_posts
+                || cold_start_base_eligible(c, follower_cap, follower_decay_width)
         };
 
         let mut unique_ids: Vec<u64> = candidates
@@ -173,6 +178,7 @@ mod tests {
     const COUNTS: &str = "rust_home_mixer_enable_engagement_counts_hydration";
     const COLD_START: &str = "rust_home_mixer_enable_viewer_cold_start_boost";
     const CAP: &str = "rust_home_mixer_cold_start_follower_cap";
+    const FOLLOWER_DECAY_WIDTH: &str = "rust_home_mixer_cold_start_follower_decay_width";
 
     fn query(has_cached_posts: bool, flags: &[(&str, &str)]) -> ScoredPostsQuery {
         let mut query = ScoredPostsQuery {
@@ -269,6 +275,30 @@ mod tests {
         assert_eq!(result[0].as_ref().unwrap().view_count, Some(5));
         assert_eq!(result[1].as_ref().unwrap().view_count, Some(999));
         assert_eq!(result[2].as_ref().unwrap().view_count, Some(888));
+    }
+
+    #[tokio::test]
+    async fn cached_posts_refresh_counts_inside_follower_decay_band() {
+        let h = hydrator(view_counts(&[(10, 5)])).await;
+        let candidates = vec![PostCandidate {
+            tweet_id: 10,
+            author_id: 1,
+            author_followers_count: Some(1100),
+            view_count: Some(999),
+            ..Default::default()
+        }];
+        let q = query(
+            true,
+            &[
+                (COLD_START, "true"),
+                (CAP, "1000"),
+                (FOLLOWER_DECAY_WIDTH, "250"),
+            ],
+        );
+
+        let result = h.hydrate_from_client(&q, &candidates).await;
+
+        assert_eq!(result[0].as_ref().unwrap().view_count, Some(5));
     }
 
     #[derive(Default)]
