@@ -53,7 +53,9 @@ impl TesHydrator {
     ) -> Self {
         Self {
             tes_client,
-            fallback_cache: FallbackCache::new("media", CACHE_CAPACITY, cache_mode),
+            // Preserve the existing media-cache policy; the bounded recovery behavior is
+            // intentionally scoped to author restrictions in this change.
+            fallback_cache: FallbackCache::new("media", CACHE_CAPACITY, cache_mode, None),
         }
     }
 

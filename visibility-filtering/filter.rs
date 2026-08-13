@@ -124,9 +124,10 @@ impl FilterTweets {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::MockSocialgraphClient;
+    use crate::models::SafetyLabelType;
+    use crate::safety_label_source::SafetyLabelSource;
     use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
-    use crate::safety_label_source::SafetyLabelSource;
     use std::sync::Arc;
     use tonic::async_trait;
     use xai_core_entities::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient};
@@ -138,6 +139,18 @@ mod tests {
         }
     }
 
+    fn spam_high_recall_label_map(expires_at_msec: i64) -> vf_pb::SafetyLabelMap {
+        vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(
+                i32::from(SafetyLabelType::SPAM_HIGH_RECALL),
+                vf_pb::SafetyLabel {
+                    expires_at_msec: Some(expires_at_msec),
+                    ..Default::default()
+                },
+            )]),
+        }
+    }
+
     struct FakeTwemcache;
 
     #[async_trait]
@@ -146,10 +159,11 @@ mod tests {
             ids.iter()
                 .copied()
                 .map(|id| {
-                    let outcome = if id == 2 {
-                        TwemcacheOutcome::Hit(full_label_map())
-                    } else {
-                        TwemcacheOutcome::Miss
+                    let outcome = match id {
+                        2 => TwemcacheOutcome::Hit(full_label_map()),
+                        3 => TwemcacheOutcome::Hit(spam_high_recall_label_map(0)),
+                        4 => TwemcacheOutcome::Hit(spam_high_recall_label_map(i64::MAX)),
+                        _ => TwemcacheOutcome::Miss,
                     };
                     (id, outcome)
                 })
@@ -279,6 +293,59 @@ mod tests {
         assert_eq!(
             filter_all.outcomes[0].verdict.decided_by,
             Some("FilterAllRule")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_spam_high_recall_allows_oon_and_is_removed_from_response() {
+        let response = filter_tweets()
+            .run(FilterRequest {
+                viewer_id: None,
+                country_code: None,
+                safety_level: SafetyLevel::TimelineHomeRecommendations,
+                candidates: vec![candidate(3, Some(30))],
+            })
+            .await;
+
+        assert!(matches!(
+            response.outcomes[0].verdict.action,
+            VfAction::Allow
+        ));
+        assert_eq!(response.outcomes[0].verdict.decided_by, None);
+        assert!(
+            response.outcomes[0]
+                .safety_labels
+                .as_ref()
+                .is_some_and(|labels| labels.labels.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpired_spam_high_recall_still_drops_oon() {
+        let response = filter_tweets()
+            .run(FilterRequest {
+                viewer_id: None,
+                country_code: None,
+                safety_level: SafetyLevel::TimelineHomeRecommendations,
+                candidates: vec![candidate(4, Some(40))],
+            })
+            .await;
+
+        assert!(matches!(
+            response.outcomes[0].verdict.action,
+            VfAction::Drop(_)
+        ));
+        assert_eq!(
+            response.outcomes[0].verdict.decided_by,
+            Some("SpamHighRecallDropRule")
+        );
+        assert!(
+            response.outcomes[0]
+                .safety_labels
+                .as_ref()
+                .is_some_and(|labels| labels
+                    .labels
+                    .contains_key(&i32::from(SafetyLabelType::SPAM_HIGH_RECALL)))
         );
     }
 }
