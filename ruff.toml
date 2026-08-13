@@ -1,0 +1,17 @@
+# Shared Python lint config for the whole repo.
+# Subprojects with their own [tool.ruff] section (phoenix/, bdsm/) extend this file.
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = [
+    "E4", "E7", "E9", "F", # pycodestyle / pyflakes core
+    "I",                   # isort: deterministic import order
+    "UP",                  # pyupgrade: Optional[X] -> X | None, typing.List -> list
+    "B",                   # bugbear: likely bugs (loop-variable capture, mutable defaults)
+    "SIM",                 # obvious simplifications
+    "RUF",                 # ruff-specific checks
+]
+ignore = [
+    "RUF012", # mutable class attrs on config/dataclass-style ML classes: noisy here
+]
