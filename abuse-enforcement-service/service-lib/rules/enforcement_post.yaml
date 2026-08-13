@@ -59,7 +59,7 @@ rules:
 
   - id: anchor_campaign_post
     when: '"anchor_campaign_post" in score.labels'
-    then: { kind: act_add_post_labels_v2, labels: ["SpamHighRecall"] }
+    then: { kind: act_add_post_labels_v2, labels: ["SpamHighRecall"], ttl_msec: 2592000000 }
 
 
   - id: act_add_spam_embedding_ptos_distilled_label
@@ -67,6 +67,7 @@ rules:
     then:
       kind: act_add_post_labels_v2
       labels: ["SpamHighRecall"]
+      ttl_msec: 2592000000
 
   - id: act_suspend_ncmec_reported_content_author
     when: '"cse_reports_embedding_v2" in score.labels'
