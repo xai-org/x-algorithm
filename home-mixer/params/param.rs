@@ -280,7 +280,7 @@ param!(
     EnableSlateDiversity,
     bool,
     "rust_home_mixer_enable_slate_diversity",
-    true
+    false
 );
 param!(
     SlateDiversityAuthorWindowSize,
@@ -299,6 +299,12 @@ param!(
     bool,
     "rust_home_mixer_enable_slate_semantic_diversity",
     true
+);
+param!(
+    SlateDiversityMaxLookahead,
+    u32,
+    "rust_home_mixer_slate_diversity_max_lookahead",
+    10
 );
 
 // These weights reflect a combination of how much an action is
