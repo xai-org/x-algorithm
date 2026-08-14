@@ -1,6 +1,7 @@
 use crate::models::candidate::{MpnParts, PhoenixScores, PostCandidate, SlateContext};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
+use crate::scorers::maga::maga_multiplier;
 use crate::scorers::author_cold_start::AuthorColdStart;
 use crate::scorers::value_model_gate::GateModel;
 use rustc_hash::FxHashMap;
@@ -783,6 +784,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                     if oon_applies(c) {
                         m *= effective_oon;
                     }
+                    m *= maga_multiplier(query, c);
                     m
                 })
                 .collect();
@@ -849,11 +851,12 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
             .enumerate()
             .map(|(i, c)| {
                 let after_diversity = diversity_adjusted[i];
-                if oon_applies(c) {
+                let after_oon = if oon_applies(c) {
                     after_diversity * effective_oon
                 } else {
                     after_diversity
-                }
+                };
+                after_oon * maga_multiplier(query, c)
             })
             .collect();
 
@@ -1042,6 +1045,58 @@ mod tests {
         let oon_score = scored[1].as_ref().unwrap().score.unwrap();
 
         assert!((oon_score - in_network_score * 0.75).abs() < 1e-9);
+    }
+
+    fn spanish_candidate(author_id: u64, text: &str) -> PostCandidate {
+        PostCandidate {
+            tweet_text: text.to_string(),
+            language_code: Some("es".to_string()),
+            ..candidate(author_id, Some(true))
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_maga_boost_to_argentine_posts() {
+        let scorer = test_scorer();
+        let candidates = vec![
+            spanish_candidate(1, "hoy llueve en toda la ciudad"),
+            spanish_candidate(2, "che qué quilombo se armó"),
+        ];
+
+        let query = query_with_flags(&[
+            ("rust_home_mixer_enable_maga_boost", "true"),
+            ("rust_home_mixer_maga_boost_factor", "1.15"),
+            ("rust_home_mixer_value_model_mode", "weighted"),
+            ("rust_home_mixer_enable_mpn_scoring", "false"),
+        ]);
+        let scored = scorer.score(&query, &candidates).await;
+
+        let neutral_score = scored[0].as_ref().unwrap().score.unwrap();
+        let argentine_score = scored[1].as_ref().unwrap().score.unwrap();
+
+        assert!((argentine_score - neutral_score * 1.15).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn maga_boost_disabled_is_noop() {
+        let scorer = test_scorer();
+        let candidates = vec![
+            spanish_candidate(1, "hoy llueve en toda la ciudad"),
+            spanish_candidate(2, "che qué quilombo se armó"),
+        ];
+
+        let query = query_with_flags(&[
+            ("rust_home_mixer_enable_maga_boost", "false"),
+            ("rust_home_mixer_maga_boost_factor", "1.15"),
+            ("rust_home_mixer_value_model_mode", "weighted"),
+            ("rust_home_mixer_enable_mpn_scoring", "false"),
+        ]);
+        let scored = scorer.score(&query, &candidates).await;
+
+        let neutral_score = scored[0].as_ref().unwrap().score.unwrap();
+        let argentine_score = scored[1].as_ref().unwrap().score.unwrap();
+
+        assert!((argentine_score - neutral_score).abs() < 1e-9);
     }
 
     #[test]
