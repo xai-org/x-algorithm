@@ -19,6 +19,13 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
 /// Selects the highest-scoring candidates while improving slate diversity.
 /// Author caps apply near the top; semantic adjacency applies throughout.
 /// Lookahead bounds how far a constraint may displace a ranked candidate.
+///
+/// `RankingScorer` may already have applied a soft serving-author decay and
+/// populated `SlateContext.k`. This selector intentionally recomputes counts:
+/// VMRanker can change the order after that context is recorded, `k` describes
+/// the earlier pool order rather than this selector's chosen prefix, and it
+/// does not track the original author of a retweeted post. The hard cap is a
+/// final guardrail layered on top of that independently configurable decay.
 pub struct SlateDiversitySelector;
 
 impl SlateItem for PostCandidate {
