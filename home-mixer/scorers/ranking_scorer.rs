@@ -1474,6 +1474,97 @@ mod tests {
     }
 
     #[test]
+    fn dwell_regret_high_negative_feedback_overrides_shallow_engagement() {
+        let shallow_high_engagement = dr_candidate(
+            1,
+            PhoenixScores {
+                favorite_score: Some(0.9),
+                reply_score: Some(0.8),
+                retweet_score: Some(0.7),
+                quote_score: Some(0.6),
+                share_score: Some(0.5),
+                share_via_dm_score: Some(0.4),
+                share_via_copy_link_score: Some(0.3),
+                report_score: Some(0.1),
+                dwell_time: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let clean_sustained = dr_candidate(
+            2,
+            PhoenixScores {
+                favorite_score: Some(0.05),
+                dwell_time: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let scores = RankingScorer::compute_dwell_regret_base_scores(
+            &dr_weights(),
+            &[shallow_high_engagement, clean_sustained],
+        );
+
+        assert!(
+            scores[0] < 1e-20,
+            "report risk must dominate shallow engagement: {}",
+            scores[0]
+        );
+        assert!(
+            scores[1] > scores[0],
+            "clean sustained candidate {} must outrank high-risk candidate {}",
+            scores[1],
+            scores[0]
+        );
+    }
+
+    #[test]
+    fn dwell_regret_rewards_sustained_dwell_and_positive_actions() {
+        let sustained_positive = dr_candidate(
+            1,
+            PhoenixScores {
+                favorite_score: Some(0.3),
+                reply_score: Some(0.1),
+                dwell_time: Some(30.0),
+                ..Default::default()
+            },
+        );
+        let sustained_neutral = dr_candidate(
+            2,
+            PhoenixScores {
+                favorite_score: Some(0.03),
+                reply_score: Some(0.01),
+                dwell_time: Some(30.0),
+                ..Default::default()
+            },
+        );
+        let shallow_neutral = dr_candidate(
+            3,
+            PhoenixScores {
+                favorite_score: Some(0.03),
+                reply_score: Some(0.01),
+                dwell_time: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let scores = RankingScorer::compute_dwell_regret_base_scores(
+            &dr_weights(),
+            &[sustained_positive, sustained_neutral, shallow_neutral],
+        );
+
+        assert!(
+            scores[0] > scores[1],
+            "positive actions should lift equal dwell: {:?}",
+            scores
+        );
+        assert!(
+            scores[1] > scores[2],
+            "sustained dwell should beat shallow dwell at equal actions: {:?}",
+            scores
+        );
+    }
+
+    #[test]
     fn dwell_regret_floor_applies_to_low_dwell() {
         let none_dwell = dr_candidate(
             1,
@@ -1675,5 +1766,11 @@ mod tests {
             weighted < 1.0,
             "weighted-mode score should be small: {weighted}"
         );
+    }
+
+    #[test]
+    fn default_value_model_uses_the_gated_satisfaction_path() {
+        let query = query_with_flags(&[]);
+        assert_eq!(query.params.get(ValueModelMode), GATED_DWELL_REGRET_MODE);
     }
 }

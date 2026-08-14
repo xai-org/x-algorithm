@@ -321,13 +321,17 @@ Author        follow author
 Negative      not interested · mute author · block author · report · not dwelled
 ```
 
-`RankingScorer` combines them:
+`RankingScorer` has two configurable objectives. The default, `gated_dwell_regret`, uses the existing value-model gate to choose between the established weighted score and a satisfaction-oriented score. The latter starts from predicted dwell time, raises posts with stronger predicted favorite, reply, repost, quote, and share actions relative to the request's candidate set, and exponentially reduces posts with predicted not-interested, block, mute, or report feedback. If the gate configuration is invalid, scoring falls back to the weighted objective. Setting `rust_home_mixer_value_model_mode` to `weighted` provides an explicit rollback; `dwell_regret_sigmoid` selects the satisfaction-oriented score without the gate.
+
+The weighted objective combines the action heads as:
 
 ```
 Final Score = Σ (weight_i × P(action_i))
 ```
 
 Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`home-mixer/scorers/ranking_scorer.rs`](home-mixer/scorers/ranking_scorer.rs).
+
+This change does not claim to optimize survey responses, retention, session-level outcomes, or other unavailable long-term labels. It only changes how existing per-post dwell, positive-action, and negative-feedback predictions are combined, and its positive-action normalization is relative to the candidates in the current request.
 
 Three adjustments follow:
 
