@@ -1,0 +1,154 @@
+import <content_understanding/tweetUtil>
+import <visibility/under-the-hood/sharedConfig>
+import <visibility/under-the-hood/underTheHoodLabels>
+
+type User = com.twitter.gizmoduck.User
+type LiveRestriction = com.twitter.strato.graphql.UnderTheHoodLiveRestriction
+type LiveRestrictionStatus = com.twitter.strato.graphql.UnderTheHoodLiveRestrictionStatus
+
+// Bound both fanout and history. This is a creator-facing status check, not an
+// unrestricted label-history API.
+val postScanLimit = 100
+val postLookbackDays = 30
+
+def accountLabelIsActive(createdAtMsec: Long, expiresAtMsec: Option[Long], nowMs: Long): Boolean =
+  createdAtMsec <= nowMs && expiresAtMsec.map { expiry => expiry > nowMs }.getOrElse(true)
+
+def postLabelIsActive(
+    createdAtMsec: Option[Long],
+    expiresAtMsec: Option[Long],
+    nowMs: Long
+): Boolean =
+  createdAtMsec.map { applied => applied <= nowMs }.getOrElse(true) &&
+    expiresAtMsec.map { expiry => expiry > nowMs }.getOrElse(true)
+
+def build(userId: Long, userOpt: Option[User], now: Time.T): LiveRestrictionStatus = {
+  val nowMs = now.inMillis
+  val accountRestrictions: Seq[LiveRestriction] = userOpt
+    .flatMap { user => user.labels }
+    .map { labels => labels.labels }
+    .getOrElse(Seq.empty)
+    .flatMap { label =>
+      val raw = Thrift.labelOfEnum(label.labelValue)
+      if (
+        underTheHoodLabels.isAccountLabel(raw) &&
+          accountLabelIsActive(label.createdAtMsec, label.expiresAtMsec, nowMs)
+      ) {
+        Some({
+          scope = Some("ACCOUNT"),
+          postId = None,
+          label = Some(underTheHoodLabels.accountLabelName(raw)),
+          about = Some(underTheHoodLabels.accountLabelAbout(raw)),
+          effect = Some(underTheHoodLabels.accountLabelEffect(raw)),
+          // The source label does not carry a machine-readable public surface taxonomy.
+          // The human-readable effect above is the only authoritative surface description.
+          affectedSurfaces = None,
+          appliedAt = Some(label.createdAtMsec),
+          expiresAt = label.expiresAtMsec,
+          // Raw Gizmoduck source/byUser values are deliberately not surfaced: they may
+          // contain internal actor identifiers and do not form a stable public taxonomy.
+          provenance = None,
+          modelVersion = None,
+          appealAvailability = None,
+        })
+      } else {
+        None
+      }
+    }
+
+  val timelineEdges = #<profile/timelines/userTimeline/edgeBySource>
+    .paginate(Begin({
+      source = #User(userId),
+      limit = postScanLimit,
+      startAt = None,
+      direction = Descending,
+    }))
+    .data
+  val timelinePostIds = timelineEdges
+    .map { edge => edge.to }
+    .distinct
+  val recentAuthoredPostIds = timelinePostIds.filter { postId =>
+    val originalPostId = tweetUtil.originalTweetForRetweet(postId)
+    postId == originalPostId &&
+      Snowflake.getTime(postId).map { created =>
+        created.inMillis >= now.minus(postLookbackDays.days).inMillis
+      }.getOrElse(false)
+  }
+
+  val postRestrictions: Seq[LiveRestriction] = recentAuthoredPostIds.flatMap { postId =>
+    #<visibility/baseTweetSafetyLabelMap>
+      .fetch(postId, ())
+      .v
+      .map { value => value.labels.getOrElse(Map.empty).toSeq }
+      .getOrElse(Seq.empty)
+      .flatMap { case (labelType, label) =>
+        val raw = Thrift.labelOfEnum(labelType)
+        if (
+          underTheHoodLabels.isPostLabel(raw) &&
+            postLabelIsActive(label.createdAtMsec, label.expiresAtMsec, nowMs)
+        ) {
+          Some({
+            scope = Some("POST"),
+            postId = Some(postId),
+            label = Some(underTheHoodLabels.postLabelName(raw)),
+            about = Some(underTheHoodLabels.postLabelAbout(raw)),
+            effect = Some(underTheHoodLabels.postLabelEffect(raw)),
+            // Do not infer a surface list from prose; the label store does not publish one.
+            affectedSurfaces = None,
+            appliedAt = label.createdAtMsec,
+            expiresAt = label.expiresAtMsec,
+            // SafetyLabel.source can encode actors or rule ids, so do not surface it.
+            provenance = None,
+            modelVersion = None,
+            appealAvailability = None,
+          })
+        } else {
+          None
+        }
+      }
+  }
+
+  // Pagination does not publish a total. A full page is conservatively reported as partial,
+  // even if it happens to be the user's complete timeline.
+  val truncated = timelineEdges.size >= postScanLimit
+  {
+    generatedAt = Some(nowMs),
+    freshness = Some("LIVE_BEST_EFFORT"),
+    restrictions = Some(accountRestrictions ++ postRestrictions),
+    postScanLimit = Some(postScanLimit),
+    postLookbackDays = Some(postLookbackDays),
+    postsScanned = Some(recentAuthoredPostIds.size),
+    postScanTruncated = Some(truncated),
+    postScanStatus = Some(
+      if (truncated) { "PARTIAL_LIMIT_REACHED" } else { "COMPLETE_WITHIN_LOOKBACK" }
+    ),
+    accountLabelStatus = Some(
+      userOpt.flatMap { user => user.labels } match {
+        case Some(_) => "AVAILABLE"
+        case None => "UNAVAILABLE"
+      }
+    ),
+    unavailableFields = Some(Seq(
+      "affectedSurfaces",
+      "provenance",
+      "modelVersion",
+      "appealAvailability",
+    )),
+  }
+}
+
+Library({
+  export = {
+    postScanLimit = postScanLimit,
+    postLookbackDays = postLookbackDays,
+    accountLabelIsActive = accountLabelIsActive,
+    postLabelIsActive = postLabelIsActive,
+    build = build,
+  },
+  description = PlainText(
+    "Builds the bounded, creator-visible live restriction status. Only public allowlisted " +
+      "labels are returned; raw source, actor, and rule provenance is never exposed."
+  ),
+  contactInfo = sharedConfig.contactInfo,
+  lifecycle = Production,
+})
