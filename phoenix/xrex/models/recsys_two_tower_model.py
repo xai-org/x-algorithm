@@ -1317,7 +1317,8 @@ class RecsysTwoTowerModel(hk.Module):
         use_async_topk: bool = False,
         use_radix_select_topk: bool = False,
         post_scales: jax.Array | None = None,
-    ) -> tuple[tuple[jax.Array, jax.Array], ...]:
+        return_validity: bool = False,
+    ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], ...]:
         saxis = "expert"
 
         user_representation, _, _ = self(
@@ -1437,7 +1438,13 @@ class RecsysTwoTowerModel(hk.Module):
                     return top_k_scores, top_k_indices
 
                 top_k_scores, top_k_indices = slice_and_top_k(all_scores)
-                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+                if return_validity:
+                    top_k_validity = jnp.ones_like(top_k_indices, dtype=jnp.bool_)
+                    results.append(
+                        (top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity)
+                    )
+                else:
+                    results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
             return tuple(results)
 
         results = []
@@ -1448,7 +1455,11 @@ class RecsysTwoTowerModel(hk.Module):
                 type_mask = jnp.ones(post_embeddings.shape[0], dtype=jnp.bool_)
 
             top_k_scores, top_k_indices = mask_and_top_k(all_scores, type_mask)
-            results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+            if return_validity:
+                top_k_validity = jnp.take(type_mask, top_k_indices)
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity))
+            else:
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
 
         return tuple(results)
 

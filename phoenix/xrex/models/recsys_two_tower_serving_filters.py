@@ -2,13 +2,12 @@
 # Copyright 2026 X.AI Corp.
 import os
 
-import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import PartitionSpec as P
 
-from xrex.cuda.top_k_by_key import top_k_by_key
+from xrex.cuda.top_k_by_key import gather_selected_validity, top_k_by_key
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.topic_categories import NUM_TOPIC_INT32S
@@ -28,7 +27,7 @@ def forward_with_filters(
     eval_bs_per_device: int = 0,
     dataset_ranges: tuple[tuple[int, int], ...] | None = None,
     use_async_topk: bool = False,
-) -> tuple[tuple[jax.Array, jax.Array], ...]:
+) -> tuple[tuple[jax.Array, jax.Array, jax.Array], ...]:
     saxis = "expert"
 
     user_representation, _, _ = model(
@@ -78,7 +77,7 @@ def forward_with_filters(
     @shard_map(
         mesh=mesh,
         in_specs=(P(), P(), mask_in_spec, topic_bitmaps_in_spec, topic_user_bitmasks_in_spec),
-        out_specs=(P(), P()),
+        out_specs=(P(), P(), P()),
         check_vma=False,
     )
     def mask_and_top_k(
@@ -87,15 +86,14 @@ def forward_with_filters(
         user_eligible_mask: jax.Array,
         topic_bitmaps_shard: jax.Array,
         topic_user_bitmasks_full: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         combined = type_mask & user_eligible_mask
-        masked_scores = jnp.where(combined, all_scores, jnp.finfo(jnp.bfloat16).min)
 
         if use_topic_filter:
             topic_bitmaps_full = jax.lax.all_gather(
                 topic_bitmaps_shard, axis_name=saxis, axis=0, tiled=True
             )
-            B_local = masked_scores.shape[0]
+            B_local = combined.shape[0]
             shard_idx = jax.lax.axis_index(saxis)
             start_idx = shard_idx * B_local
             user_bitmasks_local = jax.lax.dynamic_slice(
@@ -107,12 +105,15 @@ def forward_with_filters(
             )
             no_filter_mask = jnp.all(user_bitmasks_local == 0, axis=-1)[:, None]
             topic_mask = jnp.where(no_filter_mask, True, topic_mask)
-            masked_scores = jnp.where(topic_mask, masked_scores, jnp.finfo(jnp.bfloat16).min)
+            combined = combined & topic_mask
 
+        masked_scores = jnp.where(combined, all_scores, jnp.finfo(jnp.bfloat16).min)
         sorted_scores, sorted_indices = local_top_k(masked_scores, top_k)
+        sorted_validity = gather_selected_validity(combined, sorted_indices)
         top_k_scores = jax.lax.all_gather(sorted_scores, axis_name=saxis, axis=0, tiled=True)
         top_k_indices = jax.lax.all_gather(sorted_indices, axis_name=saxis, axis=0, tiled=True)
-        return top_k_scores, top_k_indices
+        top_k_validity = jax.lax.all_gather(sorted_validity, axis_name=saxis, axis=0, tiled=True)
+        return top_k_scores, top_k_indices, top_k_validity
 
     all_scores = compute_top_k(post_embeddings, user_representation)
 
@@ -144,7 +145,8 @@ def forward_with_filters(
                 return top_k_scores, top_k_indices
 
             top_k_scores, top_k_indices = slice_and_top_k(all_scores)
-            results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+            top_k_validity = jnp.ones_like(top_k_indices, dtype=jnp.bool_)
+            results.append((top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity))
         return tuple(results)
 
     B = all_scores.shape[0]
@@ -165,9 +167,9 @@ def forward_with_filters(
         _topic_user_bitmasks = (
             topic_user_bitmasks if use_topic_filter else jnp.zeros((), dtype=jnp.int32)
         )
-        top_k_scores, top_k_indices = mask_and_top_k(
+        top_k_scores, top_k_indices, top_k_validity = mask_and_top_k(
             all_scores, type_mask, user_eligible_mask, _topic_bitmaps, _topic_user_bitmasks
         )
-        results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+        results.append((top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity))
 
     return tuple(results)

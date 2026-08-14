@@ -3,6 +3,11 @@
 import jax
 import jax.numpy as jnp
 
+
+def gather_selected_validity(eligibility: jax.Array, selected_indices: jax.Array) -> jax.Array:
+    return jnp.take_along_axis(eligibility, selected_indices, axis=1)
+
+
 try:
     from xrex.cuda.top_k_by_key.src import top_k_by_key_api
 except ImportError:
