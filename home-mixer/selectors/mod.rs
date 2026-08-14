@@ -6,4 +6,4 @@ mod top_k_score_selector;
 pub use blender_selector::BlenderSelector;
 pub use following_blender_selector::FollowingBlenderSelector;
 pub use passthrough_selector::PassthroughSelector;
-pub use top_k_score_selector::TopKScoreSelector;
+pub use top_k_score_selector::{SlateDiversitySelector, TopKScoreSelector};

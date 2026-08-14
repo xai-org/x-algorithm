@@ -78,7 +78,7 @@ use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledApp
 use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::ranking_scorer::RankingScorer;
 use crate::scorers::vm_ranker::VMRanker;
-use crate::selectors::TopKScoreSelector;
+use crate::selectors::SlateDiversitySelector;
 use crate::side_effects::author_served_metrics_side_effect::AuthorServedMetricsSideEffect;
 use crate::side_effects::debug_side_effect::DebugSideEffect;
 use crate::side_effects::mutual_follow_stats_side_effect::MutualFollowStatsSideEffect;
@@ -106,8 +106,8 @@ use xai_candidate_pipeline::component_library::clients::gender_prediction_client
     GenderPredictionGrpcClient, MockGenderPredictionGrpcClient, ProdGenderPredictionGrpcClient,
 };
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
-    KafkaCluster, KafkaPublisherClient, MockKafkaPublisherClient, ProdKafkaPublisherClient,
-    PHOENIX_SCORES_TOPIC, RERANKING_TOPIC,
+    KafkaCluster, KafkaPublisherClient, MockKafkaPublisherClient, PHOENIX_SCORES_TOPIC,
+    ProdKafkaPublisherClient, RERANKING_TOPIC,
 };
 use xai_candidate_pipeline::component_library::clients::media_info_cache_client::{
     MediaInfoCacheClient, MockMediaInfoCacheClient, ProdMediaInfoCacheClient,
@@ -176,7 +176,7 @@ pub struct PhoenixCandidatePipeline {
     hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>>,
     filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>>,
     scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>>,
-    selector: TopKScoreSelector,
+    selector: SlateDiversitySelector,
     post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>>,
     post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>>,
     side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, PostCandidate>>>>,
@@ -395,7 +395,7 @@ impl PhoenixCandidatePipeline {
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
             vec![phoenix_scorer, ranking_scorer, vm_ranker];
 
-        let selector = TopKScoreSelector;
+        let selector = SlateDiversitySelector;
 
         let post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(
