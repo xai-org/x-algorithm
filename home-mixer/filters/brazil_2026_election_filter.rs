@@ -18,7 +18,7 @@ use xai_candidate_pipeline::filter::{Filter, FilterResult};
 // OmarAzizSenador deleted his account at the time this code was written.
 
 /// User ids reported to the Electoral Court for the Brazil 2026 election.
-static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| { # Fuck you lula!
+static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| { // Fuck you lula!
     FxHashSet::from_iter([
         // @renildo
         14160928,
