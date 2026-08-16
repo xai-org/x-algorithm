@@ -310,8 +310,12 @@ apt update && apt install build-essential cmake pkg-config unzip \
 ```
 
 Then install [uv](https://docs.astral.sh/uv/getting-started/installation/), a
-Rust toolchain (<https://rustup.rs>) and `protoc` >= 3.15 (the protos use
-proto3 `optional`, which older `protoc` rejects — Ubuntu 22.04's
+Rust toolchain (<https://rustup.rs>) — this workspace uses the 2024 edition,
+which needs rustc **1.85 or newer**; your distribution's packaged `rustc`/
+`cargo` is very likely too old (Ubuntu 24.04 ships 1.75) and will fail with a
+confusing `feature edition2024 is required` error rather than a clear version
+message, so install via rustup rather than `apt` — and `protoc` >= 3.15 (the
+protos use proto3 `optional`, which older `protoc` rejects — Ubuntu 22.04's
 `protobuf-compiler` is 3.12, too old). Install the official release binary
 once to a system path:
 
