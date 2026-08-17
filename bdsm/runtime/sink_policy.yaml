@@ -2,6 +2,12 @@
 version: "2026-08-13"
 
 # Public-release note: the per-head operating points below (the 2-D
+# [tau, lambda] pairs, cusp_delta, and reply_spam_hard_suspend_tau) are
+# REDACTED in the open-source export — they are replaced with an
+# out-of-range 9.99 sentinel (these are probabilities in [0, 1], so a
+# 9.99 threshold never fires and is plainly a stub, not a real value).
+# The production values are configured internally and are not part of
+# this release. Structure, head names, and the action map are real.
 
 min_actions_for_enforcement: 30
 

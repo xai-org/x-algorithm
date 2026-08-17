@@ -1,4 +1,4 @@
-# Behavioral Inauthentic-Account Detection
+# Behavioral Detection Sequence Model (BDSM)
 
 A sequence-of-actions transformer that detects inauthentic (bot / spam /
 coordinated) accounts from their behavioral event streams, together with the
@@ -110,5 +110,13 @@ The scorer publishes an 8-wide row in `heads.HEAD_NAMES` order.
   detector's evasion boundary. The policy *structure*, head names, and gate
   logic are real and unredacted; only the tuned numbers are withheld. Supply
   your own via `--policy-file` / `BDSM_SINK_POLICY`.
-- Per-head **appeal-note templates** that described the tripping features in
-  prose are withheld. The `enforcement_note` proto field remains and is empty.
+- Per-head **appeal-note templates**: the production sink interpolates a
+  short prose paragraph from the dominant bot head and selected histogram
+  counts (`build_enforcement_note` in `runtime/score_results_sink_focal.py`).
+  The public package keeps the **gates** (MIN_ACTIONS, dominant-head pick)
+  and the `enforcement_note` proto field. The template *strings* and the
+  per-head `key_actions` interpolator are the sentinel `"<redacted>"` —
+  same idea as the `9.99` operating points. When a note would have fired
+  it carries that sentinel plus the model-head suffix, not the internal
+  appeal paragraph or the action types each head keys off. ActionName
+  proto enums are unchanged.

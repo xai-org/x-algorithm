@@ -177,6 +177,7 @@ impl PipelineKind {
                 WindowConfig::new("1fav", 24),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
+                WindowConfig::new("video", 24 * 14),
                 WindowConfig::new("nsfw_video", 48),
                 WindowConfig::new("nsfw_video", 168),
                 WindowConfig::new("nsfw_video", 24 * 14),
@@ -352,7 +353,7 @@ mod tests {
             .iter()
             .map(|w| w.window_name())
             .collect();
-        for w in ["nsfw_video_7day", "nsfw_video_14day"] {
+        for w in ["nsfw_video_7day", "nsfw_video_14day", "video_14day"] {
             assert!(
                 names.contains(&w.to_string()),
                 "Sid window list missing {w}: {names:?}",

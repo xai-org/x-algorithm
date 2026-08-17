@@ -1,13 +1,17 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    AuthorIsControl, AuthorIsTreatment, ColdStartFollowerCap, ColdStartImpressionThreshold,
-    ColdStartMaxPostAgeSecs, ColdStartSlotMax, ColdStartSlotMin, EnableViewerColdStart,
+    AuthorIsControl, AuthorIsTreatment, ColdStartBetaAlpha0, ColdStartBetaBeta0,
+    ColdStartFollowerCap, ColdStartImpressionScale, ColdStartImpressionThreshold,
+    ColdStartMaxPostAgeSecs, ColdStartSlotMax, ColdStartSlotMin, ColdStartTrackedIds,
+    ColdStartTsTopK, EnableColdStartThompsonSampling, EnableViewerColdStart,
     LowImpressionsMaxPositionRatio, PhoenixMoeCodivertViewerIsControl,
     PhoenixMoeCodivertViewerIsTreatment,
 };
 use crate::util::author_rules::AuthorRulesEvaluator;
 use rand::Rng;
+use rand_distr::{Beta, Distribution};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
@@ -74,6 +78,54 @@ fn record_cold_started_posts(is_moe: bool, viewer_arm: &str, count: u64) {
                 ("is_moe", if is_moe { "true" } else { "false" }),
                 ("viewer_arm", viewer_arm),
             ],
+            count,
+        );
+    }
+}
+
+fn parse_tracked_ids(raw: &str) -> HashSet<u64> {
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
+fn count_tracked_ids(
+    candidates: &[PostCandidate],
+    tracked: &HashSet<u64>,
+) -> HashMap<(u64, i32), u64> {
+    let mut counts = HashMap::new();
+    if tracked.is_empty() {
+        return counts;
+    }
+    for c in candidates {
+        if !tracked.contains(&c.tweet_id) && !tracked.contains(&c.author_id) {
+            continue;
+        }
+        let source = c.served_type.map(|t| t as i32).unwrap_or(0);
+        if tracked.contains(&c.tweet_id) {
+            *counts.entry((c.tweet_id, source)).or_insert(0) += 1;
+        }
+        if tracked.contains(&c.author_id) {
+            *counts.entry((c.author_id, source)).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn record_tracked_ids(candidates: &[PostCandidate], raw: &str) {
+    let tracked = parse_tracked_ids(raw);
+    if tracked.is_empty() {
+        return;
+    }
+    let Some(receiver) = xai_stats_receiver::global_stats_receiver() else {
+        return;
+    };
+    for ((id, source), count) in count_tracked_ids(candidates, &tracked) {
+        let id_str = id.to_string();
+        let source_str = source.to_string();
+        receiver.incr(
+            "home_mixer.cold_start_tracked_ids_total",
+            &[("id", id_str.as_str()), ("source", source_str.as_str())],
             count,
         );
     }
@@ -153,6 +205,55 @@ fn cold_start_freshness_eligible(arm: ViewerArm, c: &PostCandidate, max_age: Dur
     duration_since_creation_opt(c.tweet_id).is_some_and(|age| age <= max_age)
 }
 
+fn pick_by_score(eligible: &[usize], scores: &[f64]) -> Option<usize> {
+    eligible
+        .iter()
+        .copied()
+        .max_by(|&i, &j| scores[i].total_cmp(&scores[j]).then(i.cmp(&j)))
+}
+
+fn sample_reward<R: Rng + ?Sized>(
+    candidate: &PostCandidate,
+    alpha0: f64,
+    beta0: f64,
+    scale: f64,
+    rng: &mut R,
+) -> f64 {
+    let n = scale * candidate.view_count.unwrap_or(0) as f64;
+    let x = (candidate.fav_count.unwrap_or(0).max(0) as f64).min(n);
+    let alpha = alpha0 + x;
+    let beta = beta0 + (n - x).max(0.0);
+    Beta::new(alpha, beta).map(|d| d.sample(rng)).unwrap_or(0.5)
+}
+
+fn pick_thompson<R: Rng + ?Sized>(
+    eligible: &[usize],
+    candidates: &[PostCandidate],
+    scores: &[f64],
+    alpha0: f64,
+    beta0: f64,
+    scale: f64,
+    top_k: usize,
+    rng: &mut R,
+) -> Option<usize> {
+    if eligible.is_empty() {
+        return None;
+    }
+    if top_k == 0 || alpha0 <= 0.0 || beta0 <= 0.0 {
+        return pick_by_score(eligible, scores);
+    }
+    let mut sampled: Vec<(usize, f64)> = eligible
+        .iter()
+        .map(|&i| (i, sample_reward(&candidates[i], alpha0, beta0, scale, rng)))
+        .collect();
+    sampled.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let k = top_k.min(sampled.len());
+    sampled[..k]
+        .iter()
+        .map(|(i, _)| *i)
+        .max_by(|&i, &j| scores[i].total_cmp(&scores[j]).then(i.cmp(&j)))
+}
+
 fn apply_cold_start(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
@@ -164,11 +265,12 @@ fn apply_cold_start(
     let follower_cap = query.params.get(ColdStartFollowerCap);
     let threshold = query.params.get(ColdStartImpressionThreshold) as u64;
     let max_post_age = Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs));
+    let use_ts = query.params.get(EnableColdStartThompsonSampling);
     let (positions, nonzero) = positions_among_nonzero(scores);
     let max_cold_start_slot =
         (query.params.get(LowImpressionsMaxPositionRatio) * nonzero as f64) as usize;
 
-    let best = candidates
+    let eligible: Vec<usize> = candidates
         .iter()
         .enumerate()
         .filter(|(i, c)| {
@@ -179,9 +281,24 @@ fn apply_cold_start(
                 && c.view_count.is_some_and(|imp| imp < threshold)
         })
         .map(|(i, _)| i)
-        .max_by(|&i, &j| scores[i].total_cmp(&scores[j]));
+        .collect();
 
-    let Some(best_idx) = best else {
+    let best_idx = if use_ts {
+        pick_thompson(
+            &eligible,
+            candidates,
+            scores,
+            query.params.get(ColdStartBetaAlpha0),
+            query.params.get(ColdStartBetaBeta0),
+            query.params.get(ColdStartImpressionScale),
+            query.params.get(ColdStartTsTopK) as usize,
+            &mut rand::rng(),
+        )
+    } else {
+        pick_by_score(&eligible, scores)
+    };
+
+    let Some(best_idx) = best_idx else {
         return scores.to_vec();
     };
 
@@ -203,6 +320,9 @@ impl AuthorColdStart {
         candidates: &[PostCandidate],
         scores: &[f64],
     ) -> Vec<f64> {
+        let tracked_ids: String = query.params.get(ColdStartTrackedIds);
+        record_tracked_ids(candidates, &tracked_ids);
+
         if !query.params.get(EnableViewerColdStart) {
             return scores.to_vec();
         }
@@ -226,6 +346,7 @@ impl AuthorColdStart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use xai_candidate_pipeline::component_library::utils::current_time_to_id;
     use xai_feature_switches::{
         BucketMembership, ExperimentBucket, ExperimentBucketsChooser, FeatureSwitches,
@@ -313,11 +434,21 @@ rust_home_mixer:
     }
 
     fn cold_start_candidate(author_id: u64, age: Duration, view_count: u64) -> PostCandidate {
+        cold_start_candidate_with_favs(author_id, age, view_count, 0)
+    }
+
+    fn cold_start_candidate_with_favs(
+        author_id: u64,
+        age: Duration,
+        view_count: u64,
+        fav_count: i64,
+    ) -> PostCandidate {
         PostCandidate {
             author_id,
             tweet_id: tweet_id_with_age(age),
             author_followers_count: Some(100),
             view_count: Some(view_count),
+            fav_count: Some(fav_count),
             ..Default::default()
         }
     }
@@ -359,6 +490,32 @@ rust_home_mixer:
         results.override_fs(
             "rust_home_mixer_cold_start_max_post_age_secs".to_string(),
             "7200",
+        );
+        results.override_fs(
+            "rust_home_mixer_enable_cold_start_thompson_sampling".to_string(),
+            "false",
+        );
+        results.override_fs("rust_home_mixer_cold_start_beta_alpha0".to_string(), "0.75");
+        results.override_fs("rust_home_mixer_cold_start_beta_beta0".to_string(), "49.25");
+        results.override_fs("rust_home_mixer_cold_start_ts_top_k".to_string(), "5");
+        results.override_fs(
+            "rust_home_mixer_cold_start_impression_scale".to_string(),
+            "1.0",
+        );
+        query.params = results.into();
+        query
+    }
+
+    fn ts_query(viewer_treatment: bool, top_k: u32) -> ScoredPostsQuery {
+        let mut query = codivert_query(!viewer_treatment, viewer_treatment);
+        let mut results = query.params.0.expect("params set");
+        results.override_fs(
+            "rust_home_mixer_enable_cold_start_thompson_sampling".to_string(),
+            "true",
+        );
+        results.override_fs(
+            "rust_home_mixer_cold_start_ts_top_k".to_string(),
+            &top_k.to_string(),
         );
         query.params = results.into();
         query
@@ -490,5 +647,112 @@ rust_home_mixer:
 
         let result = author_cold_start.apply(&query, &candidates, &[10.0, 40.0, 30.0, 20.0]);
         assert_eq!(result, vec![10.0, 40.0, 30.0, 20.0]);
+    }
+
+    #[test]
+    fn ts_top_k_zero_falls_back_to_argmax_score() {
+        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
+        let candidates = vec![
+            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
+            cold_start_candidate_with_favs(2, minutes(20), 3, 0),
+        ];
+        let result = author_cold_start.apply(&ts_query(true, 0), &candidates, &[10.0, 90.0]);
+        assert_eq!(result, vec![10.0, 90.0]);
+    }
+
+    #[test]
+    fn treatment_ts_among_top_k_picks_highest_score() {
+        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
+        let candidates = vec![
+            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
+            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
+        ];
+        let result = author_cold_start.apply(&ts_query(true, 10), &candidates, &[10.0, 90.0]);
+        assert_eq!(result, vec![10.0, 90.0]);
+    }
+
+    #[test]
+    fn control_ts_among_top_k_picks_highest_score() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
+        let candidates = vec![
+            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
+            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
+        ];
+        let result = author_cold_start.apply(&ts_query(false, 10), &candidates, &[10.0, 90.0]);
+        assert_eq!(result, vec![10.0, 90.0]);
+    }
+
+    #[test]
+    fn parse_tracked_ids_splits_and_skips_junk() {
+        let ids = parse_tracked_ids("10, 20, x, 10");
+        assert_eq!(ids, HashSet::from([10, 20]));
+        assert!(parse_tracked_ids("").is_empty());
+        assert!(parse_tracked_ids(" , , ").is_empty());
+    }
+
+    #[test]
+    fn count_tracked_ids_matches_tweet_or_author() {
+        let tracked = parse_tracked_ids("10,20");
+        let candidates = vec![
+            PostCandidate {
+                author_id: 10,
+                tweet_id: 1,
+                served_type: Some(pb::ServedType::ForYouPhoenixRetrieval),
+                ..Default::default()
+            },
+            PostCandidate {
+                author_id: 10,
+                tweet_id: 2,
+                served_type: Some(pb::ServedType::ForYouPhoenixRetrievalMoe),
+                ..Default::default()
+            },
+            PostCandidate {
+                author_id: 99,
+                tweet_id: 20,
+                served_type: Some(pb::ServedType::ForYouInNetwork),
+                ..Default::default()
+            },
+            PostCandidate {
+                author_id: 30,
+                tweet_id: 3,
+                ..Default::default()
+            },
+        ];
+        let counts = count_tracked_ids(&candidates, &tracked);
+        assert_eq!(
+            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrieval as i32)),
+            Some(&1)
+        );
+        assert_eq!(
+            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrievalMoe as i32)),
+            Some(&1)
+        );
+        assert_eq!(
+            counts.get(&(20, pb::ServedType::ForYouInNetwork as i32)),
+            Some(&1)
+        );
+        assert_eq!(counts.get(&(30, 0)), None);
+    }
+
+    #[test]
+    fn pick_thompson_top_k_one_prefers_uncertain_over_peaked_zero() {
+        let candidates = vec![
+            cold_start_candidate_with_favs(1, minutes(10), 10_000, 0),
+            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
+        ];
+        let scores = [100.0, 10.0];
+        let eligible = vec![0, 1];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let picked = pick_thompson(
+            &eligible,
+            &candidates,
+            &scores,
+            0.75,
+            49.25,
+            1.0,
+            1,
+            &mut rng,
+        );
+        assert_eq!(picked, Some(1));
     }
 }

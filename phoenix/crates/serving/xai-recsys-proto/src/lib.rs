@@ -12,6 +12,8 @@ pub mod grok_topics;
 pub mod installed_apps;
 pub mod starter_packs;
 
+pub const SAFETY_BIT_AUTHOR_NSFW: u64 = 1 << 2;
+
 pub fn timezone_string_to_enum(tz: &str) -> Timezone {
     match tz {
         "" | "unknown" => Timezone::Unknown,

@@ -78,8 +78,57 @@ def _resolve_head_names(_model_version):
     return HEAD_NAMES
 
 
-def build_enforcement_note(*_args, **_kwargs):
-    return None
+# Public-release note: per-head appeal-note templates are REDACTED
+# (the prose AND the key_actions each head interpolates from the
+# histogram). What ships: MIN_ACTIONS gate, dominant bot-head pick,
+# and the sentinel "<redacted>" plus a [model: Head=score] suffix.
+# Production fills placeholders from an internal table that is not
+# part of this release. ActionName proto enums are untouched.
+_REDACTED_TEMPLATE = "<redacted>"
+
+_ENFORCEMENT_TEMPLATES = {
+    "FollowBot": _REDACTED_TEMPLATE,
+    "LikeBot": _REDACTED_TEMPLATE,
+    "EngagementAmplifier": _REDACTED_TEMPLATE,
+    "ReplySpamBot": _REDACTED_TEMPLATE,
+    "TweetSpamBot": _REDACTED_TEMPLATE,
+    "RTBot": _REDACTED_TEMPLATE,
+    "MultiActionBot": _REDACTED_TEMPLATE,
+}
+
+
+def build_enforcement_note(head_scores_list, action_hist_list):
+    """Build an enforcement note from head scores + action histogram.
+
+    Returns None when no bot head is above 0.5 or the sequence is shorter
+    than 30 actions. In this public release the note is the sentinel
+    "<redacted>" plus a model-head suffix; production interpolates from a
+    private template table (prose and key_actions).
+    """
+    if not head_scores_list:
+        return None
+
+    total = sum(h["cnt"] for h in (action_hist_list or ()))
+    if total < 30:
+        return None
+
+    bot_heads = [
+        (h["head_name"], h["score"])
+        for h in head_scores_list
+        if h["head_name"] != "LegitimateUser" and h["score"] > 0.5
+    ]
+    if not bot_heads:
+        return None
+
+    bot_heads.sort(key=lambda x: x[1], reverse=True)
+    dominant_name, dominant_score = bot_heads[0]
+    note = _ENFORCEMENT_TEMPLATES.get(dominant_name, _REDACTED_TEMPLATE)
+    note += f" [model: {dominant_name}={dominant_score:.2f}"
+    if len(bot_heads) > 1:
+        secondary = ", ".join(f"{n}={s:.2f}" for n, s in bot_heads[1:3])
+        note += f", also: {secondary}"
+    note += "]"
+    return note
 
 
 def _build_flag_config(head_names):
@@ -1116,7 +1165,7 @@ def _build_bq_row(
         "head_scores": user_head_scores,
         "action_histogram": user_action_hist,
         "total_actions": total_actions,
-        "enforcement_note": build_enforcement_note(),
+        "enforcement_note": build_enforcement_note(user_head_scores, user_action_hist),
         "labels": user_labels,
         "model_version": args.model_version,
         "pipeline_version": "gpu_scorer_kafka_v3",

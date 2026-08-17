@@ -43,3 +43,44 @@ def test_invalid_policy_key_fails_loudly(tmp_path):
     bad.write_text("version: x\nnot_a_policy_key: 1\n")
     with pytest.raises(ValueError):
         m._load_policy(str(bad))
+
+
+def _hist(*pairs):
+    return [{"action_type": a, "cnt": n} for a, n in pairs]
+
+
+def _heads(**scores):
+    return [
+        {"head_index": i, "head_name": n, "score": s} for i, (n, s) in enumerate(scores.items())
+    ]
+
+
+def test_enforcement_note_gates_and_redacted_prose():
+    m = _load_sink_module()
+    heads = _heads(FollowBot=0.91, LegitimateUser=0.1)
+    short = _hist(("SERVER_PROFILE_FOLLOW", 10))
+    long = _hist(("SERVER_PROFILE_FOLLOW", 40), ("SERVER_PROFILE_UNFOLLOW", 5))
+
+    assert m.build_enforcement_note(heads, short) is None
+    assert m.build_enforcement_note(heads, None) is None
+    assert m.build_enforcement_note(heads, []) is None
+    assert m.build_enforcement_note(_heads(FollowBot=0.4, LegitimateUser=0.8), long) is None
+
+    note = m.build_enforcement_note(heads, long)
+    assert note == f"{m._REDACTED_TEMPLATE} [model: FollowBot=0.91]"
+
+
+def test_enforcement_templates_are_the_redacted_sentinel():
+    m = _load_sink_module()
+    assert set(m._ENFORCEMENT_TEMPLATES) == {
+        "FollowBot",
+        "LikeBot",
+        "EngagementAmplifier",
+        "ReplySpamBot",
+        "TweetSpamBot",
+        "RTBot",
+        "MultiActionBot",
+    }
+    for tmpl in m._ENFORCEMENT_TEMPLATES.values():
+        assert tmpl == m._REDACTED_TEMPLATE
+    assert not hasattr(m, "_ACTION_FRIENDLY")

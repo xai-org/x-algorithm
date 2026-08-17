@@ -57,7 +57,6 @@ class FeedForwardConfig(Config):
     with_bias: bool = False
     force_ffn_base_size: bool = True
     base_ffn_size: int = 32
-
     merge_gate_up: bool = False
 
 
