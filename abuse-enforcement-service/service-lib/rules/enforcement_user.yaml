@@ -174,13 +174,7 @@ rules:
     then:
       kind: act_add_labels_v2
       labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000   
-
-  - id: hold_cluster_spam
-    when: 'score.model_version.startsWith("cluster_spam")'
-    then:
-      kind: skip
-      reason: cluster_spam_held
+      ttl_msec: 2592000000
 
   - id: act_cluster_spam_suspend
     when: 'score.model_version.startsWith("cluster_spam") && "cluster_spam_suspend" in score.labels'
@@ -199,7 +193,13 @@ rules:
     then:
       kind: act_add_labels_v2
       labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000   
+      ttl_msec: 2592000000
+
+  - id: hold_cluster_spam
+    when: 'score.model_version.startsWith("cluster_spam")'
+    then:
+      kind: skip
+      reason: cluster_spam_held
 
   - id: act_suspend
     when: "true"
