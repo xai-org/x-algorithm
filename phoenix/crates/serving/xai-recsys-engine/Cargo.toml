@@ -69,6 +69,7 @@ xai-recsys-mm-server = { workspace = true }
 ibverbs = { workspace = true }
 
 [dev-dependencies]
+serial_test = "3"
 tokio-stream = { workspace = true }
 
 [lints]

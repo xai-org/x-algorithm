@@ -20,7 +20,8 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     fs, io, mem,
-    path::Path,
+    os::fd::AsRawFd,
+    path::{Path, PathBuf},
     str,
     sync::Arc,
     task::{Context, Poll},
@@ -341,12 +342,7 @@ fn mmap_file(
     context_indexes: &[usize],
 ) -> io::Result<(Bytes, MRs)> {
     task::block_in_place(|| {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .truncate(false)
-            .open(format!("{path}{name}"))?;
+        let file = open_checkpoint_file(Path::new(path), Path::new(name))?;
         let mut mmap = unsafe { memmap2::MmapOptions::new().map_mut(&file)? };
         let mut mrs: Vec<_> = (0..contexts.len()).map(|_| None).collect();
         for &i in context_indexes {
@@ -355,6 +351,44 @@ fn mmap_file(
         }
         Ok((Bytes::from_owner(mmap), Arc::new(mrs)))
     })
+}
+
+fn open_checkpoint_file(path: &Path, name: &Path) -> io::Result<fs::File> {
+    open_file_within(Path::new(ROOT_DIR), path, name)
+}
+
+fn open_file_within(root: &Path, path: &Path, name: &Path) -> io::Result<fs::File> {
+    let root = root.canonicalize()?;
+    let mut file = path.as_os_str().to_os_string();
+    file.push(name.as_os_str());
+    let file = PathBuf::from(file).canonicalize()?;
+    if !file.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "checkpoint file is outside the checkpoint root",
+        ));
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(file)?;
+    ensure_open_file_within(&root, &file)?;
+    Ok(file)
+}
+
+fn ensure_open_file_within(root: &Path, file: &fs::File) -> io::Result<()> {
+    let opened_path =
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).canonicalize()?;
+    if !opened_path.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened checkpoint file is outside the checkpoint root",
+        ));
+    }
+    Ok(())
 }
 
 fn cleanup<'a>(mut bytez: MutexGuard<'a, BTreeMap<String, (Bytes, MRs)>>, max_entries: usize) {
@@ -695,6 +729,95 @@ impl Service<http::Request<body::Body>> for CopyService {
 
     fn call(&mut self, request: http::Request<body::Body>) -> Self::Future {
         Box::pin(handle(self.sender.clone(), request))
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use std::{
+        os::unix::fs::symlink,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "xai-copy-path-test-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn checkpoint_file_open_stays_within_root() {
+        let assert_denied = |result: io::Result<fs::File>| {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        };
+        let temp = TestDir::new();
+        let root = temp.0.join("checkpoints");
+        let nested = root.join("run");
+        let staging = root.join(".staging");
+        let outside = temp.0.join("outside");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(nested.join("weights.bin"), b"weights").unwrap();
+        fs::write(staging.join("weights.bin"), b"staging").unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+
+        let send_prefix = PathBuf::from(format!("{}/", root.display()));
+        let file = open_file_within(&root, &send_prefix, Path::new("run/weights.bin")).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 7);
+
+        let register_prefix = PathBuf::from(format!("{}/.", root.display()));
+        let file =
+            open_file_within(&root, &register_prefix, Path::new("staging/weights.bin")).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 7);
+
+        assert_denied(open_file_within(
+            &root,
+            &send_prefix,
+            Path::new("../outside/secret"),
+        ));
+        assert_denied(open_file_within(
+            &root,
+            Path::new(""),
+            &outside.join("secret"),
+        ));
+        assert_denied(open_file_within(&root, &outside, Path::new("/secret")));
+
+        symlink(outside.join("secret"), root.join("linked-secret")).unwrap();
+        assert_denied(open_file_within(
+            &root,
+            &send_prefix,
+            Path::new("linked-secret"),
+        ));
+
+        let outside_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(outside.join("secret"))
+            .unwrap();
+        assert_eq!(
+            ensure_open_file_within(&root.canonicalize().unwrap(), &outside_file)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }
 
