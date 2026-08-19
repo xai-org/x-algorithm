@@ -206,7 +206,7 @@ class _ASRWorker:
                 error_msg = e.stderr.decode() if e.stderr else str(e)
                 logger.warning(f"FFmpeg error for post {request.post_id}: {error_msg}")
                 self._resp_queue.put(result(error=f"ffmpeg_error: {error_msg}"))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"ASR request timed out for post {request.post_id}")
                 self._resp_queue.put(result(error="asr_timeout"))
             except Exception as e:

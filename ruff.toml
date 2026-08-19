@@ -1,6 +1,6 @@
 # Shared Python lint config for the whole repo.
 # Subprojects with their own [tool.ruff] section (phoenix/, bdsm/) extend this file.
-target-version = "py310"
+target-version = "py312"
 line-length = 100
 
 [lint]

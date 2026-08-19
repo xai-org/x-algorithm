@@ -88,6 +88,7 @@ xai-checkpointing = { path = "python/training/xai-checkpointing" }
 
 [tool.ruff]
 extend = "../ruff.toml"
+target-version = "py311"
 line-length = 100
 
 [tool.vulture]
