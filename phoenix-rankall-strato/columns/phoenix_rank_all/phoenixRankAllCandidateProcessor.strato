@@ -76,19 +76,16 @@ def build32FavIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiv
 }
 
 def build1FavIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
-  candidate.engagementCount match {
-    case Some(ec) =>
-      if(ec.favoriteCount.getOrElse(0) >= 1) {
-        val object = {
-          postId = candidate.postId,
-          authorId = candidate.authorId,
-          indexName = "1fav"
-        }
-        #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
-        stats.counter("1fav_indexing_event_created").incr(1)
-      }
-    case None => ()
+  if (candidate.engagementCount.flatMap { ec => ec.favoriteCount }.getOrElse(0) == 0) {
+    stats.counter("1fav_uec_count_race").incr(1)
   }
+  val object = {
+    postId = candidate.postId,
+    authorId = candidate.authorId,
+    indexName = "1fav"
+  }
+  #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
+  stats.counter("1fav_indexing_event_created").incr(1)
 }
 
 def build1FavIndexBackup(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
@@ -340,39 +337,33 @@ def buildMetadataDump(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRece
 }
 
 def buildMMEmbMetadataDump(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
-  candidate.engagementCount match {
-    case Some(ec) =>
-      if(ec.favoriteCount.getOrElse(0) >= 1) {
-        candidate.tweetMedadata match {
-          case Some(tweet) =>
-            val hasImage = tweetUtil.hasImage(tweet)
-            val hasVideo = tweetUtil.hasVideo(tweet)
-            try {
-              val emb3Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v3"), ())
-              val emb5Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v5_1"), ())
-              val emb6Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v6_dev"), ())
-              val mmEmbs = {
-                mmEmbV3 = emb3Result.v.flatMap { emb => emb.embedding1 },
-                mmEmbV5 = emb5Result.v.flatMap { emb => emb.embedding1 },
-                mmEmbV6 = emb6Result.v.flatMap { emb => emb.embedding1 }
-              }
-              val flatObject = {
-                postId = candidate.postId,
-                authorId = candidate.authorId,
-                hasVideo = hasVideo,
-                hasImage = hasImage,
-                authorFollowersCount = candidate.authorFollowers,
-                mmEmbs = Some(mmEmbs),
-                indexName = Some("mm_emb_metadata")
-              }
-              #<hydra/kafka/metadataEventKafkaTopic>.insert((), flatObject)
-              stats.counter("metadata_dump_mm_emb_created").incr(1)
-            } catch {
-              case _ =>
-                stats.counter("metadata_dump_mm_emb_fetch_error").incr(1)
-            }
-          case None => ()
+  candidate.tweetMedadata match {
+    case Some(tweet) =>
+      val hasImage = tweetUtil.hasImage(tweet)
+      val hasVideo = tweetUtil.hasVideo(tweet)
+      try {
+        val emb3Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v3"), ())
+        val emb5Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v5_1"), ())
+        val emb6Result = postMultimodalEmbeddingMhColumnV2.fetch((candidate.postId, "v6_dev"), ())
+        val mmEmbs = {
+          mmEmbV3 = emb3Result.v.flatMap { emb => emb.embedding1 },
+          mmEmbV5 = emb5Result.v.flatMap { emb => emb.embedding1 },
+          mmEmbV6 = emb6Result.v.flatMap { emb => emb.embedding1 }
         }
+        val flatObject = {
+          postId = candidate.postId,
+          authorId = candidate.authorId,
+          hasVideo = hasVideo,
+          hasImage = hasImage,
+          authorFollowersCount = candidate.authorFollowers,
+          mmEmbs = Some(mmEmbs),
+          indexName = Some("mm_emb_metadata")
+        }
+        #<hydra/kafka/metadataEventKafkaTopic>.insert((), flatObject)
+        stats.counter("metadata_dump_mm_emb_created").incr(1)
+      } catch {
+        case _ =>
+          stats.counter("metadata_dump_mm_emb_fetch_error").incr(1)
       }
     case None => ()
   }

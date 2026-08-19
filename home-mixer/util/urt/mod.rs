@@ -51,6 +51,7 @@ pub(crate) fn make_urt_timeline(
         cursor,
         language_code,
         country_code,
+        true,
     ));
 
     let mut entries: Vec<TimelineEntry> = items

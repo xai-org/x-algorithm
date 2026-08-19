@@ -81,6 +81,12 @@ class PostRenderer:
             res.append(f"\n{indent_str}This post has the following cards attached: ")
             for cardV2 in post.cardsV2:
                 res.extend(cardV2.to_convo())
+        if post.grok_share_metadatas:
+            res.append(
+                f"\n{indent_str}This post includes a shared Grok conversation. The conversation messages are as rendered below:"
+            )
+            for grok_share in post.grok_share_metadatas:
+                res.extend(grok_share.to_convo())
         if post.article_metadata:
             res.append(f"\n{indent_str}[Article Post] This post is an Article.")
             res.extend(post.article_metadata.to_convo())

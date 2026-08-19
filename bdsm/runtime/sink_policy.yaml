@@ -1,9 +1,18 @@
 
-version: "2026-08-13"
+version: "2026-08-14"
 
-# Public-release note: the per-head operating points below (the 2-D
+# Public-release note: the operating points below (the 2-D
+# [tau, lambda] pairs, cusp_delta, reply_spam_hard_suspend_tau, and
+# the min_actions_for_enforcement count gate) are REDACTED in the
+# open-source export. Probabilities are replaced with an out-of-range
+# 9.99 sentinel (these fields live in [0, 1], so a 9.99 threshold
+# never fires and is plainly a stub, not a real value); the action
+# count with an impossible 999999 (far longer than any scoreable
+# sequence, so the gate can never pass). The production values are
+# configured internally and are not part of this release. Structure,
+# head names, and the action map are real.
 
-min_actions_for_enforcement: 30
+min_actions_for_enforcement: 999999
 
 thresholds:
   FollowBot:           [9.99, 9.99]
@@ -31,5 +40,6 @@ official_client_app_ids: [3033300, 129032, 258901, 191841]
 reply_spam_hard_suspend_tau: 9.99
 
 notes: >
-  2026-08-13: enforcement policy for the 8-head behavioral model.
-  Operating points are redacted in this export (9.99 sentinel).
+  2026-08-14: enforcement policy for the 8-head behavioral model.
+  Operating points are redacted in this export (out-of-range sentinels:
+  9.99 for probabilities, 999999 for the min-actions count gate).

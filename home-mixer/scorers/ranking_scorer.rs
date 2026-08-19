@@ -415,6 +415,35 @@ pub struct RankingScorer {
 }
 
 impl RankingScorer {
+    // These weights reflect a combination of how much an action is
+    // valued in ranking and typical propensities of these actions
+    // across the X network (e.g. negative feedback is overall rare).
+
+    // Each weight multiplies the *predicted* probability of that
+    // action (P(favorite), P(repost), …) or a continuous value e.g.
+    // watch time -- the weights do not multiply raw engagement counts.
+    // One common misinterpretation is that you can read these weight
+    // ratios as count equivalences, e.g. the incorrect statement that
+    // "one report cancels 468 likes" -- this is incorrect because the
+    // weights apply to the predicted probabilities rather than raw counts.
+
+    // And the baseline probability of a Report is more than 1000x lower
+    // than a Like, so it’s weighted more to allow the prediction to affect
+    // the final ranking at all.
+
+    // Related to the above is a misunderstanding that bad actors engaging
+    // in mass blocking/reporting will significantly suppress reach. There
+    // are multiple things inhibiting this:
+    // 1. It’s predicting your likelihood of the action, not summing up
+    // raw weights on counts. Also, recommendations are personalized, so
+    // reports from bad actors will primarily affect recommendations for
+    // users who are similar to the bad actors, rather than having the same
+    // effect on the post's ranking to everyone.
+    // 2. For an account to count in the algorithms recommendation system,
+    // it must take place on a post served in Home Timeline. Directly
+    // navigating to a post (i.e., coordinating via groupchat) has no
+    // ranking impact. And users cannot manufacture a post to show up in
+    // their Timeline in any consistently reproducible way.
     fn apply(score: Option<f64>, weight: f64) -> f64 {
         score.unwrap_or(0.0) * weight
     }
@@ -629,17 +658,40 @@ impl RankingScorer {
         let mut contexts = vec![SlateContext::default(); candidates.len()];
         let mut author_counts: FxHashMap<u64, u32> = FxHashMap::default();
         let mut last_author_rank: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut sid_counts: [FxHashMap<u64, u32>; 3] = Default::default();
+        let mut last_sid_rank: [FxHashMap<u64, u32>; 3] = Default::default();
         for (rank, (idx, score)) in indexed.into_iter().enumerate() {
             let rank = rank as u32;
             let author_id = candidates[idx].author_id;
             let k = author_counts.get(&author_id).copied().unwrap_or(0);
             let rank_gap = last_author_rank.get(&author_id).map(|last| rank - last);
+
+            let mut sid_k = [0u32; 3];
+            let mut sid_gap = [None; 3];
+            let sids = candidates[idx].semantic_ids.as_deref().unwrap_or(&[]);
+            let sid_known = !sids.is_empty();
+            let mut prefix = 0u64;
+            for (level, &code) in sids.iter().take(3).enumerate() {
+                prefix = (prefix << 20) | (code as u32 as u64 & 0xFFFFF);
+                sid_k[level] = sid_counts[level].get(&prefix).copied().unwrap_or(0);
+                sid_gap[level] = last_sid_rank[level].get(&prefix).map(|last| rank - last);
+                sid_counts[level].insert(prefix, sid_k[level] + 1);
+                last_sid_rank[level].insert(prefix, rank);
+            }
+
             contexts[idx] = SlateContext {
                 k,
                 pool_rank: rank,
                 pool_rank_gap: rank_gap,
                 fatigue: 0.0,
                 pre_diversity_score: score,
+                sid_known,
+                sid_k_l1: sid_k[0],
+                sid_k_l2: sid_k[1],
+                sid_k_l3: sid_k[2],
+                sid_gap_l1: sid_gap[0],
+                sid_gap_l2: sid_gap[1],
+                sid_gap_l3: sid_gap[2],
             };
             author_counts.insert(author_id, k + 1);
             last_author_rank.insert(author_id, rank);
@@ -974,6 +1026,7 @@ mod tests {
             pool_rank_gap: Some(3),
             fatigue: 0.0,
             pre_diversity_score: 0.5,
+            ..Default::default()
         };
         let stored_repeat = PostCandidate {
             slate_context: Some(stored_context),

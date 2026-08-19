@@ -194,6 +194,13 @@ fn build_request(query: &ScoredPostsQuery, candidates: &[PostCandidate]) -> Rank
                     k: s.k,
                     pool_rank: s.pool_rank,
                     pool_rank_gap: s.pool_rank_gap,
+                    sid_known: s.sid_known,
+                    sid_k1: s.sid_k_l1,
+                    sid_k2: s.sid_k_l2,
+                    sid_k3: s.sid_k_l3,
+                    sid_gap1: s.sid_gap_l1,
+                    sid_gap2: s.sid_gap_l2,
+                    sid_gap3: s.sid_gap_l3,
                 }),
                 head_weights: scoring_weights
                     .as_ref()

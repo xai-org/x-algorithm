@@ -4,9 +4,10 @@ type Event = com.twitter.strato.columns.content_understanding.content_understand
 
 val processor = #<hydra/phoenix_rank_all/phoenixRankAllCandidateProcessor>
 
-val executeOp = Op.execute({ idempotent = true })[Event, Unit] { ctx =>
+val executeOp = Op.execute({ idempotent = true })[(Long, Event), Unit] { ctx =>
+  val (postId, _) = ctx.arg
   val request = {
-    postId = ctx.arg.postMetadata.post.postId,
+    postId = postId,
     eventSource = PostCreation
   }
   processor.execute(request)

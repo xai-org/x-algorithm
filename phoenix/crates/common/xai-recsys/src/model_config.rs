@@ -37,6 +37,8 @@ pub struct HashTableConfig {
     pub num_post_bool_features: usize,
     pub num_post_float_features: usize,
     pub num_post_int64_features: usize,
+
+    pub enable_stale_post: bool,
 }
 
 impl HashTableConfig {
@@ -249,6 +251,7 @@ impl ModelConfig {
         num_post_bool_features: usize,
         num_post_float_features: usize,
         num_post_int64_features: usize,
+        enable_stale_post: bool,
     ) -> Self {
         ModelConfig {
             hash_table: HashTableConfig {
@@ -281,6 +284,7 @@ impl ModelConfig {
                 num_post_bool_features,
                 num_post_float_features,
                 num_post_int64_features,
+                enable_stale_post,
             },
             history_seq_len,
             candidate_seq_len,

@@ -1,14 +1,16 @@
-import <content_understanding/sharedConfig>
+import <hydra/sharedConfig>
 
 StreamForwarder({
   source = KafkaTopic({
-    topic = "content_understanding_realtime_unified_posts",
-    dest = "/s/kafka/main-2:kafka-tls",
-    consumerGroupId = "post_creation_event",
-    develConsumerGroupId = None,
-    mapping = ValueOnly({
+    topic = "content_understanding_realtime_unified_posts_v3",
+    dest = "/s/kafka/phoenix-kafka-external-bootstrap",
+    consumerGroupId = "post_creation_event_v3",
+    develConsumerGroupId = Some("post_creation_event_v3_devel"),
+    mapping = KeyValue({
+      key = Type(Long),
+      keyEncoding = NativeEncoding,
       value = Type(com.twitter.strato.columns.content_understanding.content_understanding.ContentUnderstandingMetadataV2),
-      encoding = ThriftEncoding
+      valueEncoding = ThriftEncoding
     })
   }),
   forwardToOp = Execute,

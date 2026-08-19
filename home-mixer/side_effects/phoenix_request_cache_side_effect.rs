@@ -230,6 +230,7 @@ mod tests {
                 pool_rank_gap: Some(3),
                 fatigue: 1.5,
                 pre_diversity_score: 0.42,
+                ..Default::default()
             }),
             ..candidate(1, 100)
         };

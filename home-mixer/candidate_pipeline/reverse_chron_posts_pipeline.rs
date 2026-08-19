@@ -2,7 +2,7 @@ use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHy
 use crate::candidate_hydrators::conversation_gap_ancestor_hydrator::ConversationGapAncestorHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
-use crate::candidate_hydrators::vf_candidate_hydrator::VFCandidateHydrator;
+use crate::candidate_hydrators::vf_following_candidate_hydrator::VFFollowingCandidateHydrator;
 use crate::clients::night_owl_client::{MockNightOwlClient, NightOwlClient, ProdNightOwlClient};
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};
@@ -138,7 +138,10 @@ impl ReverseChronPostsPipeline {
         ];
 
         let post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
-            Box::new(VFCandidateHydrator::new(strato_vf_client, xai_vf_client).await),
+            Box::new(VFFollowingCandidateHydrator::new(
+                strato_vf_client,
+                xai_vf_client,
+            )),
             Box::new(AdsBrandSafetyVfHydrator {
                 client: vf_safety_labels_client,
             }),

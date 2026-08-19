@@ -88,6 +88,7 @@ class SafetyPostAnnotations(BaseModel):
 
 
 class SafemodelResult(BaseModel):
+    scored: bool = False
     positive: bool = False
     confidence: float = 0.0
 

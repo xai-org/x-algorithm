@@ -37,6 +37,7 @@ use crate::clients::vm_ranker_client::{MockVMRankerClient, ProdVMRankerClient, V
 use crate::filters::age_filter::AgeFilter;
 use crate::filters::ancillary_vf_filter::AncillaryVFFilter;
 use crate::filters::author_socialgraph_filter::AuthorSocialgraphFilter;
+use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
 use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
@@ -355,6 +356,16 @@ impl PhoenixCandidatePipeline {
             Box::new(PreviouslyServedPostsFilter),
             Box::new(MutedKeywordFilter::new()),
             Box::new(AuthorSocialgraphFilter),
+            // Brazil 2026 election filter
+
+            // Application providers that use a recommendation system for users must exclude from the
+            // results the channels and profiles reported to the Electoral Court under the terms of
+            // § 1º of this article and, except in cases of paid boosting, the content posted on them.
+
+            // https://dadosabertos.tse.jus.br/dataset/candidatos-2026
+
+            // OmarAzizSenador deleted his account at the time this code was written.
+            Box::new(Brazil2026ElectionFilter),
             Box::new(VideoFilter),
             Box::new(TopicIdsFilter),
             Box::new(NewUserMinEngagementFilter),

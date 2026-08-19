@@ -98,6 +98,9 @@ message ScoreResult {
 
   repeated DecodedAction decoded_actions = 18;
 
+  // Optional human-readable note. In this release templates and
+  // key_actions are the sentinel "<redacted>" (see README); production
+  // fills the real appeal paragraph. ActionName enums are unchanged.
   string enforcement_note = 19;
 }
 

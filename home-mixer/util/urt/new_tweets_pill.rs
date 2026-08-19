@@ -24,6 +24,7 @@ pub(super) fn build_new_tweets_pill_instruction(
     cursor: Option<&UrtOrderedCursor>,
     language: &str,
     country: Option<&str>,
+    require_full_facepile: bool,
 ) -> Option<TimelineInstruction> {
     let has_top_cursor = cursor
         .and_then(|c| c.cursor_type.as_ref())
@@ -37,8 +38,8 @@ pub(super) fn build_new_tweets_pill_instruction(
         return None;
     }
 
-    let user_ids = extract_pill_user_ids(items, viewer_id);
-    if user_ids.as_ref().is_none_or(|ids| ids.len() < NUM_AVATARS) {
+    let user_ids = extract_pill_user_ids(items, viewer_id).filter(|ids| ids.len() >= NUM_AVATARS);
+    if require_full_facepile && user_ids.is_none() {
         return None;
     }
 

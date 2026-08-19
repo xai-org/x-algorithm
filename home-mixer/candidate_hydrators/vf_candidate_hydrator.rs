@@ -136,7 +136,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
     }
 }
 
-fn should_drop_ancillary(
+pub(crate) fn should_drop_ancillary(
     candidate: &PostCandidate,
     vf_results: &HashMap<u64, Result<Option<FilteredReason>>>,
 ) -> bool {

@@ -83,11 +83,22 @@ _EAPI_4_5_INTERNAL_BREAKER_CONFIG = CircuitBreakerConfig(
     half_open_max_calls=5,
     excluded_exceptions=(asyncio.CancelledError,),
 )
+_EAPI_4_5_X_ALGO_BREAKER_CONFIG = CircuitBreakerConfig(
+    failure_rate_threshold=0.5,
+    window_size=600.0,
+    min_calls_in_window=10,
+    recovery_timeout=600.0,
+    half_open_max_calls=5,
+    excluded_exceptions=(asyncio.CancelledError,),
+)
 _eapi_4_3_x_algo_breaker = CircuitBreaker(
     ModelName.EAPI_GROK_4_3_X_ALGO, _EAPI_4_3_X_ALGO_BREAKER_CONFIG
 )
 _eapi_4_5_internal_breaker = CircuitBreaker(
     ModelName.EAPI_GROK_4_5_INTERNAL, _EAPI_4_5_INTERNAL_BREAKER_CONFIG
+)
+_eapi_4_5_x_algo_breaker = CircuitBreaker(
+    ModelName.EAPI_GROK_4_5_X_ALGO, _EAPI_4_5_X_ALGO_BREAKER_CONFIG
 )
 
 
@@ -542,3 +553,46 @@ class SafetyPtosPolicyClassifier:
         return await self.llm.sample(
             convo.interleave(), conversation_id=convo.conversation_id
         )
+
+
+class SafetyPtosAdultContentCrossValidationJudge:
+    result_pattern = re.compile(r"(.*)<json>(.*)</json>", re.DOTALL)
+
+    def __init__(self):
+        eapi_cfg = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)
+        self.llm = EapiSampler(EapiModelConfig(**eapi_cfg.model_dump()))
+
+    def build_convo(self, post: Post) -> Conversation:
+        convo = Conversation(conversation_id=uuid.uuid4().hex)
+        convo.messages.append(
+            Message(
+                role=Role.SYSTEM,
+                content=[_strip_thinking_restrictions(adult_content_policy_prompt())],
+            )
+        )
+
+        user_msg = Message(role=Role.USER, content=[])
+        user_msg.content.extend(UserRenderer.render(post.user))
+        user_msg.content.extend(PostRenderer.render(post, include_reply_to=True))
+        user_msg.content.append(
+            f"\n\nAnalyze the post {post.id} for the specific safety policy violation category: {SafetyPolicyCategory.AdultContent.value}"
+        )
+        user_msg.content.append(
+            f"\n\nProvide the requested JSON object for the specific safety policy type.{THINKING_CONTROL_START}"
+        )
+        convo.messages.append(user_msg)
+        convo.messages.append(Message(role=Role.ASSISTANT, content=[]))
+        return convo
+
+    async def judge(self, post: Post) -> SafetyPolicy:
+        convo = self.build_convo(post)
+        async with _eapi_4_5_x_algo_breaker.guard():
+            raw = await self.llm.sample(
+                convo.interleaveToEapi(), conversation_id=convo.conversation_id
+            )
+        match = self.result_pattern.search(raw)
+        if not match:
+            raise ValueError(
+                f"Invalid output for adult content cross validation judge: {raw[:500]!r}"
+            )
+        return SafetyPolicy.model_validate_json(match.group(2).strip())

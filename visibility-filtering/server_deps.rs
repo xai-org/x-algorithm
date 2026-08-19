@@ -241,12 +241,15 @@ fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {
     }
 }
 
+const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 = 80;
+
 fn gizmoduck_client_config(deterministic_aperture: bool) -> GizmoduckClientConfig {
     GizmoduckClientConfig {
         aperture_size: Some(GizmoduckRpcConstants::num_endpoints()),
         deterministic_aperture,
         lb_policy: Some(LbPolicy::least_request()),
         readiness_probe_port: Some(GIZMODUCK_READINESS_PROBE_PORT),
+        request_timeout_ms: Some(GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS),
         ..Default::default()
     }
 }

@@ -4,7 +4,9 @@ This repository contains the core code that determines which posts a viewer sees
 
 ## Table of Contents
 
-- [Latest update](#latest-update--august-13th-2026)
+- [Latest Updates](#latest-updates)
+  - [August 14th, 2026](#august-14th-2026)
+  - [August 13th, 2026](#august-13th-2026)
 - [Overview](#overview)
 - [System Architecture](#system-architecture)
   - [Request Path](#request-path)
@@ -23,7 +25,16 @@ This repository contains the core code that determines which posts a viewer sees
 
 
 
-## Latest update — August 13th, 2026
+## Latest Updates
+
+### August 14th, 2026
+
+Notable updates:
+
+- **How weights work.** There's a common misconception about how weights related to actions (e.g. Like, Share, Block, Report, etc) work in ranking. The weights scale the predicted probabilities of such actions (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior. We've [added comments](home-mixer/params/param.rs) [to the code](home-mixer/scorers/ranking_scorer.rs) so that LLMs or people reading it are more likely to understand it correctly.
+- **Brazil 2026 Elections.** As [announced by X](https://x.com/XBR/status/2088341967864320507?s=20), in accordance with Brazilian electoral law, For You now runs `Brazil2026ElectionFilter`, which removes posts from accounts reported to Brazil's Electoral Court for the 2026 election, unless the viewer explicitly follows the account. A benefit of open-source is that you can see that changes like this exist, and exactly how they work — take a [look at the code](home-mixer/filters/brazil_2026_election_filter.rs).
+
+### August 13th, 2026
 
 This release:
 
@@ -328,6 +339,8 @@ Final Score = Σ (weight_i × P(action_i))
 ```
 
 Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`home-mixer/scorers/ranking_scorer.rs`](home-mixer/scorers/ranking_scorer.rs).
+
+There is a common misconception to be aware of about the weights: they scale the predicted probabilities (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior.
 
 Three adjustments follow:
 

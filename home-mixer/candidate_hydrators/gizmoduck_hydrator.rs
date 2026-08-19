@@ -49,6 +49,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
             retweeted_screen_name: hydrated.retweeted_screen_name.clone(),
             nsfw_author: hydrated.nsfw_author,
             nsfw_author_ads: hydrated.nsfw_author_ads,
+            nsfw_author_phoenix: hydrated.nsfw_author_phoenix,
         }
     }
 
@@ -59,6 +60,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
             retweeted_screen_name: value.retweeted_screen_name,
             nsfw_author: value.nsfw_author,
             nsfw_author_ads: value.nsfw_author_ads,
+            nsfw_author_phoenix: value.nsfw_author_phoenix,
             ..Default::default()
         }
     }
@@ -134,6 +136,17 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
                                 label.label_value == LabelValue::POSSIBLY_NSFW_ACCOUNT.0
                             })
                     });
+                    let nsfw_author_phoenix: Option<bool> = author.map(|u| {
+                        u.safety.nsfw_user
+                            || u.safety.nsfw_admin
+                            || u.labels.labels.iter().any(|l| {
+                                matches!(
+                                    LabelValue(l.label_value),
+                                    LabelValue::NSFW_HIGH_PRECISION
+                                        | LabelValue::POSSIBLY_NSFW_ACCOUNT
+                                )
+                            })
+                    });
 
                     Ok(PostCandidate {
                         author_followers_count,
@@ -141,6 +154,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
                         retweeted_screen_name,
                         nsfw_author,
                         nsfw_author_ads,
+                        nsfw_author_phoenix,
                         ..Default::default()
                     })
                 }
@@ -158,6 +172,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
         candidate.retweeted_screen_name = hydrated.retweeted_screen_name;
         candidate.nsfw_author = hydrated.nsfw_author;
         candidate.nsfw_author_ads = hydrated.nsfw_author_ads;
+        candidate.nsfw_author_phoenix = hydrated.nsfw_author_phoenix;
     }
 }
 
@@ -174,4 +189,5 @@ pub struct GizmoduckCacheValue {
     pub retweeted_screen_name: Option<String>,
     pub nsfw_author: Option<bool>,
     pub nsfw_author_ads: Option<bool>,
+    pub nsfw_author_phoenix: Option<bool>,
 }

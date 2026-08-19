@@ -7,7 +7,7 @@ rules:
     when: "!user.present"
     then: { kind: skip, reason: not_present }
   - id: cred_skip
-    when: cred.is_high || cred.follower_count >= 1234 || cred.score >= 7.5
+    when: cred.is_high || cred.follower_count >= 12.34 || cred.score >= 7.5
     then: { kind: skip, reason: cred_skip }
   - id: composite
     when: '"composite_label" in score.labels'

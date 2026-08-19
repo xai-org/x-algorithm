@@ -77,8 +77,57 @@ def _resolve_head_names(_model_version):
     return HEAD_NAMES
 
 
-def build_enforcement_note(*_args, **_kwargs):
-    return None
+# Public-release note: per-head appeal-note templates are REDACTED
+# (the prose AND the key_actions each head interpolates from the
+# histogram). What ships: MIN_ACTIONS gate, dominant bot-head pick,
+# and the sentinel "<redacted>" plus a [model: Head=score] suffix.
+# Production fills placeholders from an internal table that is not
+# part of this release. ActionName proto enums are untouched.
+_REDACTED_TEMPLATE = "<redacted>"
+
+_ENFORCEMENT_TEMPLATES = {
+    "FollowBot": _REDACTED_TEMPLATE,
+    "LikeBot": _REDACTED_TEMPLATE,
+    "EngagementAmplifier": _REDACTED_TEMPLATE,
+    "ReplySpamBot": _REDACTED_TEMPLATE,
+    "TweetSpamBot": _REDACTED_TEMPLATE,
+    "RTBot": _REDACTED_TEMPLATE,
+    "MultiActionBot": _REDACTED_TEMPLATE,
+}
+
+
+def build_enforcement_note(head_scores_list, action_hist_list, min_actions):
+    """Build an enforcement note from head scores + action histogram.
+
+    Returns None when no bot head is above 0.5 or the sequence is shorter
+    than `min_actions` (the policy min-actions gate). In this public release
+    the note is the sentinel "<redacted>" plus a model-head suffix; production
+    interpolates from a private template table (prose and key_actions).
+    """
+    if not head_scores_list:
+        return None
+
+    total = sum(h["cnt"] for h in (action_hist_list or ()))
+    if total < min_actions:
+        return None
+
+    bot_heads = [
+        (h["head_name"], h["score"])
+        for h in head_scores_list
+        if h["head_name"] != "LegitimateUser" and h["score"] > 0.5
+    ]
+    if not bot_heads:
+        return None
+
+    bot_heads.sort(key=lambda x: x[1], reverse=True)
+    dominant_name, dominant_score = bot_heads[0]
+    note = _ENFORCEMENT_TEMPLATES.get(dominant_name, _REDACTED_TEMPLATE)
+    note += f" [model: {dominant_name}={dominant_score:.2f}"
+    if len(bot_heads) > 1:
+        secondary = ", ".join(f"{n}={s:.2f}" for n, s in bot_heads[1:3])
+        note += f", also: {secondary}"
+    note += "]"
+    return note
 
 
 def _build_flag_config(head_names):
@@ -170,7 +219,7 @@ _CUSP_BUCKET_LABELS = _CHALLENGE_ARKOSE_CAPTCHA
 class SinkPolicy:
     version: str = "baked-in-defaults"
     source: str = "defaults"
-    min_actions_for_enforcement: int = 30
+    min_actions_for_enforcement: int = 999999
     thresholds: dict = field(
         default_factory=lambda: {
             "FollowBot": (9.99, 9.99),
@@ -308,9 +357,9 @@ def _parse_args():
     parser.add_argument(
         "--min-actions-for-long-cooldown",
         type=int,
-        default=30,
+        default=None,
         help="Action-count threshold separating short vs long cooldown buckets. "
-        "Default matches MIN_ACTIONS_FOR_ENFORCEMENT (30).",
+        "Defaults to the policy min-actions enforcement gate.",
     )
     parser.add_argument(
         "--bq-project", default="your-gcp-project", help="GCP project for the scores table."
@@ -1088,7 +1137,15 @@ def _spam_bounce_lane(
 
 
 def _build_bq_row(
-    uid_int, score_id, now_ts, user_head_scores, user_action_hist, user_labels, bsummary, args
+    uid_int,
+    score_id,
+    now_ts,
+    user_head_scores,
+    user_action_hist,
+    user_labels,
+    bsummary,
+    args,
+    min_note_actions,
 ):
     total_actions = None
     if user_action_hist:
@@ -1115,7 +1172,9 @@ def _build_bq_row(
         "head_scores": user_head_scores,
         "action_histogram": user_action_hist,
         "total_actions": total_actions,
-        "enforcement_note": build_enforcement_note(),
+        "enforcement_note": build_enforcement_note(
+            user_head_scores, user_action_hist, min_note_actions
+        ),
         "labels": user_labels,
         "model_version": args.model_version,
         "pipeline_version": "gpu_scorer_kafka_v3",
@@ -1441,7 +1500,11 @@ def main():
     r = redis_lib.Redis(host=args.redis_host, port=args.redis_port)
     cooldown_low_sec = int(args.cooldown_low_hours * 3600)
     cooldown_high_sec = int(args.cooldown_high_hours * 3600)
-    cooldown_threshold = args.min_actions_for_long_cooldown
+    cooldown_threshold = (
+        args.min_actions_for_long_cooldown
+        if args.min_actions_for_long_cooldown is not None
+        else pol.min_actions_for_enforcement
+    )
     try:
         r.ping()
         log.info(
@@ -1587,6 +1650,7 @@ def main():
                     user_labels,
                     bsummary,
                     args,
+                    pol.min_actions_for_enforcement,
                 )
                 bq_buffer.append(row)
 

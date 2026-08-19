@@ -7,17 +7,15 @@ import urllib.error
 import urllib.request
 import uuid
 
-from monitor.metrics import Metrics
-
-from grox.core.data_loaders.data_types import Image, Post, Video
 from grox.core.lib.utils import detect_image_content_type
+from grox.core.data_loaders.data_types import Image, Post, Video
+from grox.flows.ptos.state import SafetyPolicyCategory, SafetyPtosState
 from grox.core.schedules.types import TaskContext
-from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
+from monitor.metrics import Metrics
 from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
-from grox.flows.ptos.state import (
-    SafetyPolicyCategory,
-    SafetyPolicyType,
-    SafetyPtosState,
+from strato_http.queries.safety_post_annotations_result import (
+    StratoSafetyPostAnnotationsResultDirectMh,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +34,8 @@ _METRIC_PREFIX = "task.safety_ptos_safemodel_sex_nudity"
 
 
 class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
+    _result_direct_mh = StratoSafetyPostAnnotationsResultDirectMh()
+
     @classmethod
     async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
         try:
@@ -50,6 +50,20 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
                 1, attributes={"reason": "exception"}
             )
             logger.warning(f"Post {post.id}: safemodel failed: {e}")
+
+    @classmethod
+    async def _post_is_already_flagged_nsfw(cls, post: Post) -> bool:
+        try:
+            result = await cls._result_direct_mh.fetch(int(post.id))
+        except Exception as e:
+            Metrics.counter(f"{_METRIC_PREFIX}.nsfw_lookup_error.count").add(1)
+            logger.warning(
+                f"Post {post.id}: NSFW MH lookup failed, treating as not flagged: {e}"
+            )
+            return False
+        return bool(
+            result and result.safetyBoolMetadata and result.safetyBoolMetadata.isNsfw
+        )
 
     @classmethod
     def _has_adult_content_suspicion(cls, ctx: TaskContext) -> bool:
@@ -69,6 +83,12 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
         if not is_deluxe and not cls._has_adult_content_suspicion(ctx):
             Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
                 1, attributes={"reason": "no_adult_content_suspicion", "flow": flow}
+            )
+            return
+
+        if is_deluxe and await cls._post_is_already_flagged_nsfw(post):
+            Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
+                1, attributes={"reason": "prior_nsfw", "flow": flow}
             )
             return
 
@@ -124,42 +144,17 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             )
             return
 
-        annotations = ctx.state(SafetyPtosState).annotations
-        violations = (annotations.violatedPolicies or []) if annotations else []
-        ptos_positive = any(
-            v.category == SafetyPolicyCategory.AdultContent
-            and v.safetyPolicy is not None
-            and v.safetyPolicy.policyType == SafetyPolicyType.AdultContentSexualHard
-            for v in violations
-        )
-
-        outcome = cls._compare_outcome(safemodel_positive, ptos_positive)
-        Metrics.counter(f"{_METRIC_PREFIX}.compare.count").add(
-            1,
-            attributes={"outcome": outcome, "has_video": has_video_attr, "flow": flow},
-        )
-
         logger.info(
             f"Post {post.id} ({flow}): safemodel={'positive' if safemodel_positive else 'negative'} "
-            f"(buckets={buckets_seen}, n_errors={n_errors}, n_images={n_images}, n_video_frames={n_video_frames}) "
-            f"ptos={'positive' if ptos_positive else 'negative'} outcome={outcome}"
+            f"(buckets={buckets_seen}, n_errors={n_errors}, n_images={n_images}, n_video_frames={n_video_frames})"
         )
 
+        ctx.state(SafetyPtosState).safemodel_sex_nudity.scored = True
         if safemodel_positive:
             ctx.state(SafetyPtosState).safemodel_sex_nudity.positive = True
             ctx.state(
                 SafetyPtosState
             ).safemodel_sex_nudity.confidence = max_positive_confidence
-
-    @staticmethod
-    def _compare_outcome(safemodel_positive: bool, ptos_positive: bool) -> str:
-        if safemodel_positive and ptos_positive:
-            return "both_positive"
-        if not safemodel_positive and not ptos_positive:
-            return "both_negative"
-        if safemodel_positive:
-            return "safemodel_only_positive"
-        return "ptos_only_positive"
 
     @classmethod
     def _collect_payloads(cls, post: Post) -> list[tuple[str, bytes]]:
@@ -211,13 +206,15 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             ("checkpoint_gcs", _CHECKPOINT_GCS),
         ]:
             parts.append(
-                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode()
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode(
+                    "utf-8"
+                )
             )
         file_header = (
             f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="image"\r\nContent-Type: {content_type}\r\n\r\n'
-        ).encode()
+        ).encode("utf-8")
         parts.append(file_header + payload_bytes)
-        closing = f"\r\n--{boundary}--\r\n".encode()
+        closing = f"\r\n--{boundary}--\r\n".encode("utf-8")
         body = b"\r\n".join(parts) + closing
 
         last_error_reason = "exception"

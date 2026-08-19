@@ -25,6 +25,12 @@ class KafkaConsumer:
         self.group_id: str = config.group_id
         self._consumer: AIOKafkaConsumer | None = None
 
+    @property
+    def assigned_partitions(self) -> int:
+        if self._consumer is None:
+            return 0
+        return len(self._consumer.assignment() or ())
+
     def _auth_mode(self) -> str:
         if not self.config.ssl:
             return "PLAINTEXT"

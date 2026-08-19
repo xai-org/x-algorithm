@@ -1,19 +1,19 @@
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::EnableUrtMigrationComponents;
-use crate::util::tweet_type_metrics::{bitset_get, TWEET_TYPE_PREDICATES, VIDEO};
+use crate::util::tweet_type_metrics::{TWEET_TYPE_PREDICATES, VIDEO, bitset_get};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::async_trait;
 
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
-    KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient, CLIENT_EVENT_TOPIC,
+    CLIENT_EVENT_TOPIC, KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient,
 };
 use xai_candidate_pipeline::component_library::utils::client_utils::{
     ClientPlatform, RequestContext,
 };
 use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
-use xai_home_mixer_proto::{feed_item, FeedItem, ScoredPost, ServedType};
+use xai_home_mixer_proto::{FeedItem, ScoredPost, ServedType, feed_item};
 use xai_x_thrift::log_event::{EventNamespace, LogBase, LogEvent};
 use xai_x_thrift::serialize_binary;
 
@@ -61,7 +61,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ClientEventsKafkaSideEffect {
             .iter()
             .filter(|i| matches!(i.item, Some(feed_item::Item::WhoToFollow(_))))
             .count() as i64;
-        let post_count = posts.len() as i64;
+        let post_count = posts.iter().map(|p| conversation_post_count(p)).sum();
 
         let base = ClientEventParams {
             query,
@@ -99,6 +99,22 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ClientEventsKafkaSideEffect {
 
         Ok(())
     }
+}
+
+fn conversation_post_count(post: &ScoredPost) -> i64 {
+    let mut count = 1;
+    if let Some(&root) = post.ancestors.iter().min() {
+        if !post.tombstone_ancestor_ids.contains(&root) {
+            count += 1;
+        }
+        if let Some(&parent) = post.ancestors.iter().max()
+            && parent != root
+            && !post.tombstone_ancestor_ids.contains(&parent)
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn section_for(request_type: RequestType) -> &'static str {

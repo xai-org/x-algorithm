@@ -29,15 +29,6 @@ const BASE_PATH: &str = "/dev/shm/mm_embeddings";
 
 const EMBEDDING_TTL: Duration = Duration::from_secs(2 * 24 * 3600);
 
-fn embedding_ttl() -> Duration {
-    std::env::var("MM_EMBEDDING_TTL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&secs| secs >= 1)
-        .map(Duration::from_secs)
-        .unwrap_or(EMBEDDING_TTL)
-}
-
 lazy_static! {
     static ref MM_EMBEDDING_SUCCESS_RATIO: Histogram = register_histogram!(
         "mm_embedding_success_ratio",
@@ -226,7 +217,6 @@ pub fn get_mm_client(
 ) -> Result<(MmEmbeddingsClient, O2PreloadFuture)> {
     let is_writer = worker_id == 0;
     let shard_capacity = MAX_EMBEDDING_CACHE_SIZE / NUM_SHARDS;
-    let ttl = embedding_ttl();
 
     let shards: Vec<CacheShard> = if shared {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
@@ -244,10 +234,10 @@ pub fn get_mm_client(
                                 &data_path,
                                 shard_capacity,
                                 emb_dim,
-                                ttl,
+                                EMBEDDING_TTL,
                             )
                         } else {
-                            LmdbEmbeddingCache::open(&lmdb_path, &data_path, ttl)
+                            LmdbEmbeddingCache::open(&lmdb_path, &data_path, EMBEDDING_TTL)
                         };
                         CacheShard::Lmdb(Arc::new(cache.unwrap_or_else(|e| {
                             panic!("LmdbEmbeddingCache shard {} failed: {}", shard_idx, e)
@@ -267,7 +257,9 @@ pub fn get_mm_client(
             MAX_EMBEDDING_CACHE_SIZE
         );
         (0..NUM_SHARDS)
-            .map(|_| CacheShard::InProcess(Arc::new(EmbeddingCache::new(shard_capacity, ttl))))
+            .map(|_| {
+                CacheShard::InProcess(Arc::new(EmbeddingCache::new(shard_capacity, EMBEDDING_TTL)))
+            })
             .collect()
     };
 

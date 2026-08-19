@@ -3168,6 +3168,7 @@ macro_rules! server_impl {
                         num_post_bool_features = 0,
                         num_post_float_features = 0,
                         num_post_int64_features = 0,
+                        enable_stale_post = false,
                         enable_async_response_compression = false,
                         sid_num_levels = 0,
                         copy_max_entries = DEFAULT_MAX_ENTRIES,
@@ -3232,6 +3233,7 @@ macro_rules! server_impl {
                         num_post_bool_features: usize,
                         num_post_float_features: usize,
                         num_post_int64_features: usize,
+                        enable_stale_post: bool,
                         enable_async_response_compression: bool,
                         sid_num_levels: usize,
                         #[allow(unused_variables)]
@@ -3317,6 +3319,7 @@ macro_rules! server_impl {
                             num_post_bool_features,
                             num_post_float_features,
                             num_post_int64_features,
+                            enable_stale_post,
                         );
                         internal_model_config.sid_num_levels = sid_num_levels;
                         let reload_request = Arc::new(AtomicBool::new(false));

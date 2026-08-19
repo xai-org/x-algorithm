@@ -89,6 +89,7 @@ class ModelName:
     EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"
     EAPI_GROK_4_3_X_ALGO = "eapi-grok-4-3-x-algo"
     EAPI_GROK_4_5_INTERNAL = "eapi-grok-4-5-internal"
+    EAPI_GROK_4_5_X_ALGO = "eapi-grok-4-5-x-algo"
 
 
 class NightOwlConfig(BaseModel):
@@ -120,6 +121,7 @@ class GroxKafkaLoaderConfig(BaseModel):
 
     prefetching_threshold: int = 256
     prefetching_batch_size: int = 1024
+    max_qps_per_partition: int | None = None
 
 
 class GrpcServerConfig(BaseModel):

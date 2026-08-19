@@ -117,6 +117,12 @@ class MultiRegionKafkaConsumer:
         )
         return consumer
 
+    @property
+    def assigned_partitions(self) -> int:
+        return sum(
+            len(consumer.assignment() or ()) for consumer in self._consumers.values()
+        )
+
     async def stop(self):
         if self._region_retry_task is not None:
             self._region_retry_task.cancel()

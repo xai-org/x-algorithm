@@ -1,63 +1,41 @@
 import logging
 from datetime import datetime
-
 from strato_http.queries.data_types import (
-    ArticleMetadata as StratoArticleMetadata,
-)
-from strato_http.queries.data_types import (
-    BroadcastMetadata as StratoBroadcastMetadata,
-)
-from strato_http.queries.data_types import (
+    PostWithQuoteMetadata,
+    ContentUnderstandingMetadataV2,
+    PostMetadata as StratoPostMetadata,
+    MediaEntity as StratoMediaEntity,
     CardMetadata as StratoCardMetadata,
-)
-from strato_http.queries.data_types import (
+    UserMetadata as StratoUserMetadata,
+    BroadcastMetadata as StratoBroadcastMetadata,
     CardMetadataV2 as StratoCardMetadataV2,
-)
-from strato_http.queries.data_types import (
+    PollCardMetadata as StratoPollCardMetadata,
+    GrokShareCardMetadata as StratoGrokShareCardMetadata,
+    GrokShareMetadata as StratoGrokShareMetadata,
+    ArticleMetadata as StratoArticleMetadata,
+    ListMetadata as StratoListMetadata,
     ChatGroupMetadata as StratoChatGroupMetadata,
 )
-from strato_http.queries.data_types import (
-    ContentUnderstandingMetadataV2,
-    PostWithQuoteMetadata,
-)
-from strato_http.queries.data_types import (
-    GrokShareCardMetadata as StratoGrokShareCardMetadata,
-)
-from strato_http.queries.data_types import (
-    ListMetadata as StratoListMetadata,
-)
-from strato_http.queries.data_types import (
-    MediaEntity as StratoMediaEntity,
-)
-from strato_http.queries.data_types import (
-    PollCardMetadata as StratoPollCardMetadata,
-)
-from strato_http.queries.data_types import (
-    PostMetadata as StratoPostMetadata,
-)
-from strato_http.queries.data_types import (
-    UserMetadata as StratoUserMetadata,
-)
-
 from grox.core.data_loaders.data_types import (
-    AffiliatedBusiness,
-    ArticleMetadata,
-    BroadcastMetadata,
+    Post,
+    User,
+    Counts,
     Card,
     CardV2,
-    ChatGroupMetadata,
-    Counts,
-    GrokShareCard,
-    Image,
     LegacyCard,
-    ListMetadata,
-    PollCard,
-    Post,
     UnifiedCard,
-    User,
     Video,
+    Image,
     VideoInfo,
     VideoVariant,
+    BroadcastMetadata,
+    PollCard,
+    GrokShareCard,
+    GrokShare,
+    ArticleMetadata,
+    ListMetadata,
+    ChatGroupMetadata,
+    AffiliatedBusiness,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +119,12 @@ class PostMapper:
                 cls._from_strato_cardmetadataV2_to_cardV2(cardV2)
                 for cardV2 in post_metadata.cardMetadatasV2
             ]
+        grok_share_metadatas = None
+        if post_metadata.grokShareMetadatas:
+            grok_share_metadatas = [
+                cls._from_strato_grok_share_metadata(m)
+                for m in post_metadata.grokShareMetadatas
+            ]
         article_metadata = None
         if post_metadata.articleMetadata:
             article_metadata = cls._from_strato_article_metadata_to_article_metadata(
@@ -175,6 +159,7 @@ class PostMapper:
             ancestors=[],
             screenshot=None,
             cardsV2=cardsV2,
+            grok_share_metadatas=grok_share_metadatas,
             article_metadata=article_metadata,
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
@@ -326,6 +311,13 @@ class PostMapper:
         cls, metadata: StratoGrokShareCardMetadata
     ) -> GrokShareCard:
         return GrokShareCard(sender=metadata.sender, message=metadata.message)
+
+    @classmethod
+    def _from_strato_grok_share_metadata(
+        cls, metadata: StratoGrokShareMetadata
+    ) -> GrokShare:
+        sender = metadata.sender.name if metadata.sender is not None else None
+        return GrokShare(sender=sender, message=metadata.message)
 
     @classmethod
     def _from_strato_user_metadata_to_user(

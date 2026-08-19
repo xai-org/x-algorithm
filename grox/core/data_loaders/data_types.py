@@ -369,30 +369,47 @@ class LegacyCard(BaseModel):
         )
 
     def to_convo(self) -> list[str | ConvoImage]:
-        res: list[str | ConvoImage] = ["\n\n[Card] ", " "]
+        body: list[str | ConvoImage] = []
         if self.title:
-            res.append(f"\n\nTitle: {self.title}")
+            body.append(f"\n\nTitle: {self.title}")
         if self.description:
-            res.append(f"\n\nDescription: {self.description}")
+            body.append(f"\n\nDescription: {self.description}")
         if self.domain:
-            res.append(f"\n\nDomain: {self.domain}")
+            body.append(f"\n\nDomain: {self.domain}")
         if self.thumbnail_image and self.thumbnail_image.convo_image:
-            res.extend(["\n\n[Card Image] ", self.thumbnail_image.convo_image, " "])
+            body.extend(["\n\n[Card Image] ", self.thumbnail_image.convo_image, " "])
         if self.poll_cards:
-            res.append(
+            body.append(
                 "\n\nThis post includes a poll where user can vote their choices. The choices are as rendered below:"
             )
             for poll_card in self.poll_cards:
-                res.extend(poll_card.to_convo())
-        if self.grok_share_cards:
-            share_parts: list[str | ConvoImage] = []
-            for grok_share_card in self.grok_share_cards:
-                share_parts.extend(grok_share_card.to_convo())
-            if share_parts:
-                res.append(
-                    "\n\nThis post includes a shared Grok conversation. The conversation messages are as rendered below:"
-                )
-                res.extend(share_parts)
+                body.extend(poll_card.to_convo())
+        if not body:
+            return []
+        return ["\n\n[Card] ", " "] + body
+
+
+class GrokShare(BaseModel):
+    sender: str | None = None
+    message: str | None = None
+
+    @classmethod
+    def from_thrift_model(cls, metadata: t.GrokShareMetadata) -> "GrokShare":
+        sender = (
+            t.GrokShareConversationSender._VALUES_TO_NAMES.get(metadata.sender)
+            if metadata.sender is not None
+            else None
+        )
+        return cls(sender=sender, message=metadata.message)
+
+    def to_convo(self) -> list[str | ConvoImage]:
+        if not self.sender and not self.message:
+            return []
+        res: list[str | ConvoImage] = ["\n\n[Grok Share Message] ", " "]
+        if self.sender:
+            res.append(f"\n\nSender: {self.sender}")
+        if self.message:
+            res.append(f"\n\nMessage: {self.message}")
         return res
 
 
@@ -650,6 +667,7 @@ class Post(BaseModel):
     screenshot: Image | None = None
     reply: Reply | None = None
     cardsV2: list[CardV2] | None = None
+    grok_share_metadatas: list[GrokShare] | None = None
     article_metadata: ArticleMetadata | None = None
     descendants: list["Post"] | None = None
     user_agent: str | None = None
@@ -746,6 +764,12 @@ class Post(BaseModel):
             ]
         else:
             cardsV2 = None
+        if post_metadata.grokShareMetadatas:
+            grok_share_metadatas = [
+                GrokShare.from_thrift_model(m) for m in post_metadata.grokShareMetadatas
+            ]
+        else:
+            grok_share_metadatas = None
         if post_metadata.articleMetadata:
             article_metadata = ArticleMetadata.from_thrift_model(
                 post_metadata.articleMetadata
@@ -780,6 +804,7 @@ class Post(BaseModel):
             ancestors=[],
             screenshot=None,
             cardsV2=cardsV2,
+            grok_share_metadatas=grok_share_metadatas,
             article_metadata=article_metadata,
             user_agent=post_metadata.userAgent
             if hasattr(post_metadata, "userAgent")

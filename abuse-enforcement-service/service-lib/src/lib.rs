@@ -1704,6 +1704,8 @@ pub async fn start_kafka_consumers(
         )
         .with_wily_config(WilyConfig::default())
         .with_ssl(sasl_ssl_config(&consumer_conn, &sasl_password))
+        .with_enable_auto_offset_store(false)
+        .with_enable_auto_commit(false)
         .with_fetch_timeout_ms(10000);
 
         BatchConsumerConfig::new(kafka, SERVICE_NAME)
