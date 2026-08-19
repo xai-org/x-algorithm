@@ -4,7 +4,6 @@ from abc import abstractmethod
 from dataclasses import dataclass
 
 import jax.numpy as jnp
-
 from xai_configlib import Config, configclass
 
 

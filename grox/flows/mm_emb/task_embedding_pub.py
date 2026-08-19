@@ -2,13 +2,14 @@ import logging
 import os
 from functools import cache
 
+from kafka_cli.producer import ScramKafkaProducer
 from thrifts.gen.twitter.strato.columns.content_understanding.content_understanding.ttypes import (
     SimpleTweetEmbedding,
 )
 from thrifts.serdes import Serializer
-from grox.core.data_loaders.data_types import Post
+
 from grox.config.config import grox_config
-from kafka_cli.producer import ScramKafkaProducer
+from grox.core.data_loaders.data_types import Post
 from grox.flows.mm_emb.constants import (
     TOPIC_EMBEDDING_V5,
     TOPIC_EMBEDDING_V5_ALL,

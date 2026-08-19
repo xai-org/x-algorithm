@@ -33,7 +33,6 @@
 # Copyright 2026 X.AI Corp.
 import math
 from dataclasses import dataclass
-from typing import Type
 
 import cutlass
 import cutlass.cute as cute
@@ -89,7 +88,7 @@ class PagedKVManager(ParamsBase):
         head_dim_padded: cutlass.Constexpr[Int32],
         head_dim_v_padded: cutlass.Constexpr[Int32],
         num_threads: cutlass.Constexpr[Int32],
-        dtype: Type[cutlass.Numeric],
+        dtype: type[cutlass.Numeric],
         arch: cutlass.Constexpr[int] = 100,
     ):
         v_gmem_transposed = arch != 90

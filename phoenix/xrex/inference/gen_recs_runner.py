@@ -13,9 +13,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
+import xai_recsys_engine
 from jax.sharding import PartitionSpec as P
 
-import xai_recsys_engine
 from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.inference.h2d import EmbeddingSlices, lookup_h2d_embeddings

@@ -7,21 +7,22 @@ import re
 import time
 import traceback
 from collections import deque
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
-from typing import Any, Iterator, cast, final
+from typing import Any, cast, final
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow.parquet import ParquetFile
-
 from xai_configlib import configclass
+
 from xrex.configs.config import Dataset
 from xrex.data import conversion_labels
 from xrex.data.parquet_recsys_metadata import (

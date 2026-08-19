@@ -1,20 +1,20 @@
-import re
 import json
-import uuid
 import logging
+import re
+import uuid
 
 import json_repair
-
 from grok_sampler.oai_sampler import OaiSampler
+from monitor.metrics import Metrics
+
+from grox.config.config import grox_config
+from grox.core.data_loaders.data_types import Post
+from grox.core.lm.convo import Conversation, Message, Role
 from grox.core.lm.post import PostRenderer
 from grox.core.lm.user import UserRenderer
-from grox.core.lm.convo import Role, Message, Conversation
-from grox.config.config import grox_config
-from grox.flows.reply_spam.prompts import coordinated_spam_system_prompt
-from grox.core.data_loaders.data_types import Post
-from grox.flows.reply_spam.state_coordinated_spam import CoordinatedSpamResult
-from monitor.metrics import Metrics
 from grox.flows.reply_spam.constants import GEMMA_2
+from grox.flows.reply_spam.prompts import coordinated_spam_system_prompt
+from grox.flows.reply_spam.state_coordinated_spam import CoordinatedSpamResult
 
 logger = logging.getLogger(__name__)
 

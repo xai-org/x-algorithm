@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from collections import namedtuple
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 from jax.experimental import multihost_utils

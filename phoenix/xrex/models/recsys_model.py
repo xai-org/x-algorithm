@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import typing
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 import haiku as hk
 import jax
@@ -14,10 +15,10 @@ import jax.numpy as jnp
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 from numpy import typing as npt
-
 from xai_configlib import Config as Config
 from xai_configlib import configclass as configclass
 from xai_proto import recsys_pb2
+
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
     CLICK_CONDITIONED_ACTION_INDICES,

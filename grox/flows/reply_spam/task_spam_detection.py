@@ -1,12 +1,13 @@
 import logging
 from typing import override
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.reply_spam.state_reply_ranking import ReplyRankingState
+
 from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.flows.reply_spam.classifier_simple_reply_scorer import SimpleReplyScorer
+from grox.flows.reply_spam.state_reply_ranking import ReplyRankingState
 
 logger = logging.getLogger(__name__)
 

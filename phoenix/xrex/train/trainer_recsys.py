@@ -15,8 +15,9 @@ import sys
 import tempfile
 import time
 import typing
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from typing import Iterator, NamedTuple
+from typing import NamedTuple
 
 import grpc
 import haiku as hk
@@ -25,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
 import psutil
+import xai_recsys_engine
 from jax import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import (
@@ -33,13 +35,12 @@ from jax.sharding import (
 )
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import DictKey, GetAttrKey, SequenceKey
-
-import xai_recsys_engine
 from xai_checkpointing import checksum
 from xai_checkpointing.common import _unsafe_jax2np
 from xai_checkpointing.tree_util import tree_to_dict
 from xai_configlib import configclass
 from xai_proto import copy_pb2, copy_pb2_grpc
+
 from xrex.data.parquet_recsys import DataPosition, PhoenixDataset
 
 if typing.TYPE_CHECKING:
@@ -2568,7 +2569,7 @@ class RecsysTrainer(Trainer):
                             p,
                             e,
                         )
-                    data = f"{base_path}/{p}".encode("utf-8")
+                    data = f"{base_path}/{p}".encode()
                     full_path[: len(data)] = list(data)
             res = multihost_utils.broadcast_one_to_all(
                 (full_path, checksums, max_shards, data_pos_buf)

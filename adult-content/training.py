@@ -1,11 +1,9 @@
 import logging
 
-from twitter.adult_content.dataset_utils import build_dataset
-
 import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Sequential
-
+from twitter.adult_content.dataset_utils import build_dataset
 
 logger = logging.getLogger(__name__)
 

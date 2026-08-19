@@ -1,28 +1,28 @@
-import uuid
 import json
 import logging
 import re
-
+import uuid
 
 import json_repair
+from grok_sampler.config import GrokModelConfig
+from grok_sampler.vision_sampler import VisionSampler
+from monitor.metrics import Metrics
+from pydantic import ValidationError
+
+from grox.config.config import ModelName, grox_config
+from grox.core.data_loaders.data_types import Post
 from grox.core.lm.convo import (
     NO_THINKING_PROMPT,
     SEPARATOR,
     THINKING_CONTROL_END,
     THINKING_CONTROL_START,
-    Role,
-    Message,
     Conversation,
+    Message,
+    Role,
 )
 from grox.core.lm.thread import ThreadRenderer
-from grox.config.config import ModelName, grox_config
-from grok_sampler.config import GrokModelConfig
 from grox.flows.reply_spam.prompts import reply_scoring_system_prompt
-from grok_sampler.vision_sampler import VisionSampler
-from grox.core.data_loaders.data_types import Post
 from grox.flows.reply_spam.state_reply_ranking import ReplyScoreResult
-from monitor.metrics import Metrics
-from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 

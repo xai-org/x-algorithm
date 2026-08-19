@@ -8,10 +8,11 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import haiku as hk
 import jax
@@ -22,8 +23,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from opentelemetry import trace
-
 from xai_configlib import Config, configclass
+
 from xrex.configs.config import Dataset
 from xrex.eval.eval_utils import (
     EvalModule,
@@ -81,7 +82,7 @@ DEFAULT_COORDINATOR_PORT = 1234
 
 
 def default_name():
-    return f"xrex-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d-%H%M%S')}"
+    return f"xrex-{datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d-%H%M%S')}"
 
 
 class TrainerEvent(Enum):

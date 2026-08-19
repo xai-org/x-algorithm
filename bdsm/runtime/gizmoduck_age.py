@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from typing import Optional
 
 import requests
 
@@ -26,7 +25,7 @@ def _local_cache_put(uid: int, created_at_msec: int) -> None:
     _LOCAL_CACHE[uid] = created_at_msec
 
 
-def _fetch_created_at_msec(user_id: int) -> Optional[int]:
+def _fetch_created_at_msec(user_id: int) -> int | None:
     try:
         resp = requests.post(
             STRATO_URL,
@@ -51,8 +50,8 @@ def _fetch_created_at_msec(user_id: int) -> Optional[int]:
 def get_user_age_hours(
     user_id: int,
     redis_client=None,
-    metrics: Optional[dict] = None,
-) -> Optional[int]:
+    metrics: dict | None = None,
+) -> int | None:
     now_msec = int(time.time() * 1000)
 
     cam = _LOCAL_CACHE.get(user_id)

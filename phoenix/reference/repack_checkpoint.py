@@ -13,12 +13,9 @@ import zlib
 from collections import namedtuple
 from pathlib import Path
 
-from xai_checkpointing import fix_jax
-
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
-
 from xai_checkpointing.tree_util import tree_to_dict
 
 _TAG = "orbax-ckpt"

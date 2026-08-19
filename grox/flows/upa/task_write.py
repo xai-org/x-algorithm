@@ -1,27 +1,27 @@
 import logging
 
-from grox.core.tasks.task import Task
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.upa.state_initial_banger import InitialBangerState
-from grox.flows.upa.state_post_safety import PostSafetyState
-from grox.core.tasks.disable_rules import DisableTaskForNonProd
+from strato_http.queries.data_types import (
+    EntityWithMetadata,
+    FoundMetadata,
+    QualifiedId,
+    UnifiedPostAnnotations,
+)
 from strato_http.queries.unified_post_annotations import (
     StratoUnifiedPostAnnotations,
     StratoUpsertTweetBoolMetadataToUnifiedPostAnnotations,
 )
+
 from grox.core.data_loaders.data_types import (
     Image,
     Video,
 )
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.disable_rules import DisableTaskForNonProd
+from grox.core.tasks.task import Task
 from grox.flows.upa.models import ContentCategoryScore
-from strato_http.queries.data_types import (
-    EntityWithMetadata,
-    FoundMetadata,
-    UnifiedPostAnnotations,
-    QualifiedId,
-)
-
+from grox.flows.upa.state_initial_banger import InitialBangerState
+from grox.flows.upa.state_post_safety import PostSafetyState
 
 logger = logging.getLogger(__name__)
 

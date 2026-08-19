@@ -13,9 +13,9 @@ import jax.numpy as jnp
 import jax.profiler as jax_profiler
 import numpy as np
 import numpy.typing as npt
-
 import xai_recsys_engine
 from xai_configlib import configclass
+
 from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.recsys import recsys_batch
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch

@@ -1,12 +1,14 @@
 import io
 import logging
 import math
-from enum import Enum
 from base64 import b64decode, b64encode
-from PIL import Image as PILImage
-from pydantic import Field, BaseModel, field_validator, field_serializer
+from enum import Enum
 
-from xai_sdk.chat import image as xai_image, text as xai_text, system, user, assistant
+from PIL import Image as PILImage
+from pydantic import BaseModel, Field, field_serializer, field_validator
+from xai_sdk.chat import assistant, system, user
+from xai_sdk.chat import image as xai_image
+from xai_sdk.chat import text as xai_text
 from xai_sdk.proto import chat_pb2
 
 from grox.config.config import grox_config

@@ -2,9 +2,9 @@ import logging
 from abc import abstractmethod
 from typing import override
 
-from grox.core.tasks.task import Task, TaskStopExecution
-from grox.core.schedules.types import TaskContext
 from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskStopExecution
 
 logger = logging.getLogger(__name__)
 

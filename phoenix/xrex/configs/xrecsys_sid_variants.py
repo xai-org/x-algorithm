@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-import xrex.configs.data_feeds
 from xrex.configs import config_registry
 
 

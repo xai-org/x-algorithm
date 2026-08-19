@@ -1,7 +1,6 @@
-import numpy as np
-
 import heads
 import labels
+import numpy as np
 
 
 def test_impression_farmer_sets_no_head():

@@ -6,13 +6,12 @@ import json
 import logging
 import time
 import typing
-from typing import Tuple
 
 import numpy as np
 import numpy.typing as npt
 import tensorstore as ts
-
 import xai_recsys_engine
+
 from xrex.train.trainer import TrainerContext
 from xrex.utils import ocdbt
 
@@ -22,7 +21,7 @@ NUM_INIT_THREADS = 2**7
 logger = logging.getLogger(__name__)
 
 
-def _create_aligned_array(shape: Tuple[int, ...], itemsize: int, dtype):
+def _create_aligned_array(shape: tuple[int, ...], itemsize: int, dtype):
     _buffer_size_bytes = functools.reduce(lambda x, y: x * y, shape) * itemsize
     buffer_size_bytes = _buffer_size_bytes + AVX_512_ALIGNMENT
     buffer = np.empty(buffer_size_bytes, dtype=np.uint8)
@@ -79,7 +78,7 @@ def load_embedding_table(
     )
     if verify_checksums:
         checksum = xai_recsys_engine.adler32_parallel(tensor_buffer)
-        with open(f"{ctx.checkpoint.path}/checksums.0.json", "r") as f:
+        with open(f"{ctx.checkpoint.path}/checksums.0.json") as f:
             saved = json.load(f)["global_checksums"]["emb_table"]
         if checksum != saved:
             raise ValueError("emb_table: checksum does not match")

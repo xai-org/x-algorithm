@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Optional
 
 import jax.numpy as jnp
-
 from xai_configlib import configclass
+
 from xrex.models.attention import AttentionConfig, CustomAttention
 from xrex.models.sharding_context import NamedShape
 
@@ -16,8 +15,8 @@ class RecsysAttentionConfig(AttentionConfig):
     num_user_prefix_tokens: int = 1
 
     attn_grad_clip: float = 0.0
-    q_seg_ids_fn: Optional[str] = None
-    k_seg_ids_fn: Optional[str] = None
+    q_seg_ids_fn: str | None = None
+    k_seg_ids_fn: str | None = None
 
 
 class PallasRankerAttention(CustomAttention):

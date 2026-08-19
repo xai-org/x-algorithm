@@ -1,13 +1,14 @@
 import uuid
 
 from grok_sampler.oai_sampler import OaiSampler
-from grox.flows.reply_spam.classifier_reply_ranking import ReplyScorer
+
 from grox.config.config import grox_config
 from grox.core.data_loaders.data_types import Post
 from grox.core.lm.convo import Conversation, Message, Role
 from grox.core.lm.thread import ThreadRenderer
-from grox.flows.reply_spam.prompts import reply_scoring_system_simple_prompt
+from grox.flows.reply_spam.classifier_reply_ranking import ReplyScorer
 from grox.flows.reply_spam.constants import GEMMA_2
+from grox.flows.reply_spam.prompts import reply_scoring_system_simple_prompt
 
 
 class SimpleReplyScorer(ReplyScorer):

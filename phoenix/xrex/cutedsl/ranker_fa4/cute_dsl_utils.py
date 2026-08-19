@@ -32,7 +32,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from functools import lru_cache
-from typing import Tuple
 
 import torch
 
@@ -68,7 +67,7 @@ def get_max_active_clusters(cluster_size):
 
 
 @lru_cache
-def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+def get_device_capacity(device: torch.device = None) -> tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
 
@@ -128,7 +127,7 @@ def get_aux_tensor_metadata(aux_tensors):
     )
 
 
-def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
+def get_broadcast_dims(tensor: torch.Tensor) -> tuple[bool, ...]:
     return tuple(s == 0 for s in tensor.stride())
 
 

@@ -12,12 +12,12 @@ from queue import Empty
 
 import aiohttp
 from cachetools import TTLCache
+from monitor.logging import Logging
+from monitor.metrics import Metrics
 from pydantic import BaseModel
 
 from grox.config.config import grox_config
 from grox.core.schedules.init import init_proc
-from monitor.logging import Logging
-from monitor.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class _ASRWorker:
                 error_msg = e.stderr.decode() if e.stderr else str(e)
                 logger.warning(f"FFmpeg error for post {request.post_id}: {error_msg}")
                 self._resp_queue.put(result(error=f"ffmpeg_error: {error_msg}"))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"ASR request timed out for post {request.post_id}")
                 self._resp_queue.put(result(error="asr_timeout"))
             except Exception as e:

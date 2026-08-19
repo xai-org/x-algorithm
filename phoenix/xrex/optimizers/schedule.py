@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from xai_configlib import Config, configclass
 

@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from xrex.driver.driver import (
     NUM_PHYSICAL_DEVICES_PER_NODE,
@@ -34,7 +34,7 @@ class LocalDriverConfig(DriverConfig):
     rank: int = 0
     world_size: int = 1
 
-    debug: Optional[str] = None
+    debug: str | None = None
 
     run_dir: str = "/tmp/runs"
 

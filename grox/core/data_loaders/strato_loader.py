@@ -1,15 +1,14 @@
 import asyncio
 import logging
 
-from grox.core.data_loaders.data_types import Post, User
 from strato_http.queries.content_understanding_author_metadata import (
     StratoContentUnderstandingAuthorMetadata,
 )
-from strato_http.queries.content_understanding_post_quote_metadata import (
-    StratoContentUnderstandingPostQuoteMetadata,
-)
 from strato_http.queries.content_understanding_metadata_v2 import (
     StratoContentUnderstandingMetadataV2,
+)
+from strato_http.queries.content_understanding_post_quote_metadata import (
+    StratoContentUnderstandingPostQuoteMetadata,
 )
 from strato_http.queries.is_grey_badge_user import StratoIsGreyBadgeUser
 from strato_http.queries.is_high_page_rank_v2_user import (
@@ -18,8 +17,9 @@ from strato_http.queries.is_high_page_rank_v2_user import (
 )
 from strato_http.queries.safety_label import StratoSafetyLabel
 from strato_http.queries.user_recent_posts import StratoUserRecentPosts
-from grox.core.data_loaders.post_mapper import PostMapper
 
+from grox.core.data_loaders.data_types import Post, User
+from grox.core.data_loaders.post_mapper import PostMapper
 
 logger = logging.getLogger(__name__)
 

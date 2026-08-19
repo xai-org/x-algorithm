@@ -232,4 +232,4 @@ def assign_sids(embeddings: np.ndarray, codebook_path: str | Path) -> np.ndarray
 
 
 if importlib.util.find_spec("sid_io_internal") is not None:
-    import sid_io_internal
+    pass

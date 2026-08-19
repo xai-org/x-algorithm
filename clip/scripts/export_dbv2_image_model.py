@@ -1,15 +1,14 @@
 from functools import partial
 
+from com.twitter.media_understanding.common.dbv2_utils.keras_export import (
+    DEFAULT_IMAGE_FEATURE_NAME,
+)
 from twitter.clip.model import (
     DEFAULT_CLIP_MODEL_TYPE,
     DEFAULT_FINAL_EMBEDDING_DIM,
     TwitterCLIP,
 )
 from twitter.clip.utils import data_utils
-
-from com.twitter.media_understanding.common.dbv2_utils.keras_export import (
-    DEFAULT_IMAGE_FEATURE_NAME,
-)
 
 
 def export_model(

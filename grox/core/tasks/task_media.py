@@ -1,8 +1,9 @@
-from grox.core.tasks.task import TaskWithPost
-from grox.core.schedules.types import TaskContext
+from monitor.metrics import Metrics
+
 from grox.core.data_loaders.data_types import Post
 from grox.core.data_loaders.media_processor import MediaProcessor
-from monitor.metrics import Metrics
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import TaskWithPost
 
 
 class TaskMediaHydration(TaskWithPost):

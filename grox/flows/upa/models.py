@@ -1,4 +1,3 @@
-from typing import Optional
 
 from pydantic import BaseModel
 
@@ -7,7 +6,7 @@ class ContentCategoryScore(BaseModel):
     id: int
     name: str
     score: float
-    category_id: Optional[int] = None
+    category_id: int | None = None
 
 
 class TweetBoolMetadata(BaseModel):

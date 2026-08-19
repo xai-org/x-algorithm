@@ -11,8 +11,8 @@ import jax
 import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
+
 from xrex.models.model_utils import Parameter
 from xrex.optimizers.recsys.async_emb_gradient_update import (
     AsyncEmbGradientUpdate,

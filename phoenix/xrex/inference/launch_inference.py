@@ -3,25 +3,22 @@
 import argparse
 import importlib
 import importlib.util
+import logging
 import os
 import random
-import logging
 import shutil
 import uuid
 
 from xrex.configs.xrecsys import CONFIGS as model_cfgs
 from xrex.configs.xrecsys_two_tower import CONFIGS as model_cfgs_two_tower
 from xrex.data.retrieval_dataset import RetrievalDataset
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
-from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
-from xrex.inference.model_runner import RankingModelRunner, RetrievalModelRunner
-from xrex.inference import service_registry
 from xrex.driver.config_factory import build_eval_configs
 from xrex.driver.run import pin_visible_devices, run_driver_train
+from xrex.inference import service_registry
+from xrex.inference.model_runner import RankingModelRunner, RetrievalModelRunner
+from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
 from xrex.utils import cluster
-
-import xrex.inference.sid_services
-import xrex.inference.serving_services
 
 for _family in ("xrex.inference.gen_recs_services",):
     if importlib.util.find_spec(_family) is not None:

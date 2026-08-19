@@ -2,16 +2,16 @@ import argparse
 import logging
 import os
 
+import torch
+import tqdm
+from torch import nn
+from torch.utils.tensorboard import SummaryWriter
 from twitter.clip.config import ClipConfig
 from twitter.clip.datasets.language_image_dataset import LanguageImageGcsDataset
 from twitter.clip.model import TwitterCLIP
 from twitter.clip.utils import train_utils
 
 import clip
-import torch
-from torch import nn
-from torch.utils.tensorboard import SummaryWriter
-import tqdm
 
 
 def parse_args():

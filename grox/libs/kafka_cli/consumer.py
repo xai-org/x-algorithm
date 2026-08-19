@@ -9,11 +9,12 @@ from aiokafka.coordinator.assignors.sticky.sticky_assignor import (
     StickyPartitionAssignor,
 )
 from aiokafka.structs import TopicPartition
-from kafka_cli.config import KafkaConsumerConfig, KafkaMessage
 from monitor.metrics import Metrics
 from tenacity import retry, stop_after_attempt, wait_incrementing
 from wily_cli.config import WilyConfig
 from wily_cli.wily_client import WilyNs
+
+from kafka_cli.config import KafkaConsumerConfig, KafkaMessage
 
 logger = logging.getLogger(__name__)
 

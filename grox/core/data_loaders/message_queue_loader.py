@@ -1,8 +1,8 @@
 import logging
-
 from abc import ABC, abstractmethod
-from grox.core.data_loaders.data_types import Post, User
 from collections.abc import AsyncGenerator
+
+from grox.core.data_loaders.data_types import Post, User
 from grox.core.schedules.types import ExtendableModel
 
 logger = logging.getLogger(__name__)

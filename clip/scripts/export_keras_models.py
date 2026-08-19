@@ -4,7 +4,6 @@ import socket
 import subprocess
 import tempfile
 
-
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 from twitter.clip import keras_model
@@ -16,7 +15,7 @@ def _rsync_to_packer(role, package_name, file_path):
     upload_dir = ".clip_keras"
     remote_path = os.path.join(upload_dir, os.path.basename(file_path))
     subprocess.check_call(
-        ["rsync", "-aPze", "ssh", file_path, "{}:{}/".format(nest, upload_dir)]
+        ["rsync", "-aPze", "ssh", file_path, f"{nest}:{upload_dir}/"]
     )
 
     for dc in ["atla", "pdxa"]:
@@ -24,9 +23,7 @@ def _rsync_to_packer(role, package_name, file_path):
             [
                 "ssh",
                 nest,
-                "packer add_version --cluster={} {} {} {}".format(
-                    dc, role, package_name, remote_path
-                ),
+                f"packer add_version --cluster={dc} {role} {package_name} {remote_path}",
             ]
         )
 

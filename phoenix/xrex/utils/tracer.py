@@ -17,8 +17,8 @@ from opentelemetry.sdk.trace.id_generator import IdGenerator
 from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
 from opentelemetry.util.types import Attributes, AttributeValue
 from serde import serde
-
 from xai_configlib import Config, configclass
+
 from xrex.utils import cluster
 
 logger = logging.getLogger("tracer")

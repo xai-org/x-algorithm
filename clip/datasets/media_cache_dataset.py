@@ -1,14 +1,13 @@
 import copy
-from functools import partial
 import importlib
 import os
+from functools import partial
 
-from twitter.clip.utils.data_utils import blobstore_fetch
-from twitter.magicpony.common import file_access
-
-from google.cloud import bigquery
 import pkg_resources
 import tensorflow as tf
+from google.cloud import bigquery
+from twitter.clip.utils.data_utils import blobstore_fetch
+from twitter.magicpony.common import file_access
 
 
 class MediaCacheBqDataset:

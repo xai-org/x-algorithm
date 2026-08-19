@@ -9,7 +9,6 @@ from strato_http.queries.reply_ranking_score_kafka_v2 import (
     StratoReplyRankingScoreV2Kafka,
 )
 
-
 logger = logging.getLogger(__name__)
 
 

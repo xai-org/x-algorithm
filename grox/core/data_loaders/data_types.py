@@ -1,15 +1,17 @@
 import re
-from urllib.parse import urlparse
-from typing import Any
 from datetime import datetime
+from typing import Any
+from urllib.parse import urlparse
 
 import thrifts.gen.twitter.strato.columns.content_understanding.content_understanding.ttypes as t
-from thrifts.serdes import Deserializer
 from pydantic import BaseModel
-from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
 from strato_http.queries.data_types import (
     Counts as StratoCounts,
 )
+from thrifts.serdes import Deserializer
+
+from grox.core.lm.convo import Image as ConvoImage
+from grox.core.lm.convo import Video as ConvoVideo
 
 
 class AffiliatedBusiness(BaseModel):

@@ -3,7 +3,6 @@ import re
 
 from pydantic import BaseModel
 
-
 logger = logging.getLogger(__name__)
 X_WORD_MS_PATTERN = (
     r"<X-word-ms ms=([^>]+) index=\d+ character_ranges=([^>]+)>([^<]+)</X-word-ms>"

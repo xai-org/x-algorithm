@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import threading
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp

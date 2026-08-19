@@ -1,9 +1,8 @@
+import logging
 import os
 import time
-import logging
 
 import httpx
-
 from monitor.metrics import Metrics
 
 from blobstore_http.blobstore import BlobstoreClientConfig, _BlobstoreClient

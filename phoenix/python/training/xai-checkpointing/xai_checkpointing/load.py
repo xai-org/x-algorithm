@@ -7,19 +7,18 @@ import os
 import pathlib
 import re
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
+import orbax.checkpoint as ocp
 import tensorstore as ts
 from jax.experimental.shard_map import shard_map
 
 from xai_checkpointing import (
     common,
-    fix_jax,
 )
 from xai_checkpointing.tree_util import has_subtree, tree_to_dict
-
-import orbax.checkpoint as ocp
 
 logger = logging.getLogger("checkpointing")
 rank_logger = logging.getLogger("rank")

@@ -1,7 +1,9 @@
 import pickle
+
 import numpy as np
 import pytest
-from runtime.pipeline_security import safe_pickle_loads, kafka_ssl_config
+
+from runtime.pipeline_security import kafka_ssl_config, safe_pickle_loads
 
 
 def test_numpy_roundtrip():

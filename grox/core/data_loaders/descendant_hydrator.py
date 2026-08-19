@@ -2,11 +2,12 @@ import asyncio
 import logging
 import traceback
 
-from grox.core.data_loaders.data_types import Post
-from grox.core.data_loaders.post_mapper import PostMapper
 from strato_http.queries.content_understanding_post_quote_metadata import (
     StratoContentUnderstandingPostQuoteMetadata,
 )
+
+from grox.core.data_loaders.data_types import Post
+from grox.core.data_loaders.post_mapper import PostMapper
 
 logger = logging.getLogger(__name__)
 

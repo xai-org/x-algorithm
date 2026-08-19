@@ -1,9 +1,8 @@
 import os
 from urllib.parse import urlparse
 
-from twitter.ml.common import hadoop
-
 from google.cloud import storage
+from twitter.ml.common import hadoop
 
 
 def maybe_download_file(url, local_dir=None, hdfs_config=None):

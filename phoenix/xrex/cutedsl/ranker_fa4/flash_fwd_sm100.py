@@ -62,8 +62,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import math
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Literal, NamedTuple, Optional, Tuple
+from typing import Literal, NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -192,9 +193,9 @@ _FP8_SMALL_HDIM_REGS = {
 
 
 class DescaleTensors(NamedTuple):
-    q_descale: Optional[cute.Tensor] = None
-    k_descale: Optional[cute.Tensor] = None
-    v_descale: Optional[cute.Tensor] = None
+    q_descale: cute.Tensor | None = None
+    k_descale: cute.Tensor | None = None
+    v_descale: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         return DescaleTensors(*((*values, None, None, None)[:3]))
@@ -204,7 +205,7 @@ class FlashAttentionForwardSm100:
     def __init__(
         self,
         head_dim: int,
-        head_dim_v: Optional[int] = None,
+        head_dim_v: int | None = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
@@ -440,19 +441,19 @@ class FlashAttentionForwardSm100:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
+        mLSE: cute.Tensor | None,
         softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: cute.Tensor | None = None,
+        mCuSeqlensK: cute.Tensor | None = None,
+        mSeqUsedQ: cute.Tensor | None = None,
+        mSeqUsedK: cute.Tensor | None = None,
+        mPageTable: cute.Tensor | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        descale_tensors: Optional[DescaleTensors] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_tensors: Optional[list] = None,
+        learnable_sink: cute.Tensor | None = None,
+        descale_tensors: DescaleTensors | None = None,
+        blocksparse_tensors: BlockSparseTensors | None = None,
+        aux_tensors: list | None = None,
         stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
@@ -837,35 +838,35 @@ class FlashAttentionForwardSm100:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
-        mCuSeqlensQ: Optional[cute.Tensor],
-        mCuSeqlensK: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
-        mSeqUsedK: Optional[cute.Tensor],
-        mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: Optional[cute.CopyAtom],
-        tma_atom_K: Optional[cute.CopyAtom],
-        tma_atom_V: Optional[cute.CopyAtom],
-        tma_atom_O: Optional[cute.CopyAtom],
+        mLSE: cute.Tensor | None,
+        mCuSeqlensQ: cute.Tensor | None,
+        mCuSeqlensK: cute.Tensor | None,
+        mSeqUsedQ: cute.Tensor | None,
+        mSeqUsedK: cute.Tensor | None,
+        mPageTable: cute.Tensor | None,
+        tma_atom_Q: cute.CopyAtom | None,
+        tma_atom_K: cute.CopyAtom | None,
+        tma_atom_V: cute.CopyAtom | None,
+        tma_atom_O: cute.CopyAtom | None,
         softmax_scale_log2: Float32,
         softmax_scale: Float32 | None,
-        window_size_left: Optional[Int32],
-        window_size_right: Optional[Int32],
-        learnable_sink: Optional[cute.Tensor],
-        descale_tensors: Optional[DescaleTensors],
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        window_size_left: Int32 | None,
+        window_size_right: Int32 | None,
+        learnable_sink: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
+        blocksparse_tensors: BlockSparseTensors | None,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
-        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
-        gmem_tiled_copy_O: Optional[cute.TiledCopy],
+        gmem_tiled_copy_Q: cute.TiledCopy | None,
+        gmem_tiled_copy_O: cute.TiledCopy | None,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
-        aux_tensors: Optional[list] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
     ):
@@ -1314,17 +1315,17 @@ class FlashAttentionForwardSm100:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
-        mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: Optional[cute.CopyAtom],
-        tma_atom_K: Optional[cute.CopyAtom],
-        tma_atom_V: Optional[cute.CopyAtom],
-        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
+        mPageTable: cute.Tensor | None,
+        tma_atom_Q: cute.CopyAtom | None,
+        tma_atom_K: cute.CopyAtom | None,
+        tma_atom_V: cute.CopyAtom | None,
+        gmem_tiled_copy_Q: cute.TiledCopy | None,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: BlockSparseTensors | None,
         tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
@@ -1551,7 +1552,7 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: BlockSparseTensors | None,
         tile_scheduler=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
@@ -1751,10 +1752,10 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def _load_effective_descales(
         self,
-        descale_tensors: Optional[DescaleTensors],
+        descale_tensors: DescaleTensors | None,
         batch_idx: Int32,
         kv_head_idx: Int32,
-    ) -> Tuple[Float32, Float32]:
+    ) -> tuple[Float32, Float32]:
         qk_descale = Float32(1.0)
         v_descale = Float32(1.0)
         if cutlass.const_expr(descale_tensors is not None):
@@ -1772,25 +1773,25 @@ class FlashAttentionForwardSm100:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32 | None,
-        descale_tensors: Optional[DescaleTensors],
+        descale_tensors: DescaleTensors | None,
         thr_mma_qk: cute.core.ThrMma,
         tStS: cute.Tensor,
         sScale: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
+        mLSE: cute.Tensor | None,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
         sm_stats_barrier: pipeline.NamedBarrier,
-        pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
-        learnable_sink: Optional[cute.Tensor],
+        pipeline_s0_s1_sequence: pipeline.PipelineAsync | None,
+        learnable_sink: cute.Tensor | None,
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
-        aux_tensors: Optional[list] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: BlockSparseTensors | None = None,
         tile_scheduler=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * (len(self.softmax0_warp_ids)))
@@ -2115,7 +2116,7 @@ class FlashAttentionForwardSm100:
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
         sm_stats_barrier: pipeline.NamedBarrier,
-        pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
+        pipeline_s0_s1_sequence: pipeline.PipelineAsync | None,
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: cute.CopyAtom,
         thr_tmem_store_scale: cute.CopyAtom,
@@ -2128,12 +2129,12 @@ class FlashAttentionForwardSm100:
         head_idx: Int32,
         m_block: Int32,
         seqlen,
-        aux_tensors: Optional[list] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        mask_fn: Optional[Callable] = None,
+        mask_fn: Callable | None = None,
         is_first: bool = False,
-    ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
+    ) -> tuple[cute.Int32, cute.Int32, cute.Int32]:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2222,15 +2223,15 @@ class FlashAttentionForwardSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_o_epi: pipeline.PipelineAsync,
-        learnable_sink: Optional[cute.Tensor],
-        descale_tensors: Optional[DescaleTensors],
+        learnable_sink: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
         softmax_scale_log2: Float32,
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: BlockSparseTensors | None = None,
         tile_scheduler=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
@@ -2573,9 +2574,9 @@ class FlashAttentionForwardSm100:
         seqlen_q: Int32,
         scale: Float32,
         sO: cute.Tensor,
-        mO_cur: Optional[cute.Tensor] = None,
-        gO: Optional[cute.Tensor] = None,
-        gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        mO_cur: cute.Tensor | None = None,
+        gO: cute.Tensor | None = None,
+        gmem_tiled_copy_O: cute.TiledCopy | None = None,
     ):
         corr_tile_size = 8 * 32 // self.o_dtype.width
         tOsO = thr_mma.get_slice(0).partition_C(sO)
@@ -2633,7 +2634,7 @@ class FlashAttentionForwardSm100:
     def _store_O_to_gmem(
         self,
         sO_stage: cute.Tensor,
-        gO: Optional[cute.Tensor],
+        gO: cute.Tensor | None,
         mO_cur: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
         tidx: Int32,
@@ -2677,7 +2678,7 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,
         sO: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
-        tma_atom_O: Optional[cute.CopyAtom],
+        tma_atom_O: cute.CopyAtom | None,
         pipeline_o_epi: pipeline.PipelineAsync,
         block_info: BlockInfo,
         num_splits: int,
@@ -2831,17 +2832,17 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def load_KV(
         self,
-        tma_atom: Optional[cute.CopyAtom],
-        tXgX: Optional[cute.Tensor],
-        tXsX: Optional[cute.Tensor],
-        paged_kv_manager: Optional[PagedKVManager],
+        tma_atom: cute.CopyAtom | None,
+        tXgX: cute.Tensor | None,
+        tXsX: cute.Tensor | None,
+        paged_kv_manager: PagedKVManager | None,
         sX: cute.Tensor,
         block: Int32,
         pipeline_kv: pipeline.PipelineAsync,
         producer_state: pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
-        page_idx: Optional[Int32] = None,
-        extra_tx_count: Optional[Int32] = None,
+        page_idx: Int32 | None = None,
+        extra_tx_count: Int32 | None = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase

@@ -1,30 +1,30 @@
-import os
-import struct
-import uuid
 import asyncio
 import logging
+import os
+import struct
 import traceback
+import uuid
 from abc import abstractmethod
-from typing import override
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
+from typing import override
 
 from kafka_cli.config import KafkaMessage
-from grox.config.config import grox_config
 from kafka_cli.consumer import KafkaConsumer
 from kafka_cli.multi_region_consumer import MultiRegionKafkaConsumer
 from limits import RateLimitItemPerSecond, storage, strategies
+from monitor.metrics import Metrics
+from thrifts.gen.twitter.strato.columns.content_understanding.content_understanding.ttypes import (
+    SimpleTweetEmbedding,
+)
+from thrifts.serdes import Deserializer
+
+from grox.config.config import grox_config
 from grox.core.data_loaders.data_types import Post
 from grox.core.data_loaders.message_queue_loader import (
     MessageQueueLoader,
     MessageQueuePayload,
 )
-from monitor.metrics import Metrics
-from thrifts.serdes import Deserializer
-from thrifts.gen.twitter.strato.columns.content_understanding.content_understanding.ttypes import (
-    SimpleTweetEmbedding,
-)
-
 
 logger = logging.getLogger(__name__)
 MAX_WORKING_THREADS = 12
@@ -97,7 +97,7 @@ class KafkaLoader(MessageQueueLoader):
         try:
             if self._prefetcher_task:
                 await asyncio.wait_for(self._prefetcher_task, 5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 f"Waiting prefetcher to stop timed out, topic: {self.topic_name}"
             )

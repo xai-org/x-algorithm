@@ -5,14 +5,14 @@ from __future__ import annotations
 import dataclasses
 import logging
 import traceback
+from collections.abc import Iterator
 from pathlib import Path
 from queue import Full, Queue
 from threading import Event, Thread
-from typing import Iterator
 
 import pyarrow.parquet as pq
-
 from xai_configlib import configclass
+
 from xrex.data import rust_ext
 from xrex.data.parquet_recsys import PhoenixDataset, pad_batch
 from xrex.data.parquet_recsys_metadata import (

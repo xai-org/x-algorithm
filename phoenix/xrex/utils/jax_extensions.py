@@ -6,8 +6,9 @@ import logging
 import os
 import sys
 import unittest
+from collections.abc import Callable
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 import jax.lax
 import jaxlib.mlir.ir as ir
@@ -74,7 +75,7 @@ def check_jax_cuda_version():
         with open("/sys/module/nvidia/version") as f:
             cuda_driver_version = f.read().strip()
         rank_logger.info(f"Running with CUDA driver version: {cuda_driver_version}")
-    except IOError:
+    except OSError:
         rank_logger.error("Could not read CUDA driver version")
 
     rank_logger.info(

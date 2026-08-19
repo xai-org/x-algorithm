@@ -32,8 +32,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, TypeAlias
+from typing import TypeAlias
 
 import cutlass
 import cutlass.cute as cute
@@ -96,8 +97,8 @@ class AttentionMask:
     tile_m: cutlass.Constexpr[int]
     tile_n: cutlass.Constexpr[int]
     seqlen_info: SeqlenInfoQK
-    window_size_left: Optional[Int32] = None
-    window_size_right: Optional[Int32] = None
+    window_size_left: Int32 | None = None
+    window_size_right: Int32 | None = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     swap_AB: cutlass.Constexpr[bool] = False
 
@@ -121,8 +122,8 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
-        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
-        aux_tensors: Optional[list] = None,
+        mask_mod: cutlass.Constexpr[Callable | None] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -352,16 +353,16 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
-        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        mask_mod: cutlass.Constexpr[Callable | None] = None,
         mask_diagonal: cutlass.Constexpr[bool] = False,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
-        aux_tensors: Optional[list] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
         r2p: bool = True,
-        rBitmask: Optional[cute.Tensor] = None,
+        rBitmask: cute.Tensor | None = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         assert not (mask_diagonal and (mask_causal or mask_local or mask_mod is not None)), (
@@ -544,10 +545,10 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr,
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
-        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        mask_mod: cutlass.Constexpr[Callable | None] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
-        aux_tensors: Optional[list] = None,
+        aux_tensors: list | None = None,
         fastdiv_mods=(None, None),
         is_full_block: bool = False,
         is_diagonal_block: bool = False,
@@ -730,8 +731,8 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
     ) -> Int32:
         result = 0
         offset = 0
@@ -787,9 +788,9 @@ class Sm100FusedMask:
         seqlen_k: Int32,
         is_causal: cutlass.Constexpr[bool] = False,
         is_local: cutlass.Constexpr[bool] = False,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
-    ) -> Tuple[Int32, Int32]:
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
+    ) -> tuple[Int32, Int32]:
         block_info = BlockInfo(
             tile_m=tile_shape[0],
             tile_n=tile_shape[1],
@@ -825,9 +826,9 @@ class Sm100FusedMask:
         seqlen_k: Int32,
         is_causal: cutlass.Constexpr[bool] = False,
         is_local: cutlass.Constexpr[bool] = False,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
-    ) -> Tuple[Int32, Int32]:
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
+    ) -> tuple[Int32, Int32]:
         block_info = BlockInfo(
             tile_m=tile_shape[0],
             tile_n=tile_shape[1],
@@ -867,8 +868,8 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
     ) -> Int32:
         result = 0
         offset = 0
@@ -903,9 +904,9 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
-    ) -> Tuple[Int32, Int32]:
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
+    ) -> tuple[Int32, Int32]:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -961,9 +962,9 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
-    ) -> Tuple[Optional[Int32], Optional[Int32]]:
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
+    ) -> tuple[Int32 | None, Int32 | None]:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -1027,8 +1028,8 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
     ) -> Int32:
         result = 0
         if cutlass.const_expr(
@@ -1056,9 +1057,9 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
-        rem_count: Optional[Int32] = 0,
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
+        rem_count: Int32 | None = 0,
     ) -> Int32:
         result = 0
 
@@ -1107,8 +1108,8 @@ class Sm100FusedMask:
         tile_shape: cute.Shape,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | None = None,
+        window_size_right: Int32 | None = None,
     ) -> Int32:
         result = (
             Sm100FusedMask.get_trip_count(
@@ -1149,17 +1150,15 @@ class Sm100FusedMask:
         index_qk: cute.Tensor,
         seqlen_q: Int32,
         seqlen_k: Int32,
-        window_size_left: Optional[int] = None,
-        window_size_right: Optional[int] = None,
+        window_size_left: int | None = None,
+        window_size_right: int | None = None,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
             index_k,
         ),
     ):
         offset = 0
-        if cutlass.const_expr(window_size_left is None and window_size_right is not None):
-            offset = seqlen_k - seqlen_q
-        elif cutlass.const_expr(
+        if cutlass.const_expr(window_size_left is None and window_size_right is not None) or cutlass.const_expr(
             mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE
             or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
@@ -1201,8 +1200,8 @@ class Sm100FusedMask:
         apply_semantic_window: cutlass.Constexpr[bool] = True,
         is_causal: cutlass.Constexpr[bool] = False,
         is_local: cutlass.Constexpr[bool] = False,
-        window_size_left: Optional[int] = None,
-        window_size_right: Optional[int] = None,
+        window_size_left: int | None = None,
+        window_size_right: int | None = None,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
             index_k,

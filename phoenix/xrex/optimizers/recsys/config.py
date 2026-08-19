@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import optax
-
 from xai_configlib import Config, configclass
+
 from xrex.optimizers.recsys.protocol import RecsysEmbeddingOptimizer
 from xrex.optimizers.recsys.rowwise_adagrad import (
     RecsysRowwiseAdagradConfig,

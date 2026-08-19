@@ -12,9 +12,9 @@ import jax.profiler as jax_profiler
 import numpy as np
 import numpy.typing as npt
 import pyarrow.parquet as pq
-
 import xai_recsys_engine
 from xai_configlib import configclass
+
 from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE

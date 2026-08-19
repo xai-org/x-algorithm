@@ -6,9 +6,10 @@ import logging
 import queue
 import threading
 import time
-from typing import Iterator
+from collections.abc import Iterator
 
 from xai_configlib import configclass
+
 from xrex.data import rust_ext
 from xrex.data.parquet_recsys import load_global_ids_from_parquet_file
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
@@ -17,7 +18,6 @@ from xrex.data.streaming.kafkaloader import (
     PhoenixKafkaDataset,
     _resolve_sasl_password,
 )
-
 
 rank_logger = logging.getLogger("rank")
 

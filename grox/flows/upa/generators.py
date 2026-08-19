@@ -1,7 +1,5 @@
 from grox.core.data_loaders.kafka_loader import KafkaPostLoader
 from grox.core.generators.stream_generator import StreamTaskGenerator
-from grox.flows.upa.plan_initial_banger import PlanInitialBanger
-from grox.flows.upa.plan_post_safety import PlanPostSafety
 from grox.core.registry import register
 from grox.flows.upa.constants import (
     POST_MIN_TRACTION_STREAM_FOR_GROX,
@@ -11,6 +9,8 @@ from grox.flows.upa.constants import (
     TOPIC_POPULAR,
     TOPIC_RECOVERY,
 )
+from grox.flows.upa.plan_initial_banger import PlanInitialBanger
+from grox.flows.upa.plan_post_safety import PlanPostSafety
 
 
 @register

@@ -4,10 +4,8 @@ import subprocess
 import tempfile
 import zipfile
 
-from twitter.clip.utils import data_utils
-
 import tensorflow as tf
-
+from twitter.clip.utils import data_utils
 
 OPEN_SOURCE_MODELS = ["ViT-B/32"]
 TWITTER_MODELS = ["Twitter-ViT-B/32-256", "Twitter-ViT-B/32-128"]

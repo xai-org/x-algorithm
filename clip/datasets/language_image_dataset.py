@@ -1,12 +1,13 @@
 from functools import partial
 
+import tensorflow as tf
 from twitter.clip.utils.data_utils import (
     clean_text as clean_text_fn,
+)
+from twitter.clip.utils.data_utils import (
     get_clip_decode_and_proc_fn,
     read_tfrecords_from_gcs,
 )
-
-import tensorflow as tf
 
 
 class LanguageImageGcsDataset:

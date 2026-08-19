@@ -1,14 +1,15 @@
-import time
 import asyncio
 import logging
+import time
 import traceback
 from abc import ABC
 from functools import cache
 
-from grox.core.lib.utils import camel_to_snake
-from grox.core.tasks.task import Task, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskResult, TaskContext, TaskPayload
+
+from grox.core.lib.utils import camel_to_snake
+from grox.core.schedules.types import TaskContext, TaskPayload, TaskResult
+from grox.core.tasks.task import Task, TaskResultCategory
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class Plan(ABC):
         deps = self.TASK_DEPENDENCIES.get(task_name, set())
         dep_futures = [dependencies[d] for d in deps]
         dep_results = await asyncio.gather(*dep_futures)
-        task_future = dependencies.get(task_name, None)
+        task_future = dependencies.get(task_name)
         if any(r == TaskResultCategory.SKIPPED for r in dep_results):
             if task_future is not None:
                 task_future.set_result(TaskResultCategory.SKIPPED)

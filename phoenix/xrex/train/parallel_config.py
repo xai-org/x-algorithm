@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from xai_configlib import Config, configclass
+
 from xrex.utils.gpu import NUM_PHYSICAL_DEVICES_PER_NODE
 
 

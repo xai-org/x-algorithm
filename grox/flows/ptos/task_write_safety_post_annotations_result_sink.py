@@ -2,45 +2,46 @@ import asyncio
 import logging
 import time
 
-from grox.core.tasks.task import Task
-from grox.flows.ptos.constants import HIGH_FAV_THRESHOLD
-from grox.flows.ptos.disable_rules import DisableTaskForNonPtosProd
 from monitor.metrics import Metrics
-from grox.core.schedules.types import TaskContext
-from grox.flows.ptos.state import SafetyPtosState
-from grox.core.data_loaders.data_types import Image, Video, Post
-from grox.core.data_loaders.strato_loader import UserStratoLoader
-from grox.core.lm.post import PostRenderer
-from strato_http.queries.data_types import (
-    SafetyPostAnnotations,
-    SafetyPostAnnotationsResult,
-    SafetyBoolMetadata,
-    SafetyPtosViolatedPolicy,
-    SafetyPolicy,
-    SafetyPolicyCategory,
-    SafetyPolicyType,
-    FoundMetadata,
-)
-from strato_http.queries.safety_post_annotations_result import (
-    StratoSafetyPostAnnotationsResultMh,
-    StratoSafetyPostAnnotationsResultDirectMh,
-    StratoSafetyPostAnnotationsResultKafka,
-)
 from strato_http.queries.apply_label_from_ptos import (
-    StratoApplyLabelFromPtos,
     SafetyLabelType,
+    StratoApplyLabelFromPtos,
 )
 from strato_http.queries.bounce_post_for_self_harm_encouragement import (
     StratoBouncePostForSelfHarmEncouragement,
 )
+from strato_http.queries.data_types import (
+    FoundMetadata,
+    SafetyBoolMetadata,
+    SafetyPolicy,
+    SafetyPolicyCategory,
+    SafetyPolicyType,
+    SafetyPostAnnotations,
+    SafetyPostAnnotationsResult,
+    SafetyPtosViolatedPolicy,
+)
 from strato_http.queries.grok_ptos_delete_labels import StratoGrokPtosDeleteLabels
 from strato_http.queries.is_test_user import StratoIsTestUser
+from strato_http.queries.safety_post_annotations_result import (
+    StratoSafetyPostAnnotationsResultDirectMh,
+    StratoSafetyPostAnnotationsResultKafka,
+    StratoSafetyPostAnnotationsResultMh,
+)
 from strato_http.queries.send_support_messages_for_self_harm import (
     StratoSendSupportMessagesForSelfHarm,
 )
 from strato_http.queries.suspend_user_for_child_sexual_exploitation import (
     StratoSuspendUserForChildSexualExploitation,
 )
+
+from grox.core.data_loaders.data_types import Image, Post, Video
+from grox.core.data_loaders.strato_loader import UserStratoLoader
+from grox.core.lm.post import PostRenderer
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task
+from grox.flows.ptos.constants import HIGH_FAV_THRESHOLD
+from grox.flows.ptos.disable_rules import DisableTaskForNonPtosProd
+from grox.flows.ptos.state import SafetyPtosState
 
 logger = logging.getLogger(__name__)
 

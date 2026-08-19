@@ -1,7 +1,9 @@
 import re
 
-from grox.core.lm.convo import Content, Image as ConvoImage, Video as ConvoVideo
 from grox.core.data_loaders.data_types import Post, User
+from grox.core.lm.convo import Content
+from grox.core.lm.convo import Image as ConvoImage
+from grox.core.lm.convo import Video as ConvoVideo
 
 
 def remove_tco_links(text, remove_twitter_links: bool = False):

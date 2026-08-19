@@ -2,16 +2,16 @@
 # Copyright 2026 X.AI Corp.
 import functools
 import inspect
-from typing import Any, Callable, Iterable, NamedTuple, Union
+from collections.abc import Callable, Iterable
+from typing import Any, NamedTuple
 
 import chex
 import jax
 import jax.numpy as jnp
 import optax
-
 from xai_configlib import Config, configclass
-from xrex.models.model_utils import Parameter
 
+from xrex.models.model_utils import Parameter
 from xrex.optimizers.schedule import BaseSchedule
 
 
@@ -33,7 +33,7 @@ class InjectHyperparamsState(NamedTuple):
 
 def inject_hyperparams(
     inner_factory: Callable[..., optax.GradientTransformation],
-    static_args: Union[str, Iterable[str]] = (),
+    static_args: str | Iterable[str] = (),
 ) -> Callable[..., optax.GradientTransformationExtraArgs]:
     static_args = {static_args} if isinstance(static_args, str) else set(static_args)
     inner_signature = inspect.signature(inner_factory)

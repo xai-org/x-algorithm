@@ -1,6 +1,5 @@
-import numpy as np
-
 import feature_norm
+import numpy as np
 
 
 def test_normalize_rewrites_action_group_from_one_hot():

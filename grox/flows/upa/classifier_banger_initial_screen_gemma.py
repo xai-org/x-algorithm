@@ -1,25 +1,26 @@
-import re
-import uuid
 import logging
+import re
 import traceback
+import uuid
 
-from grox.core.lm.post import PostRenderer
-from grox.core.lm.user import UserRenderer
+from grok_sampler.oai_sampler import OaiSampler
+from pydantic import BaseModel
+
+from grox.config.config import grox_config
+from grox.core.data_loaders.data_types import Post
 from grox.core.lm.convo import (
     THINKING_CONTROL_END,
     THINKING_CONTROL_START,
-    Role,
-    Message,
     Conversation,
+    Message,
+    Role,
 )
-from grox.config.config import grox_config
-from grox.flows.upa.prompts import banger_mini_vlm_screen_score_gemma_prompt
-from grok_sampler.oai_sampler import OaiSampler
-from grox.core.data_loaders.data_types import Post
-from grox.flows.upa.models import ContentCategoryScore, TweetBoolMetadata
-from grox.flows.upa.state_initial_banger import BangerScreenResult
-from pydantic import BaseModel
+from grox.core.lm.post import PostRenderer
+from grox.core.lm.user import UserRenderer
 from grox.flows.upa.constants import GEMMA_UPA
+from grox.flows.upa.models import ContentCategoryScore, TweetBoolMetadata
+from grox.flows.upa.prompts import banger_mini_vlm_screen_score_gemma_prompt
+from grox.flows.upa.state_initial_banger import BangerScreenResult
 
 logger = logging.getLogger(__name__)
 

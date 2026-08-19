@@ -1,8 +1,5 @@
 from typing import override
 
-from grox.core.data_loaders.data_types import Post
-from grox.core.schedules.types import TaskContext
-from grox.core.tasks.task_filters import TaskFilterWithPost
 from monitor.metrics import Metrics
 from strato_http.queries.grok_ptos_in_progress_dedup_cache import (
     StratoGrokPtosInProgressDedupCache,
@@ -12,6 +9,10 @@ from strato_http.queries.grok_ptos_in_progress_dedup_cache import (
 from strato_http.queries.safety_post_annotations_result import (
     StratoSafetyPostAnnotationsResultDirectMh,
 )
+
+from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task_filters import TaskFilterWithPost
 from grox.flows.ptos.constants import (
     POST_MIN_IMPRESSION_STREAM_FOR_GROX_PTOS,
     POST_MIN_TRACTION_STREAM_FOR_GROX_PTOS,

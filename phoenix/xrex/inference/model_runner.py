@@ -15,7 +15,7 @@ import time
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeVar, Union, final
+from typing import Any, Generic, Protocol, TypeVar, final
 
 import haiku as hk
 import jax
@@ -24,9 +24,8 @@ import jax.profiler as jax_profiler
 import numpy as np
 import numpy.typing as npt
 import pyarrow.parquet as pq
-from jax.sharding import PartitionSpec as P
-
 import xai_recsys_engine
+from jax.sharding import PartitionSpec as P
 from xai_checkpointing.common import _unsafe_jax2np
 from xai_checkpointing.tree_util import (
     keystr,
@@ -38,6 +37,7 @@ from xai_recsys_engine import (
     RankingBatchPrep,
     RetrievalBatchPrep,
 )
+
 from xrex.configs.xrecsys_two_tower import RecsysTwoTowerModelConfig
 from xrex.cuda import adler32
 from xrex.data.parquet_recsys import (
@@ -2794,7 +2794,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         request: RequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
-    ) -> Union[jax.Array, np.ndarray, tuple[jax.Array, jax.Array, jax.Array]]:
+    ) -> jax.Array | np.ndarray | tuple[jax.Array, jax.Array, jax.Array]:
         raise NotImplementedError
 
     @abstractmethod

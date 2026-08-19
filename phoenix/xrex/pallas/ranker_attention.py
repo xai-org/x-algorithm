@@ -18,7 +18,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import functools
-from typing import Any, Optional
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -182,7 +182,7 @@ def mha(
     block_q: int = BLOCK_Q,
     block_k: int = BLOCK_K,
     backward_pass_impl: str = "triton",
-    num_warps: Optional[int] = None,
+    num_warps: int | None = None,
     num_stages: int = 2,
     grid=None,
     interpret: bool = False,
@@ -262,7 +262,7 @@ def _mha_forward(
     block_q: int,
     block_k: int,
     backward_pass_impl: str,
-    num_warps: Optional[int],
+    num_warps: int | None,
     num_stages: int,
     grid: Any,
     interpret: bool,
@@ -614,7 +614,7 @@ def _mha_backward(
     block_q: int,
     block_k: int,
     backward_pass_impl: str,
-    num_warps: Optional[int],
+    num_warps: int | None,
     num_stages: int,
     grid: Any,
     interpret: bool,

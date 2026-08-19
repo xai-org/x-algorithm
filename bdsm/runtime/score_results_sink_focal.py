@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 
 import argparse
+import dataclasses
 import datetime
 import logging
 import os
-import time
 import threading
+import time
 import uuid as _uuid
 import zlib
-import dataclasses
 from dataclasses import dataclass, field
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
-
 from gizmoduck_age import get_user_age_hours
 from login_starter_pack_counter import get_login_pack_age_minutes
 from pipeline_security import kafka_ssl_config, safe_pickle_loads
@@ -193,8 +192,8 @@ def client_dwell_dropout(r, uid: int, args, metrics) -> bool:
             pass
     metrics["dwell_dropout_checks"] = metrics.get("dwell_dropout_checks", 0) + 1
     try:
-        import urllib.request
         import json as _json
+        import urllib.request
 
         url = args.dwell_dropout_check_url.rstrip("/") + f"/client_dwell_dropout/{uid}"
         with urllib.request.urlopen(url, timeout=args.dwell_dropout_timeout_sec) as resp:
@@ -1450,8 +1449,8 @@ def main():
 
     _start_health_server(args, metrics, liveness_cfg)
 
-    from confluent_kafka import Consumer, Producer, KafkaError
     import zstandard as zstd
+    from confluent_kafka import Consumer, KafkaError, Producer
 
     try:
         from proto_gen import abuse_inference_pb2 as pb

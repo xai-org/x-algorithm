@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import grpc
-
 from xai_proto import recsys_pb2, recsys_pb2_grpc
 
 logger = logging.getLogger("oss_bench")

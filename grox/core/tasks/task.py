@@ -4,12 +4,13 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from functools import cache
 
-from tenacity import retry, wait_fixed, stop_after_attempt
-from grox.core.lib.utils import camel_to_snake
 from monitor.metrics import Metrics
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+from grox.core.data_loaders.data_types import Post, User
+from grox.core.lib.utils import camel_to_snake
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.disable_rules import DisableTaskRule
-from grox.core.data_loaders.data_types import Post, User
 
 logger = logging.getLogger(__name__)
 

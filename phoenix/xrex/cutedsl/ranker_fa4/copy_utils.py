@@ -32,7 +32,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import math
-from typing import Callable, Optional, Type
+from collections.abc import Callable
 
 import cutlass
 import cutlass.cute as cute
@@ -50,7 +50,7 @@ def cvt_copy(
     src: cute.Tensor,
     dst: cute.Tensor,
     *,
-    pred: Optional[cute.Tensor] = None,
+    pred: cute.Tensor | None = None,
     loc=None,
     ip=None,
     **kwargs,
@@ -72,7 +72,7 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 @dsl_user_op
 def get_copy_atom(
-    dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
+    dtype: type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
 ) -> cute.CopyAtom:
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
@@ -98,7 +98,7 @@ def copy(
     src: cute.Tensor,
     dst: cute.Tensor,
     *,
-    pred: Optional[cute.Tensor] = None,
+    pred: cute.Tensor | None = None,
     num_copy_elems: int = 1,
     is_async: bool = False,
     loc=None,
@@ -110,7 +110,7 @@ def copy(
 
 
 def tiled_copy_1d(
-    dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
+    dtype: type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
 ) -> cute.TiledCopy:
     num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
@@ -121,7 +121,7 @@ def tiled_copy_1d(
 
 
 def tiled_copy_2d(
-    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
+    dtype: type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
 ) -> cute.TiledCopy:
     num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
     copy_elems = num_copy_bits // dtype.width

@@ -6,6 +6,8 @@ from kafka_cli.producer import KafkaProducer
 from monitor.metrics import Metrics
 from strato_http.queries.data_types import (
     SafetyPostAnnotations as StratoSafetyPostAnnotations,
+)
+from strato_http.queries.data_types import (
     SafetyPtosViolatedPolicy as StratoSafetyPtosViolatedPolicy,
 )
 from strato_http.queries.live_cluster_anchor_verdict_mh import (

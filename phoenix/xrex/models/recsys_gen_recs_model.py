@@ -12,8 +12,8 @@ import jax.numpy as jnp
 from jax import shard_map
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import configclass
+
 from xrex.data.recsys.gen_recs_semantics import (
     build_global_negative_target_embeddings,
     build_target_embeddings_from_batch,
@@ -45,7 +45,7 @@ INF = 1e12
 
 
 def autoregressive_generate(
-    model: "RecsysGenRecsModel",
+    model: RecsysGenRecsModel,
     input_embeddings: jax.Array,
     padding_mask: jax.Array,
     num_generate: int,

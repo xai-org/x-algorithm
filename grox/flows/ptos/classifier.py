@@ -1,25 +1,33 @@
+import asyncio
 import logging
 import random
 import re
-import asyncio
 import traceback
 import uuid
 from datetime import datetime
 
+from circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpen
+from grok_sampler.config import EapiModelConfig, GrokModelConfig
+from grok_sampler.eapi_sampler import EapiSampler
+from grok_sampler.oai_sampler import OaiSampler
+from grok_sampler.vision_sampler import VisionSampler
+from monitor.metrics import Metrics
+
+from grox.config.config import ModelName, grox_config
+from grox.core.data_loaders.data_types import Post
 from grox.core.lm.convo import (
     NO_THINKING_PROMPT,
     THINKING_CONTROL_END,
     THINKING_CONTROL_START,
-    Role,
-    Message,
     Conversation,
+    Message,
+    Role,
 )
 from grox.core.lm.post import PostRenderer
 from grox.core.lm.thread import ThreadRenderer
 from grox.core.lm.user import UserRenderer
-from grox.config.config import ModelName, grox_config
+from grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD
 from grox.flows.ptos.mode import SafetyPtosMode
-from grok_sampler.config import GrokModelConfig, EapiModelConfig
 from grox.flows.ptos.prompts import (
     adult_content_policy_prompt,
     child_safety_policy_prompt,
@@ -31,13 +39,6 @@ from grox.flows.ptos.prompts import (
     violent_media_policy_prompt,
     violent_speech_policy_prompt,
 )
-from grok_sampler.vision_sampler import VisionSampler
-from grok_sampler.eapi_sampler import EapiSampler
-from grok_sampler.oai_sampler import OaiSampler
-from circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpen
-from monitor.metrics import Metrics
-from grox.core.data_loaders.data_types import Post
-from grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD
 from grox.flows.ptos.state import (
     SafetyPolicy,
     SafetyPolicyCategory,

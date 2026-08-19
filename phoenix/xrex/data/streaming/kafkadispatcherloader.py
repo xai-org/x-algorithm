@@ -7,13 +7,12 @@ import queue
 import threading
 import time
 import typing
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Callable
 
 import grpc
 import pyarrow as pa
-
 from xai_configlib import configclass
 from xai_proto.recsys_kafka_pb2 import (
     CheckStateRequest,
@@ -25,6 +24,7 @@ from xai_proto.recsys_kafka_pb2 import (
     SeekRequest,
 )
 from xai_proto.recsys_kafka_pb2_grpc import KafkaDispatcherStub
+
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.streaming.kafkaconsumer import deserialize_arrow_ipc
 from xrex.data.streaming.kafkaloader import PhoenixKafkaDataset

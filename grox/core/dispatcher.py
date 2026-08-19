@@ -1,20 +1,20 @@
 import asyncio
 import logging
-import traceback
 import multiprocessing
+import traceback
+from multiprocessing import Process
 from queue import Empty, Queue
 from threading import Event
-from multiprocessing import Process
 
 from monitor.metrics import Metrics
 
 from grox.config.config import grox_config
-from grox.core.schedules.init import init_proc
-from grox.core.schedules.types import TaskResult, TaskPayload
-from grox.core.schedules.context import ScheduleContext
-from grox.core.loading import load_all
 from grox.core.generators.registry import build as build_generator
-from grox.core.generators.task_generator import TaskGenerator, PriorityTaskGenerator
+from grox.core.generators.task_generator import PriorityTaskGenerator, TaskGenerator
+from grox.core.loading import load_all
+from grox.core.schedules.context import ScheduleContext
+from grox.core.schedules.init import init_proc
+from grox.core.schedules.types import TaskPayload, TaskResult
 
 logger = logging.getLogger(__name__)
 

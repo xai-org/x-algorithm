@@ -13,7 +13,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 try:
     from jax import shard_map
@@ -207,7 +208,7 @@ def encode_rq(
     n_devices = len(mesh.devices)
     N_orig, D = embeddings.shape
     M, K, D_cb = codebooks.shape
-    assert D == D_cb, f"dim mismatch: data {D} vs codebook {D_cb}"
+    assert D_cb == D, f"dim mismatch: data {D} vs codebook {D_cb}"
 
     padded, pad = _pad_to_multiple(embeddings.astype(np.float32, copy=False), n_devices)
     residual = _put_sharded(padded)
@@ -675,11 +676,13 @@ def evaluate_rqvae(
 
 
 from sid_io import (
+    load_codebook as _load_codebook,
+)
+from sid_io import (
     save_codebook_npz,
     save_codebook_safetensors,
     save_rqvae_npz,
     save_rqvae_safetensors,
-    load_codebook as _load_codebook,
 )
 
 

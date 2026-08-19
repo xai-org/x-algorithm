@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from grox.config.config import grox_config
@@ -100,7 +100,7 @@ def _format_join_date(msec: int | None) -> str:
     if not msec or msec <= 0:
         return ""
     try:
-        dt = datetime.fromtimestamp(msec / 1000.0, tz=timezone.utc)
+        dt = datetime.fromtimestamp(msec / 1000.0, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return ""
     return f"{_MONTHS[dt.month - 1]} {dt.year}"

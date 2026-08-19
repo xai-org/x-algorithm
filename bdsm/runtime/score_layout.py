@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import numpy as np
-
 import heads
+import numpy as np
 
 HEAD_ORDER: tuple[str, ...] = heads.HEAD_NAMES
 

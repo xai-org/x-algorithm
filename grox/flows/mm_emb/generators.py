@@ -1,13 +1,5 @@
 from grox.core.data_loaders.kafka_loader import KafkaPostLoader
 from grox.core.generators.stream_generator import StreamTaskGenerator
-from grox.flows.mm_emb.plan_post_embedding_v5 import PlanPostEmbeddingV5
-from grox.flows.mm_emb.plan_post_embedding_v5_for_reply import (
-    PlanPostEmbeddingV5ForReply,
-)
-from grox.flows.mm_emb.plan_post_embedding_v82 import PlanPostEmbeddingV82
-from grox.flows.mm_emb.plan_post_embedding_v82_for_reply import (
-    PlanPostEmbeddingV82ForReply,
-)
 from grox.core.registry import register
 from grox.flows.mm_emb.constants import (
     POST_EMBEDDING_V5_FOR_REPLY_STREAM,
@@ -20,6 +12,14 @@ from grox.flows.mm_emb.constants import (
     TOPIC_REQUESTS_WITH_SUMMARY,
     TOPIC_V5_RECOVERY,
     TOPIC_V8_RECOVERY,
+)
+from grox.flows.mm_emb.plan_post_embedding_v5 import PlanPostEmbeddingV5
+from grox.flows.mm_emb.plan_post_embedding_v5_for_reply import (
+    PlanPostEmbeddingV5ForReply,
+)
+from grox.flows.mm_emb.plan_post_embedding_v82 import PlanPostEmbeddingV82
+from grox.flows.mm_emb.plan_post_embedding_v82_for_reply import (
+    PlanPostEmbeddingV82ForReply,
 )
 
 

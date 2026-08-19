@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import numpy as np
-
 import heads
+import numpy as np
 
 
 def labels_to_vectors(

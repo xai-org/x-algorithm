@@ -2,8 +2,8 @@ from grox.core.plans.plan import Plan
 from grox.core.registry import register
 from grox.core.tasks.task_media import TaskMediaHydration
 from grox.flows.ptos.task_filter import TaskSafetyPtosRealtimeWithSignalsFilter
-from grox.flows.ptos.task_rate_limit import TaskRateLimitSafetyPtosRealtimeWithSignals
 from grox.flows.ptos.task_ptos_spam_detection import TaskPtosSpamDetection
+from grox.flows.ptos.task_rate_limit import TaskRateLimitSafetyPtosRealtimeWithSignals
 from grox.flows.ptos.task_write_safety_post_annotations_result_sink import (
     TaskWriteSafetyPostAnnotationsResultSink,
 )

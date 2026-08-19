@@ -7,16 +7,17 @@ import urllib.error
 import urllib.request
 import uuid
 
-from grox.core.lib.utils import detect_image_content_type
-from grox.core.data_loaders.data_types import Image, Post, Video
-from grox.flows.ptos.state import SafetyPolicyCategory, SafetyPtosState
-from grox.core.schedules.types import TaskContext
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
 from strato_http.queries.safety_post_annotations_result import (
     StratoSafetyPostAnnotationsResultDirectMh,
 )
+
+from grox.core.data_loaders.data_types import Image, Post, Video
+from grox.core.lib.utils import detect_image_content_type
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
+from grox.flows.ptos.state import SafetyPolicyCategory, SafetyPtosState
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
     async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
         try:
             await asyncio.wait_for(cls._run(ctx, post), timeout=_TASK_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             Metrics.counter(f"{_METRIC_PREFIX}.timeout.count").add(1)
             logger.warning(
                 f"Post {post.id}: safemodel timed out after {_TASK_TIMEOUT_S}s"
@@ -206,15 +207,13 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             ("checkpoint_gcs", _CHECKPOINT_GCS),
         ]:
             parts.append(
-                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode(
-                    "utf-8"
-                )
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}'.encode()
             )
         file_header = (
             f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="image"\r\nContent-Type: {content_type}\r\n\r\n'
-        ).encode("utf-8")
+        ).encode()
         parts.append(file_header + payload_bytes)
-        closing = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        closing = f"\r\n--{boundary}--\r\n".encode()
         body = b"\r\n".join(parts) + closing
 
         last_error_reason = "exception"

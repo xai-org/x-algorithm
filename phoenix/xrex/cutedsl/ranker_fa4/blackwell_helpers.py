@@ -31,7 +31,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -66,8 +65,8 @@ def gemm_w_idx(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    A_idx: Optional[Int32] = None,
-    B_idx: Optional[Int32] = None,
+    A_idx: Int32 | None = None,
+    B_idx: Int32 | None = None,
     zero_init: bool | Boolean = False,
     swap_AB: bool = False,
     num_unroll_groups: int = 1,
@@ -95,10 +94,10 @@ def gemm_ptx_w_idx(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    sA: Optional[cute.Tensor],
+    sA: cute.Tensor | None,
     sB: cute.Tensor,
-    A_idx: Optional[Int32] = None,
-    B_idx: Optional[Int32] = None,
+    A_idx: Int32 | None = None,
+    B_idx: Int32 | None = None,
     zero_init: bool | Boolean = False,
     cta_group: int = 1,
     **kwargs,
@@ -138,7 +137,7 @@ def gemm(
         cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
-def i64_to_i32x2(i: int) -> Tuple[int, int]:
+def i64_to_i32x2(i: int) -> tuple[int, int]:
     return i & 0xFFFF_FFFF, (i >> 32) & 0xFFFF_FFFF
 
 
@@ -148,7 +147,7 @@ def gemm_ptx(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    sA: Optional[cute.Tensor],
+    sA: cute.Tensor | None,
     sB: cute.Tensor,
     zero_init: bool | Boolean = False,
 ) -> None:
@@ -261,7 +260,7 @@ def gemm_ptx_loop(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    sA: Optional[cute.Tensor],
+    sA: cute.Tensor | None,
     sB: cute.Tensor,
     zero_init: bool | Boolean = False,
 ) -> None:
@@ -423,13 +422,13 @@ def gemm_ptx_partial(
     acc_tmem_addr: Int32,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    sA: Optional[cute.Tensor],
+    sA: cute.Tensor | None,
     sB: cute.Tensor,
-    mbar_ptr: Optional[cutlass.Pointer] = None,
-    mbar_phase: Optional[Int32] = None,
-    split_arrive: Optional[int] = None,
+    mbar_ptr: cutlass.Pointer | None = None,
+    mbar_phase: Int32 | None = None,
+    split_arrive: int | None = None,
     zero_init: bool | Boolean = False,
-    tA_addr: Optional[Int32] = None,
+    tA_addr: Int32 | None = None,
     cta_group: int = 1,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -628,9 +627,9 @@ def gemm_ptx_partial1(
     sB_base_addr_for_desc: Int32,
     sB_addr_offset_for_desc: cutlass.Constexpr[int],
     sB_stage: Int32,
-    sA_layout: Optional[cute.Layout],
-    sB_layout: Optional[cute.Layout],
-    sA_swizzle: Optional[cute.Swizzle],
+    sA_layout: cute.Layout | None,
+    sB_layout: cute.Layout | None,
+    sA_swizzle: cute.Swizzle | None,
     sB_swizzle: cute.Swizzle,
     zero_init: bool | Boolean = False,
 ) -> None:
@@ -793,12 +792,12 @@ def gemm_ptx_precomputed(
     smem_desc_start_a: Int32,
     smem_desc_start_b: Int32,
     idesc: int,
-    smem_desc_base_a: Optional[int],
+    smem_desc_base_a: int | None,
     smem_desc_base_b: int,
     tCrA_layout: cute.Layout,
     tCrB_layout: cute.Layout,
-    mbar_ptr: Optional[cutlass.Pointer] = None,
-    mbar_phase: Optional[Int32] = None,
+    mbar_ptr: cutlass.Pointer | None = None,
+    mbar_phase: Int32 | None = None,
     zero_init: bool | Boolean = False,
     cta_group: int = 1,
     kind: str = "f16",
@@ -946,7 +945,7 @@ def gemm_ptx_precomputed(
 @cute.jit
 def declare_ptx_smem_desc(
     smem_desc_start_a: Int32,
-    smem_desc_base_a: Optional[int],
+    smem_desc_base_a: int | None,
     tCrA_layout: cute.Layout,
     var_name_prefix: str = "smem_desc",
 ) -> None:

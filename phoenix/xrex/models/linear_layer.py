@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import Config, configclass
+
 from xrex.models.model_utils import get_parameter
 from xrex.models.sharding_context import ShardingContext
 
@@ -27,12 +26,12 @@ class LinearImpl(hk.Module):
         config: LinearConfig,
         output_size: int,
         sharding_context: ShardingContext,
-        rms_clip_axes: Optional[Tuple] = (-2, -1),
+        rms_clip_axes: tuple | None = (-2, -1),
         with_bias: bool = False,
-        w_init: Optional[hk.initializers.Initializer] = None,
-        b_init: Optional[hk.initializers.Initializer] = None,
-        pspec: Optional[P] = None,
-        name: Optional[str] = None,
+        w_init: hk.initializers.Initializer | None = None,
+        b_init: hk.initializers.Initializer | None = None,
+        pspec: P | None = None,
+        name: str | None = None,
     ):
         super().__init__(name=name)
         self.input_size = None

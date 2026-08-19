@@ -1,5 +1,9 @@
 import os
 
+import gin
+import numpy as np
+import pandas
+import tensorflow.compat.v2 as tf
 from twitter.deepbird.data import (
     get_batch_prediction_request_decoder,
     get_batch_prediction_response_writer,
@@ -7,11 +11,6 @@ from twitter.deepbird.data import (
 )
 from twitter.deepbird.io.legacy.contrib.feature_config import FeatureConfigBuilder
 from twitter.deepbird.stats_server.app_with_stats import run_with_stats_server
-
-import gin
-import numpy as np
-import pandas
-import tensorflow.compat.v2 as tf
 
 
 class Model(tf.keras.Model):
@@ -37,7 +36,7 @@ class Model(tf.keras.Model):
             self._batch_prediction_response_writer = None
 
     def get_config(self):
-        config = super(Model, self).get_config()
+        config = super().get_config()
         config.update({"_clip_model": self._clip_model})
         return config
 

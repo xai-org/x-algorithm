@@ -1,18 +1,18 @@
-import io
 import asyncio
+import io
 import logging
-import random
 import math
+import random
 
 import av
 import cv2
 import numpy as np
+from av.container import InputContainer
+from av.stream import Stream
 from PIL import Image
 from pydantic import BaseModel
-from av.stream import Stream
-from av.container import InputContainer
 
-from video_tools.image import resize_tile, enhance_image_with_clahe
+from video_tools.image import enhance_image_with_clahe, resize_tile
 
 logger = logging.getLogger(__name__)
 
@@ -182,17 +182,16 @@ class VideoFramesExtractor:
             return None
         combined_array = None
         for i, frame in enumerate(frames):
-            with io.BytesIO(frame) as buffer:
-                with Image.open(buffer) as image:
-                    with image.convert("RGB") as converted_image:
-                        np_arr = np.array(converted_image)
-                        np_frame = np_arr.transpose(2, 0, 1)
-                        del np_arr
-                        if i == 0:
-                            combined_array = np.empty(
-                                (num_frames,) + np_frame.shape, dtype=np.uint8
-                            )
-                        combined_array[i] = np_frame
+            with io.BytesIO(frame) as buffer, Image.open(buffer) as image:
+                with image.convert("RGB") as converted_image:
+                    np_arr = np.array(converted_image)
+                    np_frame = np_arr.transpose(2, 0, 1)
+                    del np_arr
+                    if i == 0:
+                        combined_array = np.empty(
+                            (num_frames,) + np_frame.shape, dtype=np.uint8
+                        )
+                    combined_array[i] = np_frame
         with io.BytesIO() as buffer:
             np.save(buffer, combined_array)
             del combined_array

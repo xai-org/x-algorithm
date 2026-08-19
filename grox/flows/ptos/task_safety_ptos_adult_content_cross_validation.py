@@ -1,6 +1,11 @@
 import logging
 from enum import Enum
 
+from monitor.metrics import Metrics
+from strato_http.queries.safety_post_annotations_result import (
+    StratoSafetyPostAnnotationsResultDirectMh,
+)
+
 from grox.core.data_loaders.data_types import Post
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
@@ -12,10 +17,6 @@ from grox.flows.ptos.state import (
     SafetyPolicyType,
     SafetyPtosState,
     SafetyPtosViolatedPolicy,
-)
-from monitor.metrics import Metrics
-from strato_http.queries.safety_post_annotations_result import (
-    StratoSafetyPostAnnotationsResultDirectMh,
 )
 
 logger = logging.getLogger(__name__)

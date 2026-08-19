@@ -13,8 +13,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import configclass
+
 from xrex.data.recsys.gen_recs_semantics import (
     build_recall_metrics,
     l2_normalize,
@@ -224,7 +224,7 @@ class GenRecsTrainer(RecsysTrainer):
     def eval(self, soft_step: int):
         if isinstance(self.model_config, RecsysGenRecsModelConfig):
             return self.eval_gen_recs(soft_step)
-        return super(GenRecsTrainer, self).eval(soft_step)
+        return super().eval(soft_step)
 
     def maybe_build_gen_recs_post_embeddings(self):
         if not isinstance(self.model_config, RecsysGenRecsModelConfig):

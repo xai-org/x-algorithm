@@ -87,4 +87,10 @@ xai-gimmick = { path = "python/common/xai-gimmick" }
 xai-checkpointing = { path = "python/training/xai-checkpointing" }
 
 [tool.ruff]
+extend = "../ruff.toml"
+target-version = "py311"
 line-length = 100
+
+[tool.vulture]
+min_confidence = 90
+ignore_names = ["exc_type", "exc_value", "exc_tb"]

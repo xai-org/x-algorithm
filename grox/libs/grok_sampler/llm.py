@@ -1,13 +1,14 @@
-import time
 import logging
+import time
 import traceback
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, AsyncGenerator
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
+from typing import Generic, TypeVar
 
+from grpc_cli.grpc_client import GrpcClient, aclosing_grpc
 from monitor.logging import Logging
 from monitor.metrics import Metrics
-from grpc_cli.grpc_client import GrpcClient, aclosing_grpc
 from protos.sampler.sampler_pb2 import (
     PromptInput,
     SampleTextRequest,
@@ -135,7 +136,7 @@ class LiteLLM(ABC, Generic[T]):
         self, request: SampleTextRequest, **kwargs
     ) -> AsyncGenerator[SampleTextResponse, None]:
         request_metadata = self.request_metadata.copy()
-        conversation_id = kwargs.get("conversation_id", None)
+        conversation_id = kwargs.get("conversation_id")
         if conversation_id:
             request_metadata.append(("x-conversation-id", conversation_id))
         async with aclosing_grpc(

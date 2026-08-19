@@ -1,10 +1,10 @@
 import logging
 
-from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
-from grox.core.schedules.types import TaskContext
-from grox.flows.reply_spam.state_reply_ranking import ReplyRankingState
 from grox.core.data_loaders.data_types import Post
+from grox.core.schedules.types import TaskContext
+from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.flows.reply_spam.classifier_reply_ranking import ReplyScorer
+from grox.flows.reply_spam.state_reply_ranking import ReplyRankingState
 
 logger = logging.getLogger(__name__)
 

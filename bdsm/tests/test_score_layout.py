@@ -4,7 +4,6 @@ import pickle
 
 import numpy as np
 import pytest
-
 from score_layout import (
     HEAD_ORDER,
     action_histogram,

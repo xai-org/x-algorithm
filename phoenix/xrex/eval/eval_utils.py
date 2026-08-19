@@ -2,17 +2,16 @@
 # Copyright 2026 X.AI Corp.
 import logging
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple
 
 import jax
+from xai_configlib import Config, configclass
+
 from xrex.eval.metrics import ForwardMetrics
 from xrex.train.misc import TrainingState
 from xrex.utils.utils import alarm_after, flatten_dict
-
-from xai_configlib import Config, configclass
 
 rank_logger = logging.getLogger("rank")
 
@@ -43,14 +42,14 @@ class EvalModule(Config):
 class EvaluationTaskNew(Config):
     max_steps: int = -1
     eval_step_timeout: int = 300
-    metrics: Optional[List[Tuple[str, ForwardMetrics]]] = None
+    metrics: list[tuple[str, ForwardMetrics]] | None = None
 
     def initialize(self):
         if self.metrics is not None:
             for _, metric in self.metrics:
                 metric.initialize()
 
-    def report(self, name: str, step: Optional[int] = None) -> str:
+    def report(self, name: str, step: int | None = None) -> str:
         results = sorted(self.results)
         max_len = max([len(name) for name in results])
         step = ""
@@ -106,14 +105,14 @@ class ForwardEvalNew(EvaluationTaskNew):
 
 
 def run_forward_evals_new(
-    evals: List[Tuple[str, ForwardEvalNew]],
+    evals: list[tuple[str, ForwardEvalNew]],
     data_iter: Iterator,
     *,
     forward_fn: Callable,
     state: TrainingState,
     mesh: jax.sharding.Mesh,
     sampler=None,
-) -> Dict[str, ForwardEvalNew]:
+) -> dict[str, ForwardEvalNew]:
     return {
         name: conf.run(
             data_iter,
@@ -127,11 +126,11 @@ def run_forward_evals_new(
 
 
 def report_forward_eval_results(
-    results: Dict[str, ForwardEvalNew | EvaluationTaskNew],
-    metric_folder: Optional[str] = None,
-    elapsed_samples: Optional[int] = None,
+    results: dict[str, ForwardEvalNew | EvaluationTaskNew],
+    metric_folder: str | None = None,
+    elapsed_samples: int | None = None,
     is_data_shard_output_rank: bool = True,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     all_metrics = {}
     for eval_name, eval in results.items():
         all_metrics[eval_name] = {}

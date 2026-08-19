@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
-
 from xai_configlib import configclass
 from xai_proto import recsys_pb2
+
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
 from xrex.models.normalization import rms_norm_fn

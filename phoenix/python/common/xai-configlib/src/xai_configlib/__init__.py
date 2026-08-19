@@ -11,11 +11,11 @@ import logging
 import pkgutil
 import re
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, NoneType, UnionType
 from typing import (
     Any,
-    Callable,
     Literal,
     NamedTuple,
     Type,
@@ -76,9 +76,9 @@ class Config:
 
     @classmethod
     def from_dict(
-        cls: Type[ConfigType],
+        cls: type[ConfigType],
         d: dict[str, Any],
-        ensure_class: Union[str, type] = "",
+        ensure_class: str | type = "",
         max_back_compat: bool = False,
         ignore_unregistered_cls: bool = False,
     ) -> ConfigType:
@@ -96,9 +96,9 @@ class Config:
 
     @classmethod
     def from_json(
-        cls: Type[ConfigType],
+        cls: type[ConfigType],
         json_string: str,
-        ensure_class: Union[str, type] = "",
+        ensure_class: str | type = "",
         max_back_compat: bool = False,
         ignore_unregistered_cls: bool = False,
     ) -> ConfigType:
@@ -118,21 +118,21 @@ class Config:
 
 
 @overload
-def configclass(cls: Type[ConfigType]) -> Type[ConfigType]: ...
+def configclass(cls: type[ConfigType]) -> type[ConfigType]: ...
 
 
 @overload
 def configclass(
     *, kw_only: bool = ..., unsafe_hash: bool = ...
-) -> Callable[[Type[ConfigType]], Type[ConfigType]]: ...
+) -> Callable[[type[ConfigType]], type[ConfigType]]: ...
 
 
 @dataclass_transform()
 def configclass(
-    cls: Type[ConfigType] | None = None, *, kw_only: bool = False, unsafe_hash=True
-) -> Callable[[Type[ConfigType]], Type[ConfigType]] | Type[ConfigType]:
+    cls: type[ConfigType] | None = None, *, kw_only: bool = False, unsafe_hash=True
+) -> Callable[[type[ConfigType]], type[ConfigType]] | type[ConfigType]:
     @dataclass_transform()
-    def _configclass(cls: Type[ConfigType]) -> Type[ConfigType]:
+    def _configclass(cls: type[ConfigType]) -> type[ConfigType]:
         assert issubclass(cls, Config), (
             f"Configured class {cls.__name__} must be a subclass of Config."
         )
@@ -156,7 +156,7 @@ def configclass(
 
 def from_dict(
     value: Any,
-    ensure_class: Union[str, type] = "",
+    ensure_class: str | type = "",
     max_back_compat: bool = False,
     ignore_unregistered_cls: bool = False,
 ):
@@ -288,7 +288,7 @@ def to_dict(obj: Any, container: str = "???") -> Any:
     return obj
 
 
-def resolve_type_hints(dcls: Any) -> dict[str, Type[Any]]:
+def resolve_type_hints(dcls: Any) -> dict[str, type[Any]]:
     if isinstance(dcls, Config):
         resolved_hints = type(dcls).get_type_hints()
     elif isinstance(dcls, type):
@@ -396,7 +396,7 @@ def replace_recursive(
     return new_dcls
 
 
-def cast_type(ty: Type[Any], val: str):
+def cast_type(ty: type[Any], val: str):
     if ty is bool:
         if val in ("False", "false"):
             return False

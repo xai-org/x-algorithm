@@ -1,19 +1,18 @@
 import asyncio
 import logging
 import time
-from typing import Optional, List
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, async_playwright
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class BrowserPool:
-    browsers: List[Browser]
-    contexts: List[BrowserContext]
+    browsers: list[Browser]
+    contexts: list[BrowserContext]
     available_contexts: asyncio.Queue = field(init=False)
 
     def __post_init__(self):
@@ -24,7 +23,7 @@ class TweetRenderForGrox:
     def __init__(self, pool_size: int = 2, max_contexts_per_browser: int = 5):
         self.pool_size = pool_size
         self.max_contexts_per_browser = max_contexts_per_browser
-        self.browser_pool: Optional[BrowserPool] = None
+        self.browser_pool: BrowserPool | None = None
         self._playwright = None
         self._initialization_lock = asyncio.Lock()
         self._initialized = False
@@ -114,7 +113,7 @@ class TweetRenderForGrox:
 
     async def take_screenshot(
         self, tweet_id: str, theme: str = "light"
-    ) -> Optional[bytes]:
+    ) -> bytes | None:
         logger.info(f"Taking screenshot for tweet_id: {tweet_id}")
         start = time.perf_counter()
 
@@ -147,7 +146,7 @@ class TweetRenderForGrox:
                     if not page.is_closed():
                         await page.close()
         except Exception as e:
-            logger.warning(f"Error screenshotting {tweet_id}: {str(e)}")
+            logger.warning(f"Error screenshotting {tweet_id}: {e!s}")
             return None
 
     async def cleanup(self):

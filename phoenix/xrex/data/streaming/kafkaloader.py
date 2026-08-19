@@ -8,13 +8,13 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Iterator, Mapping
 from functools import partial
 from threading import Event
-from typing import Any, Iterator, Mapping, Optional, cast
+from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa
-
 from xai_configlib import configclass
 
 _OTEL_AVAILABLE = False
@@ -61,11 +61,11 @@ logger.setLevel(log_level)
 rank_logger = logging.getLogger("rank")
 
 
-consumer: Optional[threading.Thread] = None
+consumer: threading.Thread | None = None
 stop_event = threading.Event()
 metrics_server_started = False
 
-_kafka_reset_event: Optional[threading.Event] = None
+_kafka_reset_event: threading.Event | None = None
 
 _meter = None
 _kafka_batches_processed = None

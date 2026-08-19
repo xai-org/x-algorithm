@@ -2,12 +2,13 @@ import asyncio
 import logging
 import random
 import traceback
-
 from abc import ABC, abstractmethod
-from grox.config.config import TaskGeneratorConfig
-from grox.core.schedules.types import TaskResult, TaskPayload
+from collections.abc import AsyncGenerator
+
 from limits import RateLimitItemPerSecond, storage, strategies
-from typing import AsyncGenerator
+
+from grox.config.config import TaskGeneratorConfig
+from grox.core.schedules.types import TaskPayload, TaskResult
 
 logger = logging.getLogger(__name__)
 limiter = strategies.FixedWindowRateLimiter(storage.MemoryStorage())

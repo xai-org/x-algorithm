@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -387,7 +387,7 @@ def write_dump(
 
 
 def _fmt_ts(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+    return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%m-%d %H:%M")
 
 
 def _fmt_actions(row: np.ndarray) -> str:
