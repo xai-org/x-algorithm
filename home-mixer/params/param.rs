@@ -270,6 +270,18 @@ param!(
     true
 );
 param!(
+    EnableMagaBoost,
+    bool,
+    "rust_home_mixer_enable_maga_boost",
+    false
+);
+param!(
+    MagaBoostFactor,
+    f64,
+    "rust_home_mixer_maga_boost_factor",
+    1.15
+);
+param!(
     TopicOonWeightFactor,
     f64,
     "rust_home_mixer_topic_oon_weight_factor",
