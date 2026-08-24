@@ -639,29 +639,28 @@ mod tests {
         assert_eq!(post.source, RuleSource::Static);
         assert!(!user.rule_ids.is_empty(), "user pipeline empty");
         assert!(!post.rule_ids.is_empty(), "post pipeline empty");
-        for id in [
-            "user_in_allowlist",
-            "user_not_found",
-            "high_follower_count",
-            "pagerank_skipped",
-        ] {
+        for id in ["user_in_allowlist", "user_not_found"] {
             assert!(
                 user.rule_ids.iter().any(|r| r == id),
                 "user missing guardrail {id:?}; got {:?}",
                 user.rule_ids
             );
         }
-        for id in [
-            "post_in_allowlist",
-            "user_in_allowlist",
-            "user_not_found",
-            "high_follower_count",
-            "pagerank_skipped",
-        ] {
+        for id in ["post_in_allowlist", "user_in_allowlist", "user_not_found"] {
             assert!(
                 post.rule_ids.iter().any(|r| r == id),
                 "post missing guardrail {id:?}; got {:?}",
                 post.rule_ids
+            );
+        }
+        for removed in ["high_follower_count", "pagerank_skipped"] {
+            assert!(
+                !user.rule_ids.iter().any(|r| r == removed),
+                "user credibility bypass {removed:?} must not be present"
+            );
+            assert!(
+                !post.rule_ids.iter().any(|r| r == removed),
+                "post credibility bypass {removed:?} must not be present"
             );
         }
     }
@@ -764,6 +763,91 @@ mod tests {
         let rules = RulesCache::new().resolve(EntityType::User, None);
         let mut f = base_facts();
         f.user_allowlist_mut().is_allowlisted = true;
+        f.score.labels = vec!["anchor_campaign_suspend".into()];
+        f.cred_mut().is_high = Some(true);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("user_in_allowlist".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_missing_user_still_precedes_enforcement() {
+        let user_rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut user = base_facts();
+        user.user_mut().present = false;
+        user.score.labels = vec!["anchor_campaign_suspend".into()];
+        assert_eq!(
+            decide_with(&user_rules, &user).unwrap(),
+            Decision::Skip("user_not_found".into())
+        );
+
+        let post_rules = RulesCache::new().resolve(EntityType::Post, None);
+        let mut missing_author = safe_author();
+        missing_author.user.present = false;
+        let post = post_facts(missing_author, vec!["gibberish_post".into()]);
+        assert_eq!(
+            decide_with(&post_rules, &post).unwrap(),
+            Decision::Skip("user_not_found".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_user_credibility_does_not_bypass_enforcement() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = base_facts();
+        f.score.labels = vec!["anchor_campaign_suspend".into()];
+        f.cred_mut().is_high = Some(true);
+        f.cred_mut().score = Some(100.0);
+        f.cred_mut().follower_count = Some(10_000_000);
+
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Act(vec![ActionSpec::SuspendUser {
+                perm: false,
+                policy: "PlatformManipulation".into(),
+            }])
+        );
+    }
+
+    #[test]
+    fn baked_in_post_credibility_does_not_bypass_enforcement() {
+        let rules = RulesCache::new().resolve(EntityType::Post, None);
+        for skip_prechecks in [false, true] {
+            let mut author = safe_author();
+            author.cred.is_high = Some(true);
+            author.cred.score = Some(100.0);
+            author.cred.follower_count = Some(10_000_000);
+            let mut f = post_facts(author, vec!["gibberish_post".into()]);
+            f.score.skip_author_credibility_prechecks = skip_prechecks;
+
+            assert_eq!(
+                decide_with(&rules, &f).unwrap(),
+                Decision::Act(vec![ActionSpec::AddPostLabelsV2 {
+                    labels: vec!["SpamHighRecall".into()],
+                    ttl_msec: Some(2_592_000_000),
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn baked_in_post_allowlists_still_precede_enforcement() {
+        let rules = RulesCache::new().resolve(EntityType::Post, None);
+        let mut f = with_post_allowlisted(post_facts(
+            safe_author(),
+            vec!["gibberish_post".into()],
+        ));
+        f.cred_mut().is_high = Some(true);
+
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("post_in_allowlist".into())
+        );
+
+        let mut allowlisted_author = safe_author();
+        allowlisted_author.allowlist.is_allowlisted = true;
+        let f = post_facts(allowlisted_author, vec!["gibberish_post".into()]);
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("user_in_allowlist".into())

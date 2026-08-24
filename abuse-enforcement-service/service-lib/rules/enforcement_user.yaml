@@ -1,4 +1,6 @@
 # mirrored from GrowthBook dynamic config; last sync 2026-08-12T16:22:21Z
+# Production can override this file through GrowthBook. Keep the dynamic rules in sync:
+# credibility and follower-count signals must not bypass abuse enforcement.
 
 for_entity: user
 
@@ -14,22 +16,6 @@ rules:
     then:
       kind: skip
       reason: user_not_found
-
-  - id: high_follower_count
-    # Prod uses a different follower count floor; this is a mock value to reduce gaming.
-    when: cred.follower_count >= 12.34
-    then:
-      kind: skip
-      reason: high_follower_count
-
-  - id: pagerank_skipped
-    when: >
-      cred.is_high
-      || cred.score >= 50.0
-    then:
-      kind: skip
-      reason: pagerank_skipped
-
 
   - id: anchor_campaign_suspend
     when: '"anchor_campaign_suspend" in score.labels'
