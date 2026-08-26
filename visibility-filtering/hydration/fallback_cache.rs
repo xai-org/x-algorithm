@@ -1,9 +1,11 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Mutex,
+    atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
+use quanta::{Clock, Instant};
 use quick_cache::unsync::Cache;
 
 use crate::hydration::batch::{Hydrated, HydrationBatch};
@@ -33,6 +35,7 @@ impl FallbackCacheMode {
 struct CacheEntry<V> {
     generation: u64,
     value: Option<V>,
+    stale_until: Option<Instant>,
 }
 
 type CacheShards<K, V> = Vec<Mutex<Cache<K, CacheEntry<V>>>>;
@@ -40,6 +43,8 @@ type CacheShards<K, V> = Vec<Mutex<Cache<K, CacheEntry<V>>>>;
 pub(crate) struct FallbackCache<K, V> {
     facet: &'static str,
     mode: FallbackCacheMode,
+    max_stale_age: Option<Duration>,
+    clock: Clock,
     shards: Option<CacheShards<K, V>>,
     next_generation: AtomicU64,
 }
@@ -49,7 +54,22 @@ where
     K: Eq + Hash + Clone,
     V: Clone,
 {
-    pub(crate) fn new(facet: &'static str, capacity: usize, mode: FallbackCacheMode) -> Self {
+    pub(crate) fn new(
+        facet: &'static str,
+        capacity: usize,
+        mode: FallbackCacheMode,
+        max_stale_age: Option<Duration>,
+    ) -> Self {
+        Self::with_clock(facet, capacity, mode, max_stale_age, Clock::new())
+    }
+
+    fn with_clock(
+        facet: &'static str,
+        capacity: usize,
+        mode: FallbackCacheMode,
+        max_stale_age: Option<Duration>,
+        clock: Clock,
+    ) -> Self {
         let shards = mode.enabled().then(|| {
             let shard_count = CACHE_SHARDS.min(capacity.max(1));
             let shard_capacity = capacity.div_ceil(shard_count);
@@ -60,6 +80,8 @@ where
         Self {
             facet,
             mode,
+            max_stale_age,
+            clock,
             shards,
             next_generation: AtomicU64::new(0),
         }
@@ -85,6 +107,7 @@ where
         let mut fresh = 0;
         let mut stale = 0;
         let mut stale_not_found = 0;
+        let mut stale_expired = 0;
         let mut shadow_hit = 0;
         let mut not_found = 0;
         let mut unavailable = 0;
@@ -104,6 +127,13 @@ where
                         Hydrated::NotFound
                     }
                     Hydrated::Failed(error) => match self.cached_entry(&key) {
+                        Some(CacheEntry {
+                            stale_until: Some(stale_until),
+                            ..
+                        }) if self.clock.now() >= stale_until => {
+                            stale_expired += 1;
+                            Hydrated::Failed(error)
+                        }
                         Some(CacheEntry {
                             value: Some(value), ..
                         }) if self.mode.serves_stale() => {
@@ -133,6 +163,7 @@ where
             fresh,
             stale,
             stale_not_found,
+            stale_expired,
             shadow_hit,
             not_found,
             unavailable,
@@ -166,7 +197,17 @@ where
         {
             return;
         }
-        cache.insert(key.clone(), CacheEntry { generation, value });
+        let stale_until = self
+            .max_stale_age
+            .map(|max_stale_age| self.clock.now() + max_stale_age);
+        cache.insert(
+            key.clone(),
+            CacheEntry {
+                generation,
+                value,
+                stale_until,
+            },
+        );
     }
 
     fn cached_entry(&self, key: &K) -> Option<CacheEntry<V>> {
@@ -199,8 +240,10 @@ mod tests {
     use super::*;
     use crate::hydration::batch::HydrationError;
 
+    const MAX_STALE_AGE: Duration = Duration::from_secs(30);
+
     fn cache(mode: FallbackCacheMode) -> FallbackCache<u64, String> {
-        FallbackCache::new("test", 8, mode)
+        FallbackCache::new("test", 8, mode, Some(MAX_STALE_AGE))
     }
 
     fn batch(
@@ -233,6 +276,82 @@ mod tests {
         assert_eq!(resolved.get(&1), Some(&"cached".to_string()));
         assert!(matches!(resolved.hydrated(&2), Some(Hydrated::Failed(_))));
         assert_eq!(resolved.get(&3), Some(&"fresh".to_string()));
+    }
+
+    #[test]
+    fn stale_value_is_not_served_at_max_age() {
+        let (clock, mock) = Clock::mock();
+        let cache = FallbackCache::with_clock(
+            "test",
+            8,
+            FallbackCacheMode::ServeStale,
+            Some(MAX_STALE_AGE),
+            clock,
+        );
+        cache.resolve_hydration_batch(
+            cache.begin_request(),
+            batch([(1, Hydrated::Found("cached".to_string()))]),
+        );
+
+        mock.increment(MAX_STALE_AGE);
+        let resolved = cache.resolve_hydration_batch(cache.begin_request(), batch([(1, failed())]));
+
+        assert!(matches!(resolved.hydrated(&1), Some(Hydrated::Failed(_))));
+    }
+
+    #[test]
+    fn stale_value_is_served_before_max_age() {
+        let (clock, mock) = Clock::mock();
+        let cache = FallbackCache::with_clock(
+            "test",
+            8,
+            FallbackCacheMode::ServeStale,
+            Some(MAX_STALE_AGE),
+            clock,
+        );
+        cache.resolve_hydration_batch(
+            cache.begin_request(),
+            batch([(1, Hydrated::Found("cached".to_string()))]),
+        );
+
+        mock.increment(MAX_STALE_AGE - Duration::from_secs(1));
+        let resolved = cache.resolve_hydration_batch(cache.begin_request(), batch([(1, failed())]));
+
+        assert_eq!(resolved.get(&1), Some(&"cached".to_string()));
+    }
+
+    #[test]
+    fn stale_not_found_is_not_served_after_max_age() {
+        let (clock, mock) = Clock::mock();
+        let cache = FallbackCache::with_clock(
+            "test",
+            8,
+            FallbackCacheMode::ServeStale,
+            Some(MAX_STALE_AGE),
+            clock,
+        );
+        cache.resolve_hydration_batch(cache.begin_request(), batch([(1, Hydrated::NotFound)]));
+
+        mock.increment(MAX_STALE_AGE + Duration::from_secs(1));
+        let resolved = cache.resolve_hydration_batch(cache.begin_request(), batch([(1, failed())]));
+
+        assert!(matches!(resolved.hydrated(&1), Some(Hydrated::Failed(_))));
+    }
+
+    #[test]
+    fn unbounded_cache_preserves_stale_serving() {
+        let (clock, mock) = Clock::mock();
+        let cache =
+            FallbackCache::with_clock("test", 8, FallbackCacheMode::ServeStale, None, clock);
+        cache.resolve_hydration_batch(
+            cache.begin_request(),
+            batch([(1, Hydrated::Found("cached".to_string()))]),
+        );
+
+        mock.increment(Duration::from_secs(24 * 60 * 60));
+        let resolved = cache.resolve_hydration_batch(cache.begin_request(), batch([(1, failed())]));
+
+        assert_eq!(resolved.get(&1), Some(&"cached".to_string()));
     }
 
     #[test]

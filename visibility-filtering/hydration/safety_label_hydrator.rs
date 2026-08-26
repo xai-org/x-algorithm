@@ -1,13 +1,22 @@
 use crate::hydration::metrics::{batch_outcome, record_batch_size, record_hydrator_request};
+use crate::models::safety_labels::retain_unexpired_proto_labels;
 use crate::models::{SafetyLabelMap, TweetId};
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::SafetyLabelSource;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use xai_visibility_filtering_proto as vf_pb;
 
 const CLIENT: &str = "safety_labels";
+
+fn unix_now_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
 
 pub struct SafetyLabelHydrator {
     pub source: Arc<SafetyLabelSource>,
@@ -38,6 +47,7 @@ impl SafetyLabelHydrator {
             start.elapsed().as_secs_f64() * 1000.0,
         );
 
+        let now_msec = unix_now_millis();
         let mut label_types = HashMap::with_capacity(tweet_ids.len());
         let mut label_response = HashMap::with_capacity(tweet_ids.len());
         for tweet_id in tweet_ids {
@@ -46,9 +56,13 @@ impl SafetyLabelHydrator {
                 .and_then(|result| result.as_ref().ok())
             {
                 Some(label_map) => {
-                    label_types
-                        .insert(*tweet_id, SafetyLabelMap::from_proto_label_types(label_map));
-                    label_response.insert(*tweet_id, label_map.clone());
+                    let mut active_labels = label_map.clone();
+                    retain_unexpired_proto_labels(&mut active_labels, now_msec);
+                    label_types.insert(
+                        *tweet_id,
+                        SafetyLabelMap::from_proto_label_types(&active_labels),
+                    );
+                    label_response.insert(*tweet_id, active_labels);
                 }
                 None => {
                     label_types.insert(*tweet_id, SafetyLabelMap::default());

@@ -13,6 +13,7 @@ use xai_x_thrift::user_labels::LabelValue;
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(150);
 const CLIENT: &str = "gizmoduck";
 const CACHE_CAPACITY: usize = 1_000_000;
+const AUTHOR_FALLBACK_MAX_STALE_AGE: Duration = Duration::from_secs(5 * 60);
 
 pub struct GizmoduckAuthorHydrator {
     pub gizmoduck_client: GizmoduckLookup,
@@ -23,7 +24,15 @@ impl GizmoduckAuthorHydrator {
     pub(crate) fn new(gizmoduck_client: GizmoduckLookup, cache_mode: FallbackCacheMode) -> Self {
         Self {
             gizmoduck_client,
-            fallback_cache: FallbackCache::new("author", CACHE_CAPACITY, cache_mode),
+            // Once this bound is reached, an unavailable Gizmoduck response follows the
+            // existing failed-hydration path, which defaults author features and therefore
+            // fails open. Keep this tradeoff explicit when changing or rolling out the bound.
+            fallback_cache: FallbackCache::new(
+                "author",
+                CACHE_CAPACITY,
+                cache_mode,
+                Some(AUTHOR_FALLBACK_MAX_STALE_AGE),
+            ),
         }
     }
 
