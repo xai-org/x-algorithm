@@ -9,6 +9,7 @@ pub mod tweet_flag_rules;
 pub mod tweet_label_drops;
 pub mod user_label_drops;
 pub mod user_rules;
+pub mod high_risk_tag_drops;
 
 use crate::models::{HydratedTweetCandidate, SafetyLabelType, VfAction, ViewerFeatures};
 use xai_visibility_filtering::models::FilteredReason;

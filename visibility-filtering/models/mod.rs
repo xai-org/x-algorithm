@@ -4,6 +4,7 @@ pub mod relationship;
 pub mod safety_labels;
 pub mod tweet;
 pub mod viewer;
+pub mod high_risk_tags;
 
 pub use author::{AuthorFeatures, UserLabelSet};
 pub use exclusive_content::ExclusiveContentFeatures;
