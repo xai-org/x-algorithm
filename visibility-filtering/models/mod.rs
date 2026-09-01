@@ -71,6 +71,8 @@ pub struct HydratedTweetCandidate {
     pub author_features: AuthorFeatures,
     pub safety_labels: SafetyLabelMap,
     pub relationship: ViewerAuthorRelationship,
+    /// True when safety-critical author or social-graph hydration failed.
+    pub safety_hydration_failed: bool,
     pub exclusive_content: Option<ExclusiveContentFeatures>,
 }
 
@@ -143,6 +145,7 @@ pub fn assemble(
     author_features: AuthorFeatures,
     safety_labels: SafetyLabelMap,
     relationship: ViewerAuthorRelationship,
+    safety_hydration_failed: bool,
     exclusive_content: Option<ExclusiveContentFeatures>,
 ) -> HydratedTweetCandidate {
     HydratedTweetCandidate {
@@ -152,6 +155,7 @@ pub fn assemble(
         author_features,
         safety_labels,
         relationship,
+        safety_hydration_failed,
         exclusive_content,
     }
 }

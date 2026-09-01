@@ -97,6 +97,22 @@ impl Default for Policies {
     }
 }
 
+struct SafetyHydrationFailureDropRule;
+
+impl Rule for SafetyHydrationFailureDropRule {
+    fn name(&self) -> &'static str {
+        "SafetyHydrationFailureDropRule"
+    }
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> VfAction {
+        if context.candidate().safety_hydration_failed {
+            VfAction::Drop(FilteredReason::UnspecifiedReason)
+        } else {
+            VfAction::Allow
+        }
+    }
+}
+
 struct FilterAllRule;
 
 impl Rule for FilterAllRule {
@@ -111,6 +127,7 @@ impl Rule for FilterAllRule {
 
 fn base_home_rules(gating_countries: &Arc<NsfwGatingCountries>) -> Vec<Box<dyn Rule>> {
     vec![
+        Box::new(SafetyHydrationFailureDropRule),
         Box::new(author::SUSPENDED_AUTHOR_DROP),
         Box::new(author::DEACTIVATED_AUTHOR_DROP),
         Box::new(author::ERASED_AUTHOR_DROP),
@@ -205,6 +222,30 @@ mod tests {
                 SafetyLevel::FilterAll | SafetyLevel::TimelineHome => VfAction::Allow,
             }
         }
+    }
+
+    #[test]
+    fn failed_safety_hydration_fails_closed_on_both_home_surfaces() {
+        let policies = Policies::new();
+        let viewer = ViewerFeatures::default();
+        let mut failed = HydratedTweetCandidate::default();
+        failed.safety_hydration_failed = true;
+
+        for level in [SafetyLevel::TimelineHome, SafetyLevel::TimelineHomeRecommendations] {
+            let verdict = policies.evaluate(level, &viewer, &failed);
+            assert!(matches!(verdict.action, VfAction::Drop(_)));
+            assert_eq!(verdict.decided_by, Some("SafetyHydrationFailureDropRule"));
+        }
+    }
+
+    #[test]
+    fn successful_safety_hydration_remains_eligible_for_normal_rules() {
+        let policies = Policies::new();
+        let viewer = ViewerFeatures::default();
+        let candidate = HydratedTweetCandidate::default();
+
+        let verdict = policies.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
+        assert!(matches!(verdict.action, VfAction::Allow));
     }
 
     #[test]
