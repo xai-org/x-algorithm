@@ -61,12 +61,17 @@ impl ViewerHydrator {
                         )
                     }
                     Ok(Err(e)) => {
-                        warn!(error = %e, "Gizmoduck viewer lookup failed; failing open");
-                        (false, ViewerAge::Unknown, None)
+                        warn!(
+                            error = %e,
+                            "Gizmoduck viewer lookup failed; treating logged-in viewer as no stated age"
+                        );
+                        (false, ViewerAge::NotStated, None)
                     }
                     Err(_) => {
-                        warn!("Gizmoduck viewer lookup timed out; failing open");
-                        (false, ViewerAge::Unknown, None)
+                        warn!(
+                            "Gizmoduck viewer lookup timed out; treating logged-in viewer as no stated age"
+                        );
+                        (false, ViewerAge::NotStated, None)
                     }
                 }
             }
@@ -175,23 +180,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_error_fails_open_to_logged_in_defaults() {
+    async fn rpc_error_treats_logged_in_viewer_as_no_stated_age() {
         let viewer = hydrate_with_broken_client(ViewerLookup::Fails).await;
 
         assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
         assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
+        assert_eq!(viewer.viewer_age, ViewerAge::NotStated);
+        assert!(viewer.viewer_has_no_stated_age());
         assert_eq!(viewer.account_country_code, None);
         assert_eq!(viewer.country_code.as_deref(), Some("us"));
     }
 
     #[tokio::test]
-    async fn rpc_timeout_fails_open_to_logged_in_defaults() {
+    async fn rpc_timeout_treats_logged_in_viewer_as_no_stated_age() {
         let viewer = hydrate_with_broken_client(ViewerLookup::Hangs).await;
 
         assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
         assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
+        assert_eq!(viewer.viewer_age, ViewerAge::NotStated);
+        assert!(viewer.viewer_has_no_stated_age());
         assert_eq!(viewer.account_country_code, None);
         assert_eq!(viewer.country_code.as_deref(), Some("us"));
     }

@@ -38,8 +38,12 @@ impl ViewerFeatures {
         matches!(self.viewer_age, ViewerAge::Known(age) if age < ADULT_AGE_YEARS)
     }
 
+    /// Logged-in viewers whose age was not loaded (gizmoduck miss/error) use the
+    /// same jurisdiction-scoped NSFW gate as a confirmed missing birthday.
+    /// Logged-out viewers stay on `SensitiveViewerLoggedOutDropRule`.
     pub fn viewer_has_no_stated_age(&self) -> bool {
-        matches!(self.viewer, Viewer::LoggedIn(_)) && self.viewer_age == ViewerAge::NotStated
+        matches!(self.viewer, Viewer::LoggedIn(_))
+            && matches!(self.viewer_age, ViewerAge::NotStated | ViewerAge::Unknown)
     }
 }
 

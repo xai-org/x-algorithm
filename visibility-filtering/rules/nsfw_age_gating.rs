@@ -214,16 +214,47 @@ mod tests {
     }
 
     #[test]
-    fn unknown_age_fails_open() {
+    fn unknown_age_is_not_confirmed_underage() {
         let c = media_candidate_with_label(SafetyLabelType::NSFW_HIGH_PRECISION);
         assert!(matches!(
             SensitiveViewerUnderageDropRule
                 .evaluate(&crate::rules::test_context(&viewer(ViewerAge::Unknown), &c)),
             VfAction::Allow
         ));
+    }
+
+    #[test]
+    fn unknown_age_drops_like_no_stated_age_in_gating_jurisdiction() {
+        let c = media_candidate_with_label(SafetyLabelType::NSFW_HIGH_PRECISION);
         assert!(matches!(
             SensitiveViewerNoStatedAgeDropRule
                 .evaluate(&crate::rules::test_context(&viewer(ViewerAge::Unknown), &c)),
+            VfAction::Drop(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_age_allows_outside_gating_jurisdiction() {
+        let c = media_candidate_with_label(SafetyLabelType::NSFW_HIGH_PRECISION);
+        let v = ViewerFeatures {
+            country_code: Some("us".into()),
+            ..viewer(ViewerAge::Unknown)
+        };
+        assert!(matches!(
+            SensitiveViewerNoStatedAgeDropRule.evaluate(&crate::rules::test_context(&v, &c)),
+            VfAction::Allow
+        ));
+    }
+
+    #[test]
+    fn logged_out_unknown_is_not_handled_by_no_stated_age_rule() {
+        let c = media_candidate_with_label(SafetyLabelType::NSFW_HIGH_PRECISION);
+        let v = ViewerFeatures {
+            viewer: Viewer::LoggedOut,
+            ..viewer(ViewerAge::Unknown)
+        };
+        assert!(matches!(
+            SensitiveViewerNoStatedAgeDropRule.evaluate(&crate::rules::test_context(&v, &c)),
             VfAction::Allow
         ));
     }
@@ -322,17 +353,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_age_allows_nsfw_text() {
+    fn unknown_age_is_not_confirmed_underage_for_nsfw_text() {
         let c = no_media_candidate_with_label(SafetyLabelType::NSFW_TEXT);
         assert!(matches!(
             SensitiveViewerUnderageDropRule
                 .evaluate(&crate::rules::test_context(&viewer(ViewerAge::Unknown), &c)),
             VfAction::Allow
         ));
+    }
+
+    #[test]
+    fn unknown_age_drops_nsfw_text_in_gating_jurisdiction() {
+        let c = no_media_candidate_with_label(SafetyLabelType::NSFW_TEXT);
         assert!(matches!(
             SensitiveViewerNoStatedAgeDropRule
                 .evaluate(&crate::rules::test_context(&viewer(ViewerAge::Unknown), &c)),
-            VfAction::Allow
+            VfAction::Drop(_)
         ));
     }
 
