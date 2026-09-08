@@ -327,12 +327,17 @@ impl PhoenixCandidatePipeline {
             cached_posts_source,
         ];
 
+        // CoreData must run before InNetwork. TweetMixer (and other thin sources) often
+        // ship author_id = 0; TES fills it. InNetwork reads author_id and stamps
+        // in_network forever. Stamping first marks followed authors as OON, so Recs-only
+        // VF drops (DoNotAmplify, NSFW/spam high-recall, malicious URL) fire on Home
+        // authors. PhoenixScoresPipeline already uses this order.
         let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
-            Box::new(InNetworkCandidateHydrator),
             Box::new(BidirectionalFollowHydrator {
                 socialgraph_client: socialgraph_client.clone(),
             }),
             Box::new(core_data_hydrator),
+            Box::new(InNetworkCandidateHydrator),
             Box::new(
                 QuoteHydrator::new(
                     tes_client.clone(),

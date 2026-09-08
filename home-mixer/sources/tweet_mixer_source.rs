@@ -84,6 +84,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for TweetMixerSource {
                     return None;
                 }
 
+                // 0 until CoreData/TES. InNetwork must run after that fill.
                 let author_id = candidate
                     .author_id
                     .and_then(|id| u64::try_from(id).ok())
