@@ -49,6 +49,7 @@ use crate::filters::oon_nsfw_simclusters_filter::OONNsfwSimclustersFilter;
 use crate::filters::oon_retweet_reply_filter::OONRetweetReplyFilter;
 use crate::filters::previously_seen_posts_backup_filter::PreviouslySeenPostsBackupFilter;
 use crate::filters::previously_seen_posts_filter::PreviouslySeenPostsFilter;
+use crate::filters::controlled_source_reexposure_filter::ControlledSourceReexposureFilter;
 use crate::filters::previously_served_posts_filter::PreviouslyServedPostsFilter;
 use crate::filters::retweet_deduplication_filter::RetweetDeduplicationFilter;
 use crate::filters::self_tweet_filter::SelfTweetFilter;
@@ -355,6 +356,8 @@ impl PhoenixCandidatePipeline {
             Box::new(PreviouslySeenPostsFilter),
             Box::new(PreviouslySeenPostsBackupFilter),
             Box::new(PreviouslyServedPostsFilter),
+            // PR-F5: armed only when EnableControlledSourceReexposure && K>1
+            Box::new(ControlledSourceReexposureFilter),
             Box::new(ViewerMutedKeywordFilter::new()),
             Box::new(AuthorSocialgraphFilter),
             // Brazil 2026 election filter

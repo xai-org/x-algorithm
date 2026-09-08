@@ -16,6 +16,18 @@ pub fn related_post_ids_iter(candidate: &PostCandidate) -> impl Iterator<Item = 
         .chain(candidate.in_reply_to_tweet_id)
 }
 
+/// PR-F5 attribution key: RTs and quotes of the same original share one K bucket.
+/// IncludeQuotes is fixed true (HoE) — quoted_tweet_id always participates.
+pub fn source_key(candidate: &PostCandidate) -> u64 {
+    if let Some(rt) = candidate.retweeted_tweet_id {
+        return rt;
+    }
+    if let Some(q) = candidate.quoted_tweet_id {
+        return q;
+    }
+    candidate.tweet_id
+}
+
 pub fn vqv_weight(
     query: &ScoredPostsQuery,
     candidate: &PostCandidate,
@@ -106,5 +118,29 @@ mod tests {
             ..Default::default()
         };
         assert!((quoted_vqv_weight(&candidate, 10_000, 0.5, true)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn source_key_prefers_retweeted_then_quoted_then_tweet() {
+        let rt = PostCandidate {
+            tweet_id: 1,
+            retweeted_tweet_id: Some(100),
+            quoted_tweet_id: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(source_key(&rt), 100);
+
+        let quote = PostCandidate {
+            tweet_id: 2,
+            quoted_tweet_id: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(source_key(&quote), 100);
+
+        let orig = PostCandidate {
+            tweet_id: 100,
+            ..Default::default()
+        };
+        assert_eq!(source_key(&orig), 100);
     }
 }

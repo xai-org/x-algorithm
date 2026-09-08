@@ -13,3 +13,4 @@ pub mod tweet_type_metrics;
 pub mod url;
 pub mod urt;
 pub mod xds;
+pub mod serve_card_classify;
