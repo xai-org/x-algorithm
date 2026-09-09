@@ -521,6 +521,33 @@ pub struct RetrieveRequestItem {
     pub mm_query_seed_post_ids: Option<Vec<u64>>,
 }
 
+pub fn fill_candidate_search_query_embeddings(
+    sq_slice: &mut [f32],
+    items: &[PredictRequestItem],
+    length_of_input: usize,
+    candidate_seq_len: usize,
+    search_query_embedding_dim: usize,
+    num_item_hashes: usize,
+) {
+    use rayon::prelude::*;
+
+    sq_slice.fill(0.0);
+    sq_slice
+        .par_chunks_exact_mut(candidate_seq_len * search_query_embedding_dim)
+        .take(length_of_input)
+        .zip(items.par_iter())
+        .for_each(|(search_query_emb_row, item)| {
+            if let Some(ref input_buffer) = item.input_buffer {
+                let src = &input_buffer.candidate_search_query_embeddings;
+                if src.len() == search_query_embedding_dim {
+                    let n_rep =
+                        input_buffer.num_real_candidates(num_item_hashes, candidate_seq_len);
+                    xai_recsys::util::repeat_query_into(search_query_emb_row, src, n_rep);
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +622,98 @@ mod tests {
             buf.history_semantic_ids,
             vec![1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    const SQ_DIM: usize = 2;
+    const SQ_SEQ_LEN: usize = 2;
+    const SQ_ROW: usize = SQ_SEQ_LEN * SQ_DIM;
+    const SQ_ITEM_HASHES: usize = 1;
+
+    fn sq_item(query: Option<Vec<f32>>, real_candidates: usize) -> PredictRequestItem {
+        let input_buffer = query.map(|candidate_search_query_embeddings| InputBuffer {
+            candidate_post_hashes: (0..real_candidates as i32).map(|i| i + 1).collect(),
+            candidate_search_query_embeddings,
+            ..Default::default()
+        });
+        PredictRequestItem {
+            input_buffer,
+            ..Default::default()
+        }
+    }
+
+    fn sq_item_without_input_buffer() -> PredictRequestItem {
+        PredictRequestItem::default()
+    }
+
+    fn fill_sq(sq_slice: &mut [f32], items: &[PredictRequestItem], length_of_input: usize) {
+        fill_candidate_search_query_embeddings(
+            sq_slice,
+            items,
+            length_of_input,
+            SQ_SEQ_LEN,
+            SQ_DIM,
+            SQ_ITEM_HASHES,
+        );
+    }
+
+    #[test]
+    fn search_query_row_for_item_without_input_buffer_is_zeroed() {
+        let items = vec![
+            sq_item(Some(vec![1.0, 2.0]), SQ_SEQ_LEN),
+            sq_item_without_input_buffer(),
+        ];
+        let mut sq_slice = vec![9.0f32; 2 * SQ_ROW];
+
+        fill_sq(&mut sq_slice, &items, items.len());
+
+        assert_eq!(sq_slice[..SQ_ROW], [1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(sq_slice[SQ_ROW..], [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn search_query_rows_beyond_length_of_input_are_zeroed() {
+        let items = vec![sq_item(Some(vec![1.0, 2.0]), SQ_SEQ_LEN)];
+        let mut sq_slice = vec![9.0f32; 3 * SQ_ROW];
+
+        fill_sq(&mut sq_slice, &items, items.len());
+
+        assert_eq!(sq_slice[..SQ_ROW], [1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(sq_slice[SQ_ROW..], [0.0; 2 * SQ_ROW]);
+    }
+
+    #[test]
+    fn queryless_request_does_not_inherit_reused_search_query_rows() {
+        let mut sq_slice = vec![0.0f32; 2 * SQ_ROW];
+        let with_query = vec![
+            sq_item(Some(vec![1.0, 2.0]), SQ_SEQ_LEN),
+            sq_item(Some(vec![3.0, 4.0]), SQ_SEQ_LEN),
+        ];
+        fill_sq(&mut sq_slice, &with_query, with_query.len());
+        assert_eq!(sq_slice, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+
+        let queryless = vec![sq_item(Some(Vec::new()), SQ_SEQ_LEN), sq_item(None, 0)];
+        fill_sq(&mut sq_slice, &queryless, queryless.len());
+
+        assert_eq!(sq_slice, vec![0.0; 2 * SQ_ROW]);
+    }
+
+    #[test]
+    fn malformed_width_search_query_leaves_no_reused_values() {
+        let mut sq_slice = vec![9.0f32; SQ_ROW];
+        let items = vec![sq_item(Some(vec![1.0, 2.0, 3.0]), SQ_SEQ_LEN)];
+
+        fill_sq(&mut sq_slice, &items, items.len());
+
+        assert_eq!(sq_slice, vec![0.0; SQ_ROW]);
+    }
+
+    #[test]
+    fn search_query_is_repeated_only_across_real_candidates() {
+        let items = vec![sq_item(Some(vec![1.0, 2.0]), 1)];
+        let mut sq_slice = vec![9.0f32; SQ_ROW];
+
+        fill_sq(&mut sq_slice, &items, items.len());
+
+        assert_eq!(sq_slice, vec![1.0, 2.0, 0.0, 0.0]);
     }
 }

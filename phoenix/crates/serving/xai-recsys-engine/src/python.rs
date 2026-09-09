@@ -2042,25 +2042,14 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
             if search_query_embedding_dim > 0
                 && let Some(sq_slice) = candidate_search_query_embeddings_slice
             {
-                sq_slice.fill(0.0);
-                sq_slice
-                    .par_chunks_exact_mut(candidate_seq_len * search_query_embedding_dim)
-                    .take(length_of_input)
-                    .zip(request.items.par_iter())
-                    .for_each(|(search_query_emb_row, item)| {
-                        if let Some(ref input_buffer) = item.input_buffer {
-                            let src = &input_buffer.candidate_search_query_embeddings;
-                            if src.len() == search_query_embedding_dim {
-                                let n_rep = input_buffer
-                                    .num_real_candidates(num_item_hashes, candidate_seq_len);
-                                xai_recsys::util::repeat_query_into(
-                                    search_query_emb_row,
-                                    src,
-                                    n_rep,
-                                );
-                            }
-                        }
-                    });
+                crate::util::fill_candidate_search_query_embeddings(
+                    sq_slice,
+                    &request.items,
+                    length_of_input,
+                    candidate_seq_len,
+                    search_query_embedding_dim,
+                    num_item_hashes,
+                );
             }
 
             let n_user_cat = model_config.hash_table.num_user_categorical_features;
