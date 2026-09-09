@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use half::f16;
 use log::info;
-use rand::Rng;
 use xai_vm_ranker_proto::{RankCandidate, RankRequest, RankedCandidate};
 
 use super::DppContext;
@@ -19,20 +18,40 @@ fn l2_norm(v: &[f16]) -> f64 {
         .sqrt() as f64
 }
 
-fn random_unit_embedding(dim: usize) -> Arc<Vec<f16>> {
-    let mut rng = rand::rng();
+fn mix_u64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Builds a stable fallback whose expected cosine similarity with other embeddings is zero.
+///
+/// DPP treats embeddings as directions, so a dense hash-derived unit vector preserves the old
+/// random fallback's approximately orthogonal geometry without changing between requests. Keying
+/// by the embedding ID also gives multiple candidates for the same original post the same vector.
+fn deterministic_unit_embedding(embedding_id: u64, dim: usize) -> (Arc<Vec<f16>>, f64) {
+    if dim == 0 {
+        return (Arc::new(Vec::new()), 0.0);
+    }
+
+    let seed = mix_u64(embedding_id ^ (dim as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let v: Vec<f32> = (0..dim)
-        .map(|_| rng.random_range(-1.0f32..1.0f32))
+        .map(|coordinate| {
+            let bits = mix_u64(seed ^ (coordinate as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let unit_interval = (bits >> 40) as f32 / (1u32 << 24) as f32;
+            unit_interval.mul_add(2.0, -1.0)
+        })
         .collect();
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let emb = if norm > 0.0 {
+    let emb: Vec<f16> = if norm.is_finite() && norm > f32::EPSILON {
         v.into_iter().map(|x| f16::from_f32(x / norm)).collect()
     } else {
         let mut u = vec![f16::ZERO; dim];
-        u[0] = f16::ONE;
+        u[(mix_u64(seed) % dim as u64) as usize] = f16::ONE;
         u
     };
-    Arc::new(emb)
+    let quantized_norm = l2_norm(&emb);
+    (Arc::new(emb), quantized_norm)
 }
 
 fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
@@ -68,7 +87,7 @@ fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
                     let n = l2_norm(&arc);
                     (arc, n)
                 }
-                None => (random_unit_embedding(dim), 1.0),
+                None => deterministic_unit_embedding(embedding_id, dim),
             };
             DppInput {
                 id: c.tweet_id,
@@ -79,6 +98,50 @@ fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_embedding_fallback_is_repeatable() {
+        let (first, first_norm) = deterministic_unit_embedding(42, 128);
+        let (second, second_norm) = deterministic_unit_embedding(42, 128);
+        let (different_id, _) = deterministic_unit_embedding(43, 128);
+
+        assert_eq!(first, second);
+        assert_eq!(first_norm, second_norm);
+        assert_ne!(first, different_id);
+    }
+
+    #[test]
+    fn missing_embedding_fallback_is_finite_and_normalized() {
+        for embedding_id in [0, 1, 42, u64::MAX] {
+            for dim in [1, 2, 128, 1024] {
+                let (embedding, norm) = deterministic_unit_embedding(embedding_id, dim);
+
+                assert_eq!(embedding.len(), dim);
+                assert!(
+                    embedding.iter().all(|value| value.to_f32().is_finite()),
+                    "embedding_id={embedding_id}, dim={dim} contains a non-finite value"
+                );
+                assert!(norm.is_finite(), "embedding_id={embedding_id}, dim={dim}");
+                assert!(
+                    (norm - 1.0).abs() < 1e-3,
+                    "embedding_id={embedding_id}, dim={dim}, norm={norm}"
+                );
+                assert!((l2_norm(&embedding) - norm).abs() < f64::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_embedding_fallback_handles_empty_dimensions() {
+        let (embedding, norm) = deterministic_unit_embedding(42, 0);
+        assert!(embedding.is_empty());
+        assert_eq!(norm, 0.0);
+    }
 }
 
 pub fn rank(req: &RankRequest, ctx: &DppContext) -> Vec<RankedCandidate> {
