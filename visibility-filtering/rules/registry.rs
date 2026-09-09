@@ -78,7 +78,8 @@ impl Policy {
 
 static FILTER_ALL_POLICY: Policy = Policy::new(&[tweet_rules::FILTER_ALL]);
 
-static TIMELINE_HOME_SHARED_RULES: [&[RuleSpec]; 9] = [
+static TIMELINE_HOME_SHARED_RULES: [&[RuleSpec]; 10] = [
+    tweet_rules::SAFETY_HYDRATION_FAILURE_DROP,
     author_rules::AUTHOR_STATE_DROPS,
     author_rules::SOCIALGRAPH_DROPS,
     tweet_rules::TWEET_LABEL_DROPS,
@@ -158,6 +159,33 @@ mod tests {
     use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 
     #[test]
+    fn failed_safety_label_hydration_fails_closed_on_both_home_surfaces() {
+        let rule_engine = RuleEngine::new();
+        let viewer = ViewerFeatures::default();
+        let mut failed = HydratedTweetCandidate::default();
+        failed.safety_hydration_failed = true;
+
+        for level in [
+            SafetyLevel::TimelineHome,
+            SafetyLevel::TimelineHomeRecommendations,
+        ] {
+            let verdict = rule_engine.evaluate(level, &viewer, &failed);
+            assert!(matches!(verdict.action, VfAction::Drop(_)));
+            assert_eq!(verdict.decided_by, Some("SafetyHydrationFailureDropRule"));
+        }
+    }
+
+    #[test]
+    fn successful_safety_label_hydration_remains_eligible_for_normal_rules() {
+        let rule_engine = RuleEngine::new();
+        let viewer = ViewerFeatures::default();
+        let candidate = HydratedTweetCandidate::default();
+
+        let verdict = rule_engine.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
+        assert!(matches!(verdict.action, VfAction::Allow));
+    }
+
+    #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
         let gating_countries = Arc::new(NsfwGatingCountries::starting_at_default());
         let rule_engine = RuleEngine::with_nsfw_gating_countries(Arc::clone(&gating_countries));
@@ -206,6 +234,7 @@ rust_vf:
         assert_eq!(
             home,
             vec![
+                "SafetyHydrationFailureDropRule",
                 "SuspendedAuthorRule",
                 "DeactivatedAuthorRule",
                 "ErasedAuthorRule",

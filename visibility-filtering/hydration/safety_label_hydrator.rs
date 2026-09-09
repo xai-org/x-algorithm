@@ -50,9 +50,7 @@ impl SafetyLabelHydrator {
                         .insert(*tweet_id, SafetyLabelMap::from_proto_label_types(label_map));
                     label_response.insert(*tweet_id, Arc::clone(label_map));
                 }
-                None => {
-                    label_types.insert(*tweet_id, SafetyLabelMap::default());
-                }
+                None => {}
             }
         }
         SafetyLabelHydration {
@@ -169,7 +167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_fails_open_on_lookup_errors() {
+    async fn hydrate_fails_closed_on_lookup_errors() {
         let tweet_ids = vec![TweetId(1)];
         let hydrator = hydrator(
             HashMap::new(),
@@ -181,7 +179,7 @@ mod tests {
             .hydrate(&tweet_ids, SafetyLevel::TimelineHome)
             .await;
 
-        assert!(!result.label_types[&TweetId(1)].has_label(SafetyLabelType::SPAM));
+        assert!(!result.label_types.contains_key(&TweetId(1)));
         assert!(!result.label_response.contains_key(&TweetId(1)));
     }
 

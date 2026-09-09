@@ -102,6 +102,10 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         }
     }
 
+    pub(crate) fn is_failed(&self, key: &K) -> bool {
+        self.results.get(key).is_some_and(Hydrated::is_failed)
+    }
+
     pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {
         self.results.get(key)
     }

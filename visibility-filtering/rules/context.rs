@@ -144,6 +144,11 @@ impl TweetPredicates<'_> {
     }
 
     #[inline]
+    pub fn safety_hydration_failed(&self) -> bool {
+        self.ctx.candidate.safety_hydration_failed
+    }
+
+    #[inline]
     pub fn is_retweet(&self) -> bool {
         self.ctx.candidate.is_retweet()
     }

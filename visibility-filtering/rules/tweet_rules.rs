@@ -278,6 +278,19 @@ fn drop_geo_restricted_media(context: &RuleContext<'_>) -> VfAction {
     }
 }
 
+pub(super) const SAFETY_HYDRATION_FAILURE_DROP: &[RuleSpec] = &[RuleSpec::Custom {
+    name: "SafetyHydrationFailureDropRule",
+    evaluate: drop_failed_safety_hydration,
+}];
+
+fn drop_failed_safety_hydration(context: &RuleContext<'_>) -> VfAction {
+    if context.tweet().safety_hydration_failed() {
+        VfAction::Drop(FilteredReason::UnspecifiedReason)
+    } else {
+        VfAction::Allow
+    }
+}
+
 pub(super) const TES_HOME_DROPS: &[RuleSpec] = &[
     RuleSpec::Tweet {
         name: "DropStaleTweetsRule",
@@ -1044,11 +1057,12 @@ mod tests {
         assert_drops(no_age, &request_fallback, &hp, &reason);
     }
 
-    fn all_rule_slices() -> [&'static [RuleSpec]; 15] {
+    fn all_rule_slices() -> [&'static [RuleSpec]; 16] {
         use crate::rules::author_rules::{
             AUTHOR_STATE_DROPS, OON_NSFW_AUTHOR_DROPS, OON_USER_LABEL_DROPS, SOCIALGRAPH_DROPS,
         };
         [
+            SAFETY_HYDRATION_FAILURE_DROP,
             AUTHOR_STATE_DROPS,
             TWEET_LABEL_DROPS,
             NSFW_MEDIA_INTERSTITIALS,

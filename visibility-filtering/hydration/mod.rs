@@ -23,7 +23,7 @@ use fallback_cache::FallbackCache;
 use gizmoduck_hydrator::GizmoduckAuthorHydrator;
 use safety_label_hydrator::{SafetyLabelHydration, SafetyLabelHydrator};
 use socialgraph_hydrator::SocialgraphHydrator;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tes_hydrator::TesHydrator;
 use viewer_hydrator::ViewerHydrator;
@@ -59,6 +59,7 @@ struct CandidateFeatures {
     author_features: TweetHydrationBatch<AuthorFeatures>,
     safety_labels: HashMap<TweetId, SafetyLabelMap>,
     relationships: TweetHydrationBatch<ViewerAuthorRelationship>,
+    tes_hydration_failed: HashSet<TweetId>,
     exclusive_content: HashMap<TweetId, Option<ExclusiveContentFeatures>>,
 }
 
@@ -67,6 +68,8 @@ impl CandidateFeatures {
         candidates
             .iter()
             .map(|c| {
+                let safety_hydration_failed = !self.safety_labels.contains_key(&c.tweet_id)
+                    || self.tes_hydration_failed.contains(&c.tweet_id);
                 assemble(
                     c,
                     self.tweet_features
@@ -79,6 +82,7 @@ impl CandidateFeatures {
                         .cloned()
                         .unwrap_or_default(),
                     self.relationships.get_or_default(&c.tweet_id),
+                    safety_hydration_failed,
                     self.exclusive_content
                         .get(&c.tweet_id)
                         .cloned()
@@ -213,11 +217,17 @@ impl HydrationPipeline {
                 &tes_tweet_keyed,
             );
 
+            let tes_hydration_failed = candidates
+                .iter()
+                .map(|c| c.tweet_id)
+                .filter(|id| tes_tweet_keyed.safety_hydration_failed(id, &core_datas))
+                .collect();
             let features = CandidateFeatures {
                 tweet_features,
                 author_features,
                 safety_labels: label_types,
                 relationships,
+                tes_hydration_failed,
                 exclusive_content,
             };
             let hydrated_candidates = features.assemble(&candidates);
@@ -295,6 +305,7 @@ mod tests {
                     })),
                 )]),
             ),
+            tes_hydration_failed: HashSet::new(),
             exclusive_content: HashMap::new(),
         };
 
@@ -307,6 +318,67 @@ mod tests {
         assert_eq!(c.tweet_features.core.source_tweet_id, Some(2));
         assert!(c.author_features.is_suspended);
         assert!(c.relationship.viewer_follows_author);
+        assert!(!c.safety_hydration_failed);
+    }
+
+    #[test]
+    fn assemble_marks_failed_safety_label_hydration_without_dropping_candidate() {
+        let candidate = resolve_candidate(&raw(1, Some(100)), &HashMap::new()).unwrap();
+        let results = CandidateFeatures {
+            tweet_features: HashMap::new(),
+            author_features: TweetHydrationBatch::from_results(
+                [TweetId(1)],
+                HashMap::from([(
+                    TweetId(1),
+                    Ok::<_, anyhow::Error>(Some(AuthorFeatures::default())),
+                )]),
+            ),
+            safety_labels: HashMap::new(),
+            relationships: TweetHydrationBatch::from_results(
+                [TweetId(1)],
+                HashMap::from([(
+                    TweetId(1),
+                    Ok::<_, anyhow::Error>(Some(ViewerAuthorRelationship::default())),
+                )]),
+            ),
+            tes_hydration_failed: HashSet::new(),
+            exclusive_content: HashMap::new(),
+        };
+
+        let assembled = results.assemble(&[candidate]);
+
+        assert_eq!(assembled.len(), 1);
+        assert!(assembled[0].safety_hydration_failed);
+    }
+
+    #[test]
+    fn assemble_marks_failed_tes_tweet_flag_hydration() {
+        let candidate = resolve_candidate(&raw(1, Some(100)), &HashMap::new()).unwrap();
+        let results = CandidateFeatures {
+            tweet_features: HashMap::new(),
+            author_features: TweetHydrationBatch::from_results(
+                [TweetId(1)],
+                HashMap::from([(
+                    TweetId(1),
+                    Ok::<_, anyhow::Error>(Some(AuthorFeatures::default())),
+                )]),
+            ),
+            safety_labels: HashMap::from([(TweetId(1), SafetyLabelMap::default())]),
+            relationships: TweetHydrationBatch::from_results(
+                [TweetId(1)],
+                HashMap::from([(
+                    TweetId(1),
+                    Ok::<_, anyhow::Error>(Some(ViewerAuthorRelationship::default())),
+                )]),
+            ),
+            tes_hydration_failed: HashSet::from([TweetId(1)]),
+            exclusive_content: HashMap::new(),
+        };
+
+        let assembled = results.assemble(&[candidate]);
+
+        assert_eq!(assembled.len(), 1);
+        assert!(assembled[0].safety_hydration_failed);
     }
 
     fn raw(tweet_id: u64, request_author_id: Option<u64>) -> RawCandidate {
