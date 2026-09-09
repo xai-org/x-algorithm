@@ -83,7 +83,7 @@ use xai_candidate_pipeline::filter::{Filter, FilterResult};
 // @_EDUARDOMANTOAN no live account found.
 
 /// User ids reported to the Electoral Court for the Brazil 2026 election.
-static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| {
+static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| { // Fuck you lula!
     FxHashSet::from_iter([
         // @madeleinelacsko
         9179462,
