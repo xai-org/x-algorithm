@@ -4,7 +4,7 @@ use crate::models::{
 };
 use crate::rules::rule_spec::RuleSpec;
 use crate::rules::test_context;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::user_labels::LabelValue;
 
@@ -72,6 +72,7 @@ pub(crate) fn candidate() -> CandidateBuilder {
             ..Default::default()
         },
         labels: HashSet::new(),
+        label_users: HashMap::new(),
         user_labels: HashSet::new(),
     }
 }
@@ -79,6 +80,7 @@ pub(crate) fn candidate() -> CandidateBuilder {
 pub(crate) struct CandidateBuilder {
     candidate: HydratedTweetCandidate,
     labels: HashSet<SafetyLabelType>,
+    label_users: HashMap<SafetyLabelType, Vec<u64>>,
     user_labels: HashSet<LabelValue>,
 }
 
@@ -95,6 +97,12 @@ impl CandidateBuilder {
 
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
         self.labels.insert(label);
+        self
+    }
+
+    pub(crate) fn with_label_users(mut self, label: SafetyLabelType, users: Vec<u64>) -> Self {
+        self.labels.insert(label);
+        self.label_users.insert(label, users);
         self
     }
 
@@ -135,8 +143,12 @@ impl CandidateBuilder {
 
     pub(crate) fn build(self) -> HydratedTweetCandidate {
         let mut candidate = self.candidate;
-        if !self.labels.is_empty() {
-            candidate.safety_labels = SafetyLabelMap::new(self.labels);
+        if !self.labels.is_empty() || !self.label_users.is_empty() {
+            let mut map = SafetyLabelMap::new(self.labels);
+            for (label, users) in self.label_users {
+                map = map.with_user_scope(label, users);
+            }
+            candidate.safety_labels = map;
         }
         if !self.user_labels.is_empty() {
             candidate.author_features.user_labels = UserLabelSet::new(self.user_labels);

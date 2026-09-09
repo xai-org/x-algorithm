@@ -140,7 +140,10 @@ pub struct TweetPredicates<'a> {
 impl TweetPredicates<'_> {
     #[inline]
     pub fn has_safety_label(&self, label: SafetyLabelType) -> bool {
-        self.ctx.candidate.has_safety_label(label)
+        self.ctx
+            .candidate
+            .safety_labels
+            .applies(label, self.ctx.viewer.viewer_id())
     }
 
     #[inline]

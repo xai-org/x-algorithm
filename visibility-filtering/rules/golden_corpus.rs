@@ -125,6 +125,12 @@ fn labeled(label: SafetyLabelType) -> HydratedTweetCandidate {
     candidate().with_label(label).build()
 }
 
+fn labeled_users(label: SafetyLabelType, users: &[u64]) -> HydratedTweetCandidate {
+    candidate()
+        .with_label_users(label, users.to_vec())
+        .build()
+}
+
 fn labeled_media(label: SafetyLabelType) -> HydratedTweetCandidate {
     candidate().with_label(label).with_media().build()
 }
@@ -892,6 +898,22 @@ fn oon_tweet_label_cases() -> Vec<Case> {
             level: TimelineHomeRecommendations,
             viewer: viewer(VIEWER_ID),
             candidate: labeled(SafetyLabelType::DO_NOT_AMPLIFY),
+            expected_action: Drop(FilteredReason::PossiblyUndesirable),
+            expected_decided_by: Some("DoNotAmplifyOonDropRule"),
+        },
+        Case {
+            name: "user_scoped_do_not_amplify_allows_unlisted_viewer_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer(VIEWER_ID),
+            candidate: labeled_users(SafetyLabelType::DO_NOT_AMPLIFY, &[42]),
+            expected_action: Allow,
+            expected_decided_by: None,
+        },
+        Case {
+            name: "user_scoped_do_not_amplify_drops_listed_viewer_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer(42),
+            candidate: labeled_users(SafetyLabelType::DO_NOT_AMPLIFY, &[42]),
             expected_action: Drop(FilteredReason::PossiblyUndesirable),
             expected_decided_by: Some("DoNotAmplifyOonDropRule"),
         },
