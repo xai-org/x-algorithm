@@ -282,6 +282,37 @@ param!(
     0
 );
 
+param!(
+    EnableSlateDiversity,
+    bool,
+    "rust_home_mixer_enable_slate_diversity",
+    false
+);
+param!(
+    SlateDiversityAuthorWindowSize,
+    u32,
+    "rust_home_mixer_slate_diversity_author_window_size",
+    20
+);
+param!(
+    SlateDiversityMaxPostsPerAuthor,
+    u32,
+    "rust_home_mixer_slate_diversity_max_posts_per_author",
+    2
+);
+param!(
+    EnableSlateSemanticDiversity,
+    bool,
+    "rust_home_mixer_enable_slate_semantic_diversity",
+    true
+);
+param!(
+    SlateDiversityMaxLookahead,
+    u32,
+    "rust_home_mixer_slate_diversity_max_lookahead",
+    10
+);
+
 // These weights reflect a combination of how much an action is
 // valued in ranking and typical propensities of these actions
 // across the X network (e.g. negative feedback is overall rare).
