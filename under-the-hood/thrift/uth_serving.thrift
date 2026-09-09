@@ -53,6 +53,8 @@ enum UthFollowerClass {
 struct UthPostLabelAggregate {
   1: optional string label (personalDataType = 'TweetSafetyLabels')
   2: optional list<UthDayCarriedRemoved> days
+  // Newest logical post IDs represented by days, bounded by the month publisher.
+  4: optional list<i64> postIds (personalDataType = 'TweetId')
 }(persisted = 'true', hasPersonalData = 'true')
 
 struct UthAccountLabelAggregate {
@@ -129,6 +131,8 @@ struct UthDailyPostLabel {
   7: optional i32 observationAgeDays
   8: optional bool isFinal
   9: optional i32 postObservationDays
+  // Logical post IDs represented by carried; absent on pre-migration rows.
+  11: optional list<i64> postIds (personalDataType = 'TweetId')
 }(persisted = 'true', hasPersonalData = 'true')
 
 struct UthDailyAccountLabel {

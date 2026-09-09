@@ -190,11 +190,14 @@ def buildReportJson(
     .flatMap { agg =>
       agg.label.filter(underTheHoodLabels.isPostLabel).map { raw =>
         val posts = sumCarried(agg.days)
+        val postIds = agg.postIds.getOrElse(Seq.empty).distinct.sorted
         {
           label = underTheHoodLabels.postLabelName(raw),
           about = underTheHoodLabels.postLabelAbout(raw),
           effect = underTheHoodLabels.postLabelEffect(raw),
           posts = posts,
+          postIds = postIds.map(_.toString),
+          postIdsComplete = postIds.size.toLong == posts,
           totalPostsInMonth = postCount,
           percentageOfPosts = formatPercentage(posts, postCount),
         }

@@ -107,7 +107,7 @@ class UthDailyPostsApp {
         observationMs,
         config)
         .map {
-          case (userId, authoredDay, label, carried, removed) =>
+          case (userId, authoredDay, label, carried, removed, postIds) =>
             val age = calendarDaysBetween(authoredDay, asOfDay)
             UthDailyPostLabel(
               userId = Some(userId),
@@ -118,7 +118,8 @@ class UthDailyPostsApp {
               asOfYyyymmdd = Some(asOfDay),
               observationAgeDays = Some(age),
               isFinal = Some(age >= config.postObservationDays),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Some(postIds)
             )
         }
 
@@ -131,7 +132,7 @@ class UthDailyPostsApp {
         dayEndMs,
         config.reducers)
         .map {
-          case (userId, authoredDay, label, carried) =>
+          case (userId, authoredDay, label, carried, postIds) =>
             UthDailyPostLabel(
               userId = Some(userId),
               authoredYyyymmdd = Some(authoredDay),
@@ -141,7 +142,8 @@ class UthDailyPostsApp {
               asOfYyyymmdd = Some(asOfDay),
               observationAgeDays = Some(0),
               isFinal = Some(true),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Some(postIds)
             )
         }
 
@@ -192,7 +194,7 @@ object UthDailyPostsApp {
     dayStartMs: Long,
     dayEndMs: Long,
     reducers: Int
-  ): TypedPipe[(Long, Int, String, Long)] =
+  ): TypedPipe[(Long, Int, String, Long, Seq[Long])] =
     if (flagLabels.isEmpty) TypedPipe.empty
     else {
       val flagged = tweets.flatMap { t =>
@@ -207,11 +209,17 @@ object UthDailyPostsApp {
           } else Nil
         } else Nil
       }
-      val counts = applyReducers(flagged.group, reducers).sum.keys.map {
-        case (userId, day, _, label) => ((userId, day, label), 1L)
-      }.sumByKey
-      (if (reducers > 0) counts.withReducers(reducers) else counts).toTypedPipe
-        .map { case ((userId, day, label), carried) => (userId, day, label, carried) }
+      val distinctPosts = applyReducers(flagged.group, reducers).sum.keys
+      applyReducers(
+        distinctPosts.map {
+          case (userId, day, logicalId, label) =>
+            ((userId, day, label), UthPostIds.single(logicalId, 0L))
+        }.group,
+        reducers
+      ).reduce(UthPostIds.merge).toTypedPipe.map {
+        case ((userId, day, label), summary) =>
+          (userId, day, label, summary.carried, summary.postIds)
+      }
     }
 
   private[under_the_hood] def loadPosts(
@@ -340,7 +348,7 @@ object UthDailyPostsApp {
     dayEndMs: Long,
     observationMs: Long,
     config: UthDailyPostsConfig
-  ): TypedPipe[(Long, Int, String, Long, Long)] = {
+  ): TypedPipe[(Long, Int, String, Long, Long, Seq[Long])] = {
     val postByTweetId = posts.map {
       case (tweetId, userId, day, logicalId, createdMs) =>
         (tweetId, (logicalId, userId, day, createdMs))
@@ -380,17 +388,19 @@ object UthDailyPostsApp {
 
     applyReducers(
       reduced.collect {
-        case ((_, userId, day, label, createdMs), (everApply, _, lastApply, lastExpires))
-            if everApply =>
+        case (
+              (logicalId, userId, day, label, createdMs),
+              (everApply, _, lastApply, lastExpires)
+            ) if everApply =>
           val deadline = math.min(createdMs + observationMs, dayEndMs)
           val removed =
             if (removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L else 0L
-          ((userId, day, label), (1L, removed))
+          ((userId, day, label), UthPostIds.single(logicalId, removed))
       }.group,
       config.reducers
-    ).sum.toTypedPipe.map {
-      case ((userId, day, label), (carried, removed)) =>
-        (userId, day, label, carried, removed)
+    ).reduce(UthPostIds.merge).toTypedPipe.map {
+      case ((userId, day, label), summary) =>
+        (userId, day, label, summary.carried, summary.removed, summary.postIds)
     }
   }
 }

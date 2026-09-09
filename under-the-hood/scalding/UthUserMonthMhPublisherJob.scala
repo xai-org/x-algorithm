@@ -165,7 +165,11 @@ object UthUserMonthMhPublisherApp {
           label <- row.label
           carried <- row.carried
           removed <- row.removed
-        } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed))
+          postIds = row.postIds.getOrElse(Seq.empty)
+        } yield (
+          (userId, monthBucket(day)),
+          (label, dayOfMonth(day), carried, removed, postIds)
+        )
       },
       reducers
     )
@@ -202,21 +206,34 @@ object UthUserMonthMhPublisherApp {
 
           val postLabelAgg = labelsOpt
             .getOrElse(Nil)
-            .groupBy { case (label, _, _, _) => label }
+            .groupBy { case (label, _, _, _, _) => label }
             .map {
               case (label, rows) =>
-                val days = rows
-                  .groupBy { case (_, day, _, _) => day }
-                  .map {
-                    case (day, dayRows) =>
-                      val best = dayRows.maxBy {
-                        case (_, _, carried, removed) => (carried, removed)
-                      }
-                      UthDayCarriedRemoved(Some(day), Some(best._3), Some(best._4))
+                val selectedRows = rows
+                  .groupBy { case (_, day, _, _, _) => day }
+                  .values
+                  .map { dayRows =>
+                    dayRows.maxBy {
+                      case (_, _, carried, removed, postIds) =>
+                        (carried, removed, postIds.size)
+                    }
                   }
                   .toList
+                val days = selectedRows
+                  .map {
+                    case (_, day, carried, removed, _) =>
+                      UthDayCarriedRemoved(Some(day), Some(carried), Some(removed))
+                  }
                   .sortBy(_.dayOfMonth.getOrElse(0))
-                UthPostLabelAggregate(Some(label), Some(days))
+                val postIds = UthPostIds.newestDistinct(
+                  selectedRows.flatMap(_._5),
+                  UthPostIds.MaxPostIdsPerLabel
+                )
+                UthPostLabelAggregate(
+                  label = Some(label),
+                  days = Some(days),
+                  postIds = Some(postIds)
+                )
             }
             .toList
             .sortBy(_.label.getOrElse(""))
