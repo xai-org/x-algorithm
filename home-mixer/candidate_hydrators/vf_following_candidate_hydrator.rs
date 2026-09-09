@@ -1,4 +1,4 @@
-use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;
+use crate::candidate_hydrators::vf_candidate_hydrator::{primary_vf_id, should_drop_ancillary};
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableXaiVfClient;
@@ -70,7 +70,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let primary_result = all_results.get(&candidate.tweet_id);
+            let primary_result = all_results.get(&primary_vf_id(candidate));
             let visibility_reason = match primary_result {
                 Some(Ok(Some(reason))) => Some(reason.clone()),
                 _ => None,
@@ -94,5 +94,103 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.visibility_reason = hydrated.visibility_reason;
         candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_safety_label_store::types::SafetyLabelMap;
+    use xai_twittercontext_proto::TwitterContextViewer;
+    use xai_visibility_filtering::models::{Action, SafetyResult, SafetyResultReason};
+    use xai_visibility_filtering::vf_client::{SafetyLevel, TweetVisibility};
+
+    struct MapClient {
+        results: HashMap<u64, FilteredReason>,
+    }
+
+    fn vis(reason: FilteredReason) -> TweetVisibility {
+        TweetVisibility {
+            reason: Some(reason),
+            safety_labels: Ok(SafetyLabelMap::default()),
+        }
+    }
+
+    fn interstitial() -> FilteredReason {
+        FilteredReason::SafetyResult(SafetyResult {
+            reason: Some(SafetyResultReason::NsfwHighPrecision),
+            action: Action::Interstitial,
+        })
+    }
+
+    fn allow() -> FilteredReason {
+        FilteredReason::SafetyResult(SafetyResult {
+            reason: None,
+            action: Action::Allow,
+        })
+    }
+
+    #[async_trait]
+    impl VfClient for MapClient {
+        async fn get_result(
+            &self,
+            post_ids: Vec<u64>,
+            _safety_level: SafetyLevel,
+            _for_user_id: u64,
+            _context: Option<TwitterContextViewer>,
+        ) -> HashMap<u64, Result<TweetVisibility>> {
+            post_ids
+                .into_iter()
+                .filter_map(|id| {
+                    self.results
+                        .get(&id)
+                        .cloned()
+                        .map(|reason| (id, Ok(vis(reason))))
+                })
+                .collect()
+        }
+    }
+
+    fn hydrator(results: HashMap<u64, FilteredReason>) -> VFFollowingCandidateHydrator {
+        let client = Arc::new(MapClient { results });
+        VFFollowingCandidateHydrator::new(client.clone(), client)
+    }
+
+    #[tokio::test]
+    async fn native_post_still_uses_its_own_id() {
+        let results = hydrator(HashMap::from([(20, interstitial())]))
+            .hydrate(
+                &ScoredPostsQuery::default(),
+                &[PostCandidate {
+                    tweet_id: 20,
+                    ..Default::default()
+                }],
+            )
+            .await;
+        let hydrated = results[0].as_ref().unwrap();
+        assert!(matches!(
+            hydrated.visibility_reason,
+            Some(FilteredReason::SafetyResult(ref s)) if s.action == Action::Interstitial
+        ));
+    }
+
+    #[tokio::test]
+    async fn retweet_uses_original_interstitial() {
+        let results = hydrator(HashMap::from([(10, allow()), (20, interstitial())]))
+            .hydrate(
+                &ScoredPostsQuery::default(),
+                &[PostCandidate {
+                    tweet_id: 10,
+                    retweeted_tweet_id: Some(20),
+                    ..Default::default()
+                }],
+            )
+            .await;
+        let hydrated = results[0].as_ref().unwrap();
+        assert!(matches!(
+            hydrated.visibility_reason,
+            Some(FilteredReason::SafetyResult(ref s)) if s.action == Action::Interstitial
+        ));
+        assert_eq!(hydrated.drop_ancillary_posts, Some(false));
     }
 }
