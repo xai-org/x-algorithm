@@ -1,5 +1,6 @@
 import <visibility/under-the-hood/sharedConfig>
 import <visibility/under-the-hood/underTheHoodLabels>
+import <visibility/under-the-hood/liveRestrictionStatus>
 
 type Key = Long
 type View = Unit
@@ -296,14 +297,15 @@ def monthDataReady(
 
 val fetchOp = Op.fetch[Key, View, Value] { ctx =>
   val now = Time.now
-  val gizUserOpt = userWithQueryFields(ctx.key, Set(Account, Safety))
+  val gizUserOpt = userWithQueryFields(ctx.key, Set(Account, Safety, Labels))
   if (gizUserOpt.map { user => isSuspended(user) }.getOrElse(false)) {
     Ok.missing
   } else {
-  val ageOk =
-    gizUserOpt.map({ user =>
-      meetsAccountAgeMinimum(user, now)
-    }).getOrElse(false)
+    val liveStatus = liveRestrictionStatus.build(ctx.key, gizUserOpt, now)
+    val ageOk =
+      gizUserOpt.map({ user =>
+        meetsAccountAgeMinimum(user, now)
+      }).getOrElse(false)
 
   val primaryMonth = reportMonthBucket(now)
   val primaryUserKey: UthUserMonthKey = {
@@ -340,10 +342,18 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
     case None =>
       monthMetaOpt match {
         case None =>
-          Ok.missing
+          Ok.value(Some({
+            reportJson = None,
+            reportInfo = None,
+            liveRestrictionStatus = Some(liveStatus),
+          }))
         case Some(meta) =>
           if (!monthObservationComplete(monthBucket, meta.daysIncluded)) {
-            Ok.missing
+            Ok.value(Some({
+              reportJson = None,
+              reportInfo = None,
+              liveRestrictionStatus = Some(liveStatus),
+            }))
           } else {
             val reportInfo = {
               reportPeriod = Some(reportPeriodLabel(monthBucket)),
@@ -355,13 +365,18 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
             Ok.value(Some({
               reportJson = None,
               reportInfo = Some(reportInfo),
+              liveRestrictionStatus = Some(liveStatus),
             }))
           }
       }
     case Some(userMonth) =>
       val daysIncludedForTs = userMonth.daysIncluded
       if (!monthObservationComplete(monthBucket, daysIncludedForTs)) {
-        Ok.missing
+        Ok.value(Some({
+          reportJson = None,
+          reportInfo = None,
+          liveRestrictionStatus = Some(liveStatus),
+        }))
       } else {
         val postCount = userMonth.eligiblePostAgg
           .map { days => sumDayCounts(Some(days)) }
@@ -386,6 +401,7 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         Ok.value(Some({
           reportJson = reportJson,
           reportInfo = Some(reportInfo),
+          liveRestrictionStatus = Some(liveStatus),
         }))
       }
   }
@@ -408,7 +424,9 @@ Managed({
       "Picks the latest prior UTC month past the 10-day calendar floor (keep at 10+); if that " +
       "month lacks complete observation (finalThroughDay), falls back one month. " +
       "Uses the per-user row when present; if missing, userId=-1 month-meta can still return " +
-      "reportInfo without reportJson. Missing only when both user and meta are absent/incomplete. " +
-      "eligibilityChecks = posts/age only. Called by underTheHoodReport for the authenticated viewer."
+      "reportInfo without reportJson. The additive liveRestrictionStatus is returned even when " +
+      "monthly data is absent or incomplete; it performs a bounded scan of the authenticated " +
+      "creator's current account labels and recent authored posts. eligibilityChecks = posts/age " +
+      "only. Called by underTheHoodReport for the authenticated viewer."
   ),
 })
