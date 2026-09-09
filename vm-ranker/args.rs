@@ -21,7 +21,11 @@ pub struct Args {
     #[arg(long, default_value_t = 0.5)]
     pub dpp_theta: f64,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "Maximum DPP candidate pool size; requests may select a smaller pool"
+    )]
     pub dpp_max_selected_rank: usize,
 
     #[arg(long, default_value_t = 1024)]
