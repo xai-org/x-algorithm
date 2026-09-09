@@ -171,6 +171,13 @@ fn viewer_in_country(code: &str) -> ViewerFeatures {
     }
 }
 
+fn viewer_with_account_country(code: &str) -> ViewerFeatures {
+    ViewerFeatures {
+        account_country_code: Some(code.to_string()),
+        ..viewer(VIEWER_ID)
+    }
+}
+
 fn viewer_with_age(age: ViewerAge) -> ViewerFeatures {
     ViewerFeatures {
         viewer_age: age,
@@ -799,6 +806,22 @@ fn oon_media_cases() -> Vec<Case> {
             level: TimelineHomeRecommendations,
             viewer: viewer(VIEWER_ID),
             candidate: tweet_candidate(|t| t.media.geo_allow_list = vec!["us".to_string()]),
+            expected_action: Drop(FilteredReason::UnspecifiedReason),
+            expected_decided_by: Some("DropTweetsWithGeoRestrictedMediaRule"),
+        },
+        Case {
+            name: "geo_allow_listed_media_allows_account_country_when_request_country_missing",
+            level: TimelineHomeRecommendations,
+            viewer: viewer_with_account_country("us"),
+            candidate: tweet_candidate(|t| t.media.geo_allow_list = vec!["us".to_string()]),
+            expected_action: Allow,
+            expected_decided_by: None,
+        },
+        Case {
+            name: "geo_denied_media_drops_account_country_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer_with_account_country("de"),
+            candidate: tweet_candidate(|t| t.media.geo_deny_list = vec!["de".to_string()]),
             expected_action: Drop(FilteredReason::UnspecifiedReason),
             expected_decided_by: Some("DropTweetsWithGeoRestrictedMediaRule"),
         },

@@ -259,7 +259,12 @@ impl TakedownPredicates<'_> {
 
     #[inline]
     fn in_viewer_country(&self, extractor: fn(&TakedownReason) -> Option<&str>) -> bool {
-        let viewer_country = self.ctx.viewer.country_code.as_deref();
+        let viewer_country = self
+            .ctx
+            .viewer
+            .account_country_code
+            .as_deref()
+            .or(self.ctx.viewer.country_code.as_deref());
         self.ctx
             .candidate
             .tweet_features
@@ -278,8 +283,9 @@ impl TakedownPredicates<'_> {
         let country = self
             .ctx
             .viewer
-            .country_code
+            .account_country_code
             .as_deref()
+            .or(self.ctx.viewer.country_code.as_deref())
             .unwrap_or(WORLDWIDE_COUNTRY_CODE);
         let allow = &self.ctx.candidate.tweet_features.media.geo_allow_list;
         let deny = &self.ctx.candidate.tweet_features.media.geo_deny_list;
