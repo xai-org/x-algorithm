@@ -24,7 +24,11 @@ fn should_drop(reason: &Option<FilteredReason>) -> bool {
         Some(FilteredReason::SafetyResult(safety_result)) => {
             matches!(safety_result.action, Action::Drop(_))
         }
+        // Includes UnspecifiedReason, which VFCandidateHydrator stamps when the
+        // primary VF lookup is Err or the id is missing from the result map.
         Some(_) => true,
+        // Successful VF Allow is Ok(None) -> visibility_reason None. A lookup
+        // miss is stamped above and must not land here.
         None => false,
     }
 }
@@ -94,5 +98,23 @@ mod tests {
 
         assert_eq!(result.removed.len(), 1);
         assert_eq!(result.kept.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drops_unspecified_reason_from_vf_lookup_miss() {
+        let filter = VFFilter;
+        let query = ScoredPostsQuery::default();
+
+        let result = filter.filter(
+            &query,
+            vec![
+                candidate_with_reason(Some(FilteredReason::UnspecifiedReason)),
+                candidate_with_reason(None),
+            ],
+        );
+
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].visibility_reason, None);
     }
 }

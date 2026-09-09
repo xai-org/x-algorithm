@@ -113,32 +113,50 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
                 .map(|(id, r)| (id, r.map(|t| t.reason))),
         );
 
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let primary_result = all_results.get(&candidate.tweet_id);
-            let visibility_reason = match primary_result {
-                Some(Ok(Some(reason))) => Some(reason.clone()),
-                _ => None,
-            };
-
-            let drop_ancillary = should_drop_ancillary(candidate, &all_results);
-
-            let hydrated = match primary_result {
-                Some(Err(err)) => Err(err.to_string()),
-                _ => Ok(PostCandidate {
-                    visibility_reason,
-                    drop_ancillary_posts: Some(drop_ancillary),
-                    ..Default::default()
-                }),
-            };
-            hydrated_candidates.push(hydrated);
-        }
-        hydrated_candidates
+        candidates
+            .iter()
+            .map(|candidate| resolve_visibility(candidate, &all_results))
+            .collect()
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.visibility_reason = hydrated.visibility_reason;
         candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;
+    }
+}
+
+/// Same sentinel `XaiVfClient::results_to_map` already writes for a missing
+/// response id. `VFFilter` hard-drops every non-`SafetyResult` reason, so this
+/// reaches the filter. Returning `Err` does not: `Hydrator::update_all` skips
+/// the write and leaves `visibility_reason = None`, which `VFFilter` keeps.
+fn vf_lookup_unavailable() -> FilteredReason {
+    FilteredReason::UnspecifiedReason
+}
+
+pub(crate) fn resolve_visibility(
+    candidate: &PostCandidate,
+    vf_results: &HashMap<u64, Result<Option<FilteredReason>>>,
+) -> Result<PostCandidate, String> {
+    let primary_result = vf_results.get(&candidate.tweet_id);
+    // Ok(None) is a successful Allow. Err and a missing map key are not.
+    let visibility_reason = match primary_result {
+        Some(Ok(Some(reason))) => Some(reason.clone()),
+        Some(Ok(None)) => None,
+        Some(Err(_)) | None => Some(vf_lookup_unavailable()),
+    };
+
+    Ok(PostCandidate {
+        visibility_reason,
+        drop_ancillary_posts: Some(should_drop_ancillary(candidate, vf_results)),
+        ..Default::default()
+    })
+}
+
+fn ancillary_verdict_blocks(verdict: Option<&Result<Option<FilteredReason>>>) -> bool {
+    match verdict {
+        Some(Ok(Some(reason))) => should_drop_reason(reason),
+        Some(Ok(None)) => false,
+        Some(Err(_)) | None => true,
     }
 }
 
@@ -150,23 +168,19 @@ pub(crate) fn should_drop_ancillary(
         if candidate.tombstone_ancestor_ids.contains(&ancestor_id) {
             continue;
         }
-        if let Some(Ok(Some(reason))) = vf_results.get(&ancestor_id)
-            && should_drop_reason(reason)
-        {
+        if ancillary_verdict_blocks(vf_results.get(&ancestor_id)) {
             return true;
         }
     }
 
     if let Some(quoted_id) = candidate.quoted_tweet_id
-        && let Some(Ok(Some(reason))) = vf_results.get(&quoted_id)
-        && should_drop_reason(reason)
+        && ancillary_verdict_blocks(vf_results.get(&quoted_id))
     {
         return true;
     }
 
     if let Some(retweeted_id) = candidate.retweeted_tweet_id
-        && let Some(Ok(Some(reason))) = vf_results.get(&retweeted_id)
-        && should_drop_reason(reason)
+        && ancillary_verdict_blocks(vf_results.get(&retweeted_id))
     {
         return true;
     }
@@ -179,6 +193,112 @@ fn should_drop_reason(reason: &FilteredReason) -> bool {
         FilteredReason::SafetyResult(safety_result) => {
             matches!(safety_result.action, Action::Drop(_))
         }
-        _ => true, 
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn results(
+        entries: Vec<(u64, Result<Option<FilteredReason>>)>,
+    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
+        entries.into_iter().collect()
+    }
+
+    #[test]
+    fn primary_lookup_error_stamps_unspecified_reason() {
+        let vf_results = results(vec![(1, Err(anyhow::anyhow!("vf unavailable")))]);
+        let post = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            ..Default::default()
+        };
+
+        let hydrated = resolve_visibility(&post, &vf_results).unwrap();
+
+        assert_eq!(
+            hydrated.visibility_reason,
+            Some(FilteredReason::UnspecifiedReason)
+        );
+        assert_eq!(hydrated.drop_ancillary_posts, Some(false));
+    }
+
+    #[test]
+    fn primary_missing_key_stamps_unspecified_reason() {
+        let vf_results = results(vec![]);
+        let post = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            ..Default::default()
+        };
+
+        let hydrated = resolve_visibility(&post, &vf_results).unwrap();
+
+        assert_eq!(
+            hydrated.visibility_reason,
+            Some(FilteredReason::UnspecifiedReason)
+        );
+    }
+
+    #[test]
+    fn primary_allow_none_stays_none() {
+        let vf_results = results(vec![(1, Ok(None))]);
+        let post = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            ..Default::default()
+        };
+
+        let hydrated = resolve_visibility(&post, &vf_results).unwrap();
+
+        assert_eq!(hydrated.visibility_reason, None);
+        assert_eq!(hydrated.drop_ancillary_posts, Some(false));
+    }
+
+    #[test]
+    fn ancillary_error_drops() {
+        let vf_results = results(vec![
+            (1, Ok(None)),
+            (10, Err(anyhow::anyhow!("vf unavailable"))),
+        ]);
+        let quote = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            quoted_tweet_id: Some(10),
+            ..Default::default()
+        };
+
+        assert!(should_drop_ancillary(&quote, &vf_results));
+        let hydrated = resolve_visibility(&quote, &vf_results).unwrap();
+        assert_eq!(hydrated.visibility_reason, None);
+        assert_eq!(hydrated.drop_ancillary_posts, Some(true));
+    }
+
+    #[test]
+    fn ancillary_missing_key_drops() {
+        let vf_results = results(vec![(1, Ok(None))]);
+        let reply = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            ancestors: vec![10],
+            ..Default::default()
+        };
+
+        assert!(should_drop_ancillary(&reply, &vf_results));
+    }
+
+    #[test]
+    fn ancillary_allow_none_does_not_drop() {
+        let vf_results = results(vec![(1, Ok(None)), (10, Ok(None))]);
+        let quote = PostCandidate {
+            tweet_id: 1,
+            in_network: Some(true),
+            quoted_tweet_id: Some(10),
+            ..Default::default()
+        };
+
+        assert!(!should_drop_ancillary(&quote, &vf_results));
     }
 }

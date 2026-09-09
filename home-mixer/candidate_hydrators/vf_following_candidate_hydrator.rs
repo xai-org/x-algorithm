@@ -1,4 +1,4 @@
-use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;
+use crate::candidate_hydrators::vf_candidate_hydrator::resolve_visibility;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableXaiVfClient;
@@ -68,27 +68,10 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
                 .collect()
         };
 
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let primary_result = all_results.get(&candidate.tweet_id);
-            let visibility_reason = match primary_result {
-                Some(Ok(Some(reason))) => Some(reason.clone()),
-                _ => None,
-            };
-
-            let drop_ancillary = should_drop_ancillary(candidate, &all_results);
-
-            let hydrated = match primary_result {
-                Some(Err(err)) => Err(err.to_string()),
-                _ => Ok(PostCandidate {
-                    visibility_reason,
-                    drop_ancillary_posts: Some(drop_ancillary),
-                    ..Default::default()
-                }),
-            };
-            hydrated_candidates.push(hydrated);
-        }
-        hydrated_candidates
+        candidates
+            .iter()
+            .map(|candidate| resolve_visibility(candidate, &all_results))
+            .collect()
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
