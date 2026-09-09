@@ -340,6 +340,18 @@ param!(
 );
 param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.4);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
+// ---------------------------------------------------------------------------
+// PR-A (SpaceXAI pack): FollowAuthor / ProfileClick / CopyLink FS A/B
+// Pattern: docs/BIDIRECTIONAL_BOOST_CHANGE.md — FS arms first; ship default
+// only after a winning arm. Do NOT bump these defaults until then.
+//
+// Current ship defaults (control): FollowAuthor=4, ProfileClick=0, CopyLink=20.
+// A/B arms (Feature Store only until win):
+//   T1: Follow=12, Profile=1,  CopyLink=20
+//   T2: Follow=20, Profile=2,  CopyLink=20
+//   T3: Follow=20, Profile=2,  CopyLink=10
+// FS keys already exist; scorer already consumes them (ranking_scorer.rs).
+// ---------------------------------------------------------------------------
 param!(
     ProfileClickWeight,
     f64,
@@ -990,6 +1002,42 @@ param!(
     EnableServedFilterAllRequests,
     bool,
     "rust_home_mixer_enable_served_filter_all_requests",
+    true
+);
+
+// PR-F1: Prefer-original For You RetweetDedup (parity Following). Default false = first-wins.
+param!(
+    EnablePreferOriginalRetweetDedup,
+    bool,
+    "rust_home_mixer_enable_prefer_original_retweet_dedup",
+    false
+);
+
+// PR-F5: ControlledSourceReexposure. Enable=false and/or K=1 ≡ today's PreviouslyServed burn.
+// Quotes always share source_key with RTs (IncludeQuotes fixed true — no false arm).
+param!(
+    EnableControlledSourceReexposure,
+    bool,
+    "rust_home_mixer_enable_controlled_source_reexposure",
+    false
+);
+param!(
+    ControlledSourceReexposureMaxServesK,
+    u32,
+    "rust_home_mixer_controlled_source_reexposure_max_serves_k",
+    1
+);
+// Min requests between re-serves of the same source_key. 0 = no gap gate (landable default).
+param!(
+    ControlledSourceReexposureMinRequestGap,
+    u32,
+    "rust_home_mixer_controlled_source_reexposure_min_request_gap",
+    0
+);
+param!(
+    ControlledSourceReexposureInNetworkOnly,
+    bool,
+    "rust_home_mixer_controlled_source_reexposure_in_network_only",
     true
 );
 
