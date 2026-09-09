@@ -51,6 +51,24 @@ fn bloom_may_contain(bit_array: &[u64], num_bits: usize, post_id: i64) -> bool {
         idx < num_bits && (bit_array[idx >> 6] & (1u64 << (idx & 63))) != 0
     })
 }
+
+#[inline]
+fn should_emit_retrieval_candidate(is_valid: bool, post_id: i64) -> bool {
+    is_valid && post_id != 0
+}
+
+#[cfg(test)]
+mod retrieval_reply_tests {
+    use super::should_emit_retrieval_candidate;
+
+    #[test]
+    fn masked_candidates_are_not_emitted() {
+        assert!(should_emit_retrieval_candidate(true, 42));
+        assert!(!should_emit_retrieval_candidate(false, 42));
+        assert!(!should_emit_retrieval_candidate(true, 0));
+    }
+}
+
 use axum::routing::get;
 use bytes::Bytes;
 use chrono::TimeDelta;
@@ -768,6 +786,16 @@ impl RetrieveRequestBatch {
         Ok(())
     }
 
+    #[pyo3(signature = (
+        dataset_types,
+        all_top_k_indices,
+        all_top_k_scores,
+        all_post_ids,
+        all_author_ids,
+        large_k,
+        batch_size,
+        all_top_k_validity=None
+    ))]
     pub fn reply(
         &mut self,
         py: Python<'_>,
@@ -778,6 +806,7 @@ impl RetrieveRequestBatch {
         all_author_ids: Bound<'_, PyArray1<i64>>,
         large_k: usize,
         batch_size: usize,
+        all_top_k_validity: Option<Vec<Bound<'_, PyArray2<bool>>>>,
     ) -> PyResult<()> {
         let donated_indices: Vec<DonatedArray2<i32>> = all_top_k_indices
             .into_iter()
@@ -787,16 +816,33 @@ impl RetrieveRequestBatch {
             .into_iter()
             .map(|a| DonatedArray2::new(a))
             .collect::<PyResult<Vec<_>>>()?;
+        let donated_validity: Option<Vec<DonatedArray2<bool>>> = all_top_k_validity
+            .map(|arrays| {
+                arrays
+                    .into_iter()
+                    .map(DonatedArray2::new)
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
         let post_ids = DonatedArray1::new(all_post_ids)?;
         let author_ids = DonatedArray1::new(all_author_ids)?;
 
         let num_datasets = dataset_types.len();
-        if donated_indices.len() != num_datasets || donated_scores.len() != num_datasets {
+        if donated_indices.len() != num_datasets
+            || donated_scores.len() != num_datasets
+            || donated_validity
+                .as_ref()
+                .is_some_and(|validity| validity.len() != num_datasets)
+        {
+            let validity_len = donated_validity
+                .as_ref()
+                .map_or(num_datasets, std::vec::Vec::len);
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Mismatched array lengths: dataset_types={}, indices={}, scores={}",
+                "Mismatched array lengths: dataset_types={}, indices={}, scores={}, validity={}",
                 num_datasets,
                 donated_indices.len(),
-                donated_scores.len()
+                donated_scores.len(),
+                validity_len
             )));
         }
 
@@ -827,12 +873,25 @@ impl RetrieveRequestBatch {
                         let scores = &donated_scores[ds_idx];
                         let indices_view = unsafe { indices.as_array_view() };
                         let scores_view = unsafe { scores.as_array_view() };
+                        let validity_view = donated_validity
+                            .as_ref()
+                            .map(|validity| unsafe { validity[ds_idx].as_array_view() });
 
-                        let k = large_k.min(indices_view.ncols());
+                        let k = large_k
+                            .min(indices_view.ncols())
+                            .min(scores_view.ncols())
+                            .min(
+                                validity_view
+                                    .as_ref()
+                                    .map_or(usize::MAX, |validity| validity.ncols()),
+                            );
                         for j in 0..k {
                             let idx = indices_view[[user_idx, j]] as usize;
                             let pid = unsafe { post_ids.get(idx) };
-                            if pid == 0 {
+                            let is_valid = validity_view
+                                .as_ref()
+                                .is_none_or(|validity| validity[[user_idx, j]]);
+                            if !should_emit_retrieval_candidate(is_valid, pid) {
                                 continue;
                             }
                             let aid = unsafe { author_ids.get(idx) };
