@@ -483,7 +483,7 @@ param!(
     ValueModelMode,
     String,
     "rust_home_mixer_value_model_mode",
-    "weighted"
+    "gated_dwell_regret"
 );
 param!(
     WeightPerturbationSigma,
