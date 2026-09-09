@@ -500,12 +500,12 @@ fn tweet_label_cases() -> Vec<Case> {
             expected_decided_by: Some("FosnrAbuseDropRule"),
         },
         Case {
-            name: "fosnr_civic_integrity_label_drops",
+            name: "fosnr_civic_integrity_label_allows_in_network",
             level: TimelineHome,
             viewer: viewer(VIEWER_ID),
             candidate: labeled(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
-            expected_action: Drop(FilteredReason::PossiblyUndesirable),
-            expected_decided_by: Some("FosnrCivicIntegrityDropRule"),
+            expected_action: Allow,
+            expected_decided_by: None,
         },
     ]
 }
@@ -894,6 +894,14 @@ fn oon_tweet_label_cases() -> Vec<Case> {
             candidate: labeled(SafetyLabelType::DO_NOT_AMPLIFY),
             expected_action: Drop(FilteredReason::PossiblyUndesirable),
             expected_decided_by: Some("DoNotAmplifyOonDropRule"),
+        },
+        Case {
+            name: "fosnr_civic_integrity_label_drops_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer(VIEWER_ID),
+            candidate: labeled(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
+            expected_action: Drop(FilteredReason::PossiblyUndesirable),
+            expected_decided_by: Some("FosnrCivicIntegrityDropRule"),
         },
         Case {
             name: "malicious_url_label_drops_oon",
