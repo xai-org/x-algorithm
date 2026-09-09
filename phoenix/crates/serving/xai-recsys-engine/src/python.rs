@@ -2804,7 +2804,14 @@ impl RecsysRetrievalPredictorImpl {
             })?;
         let _in_flight_guard = InFlightGuard::new();
 
-        let user_id = request.user_ids.pop().unwrap();
+        let Some(user_id) = request.user_ids.pop() else {
+            NUM_REQUESTS_REJECTED
+                .with_label_values(&["invalid_argument", client.as_str()])
+                .inc();
+            return Err(Status::invalid_argument(
+                "RetrieveTopKCandidatesRequest.user_ids must not be empty",
+            ));
+        };
         let sequence = request.sequences.pop();
         let topic_entity_ids = request.topic_entity_ids;
         let topic_filter_mode = request.topic_filter_mode.unwrap_or(0);
