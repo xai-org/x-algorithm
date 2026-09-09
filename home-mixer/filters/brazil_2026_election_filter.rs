@@ -82,6 +82,9 @@ use xai_candidate_pipeline::filter::{Filter, FilterResult};
 // @_ANDREDOPRADO no live account found.
 // @_EDUARDOMANTOAN no live account found.
 
+/// Viewer country code the Electoral Court order applies to.
+const BRAZIL_COUNTRY_CODE: &str = "br";
+
 /// User ids reported to the Electoral Court for the Brazil 2026 election.
 static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| {
     FxHashSet::from_iter([
@@ -5221,6 +5224,13 @@ impl Brazil2026ElectionFilter {
 }
 
 impl Filter<ScoredPostsQuery, PostCandidate> for Brazil2026ElectionFilter {
+    /// The Electoral Court order applies to viewers in Brazil, so scope the
+    /// filter to them. Without this the filter runs for every viewer in every
+    /// country, which is broader than the order requires.
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        query.country_code.eq_ignore_ascii_case(BRAZIL_COUNTRY_CODE)
+    }
+
     fn filter(
         &self,
         query: &ScoredPostsQuery,
@@ -5412,5 +5422,37 @@ mod tests {
                 &no_follows
             ));
         }
+    }
+
+    fn query_from_country(country_code: &str) -> ScoredPostsQuery {
+        ScoredPostsQuery {
+            country_code: country_code.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enabled_for_viewers_in_brazil() {
+        assert!(Brazil2026ElectionFilter.enable(&query_from_country("br")));
+    }
+
+    #[test]
+    fn enabled_regardless_of_country_code_case() {
+        assert!(Brazil2026ElectionFilter.enable(&query_from_country("BR")));
+    }
+
+    #[test]
+    fn disabled_for_viewers_outside_brazil() {
+        for country_code in ["us", "gb", "jp", "pt"] {
+            assert!(
+                !Brazil2026ElectionFilter.enable(&query_from_country(country_code)),
+                "expected filter to be disabled for {country_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_when_country_code_is_unknown() {
+        assert!(!Brazil2026ElectionFilter.enable(&ScoredPostsQuery::default()));
     }
 }
