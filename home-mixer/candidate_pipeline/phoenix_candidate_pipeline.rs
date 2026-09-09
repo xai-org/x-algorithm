@@ -51,6 +51,7 @@ use crate::filters::previously_seen_posts_backup_filter::PreviouslySeenPostsBack
 use crate::filters::previously_seen_posts_filter::PreviouslySeenPostsFilter;
 use crate::filters::previously_served_posts_filter::PreviouslyServedPostsFilter;
 use crate::filters::retweet_deduplication_filter::RetweetDeduplicationFilter;
+use crate::filters::self_reply_chain_filter::SelfReplyChainFilter;
 use crate::filters::self_tweet_filter::SelfTweetFilter;
 use crate::filters::topic_ids_filter::TopicIdsFilter;
 use crate::filters::vf_filter::VFFilter;
@@ -355,6 +356,7 @@ impl PhoenixCandidatePipeline {
             Box::new(CoreDataHydrationFilter),
             Box::new(AgeFilter::new(Duration::from_secs(params::MAX_POST_AGE))),
             Box::new(SelfTweetFilter),
+            Box::new(SelfReplyChainFilter),
             Box::new(OONRetweetReplyFilter),
             Box::new(OONNsfwSimclustersFilter),
             Box::new(RetweetDeduplicationFilter),
