@@ -64,22 +64,26 @@ val executeOp = Op.execute({ idempotent = true })[Event, Unit] { ctx =>
                 limit = fetchPostCount,
                 startAt = None,
                 direction = Descending
-              })).data.map { edge => edge.to }.map { postId =>
+              })).data.map { edge => edge.to }.flatMap { postId =>
                 val originalPostId = tweetUtil.originalTweetForRetweet(postId)
-                val labels = #<visibility/baseTweetSafetyLabelMap>
-                  .fetch(originalPostId, ())
-                  .v
-                  .map { value => value.labels.getOrElse(Map.empty).keys.toSet }
-                  .getOrElse(Set.empty)
-                val hasMedia = if (checkMedia) {
-                  utils.postOrQuotedPostHasMedia(originalPostId)
+                if (originalPostId != postId) {
+                  None
                 } else {
-                  false
-                }
-                {
-                  tweetId = postId,
-                  labels = labels,
-                  hasMedia = hasMedia
+                  val labels = #<visibility/baseTweetSafetyLabelMap>
+                    .fetch(postId, ())
+                    .v
+                    .map { value => value.labels.getOrElse(Map.empty).keys.toSet }
+                    .getOrElse(Set.empty)
+                  val hasMedia = if (checkMedia) {
+                    utils.postOrQuotedPostHasMedia(postId)
+                  } else {
+                    false
+                  }
+                  Some({
+                    tweetId = postId,
+                    labels = labels,
+                    hasMedia = hasMedia
+                  })
                 }
               }
             } else {
