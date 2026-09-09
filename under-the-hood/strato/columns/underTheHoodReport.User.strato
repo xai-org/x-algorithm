@@ -35,6 +35,15 @@ val englishMonthNames = Seq(
 val reportNotes =
   "You can learn more about instances when a post’s reach may be limited by reading our open-source code at https://github.com/xai-org/x-algorithm and the guide at https://help.x.com/rules-and-policies/x-reach-limited. Learn more about account and post-level enforcement options here https://help.x.com/rules-and-policies/enforcement-options. " +
     "This report is provided on a best-effort basis — the code that generates it is open-source: https://github.com/xai-org/x-algorithm/tree/main/under-the-hood"
+val restrictionDataFreshness = "HISTORICAL_MONTHLY_SNAPSHOT"
+val unavailableRestrictionFields = Seq(
+  "appliedAt",
+  "expiresAt",
+  "nextReviewAt",
+  "source",
+  "modelVersion",
+  "appealAvailability",
+)
 
 val utcYyyyMm = TimeFormat.apply("yyyyMM").withZone("UTC")
 val utcYyyyMmDd = TimeFormat.apply("yyyy-MM-dd").withZone("UTC")
@@ -150,6 +159,17 @@ def sumCarried(days: Option[Seq[UthDayCarriedRemoved]]): Long =
     acc + d.carried.getOrElse(0L)
   }
 
+def sumRemoved(days: Option[Seq[UthDayCarriedRemoved]]): Long =
+  days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
+    acc + d.removed.getOrElse(0L)
+  }
+
+def dateForDayOfMonth(monthBucket: Int, dayOfMonth: Int): String = {
+  val year = monthBucket / 100
+  val month = monthBucket % 100
+  year.toString + "-" + pad2(month) + "-" + pad2(dayOfMonth)
+}
+
 def sumDayCounts(days: Option[Seq[UthDayCount]]): Long =
   days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
     acc + d.count.getOrElse(0L)
@@ -190,11 +210,19 @@ def buildReportJson(
     .flatMap { agg =>
       agg.label.filter(underTheHoodLabels.isPostLabel).map { raw =>
         val posts = sumCarried(agg.days)
+        val removed = sumRemoved(agg.days)
+        val stillLabeled = if (posts >= removed) { posts - removed } else { 0L }
         {
+          scope = "POST",
           label = underTheHoodLabels.postLabelName(raw),
           about = underTheHoodLabels.postLabelAbout(raw),
           effect = underTheHoodLabels.postLabelEffect(raw),
+          recommendationAffectedSurfaces =
+            underTheHoodLabels.postLabelRecommendationAffectedSurfaces(raw),
+          followerDeliveryAffected = underTheHoodLabels.postLabelAffectsFollowerDelivery(raw),
           posts = posts,
+          removedWithinObservationWindow = removed,
+          stillLabeledAtObservationEnd = stillLabeled,
           totalPostsInMonth = postCount,
           percentageOfPosts = formatPercentage(posts, postCount),
         }
@@ -205,23 +233,48 @@ def buildReportJson(
     .getOrElse(Seq.empty)
     .flatMap { agg =>
       agg.label.filter(underTheHoodLabels.isAccountLabel).map { raw =>
-        val days = agg.activeDays.map { d => d.size.toLong }.getOrElse(0L)
+        val activeDays = agg.activeDays.getOrElse(Seq.empty).distinct.sorted
+        val days = activeDays.size.toLong
+        val activeAtPeriodEnd = activeDays.lastOption.exists { day =>
+          day == calendarDaysInMonthBucket(monthBucket)
+        }
         {
+          scope = "ACCOUNT",
           label = underTheHoodLabels.accountLabelName(raw),
           about = underTheHoodLabels.accountLabelAbout(raw),
           effect = underTheHoodLabels.accountLabelEffect(raw),
+          recommendationAffectedSurfaces =
+            underTheHoodLabels.accountLabelRecommendationAffectedSurfaces(raw),
+          followerDeliveryAffected =
+            underTheHoodLabels.accountLabelAffectsFollowerDelivery(raw),
           days = days,
           daysInPeriod = periodDays,
           percentageOfDays = formatPercentage(days, periodDays.toLong),
+          firstObservedDate = activeDays.headOption.map { day =>
+            dateForDayOfMonth(monthBucket, day)
+          },
+          lastObservedDate = activeDays.lastOption.map { day =>
+            dateForDayOfMonth(monthBucket, day)
+          },
+          activeAtPeriodEnd = activeAtPeriodEnd,
         }
       }
     }
+
+  val restrictionData = {
+    freshness = restrictionDataFreshness,
+    accountStatusAsOf = period.endDate,
+    postStatusBasis = "AUTHORED_POST_OBSERVATION_WINDOW",
+    postObservationDays = userMonth.daysIncluded.flatMap { d => d.postObservationDays },
+    unavailableFields = unavailableRestrictionFields,
+  }
 
   if (postLabels.isEmpty && accountLabels.isEmpty) {
     {
       notes = reportNotes,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
+      restrictionData = restrictionData,
       postCount = postCount,
       postLabels = postLabels,
       accountLabels = accountLabels,
@@ -233,6 +286,7 @@ def buildReportJson(
       notes = reportNotes,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
+      restrictionData = restrictionData,
       postCount = postCount,
       postLabels = postLabels,
       accountLabels = accountLabels,
@@ -243,6 +297,7 @@ def buildReportJson(
       notes = reportNotes,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
+      restrictionData = restrictionData,
       postCount = postCount,
       postLabels = postLabels,
       accountLabels = accountLabels,
@@ -253,6 +308,7 @@ def buildReportJson(
       notes = reportNotes,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
+      restrictionData = restrictionData,
       postCount = postCount,
       postLabels = postLabels,
       accountLabels = accountLabels,

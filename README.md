@@ -439,6 +439,13 @@ The focus of the repository is transparency into the code that affects post visi
 
 We're piloting a new transparency tool that lets people see aggregate statistics about the visibility-impacting labels on their account and posts. Paired with the code in this repository, we believe this gives people valuable insight into the visibility of their posts.
 
+The report describes a completed historical month rather than a live account-status check. It
+includes the Home surfaces affected by each reported label, whether the checked-in Home policy can
+affect follower delivery, post-label removals observed during the configured observation window,
+and the first and last days on which an account label was observed. Exact application, expiry, and
+review timestamps, model/source provenance, and appeal availability are not present in the monthly
+aggregate and are therefore reported as unavailable rather than inferred.
+
 The tool is [available here](https://x.com/i/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/).
 
 ---
