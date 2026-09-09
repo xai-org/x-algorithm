@@ -125,6 +125,15 @@ fn labeled(label: SafetyLabelType) -> HydratedTweetCandidate {
     candidate().with_label(label).build()
 }
 
+fn labeled_countries(label: SafetyLabelType, countries: &[&str]) -> HydratedTweetCandidate {
+    candidate()
+        .with_label_countries(
+            label,
+            countries.iter().map(|c| (*c).to_string()).collect(),
+        )
+        .build()
+}
+
 fn labeled_media(label: SafetyLabelType) -> HydratedTweetCandidate {
     candidate().with_label(label).with_media().build()
 }
@@ -892,6 +901,22 @@ fn oon_tweet_label_cases() -> Vec<Case> {
             level: TimelineHomeRecommendations,
             viewer: viewer(VIEWER_ID),
             candidate: labeled(SafetyLabelType::DO_NOT_AMPLIFY),
+            expected_action: Drop(FilteredReason::PossiblyUndesirable),
+            expected_decided_by: Some("DoNotAmplifyOonDropRule"),
+        },
+        Case {
+            name: "country_scoped_do_not_amplify_allows_out_of_country_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer_in_country("us"),
+            candidate: labeled_countries(SafetyLabelType::DO_NOT_AMPLIFY, &["br"]),
+            expected_action: Allow,
+            expected_decided_by: None,
+        },
+        Case {
+            name: "country_scoped_do_not_amplify_drops_in_country_oon",
+            level: TimelineHomeRecommendations,
+            viewer: viewer_in_country("br"),
+            candidate: labeled_countries(SafetyLabelType::DO_NOT_AMPLIFY, &["br"]),
             expected_action: Drop(FilteredReason::PossiblyUndesirable),
             expected_decided_by: Some("DoNotAmplifyOonDropRule"),
         },
