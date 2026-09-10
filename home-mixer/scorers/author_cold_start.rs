@@ -365,7 +365,7 @@ impl AuthorColdStart {
         let arm = params.arm;
 
         let mut effective = apply_moe_ranking_policy(arm, candidates, &corpus, scores);
-        if let Some(target) = cold_start_target(&params, scores) {
+        if let Some(target) = cold_start_target(&params, &effective) {
             effective = apply_cold_start(&params, candidates, &effective, &corpus, target);
         }
         effective
@@ -695,6 +695,27 @@ rust_home_mixer:
 
         let result = author_cold_start.apply(&query, &candidates, &[10.0, 40.0, 30.0, 20.0]);
         assert_eq!(result, vec![10.0, 40.0, 30.0, 20.0]);
+    }
+
+    #[test]
+    fn cold_start_target_skips_scores_zeroed_by_moe_policy() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![]);
+        let candidates = vec![
+            cold_start_candidate(1, minutes(10), 3),
+            moe_candidate(2, minutes(10), 3),
+            cold_start_candidate(3, minutes(10), 5000),
+            cold_start_candidate(4, minutes(10), 5000),
+            cold_start_candidate(5, minutes(10), 5000),
+        ];
+
+        let mut query = codivert_query(false, false);
+        let mut results = query.params.0.expect("params set");
+        results.override_fs("rust_home_mixer_cold_start_slot_min".to_string(), "2");
+        results.override_fs("rust_home_mixer_cold_start_slot_max".to_string(), "3");
+        query.params = results.into();
+
+        let result = author_cold_start.apply(&query, &candidates, &[10.0, 100.0, 90.0, 80.0, 70.0]);
+        assert_eq!(result, vec![70.0, 0.0, 90.0, 80.0, 70.0]);
     }
 
     #[test]
