@@ -175,6 +175,23 @@ val accountLabels = Map(
   },
 )
 
+// These are public product-surface names, not internal rule or policy identifiers. Keep this
+// mapping aligned with visibility-filtering/rules/registry.rs. Labels outside the base Home
+// policy affect recommendation eligibility only.
+val timelineHomeSurface = "TIMELINE_HOME"
+val timelineHomeRecommendationsSurface = "TIMELINE_HOME_RECOMMENDATIONS"
+
+val postLabelsAffectingTimelineHome = Set(
+  "SPAM",
+  "PDNA",
+  "BOUNCE",
+  "FOR_EMERGENCY_USE_ONLY",
+  "FOSNR_ABUSE",
+  "FOSNR_HATEFUL_CONDUCT",
+  "FOSNR_VIOLENT_SPEECH",
+  "FOSNR_CIVIC_INTEGRITY",
+)
+
 val underscore = Regex.compile("_")
 
 def normalizeLabel(code: String): String =
@@ -260,6 +277,28 @@ def accountLabelEffect(code: String): String =
     case None => ""
   }
 
+def postLabelRecommendationAffectedSurfaces(code: String): Seq[String] =
+  resolvePostKey(code) match {
+    case Some(k) if postLabelsAffectingTimelineHome.contains(k) =>
+      Seq(timelineHomeSurface, timelineHomeRecommendationsSurface)
+    case Some(_) => Seq(timelineHomeRecommendationsSurface)
+    case None => Seq.empty
+  }
+
+def accountLabelRecommendationAffectedSurfaces(code: String): Seq[String] =
+  resolveAccountKey(code) match {
+    case Some(_) => Seq(timelineHomeRecommendationsSurface)
+    case None => Seq.empty
+  }
+
+def postLabelAffectsFollowerDelivery(code: String): Boolean =
+  resolvePostKey(code).exists { k => postLabelsAffectingTimelineHome.contains(k) }
+
+// Account labels in the public allowlist are applied by the recommendation-only policy in the
+// checked-in visibility registry. This describes Home delivery only; it makes no claim about
+// search, notifications, or other products that are not evaluated by that registry.
+def accountLabelAffectsFollowerDelivery(code: String): Boolean = false
+
 Library({
   export = {
     postLabels = postLabels,
@@ -276,6 +315,10 @@ Library({
     accountLabelAbout = accountLabelAbout,
     postLabelEffect = postLabelEffect,
     accountLabelEffect = accountLabelEffect,
+    postLabelRecommendationAffectedSurfaces = postLabelRecommendationAffectedSurfaces,
+    accountLabelRecommendationAffectedSurfaces = accountLabelRecommendationAffectedSurfaces,
+    postLabelAffectsFollowerDelivery = postLabelAffectsFollowerDelivery,
+    accountLabelAffectsFollowerDelivery = accountLabelAffectsFollowerDelivery,
   },
   description = PlainText(
     "Under the Hood public label allowlists (canonical name -> about/effect) and helpers."
