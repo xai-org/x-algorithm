@@ -100,11 +100,19 @@ val allowedApplyUserLabels = Set(
 val maxConfiguredRules = 10
 val maxConditionGroups = 10
 val maxConditionsPerGroup = 10
-val maxConfiguredWindowSize = 10
-val maxConfiguredMinimumMatchingPosts = 11
+val maxConfiguredWindowSize = 20
+val maxConfiguredMinimumMatchingPosts = 20
 val maxConfiguredPostAgeDays = 60
 val maxConfiguredUserLabelTtlDays = 7
 val mediaOnlyScanMultiplier = 4
+val originalPostScanMultiplier = 4
+
+// Public defaults for the automated NSFW account-label producer. NsfwAdmin is a separate
+// Gizmoduck safety flag; no writer or removal workflow for that flag is published in this repo.
+val defaultNsfwEvidenceWindowPosts = 20
+val defaultNsfwMinimumMatchingPosts = 10
+val defaultNsfwEvidenceMaxAgeDays = 60
+val defaultNsfwUserLabelTtlDays = 7
 
 def userLabelFromConfig(label: String): Option[UserLabelValue] = {
   if (allowedApplyUserLabels.exists { allowed => labelsEqual(allowed, label) }) {
@@ -164,7 +172,7 @@ def maxScanSize(rules: Seq[UserLabelRule]): Int = {
       if (isMediaOnly(condition)) {
         condition.windowSize * mediaOnlyScanMultiplier
       } else {
-        condition.windowSize
+        condition.windowSize * originalPostScanMultiplier
       }
     }
     .filter { scanSize => scanSize > 0 }
@@ -200,6 +208,7 @@ def isValidPostLabelCount(condition: PostLabelCountCondition): Boolean = {
     condition.windowSize <= maxConfiguredWindowSize &&
     condition.minimumMatchingPosts > 0 &&
     condition.minimumMatchingPosts <= maxConfiguredMinimumMatchingPosts &&
+    condition.minimumMatchingPosts <= condition.windowSize &&
     condition.maxPostAgeDays > 0 &&
     condition.maxPostAgeDays <= maxConfiguredPostAgeDays &&
     isValidPostLabelSelector(condition.postLabels)
@@ -370,8 +379,8 @@ val defaultRulesJson =
             {
               "allOf": [
                 {
-                  "windowSize": 10,
-                  "minimumMatchingPosts": 11,
+                  "windowSize": 20,
+                  "minimumMatchingPosts": 10,
                   "maxPostAgeDays": 60,
                   "mediaOnly": false,
                   "postLabels": {
@@ -402,8 +411,8 @@ val defaultRulesJson =
             {
               "allOf": [
                 {
-                  "windowSize": 5,
-                  "minimumMatchingPosts": 3,
+                  "windowSize": 20,
+                  "minimumMatchingPosts": 10,
                   "maxPostAgeDays": 60,
                   "mediaOnly": false,
                   "postLabels": {
@@ -442,6 +451,10 @@ val export = {
   validRules = validRules,
   evaluateForTest = evaluateForTest,
   maxScanSizeForTest = maxScanSizeForTest,
+  defaultNsfwEvidenceWindowPosts = defaultNsfwEvidenceWindowPosts,
+  defaultNsfwMinimumMatchingPosts = defaultNsfwMinimumMatchingPosts,
+  defaultNsfwEvidenceMaxAgeDays = defaultNsfwEvidenceMaxAgeDays,
+  defaultNsfwUserLabelTtlDays = defaultNsfwUserLabelTtlDays,
   defaultRulesJson = defaultRulesJson,
   configuredRulesJson = configuredRulesJson,
 }
