@@ -163,6 +163,12 @@ fn exclusive_candidate(viewer_super_follows_author: bool) -> HydratedTweetCandid
     c
 }
 
+fn exclusive_hydration_failed_candidate() -> HydratedTweetCandidate {
+    let mut c = candidate().build();
+    c.exclusive_hydration_failed = true;
+    c
+}
+
 fn viewer_in_country(code: &str) -> ViewerFeatures {
     ViewerFeatures {
         country_code: Some(code.to_string()),
@@ -691,6 +697,22 @@ fn exclusive_content_cases() -> Vec<Case> {
             candidate: exclusive_candidate(false),
             expected_action: Drop(FilteredReason::ExclusiveTweet),
             expected_decided_by: Some("DropExclusiveTweetContentRule"),
+        },
+        Case {
+            name: "exclusive_hydration_failure_drops",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: exclusive_hydration_failed_candidate(),
+            expected_action: Drop(FilteredReason::ExclusiveTweet),
+            expected_decided_by: Some("ExclusiveHydrationFailureDropRule"),
+        },
+        Case {
+            name: "exclusive_hydration_failure_drops_recommendations",
+            level: TimelineHomeRecommendations,
+            viewer: viewer(VIEWER_ID),
+            candidate: exclusive_hydration_failed_candidate(),
+            expected_action: Drop(FilteredReason::ExclusiveTweet),
+            expected_decided_by: Some("ExclusiveHydrationFailureDropRule"),
         },
     ]
 }

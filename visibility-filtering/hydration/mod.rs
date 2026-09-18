@@ -11,7 +11,7 @@ pub mod viewer_hydrator;
 use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::SocialgraphClient;
 use crate::models::{
-    assemble, resolve_candidates, AuthorFeatures, AuthorId, ExclusiveContentFeatures,
+    assemble, resolve_candidates, AuthorFeatures, AuthorId, ExclusiveHydration,
     HydratedTweetCandidate, RawCandidate, SafetyLabelMap, TweetCandidateInput, TweetFeatures,
     TweetId, Viewer, ViewerAuthorRelationship, ViewerFeatures,
 };
@@ -62,7 +62,7 @@ struct CandidateFeatures {
     author_features: TweetHydrationBatch<AuthorFeatures>,
     safety_labels: HashMap<TweetId, SafetyLabelMap>,
     relationships: TweetHydrationBatch<ViewerAuthorRelationship>,
-    exclusive_content: HashMap<TweetId, Option<ExclusiveContentFeatures>>,
+    exclusive_content: HashMap<TweetId, ExclusiveHydration>,
 }
 
 impl CandidateFeatures {
@@ -70,6 +70,11 @@ impl CandidateFeatures {
         candidates
             .iter()
             .map(|c| {
+                let exclusive = self
+                    .exclusive_content
+                    .get(&c.tweet_id)
+                    .cloned()
+                    .unwrap_or_default();
                 assemble(
                     c,
                     self.tweet_features
@@ -82,10 +87,8 @@ impl CandidateFeatures {
                         .cloned()
                         .unwrap_or_default(),
                     self.relationships.get_or_default(&c.tweet_id),
-                    self.exclusive_content
-                        .get(&c.tweet_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    exclusive.features(),
+                    exclusive.failed(),
                 )
             })
             .collect()
@@ -314,6 +317,7 @@ mod tests {
         assert_eq!(c.tweet_features.core.source_tweet_id, Some(2));
         assert!(c.author_features.is_suspended);
         assert!(c.relationship.viewer_follows_author);
+        assert!(!c.exclusive_hydration_failed);
     }
 
     fn raw(tweet_id: u64, request_author_id: Option<u64>) -> RawCandidate {

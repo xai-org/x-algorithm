@@ -154,6 +154,13 @@ pub(super) const OON_TWEET_LABEL_DROPS: &[RuleSpec] = &[
     },
 ];
 
+fn drop_exclusive_hydration_failure(context: &RuleContext<'_>) -> VfAction {
+    if context.tweet().exclusive_hydration_failed() {
+        return VfAction::Drop(FilteredReason::ExclusiveTweet);
+    }
+    VfAction::Allow
+}
+
 fn drop_exclusive_tweet_content(context: &RuleContext<'_>) -> VfAction {
     if !context.tweet().is_exclusive() {
         return VfAction::Allow;
@@ -178,10 +185,16 @@ fn drop_exclusive_tweet_content(context: &RuleContext<'_>) -> VfAction {
     VfAction::Drop(FilteredReason::ExclusiveTweet)
 }
 
-pub(super) const EXCLUSIVE_TWEET_DROP: &[RuleSpec] = &[RuleSpec::Custom {
-    name: "DropExclusiveTweetContentRule",
-    evaluate: drop_exclusive_tweet_content,
-}];
+pub(super) const EXCLUSIVE_TWEET_DROP: &[RuleSpec] = &[
+    RuleSpec::Custom {
+        name: "ExclusiveHydrationFailureDropRule",
+        evaluate: drop_exclusive_hydration_failure,
+    },
+    RuleSpec::Custom {
+        name: "DropExclusiveTweetContentRule",
+        evaluate: drop_exclusive_tweet_content,
+    },
+];
 
 pub(super) const NSFW_AUTHOR_INTERSTITIAL: &[RuleSpec] = &[RuleSpec::Tweet {
     name: "NsfwAuthorInterstitialRule",
@@ -526,7 +539,22 @@ mod tests {
 
     #[test]
     fn exclusive_content_axis() {
-        let spec = &EXCLUSIVE_TWEET_DROP[0];
+        let fail_closed = &EXCLUSIVE_TWEET_DROP[0];
+        let spec = &EXCLUSIVE_TWEET_DROP[1];
+        assert_eq!(fail_closed.name(), "ExclusiveHydrationFailureDropRule");
+        assert_eq!(spec.name(), "DropExclusiveTweetContentRule");
+
+        let mut failed = candidate().build();
+        failed.exclusive_hydration_failed = true;
+        assert_drops(
+            fail_closed,
+            &viewer(VIEWER_ID),
+            &failed,
+            &FilteredReason::ExclusiveTweet,
+        );
+        assert_allows(fail_closed, &viewer(VIEWER_ID), &candidate().build());
+        assert_allows(spec, &viewer(VIEWER_ID), &failed);
+
         assert_allows(spec, &viewer(VIEWER_ID), &candidate().build());
 
         let exclusive = exclusive_candidate(1, 100, 100);

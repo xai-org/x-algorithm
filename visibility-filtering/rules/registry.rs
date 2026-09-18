@@ -220,6 +220,7 @@ rust_vf:
                 "SensitiveViewerLoggedOutDropRule",
                 "SensitiveViewerUnderageDropRule",
                 "SensitiveViewerNoStatedAgeDropRule",
+                "ExclusiveHydrationFailureDropRule",
                 "DropExclusiveTweetContentRule",
                 "NsfwHighPrecisionInterstitialRule",
                 "GoreAndViolenceInterstitialRule",
