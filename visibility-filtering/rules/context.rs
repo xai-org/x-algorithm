@@ -191,6 +191,11 @@ impl TweetPredicates<'_> {
     pub fn is_exclusive(&self) -> bool {
         self.ctx.candidate.exclusive_content.is_some()
     }
+
+    #[inline]
+    pub fn exclusive_hydration_failed(&self) -> bool {
+        self.ctx.candidate.exclusive_hydration_failed
+    }
 }
 
 #[derive(Clone, Copy)]

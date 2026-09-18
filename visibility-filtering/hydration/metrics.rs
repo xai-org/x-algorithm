@@ -236,7 +236,7 @@ pub(crate) async fn timed_rpc<T: Default>(
     timeout: Duration,
     classify: impl FnOnce(&T) -> HydratorOutcome,
     fut: impl Future<Output = T>,
-) -> T {
+) -> (HydratorOutcome, T) {
     let start = Instant::now();
     let (outcome, body) = match tokio::time::timeout(timeout, fut).await {
         Ok(body) => {
@@ -253,7 +253,7 @@ pub(crate) async fn timed_rpc<T: Default>(
         candidate_count,
         start.elapsed().as_secs_f64() * 1000.0,
     );
-    body
+    (outcome, body)
 }
 
 pub(crate) async fn timed_results<K, V, E>(
