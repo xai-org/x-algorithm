@@ -1,5 +1,6 @@
 import <visibility/under-the-hood/sharedConfig>
 import <visibility/under-the-hood/underTheHoodLabels>
+import <visibility/under-the-hood/accountAffinityProfile>
 import <visibility/under-the-hood/params>
 
 type Key = Long
@@ -335,6 +336,23 @@ def buildReportJson(
   }
 }
 
+def withAccountAffinityProfile(userId: Long, reportJson: String): String = {
+  // This optional diagnostic must not prevent delivery of the label report.
+  try {
+    if (params.underTheHoodReportAccountAffinitiesEnabled()) {
+      val knownFor = #<visibility/under-the-hood/mh/accountKnownFor>.fetch(userId, ()).v
+      val affinityJson = knownFor.flatMap { record =>
+        accountAffinityProfile.profileJson(record, formatGeneratedAtIso(Time.now.inMillis))
+      }
+      accountAffinityProfile.appendToReport(reportJson, affinityJson)
+    } else {
+      reportJson
+    }
+  } catch {
+    case _ => reportJson
+  }
+}
+
 def userWithQueryFields(
   userId: Long,
   queryFields: Set[com.twitter.gizmoduck.QueryFields]
@@ -455,7 +473,9 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)
         val reportJson =
           if (ageOk && hasEnoughPosts) {
-            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns))
+            val labelsJson =
+              buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns)
+            Some(withAccountAffinityProfile(ctx.key, labelsJson))
           } else {
             None
           }
