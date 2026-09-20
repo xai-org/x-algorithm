@@ -1,0 +1,10 @@
+{
+  "rust_home_mixer_enable_author_diversity": "true",
+  "rust_home_mixer_enable_urt_migration_components": "true",
+  "rust_home_mixer_enable_cross_request_author_diversity": "true",
+  "rust_home_mixer_author_diversity_history_window_seconds": "300",
+  "rust_home_mixer_author_diversity_history_half_life_seconds": "60.0",
+  "rust_home_mixer_author_diversity_history_weight": "0.25",
+  "rust_home_mixer_author_diversity_history_max_count": "5.0",
+  "rust_home_mixer_author_diversity_history_max_items": "200"
+}

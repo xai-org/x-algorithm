@@ -255,6 +255,44 @@ param!(
     "rust_home_mixer_author_diversity_floor",
     0.25
 );
+// Issue #202: opt-in session-level author diversity. Requires the served-history
+// read/write path (EnableUrtMigrationComponents). Invalid settings fail open.
+param!(
+    EnableCrossRequestAuthorDiversity,
+    bool,
+    "rust_home_mixer_enable_cross_request_author_diversity",
+    false
+);
+param!(
+    AuthorDiversityHistoryWindowSeconds,
+    u32,
+    "rust_home_mixer_author_diversity_history_window_seconds",
+    300
+);
+param!(
+    AuthorDiversityHistoryHalfLifeSeconds,
+    f64,
+    "rust_home_mixer_author_diversity_history_half_life_seconds",
+    60.0
+);
+param!(
+    AuthorDiversityHistoryWeight,
+    f64,
+    "rust_home_mixer_author_diversity_history_weight",
+    0.25
+);
+param!(
+    AuthorDiversityHistoryMaxCount,
+    f64,
+    "rust_home_mixer_author_diversity_history_max_count",
+    5.0
+);
+param!(
+    AuthorDiversityHistoryMaxItems,
+    usize,
+    "rust_home_mixer_author_diversity_history_max_items",
+    200
+);
 param!(
     LogSlateContext,
     bool,

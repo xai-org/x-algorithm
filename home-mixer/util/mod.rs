@@ -1,3 +1,5 @@
+pub mod author_diversity;
+pub mod author_history;
 pub mod author_rules;
 pub mod candidates_util;
 pub mod composition;
