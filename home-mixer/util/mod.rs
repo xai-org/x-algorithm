@@ -15,3 +15,4 @@ pub mod url;
 pub mod urt;
 pub mod viewer_history;
 pub mod xds;
+pub mod serve_card_classify;
