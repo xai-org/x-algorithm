@@ -38,4 +38,4 @@ Passing these tests includes successfully reproducing known race windows. It doe
 
 The optional mutation check sets the historical contribution to zero **only in a temporary generated file** and requires the cross-request regression to fail. Its expected failure is saved separately; the fixed implementation must pass all tests.
 
-`treatment.json` is an example feature-switch override map for a controlled test. It does not change any local or production deployment configuration. See `docs/CROSS_REQUEST_AUTHOR_DIVERSITY.md` for rollout constraints.
+`treatment.json` is an example feature-switch override map for a controlled test. It does not change any local or production deployment configuration.
