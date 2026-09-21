@@ -157,6 +157,41 @@ def sumCarried(days: Option[Seq[UthDayCarriedRemoved]]): Long =
     acc + d.carried.getOrElse(0L)
   }
 
+def sumRemoved(days: Option[Seq[UthDayCarriedRemoved]]): Long =
+  days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
+    acc + d.removed.getOrElse(0L)
+  }
+
+// Entries with no dayOfMonth still contribute to the sums above, so they are
+// reported separately rather than dropped. This keeps the invariant
+// posts == sum(days[].carried) + undatedCarried exactly true.
+def sumUndatedCarried(days: Option[Seq[UthDayCarriedRemoved]]): Long =
+  days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
+    if (d.dayOfMonth.isEmpty) { acc + d.carried.getOrElse(0L) } else { acc }
+  }
+
+def sumUndatedRemoved(days: Option[Seq[UthDayCarriedRemoved]]): Long =
+  days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
+    if (d.dayOfMonth.isEmpty) { acc + d.removed.getOrElse(0L) } else { acc }
+  }
+
+// Field names mirror UthDayCarriedRemoved exactly. Upstream does not define
+// whether these are event counts, distinct posts, or running state, so this
+// layer does not rename them into a claim it cannot support. Ordering is
+// whatever the producer emitted: these are per-day buckets, not a sorted series.
+def dayRows(
+    days: Option[Seq[UthDayCarriedRemoved]]
+): Seq[{ day: Int, carried: Long, removed: Long }] =
+  days.getOrElse(Seq.empty).flatMap { d =>
+    d.dayOfMonth.map { day =>
+      {
+        day = day,
+        carried = d.carried.getOrElse(0L),
+        removed = d.removed.getOrElse(0L),
+      }
+    }
+  }
+
 def sumDayCounts(days: Option[Seq[UthDayCount]]): Long =
   days.getOrElse(Seq.empty).foldLeft(0L) { (acc, d) =>
     acc + d.count.getOrElse(0L)
@@ -180,7 +215,7 @@ def formatPercentage(numerator: Long, denominator: Long): String = {
 def postLabelRow(
     raw: String,
     countryCodes: Seq[String],
-    carried: Long,
+    days: Option[Seq[UthDayCarriedRemoved]],
     postCount: Long,
     includeTakedowns: Boolean
 ): Option[{
@@ -188,17 +223,35 @@ def postLabelRow(
   about: String,
   effect: String,
   posts: Long,
+  removed: Long,
+  undatedCarried: Long,
+  undatedRemoved: Long,
   totalPostsInMonth: Long,
-  percentageOfPosts: String
-}] =
+  percentageOfPosts: String,
+  countryCodes: Seq[String],
+  days: Seq[{ day: Int, carried: Long, removed: Long }]
+}] = {
+  val carried = sumCarried(days)
+  val removed = sumRemoved(days)
+  val undatedCarried = sumUndatedCarried(days)
+  val undatedRemoved = sumUndatedRemoved(days)
+  val byDay = dayRows(days)
   if (underTheHoodLabels.isPostLabel(raw)) {
     Some({
       label = underTheHoodLabels.postLabelName(raw),
       about = underTheHoodLabels.postLabelAbout(raw),
       effect = underTheHoodLabels.postLabelEffect(raw),
       posts = carried,
+      removed = removed,
+      undatedCarried = undatedCarried,
+      undatedRemoved = undatedRemoved,
       totalPostsInMonth = postCount,
       percentageOfPosts = formatPercentage(carried, postCount),
+      // Country codes stay inside the takedown branch, which is the only place
+      // the original read them. Emitting them here would route takedown-derived
+      // data around the underTheHoodReportTakedownsEnabled switch.
+      countryCodes = Seq.empty,
+      days = byDay,
     })
   } else if (includeTakedowns && underTheHoodLabels.isPostTakedownLabel(raw, countryCodes)) {
     Some({
@@ -206,17 +259,23 @@ def postLabelRow(
       about = underTheHoodLabels.postTakedownAbout(raw, countryCodes),
       effect = underTheHoodLabels.postTakedownEffect(raw, countryCodes),
       posts = carried,
+      removed = removed,
+      undatedCarried = undatedCarried,
+      undatedRemoved = undatedRemoved,
       totalPostsInMonth = postCount,
       percentageOfPosts = formatPercentage(carried, postCount),
+      countryCodes = countryCodes,
+      days = byDay,
     })
   } else {
     None
   }
+}
 
 def accountLabelRow(
     raw: String,
     countryCodes: Seq[String],
-    days: Long,
+    activeDays: Seq[Int],
     periodDays: Int,
     includeTakedowns: Boolean
 ): Option[{
@@ -225,8 +284,13 @@ def accountLabelRow(
   effect: String,
   days: Long,
   daysInPeriod: Int,
-  percentageOfDays: String
-}] =
+  percentageOfDays: String,
+  countryCodes: Seq[String],
+  activeDays: Seq[Int]
+}] = {
+  // `days` keeps its existing meaning and calculation; `activeDays` is the
+  // list it was already being derived from.
+  val days = activeDays.size.toLong
   if (underTheHoodLabels.isAccountLabel(raw)) {
     Some({
       label = underTheHoodLabels.accountLabelName(raw),
@@ -235,6 +299,8 @@ def accountLabelRow(
       days = days,
       daysInPeriod = periodDays,
       percentageOfDays = formatPercentage(days, periodDays.toLong),
+      countryCodes = Seq.empty,
+      activeDays = activeDays,
     })
   } else if (includeTakedowns && underTheHoodLabels.isAccountTakedownLabel(raw, countryCodes)) {
     Some({
@@ -244,10 +310,13 @@ def accountLabelRow(
       days = days,
       daysInPeriod = periodDays,
       percentageOfDays = formatPercentage(days, periodDays.toLong),
+      countryCodes = countryCodes,
+      activeDays = activeDays,
     })
   } else {
     None
   }
+}
 
 def buildReportJson(
     userMonth: UthUserMonthAggregate,
@@ -272,7 +341,7 @@ def buildReportJson(
         postLabelRow(
           raw,
           agg.countryCodes.getOrElse(Seq.empty),
-          sumCarried(agg.days),
+          agg.days,
           postCount,
           includeTakedowns)
       }
@@ -282,57 +351,29 @@ def buildReportJson(
     .getOrElse(Seq.empty)
     .flatMap { agg =>
       agg.label.flatMap { raw =>
-        val days = agg.activeDays.map { d => d.size.toLong }.getOrElse(0L)
         accountLabelRow(
           raw,
           agg.countryCodes.getOrElse(Seq.empty),
-          days,
+          agg.activeDays.getOrElse(Seq.empty),
           periodDays,
           includeTakedowns)
       }
     }
 
-  if (postLabels.isEmpty && accountLabels.isEmpty) {
-    {
-      notes = reportNotes,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalPostLabels = 0,
-      totalAccountLabels = 0,
-    }.toJson
-  } else if (postLabels.isEmpty) {
-    {
-      notes = reportNotes,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalPostLabels = 0,
-    }.toJson
-  } else if (accountLabels.isEmpty) {
-    {
-      notes = reportNotes,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalAccountLabels = 0,
-    }.toJson
-  } else {
-    {
-      notes = reportNotes,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-    }.toJson
-  }
+  // Emitted unconditionally. Previously these keys appeared only when the
+  // matching list was empty, so the payload had four different key sets and a
+  // consumer had to branch on key presence. They count EMITTED ROWS, which is
+  // not necessarily the number of distinct labels or affected posts.
+  {
+    notes = reportNotes,
+    period = period,
+    generatedAt = formatGeneratedAtIso(generatedAtMs),
+    postCount = postCount,
+    postLabels = postLabels,
+    accountLabels = accountLabels,
+    totalPostLabels = postLabels.size,
+    totalAccountLabels = accountLabels.size,
+  }.toJson
 }
 
 def userWithQueryFields(
