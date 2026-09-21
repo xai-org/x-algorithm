@@ -293,7 +293,7 @@ class FilteredRetrievalModelRunner(RetrievalModelRunner):
         request: xai_recsys_engine.RetrieveRequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
-    ) -> dict[int, tuple[jax.Array, jax.Array]]:
+    ) -> dict[int, tuple[jax.Array, jax.Array, jax.Array]]:
         forward_jit = self._forward_jit_for_bucket(bucket_size)
         bs = bucket_size if bucket_size is not None else self.inference_batch_size
         assert state.post_embeddings is not None

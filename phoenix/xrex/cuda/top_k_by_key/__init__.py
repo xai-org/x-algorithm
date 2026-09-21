@@ -55,6 +55,10 @@ if _MISSING:
     )
 
 
+def gather_selected_validity(eligibility: jax.Array, selected_indices: jax.Array) -> jax.Array:
+    return jnp.take_along_axis(eligibility, selected_indices, axis=1)
+
+
 def top_k_by_key(
     keys: jax.Array,
     k: int,
