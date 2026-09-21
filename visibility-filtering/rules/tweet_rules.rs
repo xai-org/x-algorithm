@@ -53,12 +53,6 @@ pub(super) const TWEET_LABEL_DROPS: &[RuleSpec] = &[
         action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
         exempt_author: true,
     },
-    RuleSpec::Tweet {
-        name: "FosnrCivicIntegrityDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
 ];
 
 pub(super) const NSFW_MEDIA_INTERSTITIALS: &[RuleSpec] = &[
@@ -125,6 +119,12 @@ pub(super) const OON_TWEET_LABEL_DROPS: &[RuleSpec] = &[
     RuleSpec::Tweet {
         name: "DoNotAmplifyOonDropRule",
         when: |tweet| tweet.has_safety_label(SafetyLabelType::DO_NOT_AMPLIFY),
+        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
+        exempt_author: true,
+    },
+    RuleSpec::Tweet {
+        name: "FosnrCivicIntegrityDropRule",
+        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
         action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
         exempt_author: true,
     },
