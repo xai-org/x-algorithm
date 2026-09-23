@@ -133,6 +133,16 @@ impl ScoringWeights {
     }
 
     fn recompute_sums(&mut self) {
+        // Negative action weights are configured as negative floats (e.g., -43.2).
+        // Asserting non-positive magnitude prevents sign inversion misconfigurations.
+        debug_assert!(
+            self.not_interested <= 0.0
+                && self.block_author <= 0.0
+                && self.mute_author <= 0.0
+                && self.report <= 0.0
+                && self.not_dwelled <= 0.0,
+            "Negative action weights must be non-positive values"
+        );
         let positive_sum = self.favorite
             + self.reply
             + self.retweet
@@ -225,6 +235,10 @@ impl ScoringWeights {
         !self.post_unexplored_in_network_only || candidate.in_network == Some(true)
     }
 
+    /// Determines if a post candidate is eligible for the mutual follow boost.
+    /// Excludes replies (`in_reply_to_tweet_id`) and retweets (`retweeted_tweet_id`).
+    /// Note: Quote tweets are intentionally eligible because they contain new original commentary
+    /// authored by the mutual-follow user.
     fn bidirectional_boost_eligible(candidate: &PostCandidate) -> bool {
         candidate.in_reply_to_tweet_id.is_none()
             && candidate.retweeted_tweet_id.is_none()
