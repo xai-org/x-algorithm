@@ -115,6 +115,9 @@ pub struct ScoredPostsQuery {
     pub request_context: String,
     #[serde(skip)]
     pub served_history: Vec<ServedHistory>,
+    /// Distinguishes a successful empty history from a failed/skipped read.
+    #[serde(skip)]
+    pub served_history_loaded: bool,
     pub who_to_follow_eligible: bool,
     pub feed_survey_eligible: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -225,6 +228,7 @@ impl ScoredPostsQuery {
             cursor: None,
             request_context: String::new(),
             served_history: vec![],
+            served_history_loaded: false,
             who_to_follow_eligible: false,
             feed_survey_eligible: false,
             non_polling_timestamps: None,

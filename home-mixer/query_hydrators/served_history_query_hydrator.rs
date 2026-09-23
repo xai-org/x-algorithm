@@ -58,6 +58,7 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
 
         Ok(ScoredPostsQuery {
             served_history: entries,
+            served_history_loaded: true,
             served_ids,
             who_to_follow_eligible,
             feed_survey_eligible,
@@ -67,6 +68,7 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
 
     fn update(&self, query: &mut ScoredPostsQuery, hydrated: ScoredPostsQuery) {
         query.served_history = hydrated.served_history;
+        query.served_history_loaded = hydrated.served_history_loaded;
         query.served_ids = hydrated.served_ids;
         query.who_to_follow_eligible = hydrated.who_to_follow_eligible;
         query.feed_survey_eligible = hydrated.feed_survey_eligible;

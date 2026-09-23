@@ -500,7 +500,11 @@ impl RankingScorer {
         (1.0 - floor) * decay_factor.powf(exponent) + floor
     }
 
-    fn author_pool_counts(candidates: &[PostCandidate], pre_diversity_scores: &[f64]) -> Vec<u32> {
+    fn author_pool_counts(
+        candidates: &[PostCandidate],
+        pre_diversity_scores: &[f64],
+        original_authors: bool,
+    ) -> Vec<u32> {
         let mut indexed: Vec<(usize, f64)> = pre_diversity_scores
             .iter()
             .enumerate()
@@ -511,7 +515,15 @@ impl RankingScorer {
         let mut counts = vec![0u32; candidates.len()];
         let mut author_counts: FxHashMap<u64, u32> = FxHashMap::default();
         for (idx, _) in indexed {
-            let author_id = candidates[idx].author_id;
+            let candidate = &candidates[idx];
+            let author_id = if original_authors {
+                crate::util::author_diversity::content_author_id(
+                    candidate.author_id,
+                    candidate.retweeted_user_id,
+                )
+            } else {
+                candidate.author_id
+            };
             let k = author_counts.get(&author_id).copied().unwrap_or(0);
             counts[idx] = k;
             author_counts.insert(author_id, k + 1);
@@ -527,13 +539,31 @@ impl RankingScorer {
         candidates.iter().map(|c| c.slate_context).collect()
     }
 
-    fn author_diversity_multipliers(query: &ScoredPostsQuery, counts: &[u32]) -> Vec<f64> {
+    fn author_diversity_multipliers(
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        pre_diversity_scores: &[f64],
+    ) -> Vec<f64> {
         let decay_factor = query.params.get(AuthorDiversityDecay);
         let floor = query.params.get(AuthorDiversityFloor);
+        let history = crate::util::author_history::counts_for_query(query);
+        let counts = Self::author_pool_counts(candidates, pre_diversity_scores, history.is_some());
 
         counts
             .iter()
-            .map(|&k| Self::diversity_multiplier(decay_factor, floor, f64::from(k)))
+            .zip(candidates)
+            .map(|(&k, candidate)| {
+                let author_id = crate::util::author_diversity::content_author_id(
+                    candidate.author_id,
+                    candidate.retweeted_user_id,
+                );
+                let prior = history
+                    .as_ref()
+                    .and_then(|h| h.get(&author_id))
+                    .copied()
+                    .unwrap_or(0.0);
+                Self::diversity_multiplier(decay_factor, floor, f64::from(k) + prior)
+            })
             .collect()
     }
 
@@ -542,8 +572,8 @@ impl RankingScorer {
         candidates: &[PostCandidate],
         pre_diversity_scores: &[f64],
     ) -> Vec<f64> {
-        let counts = Self::author_pool_counts(candidates, pre_diversity_scores);
-        let multipliers = Self::author_diversity_multipliers(query, &counts);
+        let multipliers =
+            Self::author_diversity_multipliers(query, candidates, pre_diversity_scores);
         pre_diversity_scores
             .iter()
             .zip(multipliers)
@@ -619,8 +649,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
 
         if query.params.get(MultiplierPreOffset) {
             let diversity_multipliers: Vec<f64> = if enable_author_diversity {
-                let counts = Self::author_pool_counts(candidates, &weighted_scores);
-                Self::author_diversity_multipliers(query, &counts)
+                Self::author_diversity_multipliers(query, candidates, &weighted_scores)
             } else {
                 vec![1.0; candidates.len()]
             };
@@ -758,6 +787,114 @@ mod tests {
             retweeted_tweet_id: Some(42),
             ..Default::default()
         }
+    }
+
+    fn recent_author_history(
+        author_id: i64,
+        now_ms: i64,
+    ) -> xai_x_thrift::served_history::ServedHistory {
+        use xai_x_thrift::served_history::{
+            EntityIdType, EntryWithItemIds, ItemIds, RequestType, ServedHistory,
+        };
+        ServedHistory {
+            request_type: RequestType::INITIAL,
+            served_id: Some(100),
+            served_time_ms: Some(now_ms),
+            entries: vec![EntryWithItemIds {
+                entity_type: EntityIdType::TWEET,
+                sort_index: Some(0),
+                size: None,
+                item_ids: Some(vec![ItemIds {
+                    tweet_id: Some(123),
+                    source_tweet_id: None,
+                    source_author_id: Some(author_id),
+                    quote_tweet_id: None,
+                    quote_author_id: None,
+                    in_reply_to_tweet_id: None,
+                    in_reply_to_author_id: None,
+                    article_id: None,
+                    tweet_score: None,
+                    entry_id_to_replace: None,
+                    user_id: None,
+                    impression_id: None,
+                }]),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_author_is_penalized_in_both_scoring_paths() {
+        let scorer = test_scorer();
+        for pre_offset in ["false", "true"] {
+            let mut query = query_with_flags(&[
+                ("rust_home_mixer_enable_author_diversity", "true"),
+                (
+                    "rust_home_mixer_enable_cross_request_author_diversity",
+                    "true",
+                ),
+                ("rust_home_mixer_author_diversity_history_weight", "1.0"),
+                ("rust_home_mixer_multiplier_pre_offset", pre_offset),
+            ]);
+            query.request_time_ms = 1_000_000;
+            query.served_history_loaded = true;
+            query.served_history = vec![recent_author_history(1, query.request_time_ms)];
+            let candidates: Vec<_> = [1, 2]
+                .into_iter()
+                .map(|id| PostCandidate {
+                    phoenix_scores: PhoenixScores {
+                        favorite_score: Some(1.0),
+                        ..Default::default()
+                    },
+                    ..candidate(id, Some(true))
+                })
+                .collect();
+            let scored = scorer.score(&query, &candidates).await;
+            assert!(
+                scored[0].as_ref().unwrap().score.unwrap()
+                    < scored[1].as_ref().unwrap().score.unwrap()
+            );
+            // Expiry and a failed/skipped read both restore the baseline.
+            query.request_time_ms += 300_000;
+            let expired = scorer.score(&query, &candidates).await;
+            assert_eq!(
+                expired[0].as_ref().unwrap().score,
+                expired[1].as_ref().unwrap().score
+            );
+            query.request_time_ms -= 300_000;
+            query.served_history_loaded = false;
+            let unavailable = scorer.score(&query, &candidates).await;
+            assert_eq!(
+                unavailable[0].as_ref().unwrap().score,
+                unavailable[1].as_ref().unwrap().score
+            );
+        }
+    }
+
+    #[test]
+    fn history_and_pool_use_the_same_original_author_key() {
+        let mut query = query_with_flags(&[
+            (
+                "rust_home_mixer_enable_cross_request_author_diversity",
+                "true",
+            ),
+            ("rust_home_mixer_author_diversity_history_weight", "1.0"),
+            ("rust_home_mixer_author_diversity_decay", "0.5"),
+            ("rust_home_mixer_author_diversity_floor", "0.25"),
+        ]);
+        query.request_time_ms = 1_000_000;
+        query.served_history_loaded = true;
+        query.served_history = vec![recent_author_history(99, query.request_time_ms)];
+        let candidates: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|id| PostCandidate {
+                retweeted_user_id: Some(99),
+                ..candidate_with_retweet(id, Some(true))
+            })
+            .collect();
+        assert_eq!(
+            RankingScorer::author_diversity_multipliers(&query, &candidates, &[100.0, 99.0]),
+            vec![0.625, 0.4375]
+        );
     }
 
     #[tokio::test]
