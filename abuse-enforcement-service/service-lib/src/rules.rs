@@ -10,6 +10,7 @@ use tracing::warn;
 
 const USER_RULE_FILE_YAML: &str = include_str!("../rules/enforcement_user.yaml");
 const POST_RULE_FILE_YAML: &str = include_str!("../rules/enforcement_post.yaml");
+const MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC: i64 = 30 * 24 * 60 * 60 * 1000;
 
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +90,17 @@ pub enum RuleCompileError {
         "rule '{id}' has an empty `act_all.actions` list; a composite must dispatch at least one action"
     )]
     EmptyActAll { id: String },
+    #[error("rule '{id}' applies recommendation-limiting label '{label}' without an expiry")]
+    MissingRecommendationRestrictionTtl { id: String, label: String },
+    #[error(
+        "rule '{id}' applies recommendation-limiting label '{label}' with invalid ttl_msec {ttl_msec}; expected 1..={max_ttl_msec}"
+    )]
+    InvalidRecommendationRestrictionTtl {
+        id: String,
+        label: String,
+        ttl_msec: i64,
+        max_ttl_msec: i64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +137,7 @@ impl CompiledRules {
                 {
                     return Err(RuleCompileError::EmptyActAll { id: r.id.clone() });
                 }
+                validate_recommendation_restriction_ttls(&r.id, &r.then)?;
                 Ok(CompiledRule {
                     id: r.id,
                     when,
@@ -144,6 +157,63 @@ impl CompiledRules {
 
                 pub fn entity_type(&self) -> EntityType {
         self.entity_type
+    }
+}
+
+fn is_recommendation_limiting_label(label: &str) -> bool {
+    let normalized: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "spamhighrecall" | "donotamplify" | "abusivehighrecall"
+    )
+}
+
+fn validate_action_ttl(rule_id: &str, action: &ActionStep) -> Result<(), RuleCompileError> {
+    let (labels, ttl_msec) = match action {
+        ActionStep::ActAddLabelsV2 { labels, ttl_msec }
+        | ActionStep::ActAddPostLabelsV2 { labels, ttl_msec } => (labels, ttl_msec),
+        _ => return Ok(()),
+    };
+
+    for label in labels
+        .iter()
+        .filter(|label| is_recommendation_limiting_label(label))
+    {
+        let Some(ttl_msec) = ttl_msec else {
+            return Err(RuleCompileError::MissingRecommendationRestrictionTtl {
+                id: rule_id.to_string(),
+                label: label.clone(),
+            });
+        };
+        if *ttl_msec <= 0 || *ttl_msec > MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC {
+            return Err(RuleCompileError::InvalidRecommendationRestrictionTtl {
+                id: rule_id.to_string(),
+                label: label.clone(),
+                ttl_msec: *ttl_msec,
+                max_ttl_msec: MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_recommendation_restriction_ttls(
+    rule_id: &str,
+    outcome: &Outcome,
+) -> Result<(), RuleCompileError> {
+    match outcome {
+        Outcome::Special(SpecialOutcome::ActAll { actions }) => {
+            for action in actions {
+                validate_action_ttl(rule_id, action)?;
+            }
+            Ok(())
+        }
+        Outcome::Action(action) => validate_action_ttl(rule_id, action),
+        Outcome::Special(SpecialOutcome::Skip { .. }) => Ok(()),
     }
 }
 
@@ -1076,6 +1146,59 @@ rules:
                 ttl_msec: None,
             }]),
         );
+    }
+
+    #[test]
+    fn recommendation_restriction_requires_ttl() {
+        let yaml = r#"
+rules:
+  - id: no_expiry
+    when: "true"
+    then: { kind: act_add_labels_v2, labels: ["SpamHighRecall"] }
+"#;
+        assert!(matches!(
+            CompiledRules::from_yaml(yaml),
+            Err(RuleCompileError::MissingRecommendationRestrictionTtl { id, label })
+                if id == "no_expiry" && label == "SpamHighRecall"
+        ));
+    }
+
+    #[test]
+    fn recommendation_restriction_rejects_invalid_ttl() {
+        for ttl_msec in [-1, 0, MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC + 1] {
+            let yaml = format!(
+                "rules:\n  - id: invalid_expiry\n    when: \"true\"\n    then: {{ kind: act_add_post_labels_v2, labels: [\"Do_Not_Amplify\"], ttl_msec: {ttl_msec} }}\n"
+            );
+            assert!(matches!(
+                CompiledRules::from_yaml(&yaml),
+                Err(RuleCompileError::InvalidRecommendationRestrictionTtl {
+                    id,
+                    label,
+                    ttl_msec: actual,
+                    max_ttl_msec: MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC,
+                }) if id == "invalid_expiry" && label == "Do_Not_Amplify" && actual == ttl_msec
+            ));
+        }
+    }
+
+    #[test]
+    fn recommendation_restriction_accepts_max_ttl_in_nested_action() {
+        let yaml = format!(
+            "rules:\n  - id: reviewed_expiry\n    when: \"true\"\n    then:\n      kind: act_all\n      actions:\n        - {{ kind: act_add_labels_v2, labels: [\"AbusiveHighRecall\"], ttl_msec: {} }}\n        - {{ kind: act_captcha }}\n",
+            MAX_RECOMMENDATION_RESTRICTION_TTL_MSEC
+        );
+        CompiledRules::from_yaml(&yaml).expect("bounded recommendation restriction should compile");
+    }
+
+    #[test]
+    fn unrelated_label_may_keep_existing_no_expiry_behavior() {
+        let yaml = r#"
+rules:
+  - id: unrelated
+    when: "true"
+    then: { kind: act_add_labels_v2, labels: ["MockLabel"] }
+"#;
+        CompiledRules::from_yaml(yaml).expect("unrelated label should remain backward compatible");
     }
 
     #[test]
