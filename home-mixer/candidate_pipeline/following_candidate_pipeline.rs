@@ -1,15 +1,33 @@
 use crate::candidate_pipeline::reverse_chron_posts_pipeline::ReverseChronPostsPipeline;
-use crate::clients::ad_index_client::{AdIndexClient, MockAdIndexClient, ProdAdIndexClient};
-use crate::clients::past_request_timestamps_client::{
-    MockPastRequestTimestampsClient, PastRequestTimestampsClient, ProdPastRequestTimestampsClient,
+use crate::clients::ad_index_client::{
+    AdIndexClient,
+    MockAdIndexClient,
+    ProdAdIndexClient,
 };
-use crate::clients::prompts_client::{MockPromptsClient, ProdPromptsClient, PromptsClient};
-use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
+use crate::clients::past_request_timestamps_client::{
+    MockPastRequestTimestampsClient,
+    PastRequestTimestampsClient,
+    ProdPastRequestTimestampsClient,
+};
+use crate::clients::prompts_client::{
+    MockPromptsClient,
+    ProdPromptsClient,
+    PromptsClient,
+};
+use crate::clients::s2s::{
+    S2S_CHAIN_PATH,
+    S2S_CRT_PATH,
+    S2S_KEY_PATH,
+};
 use crate::clients::served_history_client::{
-    MockServedHistoryClient, ProdServedHistoryClient, ServedHistoryClient,
+    MockServedHistoryClient,
+    ProdServedHistoryClient,
+    ServedHistoryClient,
 };
 use crate::clients::who_to_follow_client::{
-    MockWhoToFollowClient, ProdWhoToFollowClient, WhoToFollowClient,
+    MockWhoToFollowClient,
+    ProdWhoToFollowClient,
+    WhoToFollowClient,
 };
 use crate::filters::invalid_conversation_module_filter::InvalidConversationModuleFilter;
 use crate::models::query::ScoredPostsQuery;
@@ -33,12 +51,16 @@ use crate::sources::reverse_chron_posts_source::ReverseChronPostsSource;
 use crate::sources::who_to_follow_source::WhoToFollowSource;
 use std::sync::Arc;
 use tonic::async_trait;
+
 use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
-    KafkaPublisherClient, MockKafkaPublisherClient,
+    KafkaPublisherClient,
+    MockKafkaPublisherClient,
 };
 use xai_candidate_pipeline::component_library::clients::{
-    MockSocialGraphClient, SocialGraphClient, SocialGraphClientOps,
+    MockSocialGraphClient,
+    SocialGraphClient,
+    SocialGraphClientOps,
 };
 use xai_candidate_pipeline::filter::Filter;
 use xai_candidate_pipeline::hydrator::Hydrator;
@@ -57,6 +79,26 @@ pub struct FollowingCandidatePipeline {
     selector: FollowingBlenderSelector,
     post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>>,
     side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>>,
+}
+
+/// All dependencies required to construct the following candidate pipeline.
+///
+/// Keeping these together makes `build()` easier to read and reduces the
+/// chance of accidentally wiring a dependency into the wrong component.
+struct FollowingPipelineDeps {
+    ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
+    served_history_client: Arc<dyn ServedHistoryClient>,
+    past_request_timestamps_client: Arc<dyn PastRequestTimestampsClient>,
+    socialgraph_client: Arc<dyn SocialGraphClientOps>,
+    reverse_chron_pipeline: Arc<ReverseChronPostsPipeline>,
+    who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
+    prompts_client: Arc<dyn PromptsClient + Send + Sync>,
+
+    ads_injection_logging: AdsInjectionLoggingSideEffect,
+    served_ad_history: ServedAdHistoryCacheSideEffect,
+    publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
+    served_candidates: ServedCandidatesKafkaSideEffect,
+    client_events: ClientEventsKafkaSideEffect,
 }
 
 impl FollowingCandidatePipeline {
@@ -130,12 +172,12 @@ impl FollowingCandidatePipeline {
             ClientEventsKafkaSideEffect::prod(),
         );
 
-        Self::build(
+        Self::build(FollowingPipelineDeps {
             ad_index_client,
             served_history_client,
             past_request_timestamps_client,
             socialgraph_client,
-            Arc::new(reverse_chron_pipeline),
+            reverse_chron_pipeline: Arc::new(reverse_chron_pipeline),
             who_to_follow_client,
             prompts_client,
             ads_injection_logging,
@@ -143,66 +185,102 @@ impl FollowingCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
-        )
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
-        served_history_client: Arc<dyn ServedHistoryClient>,
-        past_request_timestamps_client: Arc<dyn PastRequestTimestampsClient>,
-        socialgraph_client: Arc<dyn SocialGraphClientOps>,
-        reverse_chron_pipeline: Arc<ReverseChronPostsPipeline>,
-        who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
-        prompts_client: Arc<dyn PromptsClient + Send + Sync>,
-        ads_injection_logging: AdsInjectionLoggingSideEffect,
-        served_ad_history: ServedAdHistoryCacheSideEffect,
-        publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
-        served_candidates: ServedCandidatesKafkaSideEffect,
-        client_events: ClientEventsKafkaSideEffect,
-    ) -> Self {
-        let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
-            Box::new(ServedHistoryQueryHydrator::from_client(Arc::clone(
-                &served_history_client,
-            ))),
-            Box::new(PastRequestTimestampsQueryHydrator::new(Arc::clone(
-                &past_request_timestamps_client,
-            ))),
-            Box::new(FollowedUserIdsQueryHydrator { socialgraph_client }),
+    fn build(deps: FollowingPipelineDeps) -> Self {
+        let FollowingPipelineDeps {
+            ad_index_client,
+            served_history_client,
+            past_request_timestamps_client,
+            socialgraph_client,
+            reverse_chron_pipeline,
+            who_to_follow_client,
+            prompts_client,
+            ads_injection_logging,
+            served_ad_history,
+            publish_seen_ids,
+            served_candidates,
+            client_events,
+        } = deps;
+
+        // Query hydration happens before candidate generation.
+        let query_hydrators = vec![
+            Box::new(
+                ServedHistoryQueryHydrator::from_client(
+                    Arc::clone(&served_history_client),
+                ),
+            )
+                as Box<dyn QueryHydrator<ScoredPostsQuery>>,
+            Box::new(
+                PastRequestTimestampsQueryHydrator::new(
+                    Arc::clone(&past_request_timestamps_client),
+                ),
+            ),
+            Box::new(FollowedUserIdsQueryHydrator {
+                socialgraph_client,
+            }),
         ];
 
-        let sources: Vec<Box<dyn Source<ScoredPostsQuery, FeedItem>>> = vec![
-            Box::new(ReverseChronPostsSource::new(reverse_chron_pipeline)),
-            Box::new(AdsSource { ad_index_client }),
+        // Candidate sources are intentionally kept in the same order as the
+        // existing implementation.
+        let sources = vec![
+            Box::new(ReverseChronPostsSource::new(reverse_chron_pipeline))
+                as Box<dyn Source<ScoredPostsQuery, FeedItem>>,
+            Box::new(AdsSource {
+                ad_index_client,
+            }),
             Box::new(WhoToFollowSource {
                 who_to_follow_client,
             }),
-            Box::new(PromptsSource { prompts_client }),
+            Box::new(PromptsSource {
+                prompts_client,
+            }),
         ];
 
-        let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, FeedItem>>> = vec![];
-        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>> =
-            vec![Box::new(InvalidConversationModuleFilter)];
+        // No candidate hydrators are currently configured.
+        let hydrators = Vec::new();
+
+        // Preserve the existing filtering behavior.
+        let filters = vec![
+            Box::new(InvalidConversationModuleFilter)
+                as Box<dyn Filter<ScoredPostsQuery, FeedItem>>,
+        ];
+
         let selector = FollowingBlenderSelector::new();
 
-        let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> =
-            Arc::new(vec![
-                Box::new(ads_injection_logging),
-                Box::new(served_ad_history),
-                Box::new(publish_seen_ids),
-                Box::new(served_candidates),
-                Box::new(client_events),
-                Box::new(ResponseStatsSideEffect),
-                Box::new(UpdatePastRequestTimestampsSideEffect::new(
-                    past_request_timestamps_client,
-                )),
-                Box::new(UpdateServedHistorySideEffect::new(Arc::clone(
-                    &served_history_client,
-                ))),
-                Box::new(TruncateServedHistorySideEffect::new(served_history_client)),
-            ]);
+        // No post-selection filters are currently configured.
+        let post_selection_filters = Vec::new();
 
-        let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>> = vec![];
+        // Keep side-effect ordering unchanged.
+        //
+        // The clients are cloned only where they are genuinely shared by
+        // multiple components.
+        let side_effects: Arc<
+            Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>,
+        > = Arc::new(vec![
+            Box::new(ads_injection_logging),
+            Box::new(served_ad_history),
+            Box::new(publish_seen_ids),
+            Box::new(served_candidates),
+            Box::new(client_events),
+            Box::new(ResponseStatsSideEffect),
+            Box::new(
+                UpdatePastRequestTimestampsSideEffect::new(
+                    past_request_timestamps_client,
+                ),
+            ),
+            Box::new(
+                UpdateServedHistorySideEffect::new(
+                    Arc::clone(&served_history_client),
+                ),
+            ),
+            Box::new(
+                TruncateServedHistorySideEffect::new(
+                    served_history_client,
+                ),
+            ),
+        ]);
 
         Self {
             query_hydrators,
@@ -216,24 +294,61 @@ impl FollowingCandidatePipeline {
     }
 
     pub async fn mock() -> Self {
-        let ad_index_client: Arc<dyn AdIndexClient + Send + Sync> = Arc::new(MockAdIndexClient);
-        let served_history_client: Arc<dyn ServedHistoryClient> = Arc::new(MockServedHistoryClient);
-        let past_request_timestamps_client: Arc<dyn PastRequestTimestampsClient> =
+        let ad_index_client: Arc<dyn AdIndexClient + Send + Sync> =
+            Arc::new(MockAdIndexClient);
+
+        let served_history_client: Arc<dyn ServedHistoryClient> =
+            Arc::new(MockServedHistoryClient);
+
+        let past_request_timestamps_client:
+            Arc<dyn PastRequestTimestampsClient> =
             Arc::new(MockPastRequestTimestampsClient);
-        let socialgraph_client: Arc<dyn SocialGraphClientOps> = Arc::new(MockSocialGraphClient);
-        let reverse_chron_pipeline = Arc::new(ReverseChronPostsPipeline::mock().await);
-        let who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync> =
+
+        let socialgraph_client: Arc<dyn SocialGraphClientOps> =
+            Arc::new(MockSocialGraphClient);
+
+        let reverse_chron_pipeline =
+            Arc::new(ReverseChronPostsPipeline::mock().await);
+
+        let who_to_follow_client:
+            Arc<dyn WhoToFollowClient + Send + Sync> =
             Arc::new(MockWhoToFollowClient);
-        let prompts_client: Arc<dyn PromptsClient + Send + Sync> = Arc::new(MockPromptsClient);
-        let mock_kafka = Arc::new(MockKafkaPublisherClient) as Arc<dyn KafkaPublisherClient>;
-        let ads_injection_logging = AdsInjectionLoggingSideEffect::new(Arc::clone(&mock_kafka));
-        let served_ad_history = ServedAdHistoryCacheSideEffect::new(Arc::new(
-            xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
-        ));
-        let publish_seen_ids = PublishSeenIdsToKafkaSideEffect::new(Arc::clone(&mock_kafka));
-        let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
-        let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
-        Self::build(
+
+        let prompts_client: Arc<dyn PromptsClient + Send + Sync> =
+            Arc::new(MockPromptsClient);
+
+        let mock_kafka =
+            Arc::new(MockKafkaPublisherClient)
+                as Arc<dyn KafkaPublisherClient>;
+
+        let ads_injection_logging =
+            AdsInjectionLoggingSideEffect::new(
+                Arc::clone(&mock_kafka),
+            );
+
+        let served_ad_history =
+            ServedAdHistoryCacheSideEffect::new(
+                Arc::new(
+                    xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
+                ),
+            );
+
+        let publish_seen_ids =
+            PublishSeenIdsToKafkaSideEffect::new(
+                Arc::clone(&mock_kafka),
+            );
+
+        let served_candidates =
+            ServedCandidatesKafkaSideEffect::new(
+                Arc::clone(&mock_kafka),
+            );
+
+        let client_events =
+            ClientEventsKafkaSideEffect::new(
+                Arc::clone(&mock_kafka),
+            );
+
+        Self::build(FollowingPipelineDeps {
             ad_index_client,
             served_history_client,
             past_request_timestamps_client,
@@ -246,45 +361,65 @@ impl FollowingCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
-        )
+        })
     }
 }
 
 #[async_trait]
-impl CandidatePipeline<ScoredPostsQuery, FeedItem> for FollowingCandidatePipeline {
-    fn query_hydrators(&self) -> &[Box<dyn QueryHydrator<ScoredPostsQuery>>] {
+impl CandidatePipeline<ScoredPostsQuery, FeedItem>
+    for FollowingCandidatePipeline
+{
+    fn query_hydrators(
+        &self,
+    ) -> &[Box<dyn QueryHydrator<ScoredPostsQuery>>] {
         &self.query_hydrators
     }
 
-    fn sources(&self) -> &[Box<dyn Source<ScoredPostsQuery, FeedItem>>] {
+    fn sources(
+        &self,
+    ) -> &[Box<dyn Source<ScoredPostsQuery, FeedItem>>] {
         &self.sources
     }
 
-    fn hydrators(&self) -> &[Box<dyn Hydrator<ScoredPostsQuery, FeedItem>>] {
+    fn hydrators(
+        &self,
+    ) -> &[Box<dyn Hydrator<ScoredPostsQuery, FeedItem>>] {
         &self.hydrators
     }
 
-    fn filters(&self) -> &[Box<dyn Filter<ScoredPostsQuery, FeedItem>>] {
+    fn filters(
+        &self,
+    ) -> &[Box<dyn Filter<ScoredPostsQuery, FeedItem>>] {
         &self.filters
     }
 
-    fn scorers(&self) -> &[Box<dyn Scorer<ScoredPostsQuery, FeedItem>>] {
+    fn scorers(
+        &self,
+    ) -> &[Box<dyn Scorer<ScoredPostsQuery, FeedItem>>] {
         &[]
     }
 
-    fn selector(&self) -> &dyn Selector<ScoredPostsQuery, FeedItem> {
+    fn selector(
+        &self,
+    ) -> &dyn Selector<ScoredPostsQuery, FeedItem> {
         &self.selector
     }
 
-    fn post_selection_hydrators(&self) -> &[Box<dyn Hydrator<ScoredPostsQuery, FeedItem>>] {
+    fn post_selection_hydrators(
+        &self,
+    ) -> &[Box<dyn Hydrator<ScoredPostsQuery, FeedItem>>] {
         &[]
     }
 
-    fn post_selection_filters(&self) -> &[Box<dyn Filter<ScoredPostsQuery, FeedItem>>] {
+    fn post_selection_filters(
+        &self,
+    ) -> &[Box<dyn Filter<ScoredPostsQuery, FeedItem>>] {
         &self.post_selection_filters
     }
 
-    fn side_effects(&self) -> Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> {
+    fn side_effects(
+        &self,
+    ) -> Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> {
         Arc::clone(&self.side_effects)
     }
 
