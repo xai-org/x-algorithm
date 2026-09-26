@@ -65,11 +65,7 @@ where
 
     fn sort(&self, candidates: Vec<C>) -> Vec<C> {
         let mut sorted = candidates;
-        sorted.sort_by(|a, b| {
-            self.score(b)
-                .partial_cmp(&self.score(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted.sort_by(|a, b| cmp_ranking_scores_desc(self.score(a), self.score(b)));
         sorted
     }
 
@@ -99,5 +95,72 @@ where
                 );
             }
         }
+    }
+}
+
+/// Finite scores keep their value. Non-finite scores (`NaN`, `±inf`) sink to
+/// the bottom of a descending ranking so they cannot occupy a Top-K slot.
+fn normalized_ranking_score(score: f64) -> f64 {
+    if score.is_finite() {
+        score
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+fn cmp_ranking_scores_desc(left: f64, right: f64) -> std::cmp::Ordering {
+    normalized_ranking_score(right).total_cmp(&normalized_ranking_score(left))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rank(mut scores: Vec<f64>) -> Vec<f64> {
+        scores.sort_by(|&a, &b| cmp_ranking_scores_desc(a, b));
+        scores
+    }
+
+    fn top_k(scores: Vec<f64>, k: usize) -> Vec<f64> {
+        let ranked = rank(scores);
+        ranked.into_iter().take(k).collect()
+    }
+
+    fn assert_finite_prefix(actual: &[f64], expected: &[f64]) {
+        assert!(actual.len() >= expected.len());
+        assert_eq!(&actual[..expected.len()], expected);
+        assert!(actual[expected.len()..].iter().all(|s| !s.is_finite()));
+    }
+
+    #[test]
+    fn nan_ranks_below_finite_scores() {
+        let ranked = rank(vec![0.90, f64::NAN, 0.80]);
+        assert_eq!(ranked[0], 0.90);
+        assert_eq!(ranked[1], 0.80);
+        assert!(ranked[2].is_nan());
+    }
+
+    #[test]
+    fn top_k_does_not_keep_nan_over_finite_candidate() {
+        let selected = top_k(vec![0.90, f64::NAN, 0.80], 2);
+        assert_eq!(selected, vec![0.90, 0.80]);
+    }
+
+    #[test]
+    fn non_finite_scores_rank_below_finite_scores() {
+        let ranked = rank(vec![
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            0.90,
+            0.80,
+        ]);
+        assert_finite_prefix(&ranked, &[0.90, 0.80]);
+    }
+
+    #[test]
+    fn finite_scores_keep_descending_order() {
+        let ranked = rank(vec![0.5, -1.0, 2.0, 0.0, -0.25]);
+        assert_eq!(ranked, vec![2.0, 0.5, 0.0, -0.25, -1.0]);
     }
 }
