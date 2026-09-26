@@ -30,6 +30,21 @@ where
     }
 }
 
+fn preview_for_log(text: &str) -> &str {
+    const MAX_PREVIEW_BYTES: usize = 300;
+    if text.len() <= MAX_PREVIEW_BYTES {
+        return text;
+    }
+    // Truncating at a fixed byte offset can split a multi-byte UTF-8
+    // character (user names in these responses are not ASCII), which
+    // would panic; back up to the nearest char boundary instead.
+    let mut end = MAX_PREVIEW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 #[derive(Debug, Deserialize)]
 struct UserProfile {
     name: String,
@@ -154,7 +169,7 @@ impl StratoClient {
                     "Failed to parse following list response for {}: {}. Response preview: {}",
                     user_id,
                     e,
-                    &text[..text.len().min(300)]
+                    preview_for_log(&text)
                 );
                 Err(anyhow!(e))
             }
@@ -224,7 +239,7 @@ impl StratoClient {
                     "Failed to parse user metadata response for {}: {}. Response preview: {}",
                     user_id,
                     e,
-                    &text[..text.len().min(300)]
+                    preview_for_log(&text)
                 );
                 Ok(None)
             }
