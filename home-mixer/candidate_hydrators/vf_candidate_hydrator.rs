@@ -177,7 +177,13 @@ pub(crate) fn visibility_fields(
             Some(visibility.action.clone()),
             visibility.to_visibility_reason(),
         ),
-        _ => (None, None),
+        // Err or missing id: fail closed. VFFilter drops NotEvaluated.
+        // Leaving (None, None) kept the post (fail-open) because the filter
+        // only partitions on Some(action).
+        _ => (
+            Some(Action::NotEvaluated),
+            Some(FilteredReason::UnspecifiedReason),
+        ),
     }
 }
 
@@ -316,5 +322,17 @@ mod tests {
             (3, Err(anyhow::anyhow!("vf unavailable"))),
         ]);
         assert!(!should_drop_ancillary(&candidate, &results));
+    }
+
+    #[test]
+    fn primary_lookup_miss_and_err_fail_closed() {
+        let miss = visibility_fields(None);
+        assert_eq!(miss.0, Some(Action::NotEvaluated));
+        assert_eq!(miss.1, Some(FilteredReason::UnspecifiedReason));
+
+        let err: Result<TweetVisibility> = Err(anyhow::anyhow!("vf unavailable"));
+        let failed = visibility_fields(Some(&err));
+        assert_eq!(failed.0, Some(Action::NotEvaluated));
+        assert_eq!(failed.1, Some(FilteredReason::UnspecifiedReason));
     }
 }
