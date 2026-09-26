@@ -139,15 +139,24 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrat
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        if candidate.author_id == 0 && hydrated.author_id != 0 {
-            candidate.author_id = hydrated.author_id;
-        }
-        candidate.retweeted_user_id = hydrated.retweeted_user_id;
-        candidate.retweeted_tweet_id = hydrated.retweeted_tweet_id;
-        candidate.in_reply_to_tweet_id = hydrated.in_reply_to_tweet_id;
-        candidate.ancestor_users = hydrated.ancestor_users;
-        candidate.tweet_text = hydrated.tweet_text;
+        apply_tes_core_data(candidate, &hydrated);
     }
+}
+
+/// TES author wins when TES resolved one. Source author_id is kept only on TES miss.
+///
+/// #128 runs InNetwork after this write. A leftover fill-if-zero kept Phoenix /
+/// Thunder's nonzero author_id, so the stamp used a stale id and VF fetched
+/// Recs. NSFW HP / gore / card then hard-dropped (Home would interstitial).
+fn apply_tes_core_data(candidate: &mut PostCandidate, hydrated: &PostCandidate) {
+    if hydrated.author_id != 0 {
+        candidate.author_id = hydrated.author_id;
+    }
+    candidate.retweeted_user_id = hydrated.retweeted_user_id;
+    candidate.retweeted_tweet_id = hydrated.retweeted_tweet_id;
+    candidate.in_reply_to_tweet_id = hydrated.in_reply_to_tweet_id;
+    candidate.ancestor_users = hydrated.ancestor_users.clone();
+    candidate.tweet_text = hydrated.tweet_text.clone();
 }
 
 fn core_data_fetch_ids(candidates: &[PostCandidate]) -> Vec<u64> {
@@ -197,5 +206,116 @@ impl CoreDataCandidateHydrator {
             receiver.incr(metric_name.as_str(), &FOUND_SCOPE, hydrated_count as u64);
             receiver.incr(metric_name.as_str(), &MISSING_SCOPE, missing_count as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::candidate_hydrators::in_network_candidate_hydrator::InNetworkCandidateHydrator;
+    use crate::models::user_features::UserFeatures;
+    use xai_candidate_pipeline::hydrator::Hydrator;
+
+    fn apply_tes_author(source_author: u64, tes_author: u64) -> u64 {
+        let mut candidate = PostCandidate {
+            tweet_id: 1,
+            author_id: source_author,
+            ..Default::default()
+        };
+        apply_tes_core_data(
+            &mut candidate,
+            &PostCandidate {
+                author_id: tes_author,
+                tweet_text: "tes".into(),
+                ..Default::default()
+            },
+        );
+        candidate.author_id
+    }
+
+    #[test]
+    fn tes_author_fills_zero_source() {
+        assert_eq!(apply_tes_author(0, 42), 42);
+    }
+
+    #[test]
+    fn tes_author_replaces_stale_nonzero_source() {
+        assert_eq!(
+            apply_tes_author(99, 42),
+            42,
+            "Phoenix/Thunder nonzero author must not block TES"
+        );
+    }
+
+    #[test]
+    fn tes_miss_keeps_source_author() {
+        assert_eq!(apply_tes_author(99, 0), 99);
+        assert_eq!(apply_tes_author(0, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn tes_author_then_in_network_stamps_followed_home() {
+        // Residual after #128: CoreData runs first, but a stale source author
+        // used to survive TES. InNetwork then stamped OON and VF Recs-dropped
+        // NSFW HP / gore / card (Home would interstitial).
+        let tes_author = 42u64;
+        let stale_source = 99u64;
+        let author_id = apply_tes_author(stale_source, tes_author);
+        assert_eq!(author_id, tes_author);
+
+        let query = ScoredPostsQuery {
+            user_id: 1,
+            user_features: UserFeatures {
+                followed_user_ids: vec![tes_author as i64],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hydrator = InNetworkCandidateHydrator;
+        let candidates = vec![PostCandidate {
+            tweet_id: 1,
+            author_id,
+            ..Default::default()
+        }];
+        let hydrated = hydrator.hydrate(&query, &candidates).await;
+        let mut candidate = candidates.into_iter().next().unwrap();
+        hydrator.update(
+            &mut candidate,
+            hydrated.into_iter().next().unwrap().unwrap(),
+        );
+        assert_eq!(
+            candidate.in_network,
+            Some(true),
+            "followed TES author must stamp Home, not Recs"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_source_author_used_to_stamp_oon() {
+        let query = ScoredPostsQuery {
+            user_id: 1,
+            user_features: UserFeatures {
+                followed_user_ids: vec![42],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hydrator = InNetworkCandidateHydrator;
+        let candidates = vec![PostCandidate {
+            tweet_id: 1,
+            author_id: 99,
+            ..Default::default()
+        }];
+        let hydrated = hydrator.hydrate(&query, &candidates).await;
+        let mut candidate = candidates.into_iter().next().unwrap();
+        hydrator.update(
+            &mut candidate,
+            hydrated.into_iter().next().unwrap().unwrap(),
+        );
+        assert_eq!(
+            candidate.in_network,
+            Some(false),
+            "stale source author 99 is not followed"
+        );
     }
 }
