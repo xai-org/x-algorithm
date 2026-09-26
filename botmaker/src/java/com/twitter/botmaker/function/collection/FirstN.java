@@ -8,6 +8,7 @@ import com.twitter.botmaker.ASTNode;
 import com.twitter.botmaker.Context;
 import com.twitter.botmaker.compiler.ActionLevel;
 import com.twitter.botmaker.compiler.BotMakerFunction;
+import com.twitter.botmaker.compiler.exceptions.FunctionFailure;
 import com.twitter.botmaker.compiler.exceptions.SemanticCheckFailure;
 import com.twitter.botmaker.compiler.types.Type;
 import com.twitter.botmaker.function.FunctionNode2;
@@ -54,6 +55,14 @@ public class FirstN extends FunctionNode2<Runtime, List<Object>, Long> {
 
   @Override
   public Object apply(Context<Runtime> context, List<Object> list, Long n) {
-    return list.subList(0, Math.min(n.intValue(), list.size()));
+    if (list == null) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException("FirstN() called on null list"));
+    }
+    // Clamp negative n so subList(0, negative) cannot throw IndexOutOfBoundsException.
+    long count = Math.max(0L, n == null ? 0L : n.longValue());
+    return list.subList(0, (int) Math.min(count, list.size()));
   }
 }
