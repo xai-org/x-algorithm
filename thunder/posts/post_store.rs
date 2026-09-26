@@ -131,7 +131,7 @@ impl PostStore {
             .unwrap_or_default()
             .as_secs() as i64;
         posts.retain(|p| {
-            p.created_at < current_time
+            p.created_at <= current_time
                 && current_time - p.created_at <= (self.retention_seconds as i64)
         });
 
