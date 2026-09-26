@@ -56,11 +56,6 @@ object UserCredV2App extends Logging {
       "deactivated",
       "erased",
       "id",
-      "is_blue_verified",
-      "is_gold_verified",
-      "is_gray_verified",
-      "is_verified_organization",
-      "is_verified_organization_affiliate",
       "restricted",
       "suspended",
       "user_state",
@@ -170,19 +165,27 @@ object UserCredV2App extends Logging {
       rawEngagementWeights.toTypedPipe.map { case (id, weight) => UserMass(id, weight) }
     )
 
-    val normalizedUniform = getNormalizedUserMassPipe(
-      validUserInfoPipe.filter(u => !u.isNearZero && u.isPremium).map(u => UserMass(u.id, 1.0))
+    val neutralPriorEligibleUsers = Stat("neutral_teleport_prior_eligible_users")
+    val neutralPriorNearZeroExcludedUsers =
+      Stat("neutral_teleport_prior_near_zero_excluded_users")
+    val normalizedNeutralPrior = getNormalizedUserMassPipe(
+      validUserInfoPipe.flatMap { user =>
+        val mass = neutralTeleportMass(user)
+        if (mass.isDefined) neutralPriorEligibleUsers.inc()
+        else neutralPriorNearZeroExcludedUsers.inc()
+        mass
+      }
     )
 
-    val blended = normalizedUniform
+    val blended = normalizedNeutralPrior
       .map(u => (u.id, u.mass))
       .group
       .outerJoin(normalizedEngagement.groupBy(_.id).mapValues(_.mass))
       .map {
-        case (id, (Some(uniform), Some(engagement))) =>
-          UserMass(id, (1.0 - beta) * uniform + beta * engagement)
-        case (id, (Some(uniform), None)) =>
-          UserMass(id, (1.0 - beta) * uniform)
+        case (id, (Some(neutralPrior), Some(engagement))) =>
+          UserMass(id, (1.0 - beta) * neutralPrior + beta * engagement)
+        case (id, (Some(neutralPrior), None)) =>
+          UserMass(id, (1.0 - beta) * neutralPrior)
         case (id, (None, Some(engagement))) =>
           UserMass(id, beta * engagement)
         case (id, (None, None)) =>
@@ -190,6 +193,14 @@ object UserCredV2App extends Logging {
       }
 
     getNormalizedUserMassPipe(blended)
+  }
+
+  /**
+   * The uniform component of the teleport prior covers every graph-eligible user equally.
+   * Verification and subscription state are deliberately not inputs to this decision.
+   */
+  private[user_cred_v2] def neutralTeleportMass(user: ValidUserInfo): Option[UserMass] = {
+    if (user.isNearZero) None else Some(UserMass(user.id, 1.0))
   }
 
   private[user_cred_v2] def pageRankMain(
@@ -272,9 +283,12 @@ object UserCredV2App extends Logging {
   private[user_cred_v2] def getNormalizedUserMassPipe(
     userMassPipe: TypedPipe[UserMass]
   ): TypedPipe[UserMass] = {
-    val massSum = userMassPipe.map(_.mass).sum
+    val safeMassPipe = userMassPipe.map { userMass =>
+      userMass.copy(mass = sanitizeMass(userMass.mass))
+    }
+    val massSum = safeMassPipe.map(_.mass).sum
 
-    userMassPipe
+    safeMassPipe
       .cross(massSum)
       .map {
         case (UserMass(id, mass), totalMass) if totalMass > 0 =>
@@ -282,6 +296,10 @@ object UserCredV2App extends Logging {
         case (UserMass(id, _), _) =>
           UserMass(id, 0.0)
       }
+  }
+
+  private[user_cred_v2] def sanitizeMass(mass: Double): Double = {
+    if (java.lang.Double.isFinite(mass) && mass > 0.0) mass else 0.0
   }
 
   private[user_cred_v2] def getPageRankGraph(
