@@ -42,12 +42,20 @@ impl Filter<ScoredPostsQuery, PostCandidate> for AuthorSocialgraphFilter {
                 .map(|uid| viewer_blocked_user_ids.contains(&(uid as i64)))
                 .unwrap_or(false);
 
+            // Conversation modules render ancestor tweets. Brazil already drops
+            // when ancestor_users hit the election list. Mute/block must too.
+            let viewer_mutes_or_blocks_ancestor = candidate.ancestor_users.iter().any(|&uid| {
+                let id = uid as i64;
+                viewer_muted_user_ids.contains(&id) || viewer_blocked_user_ids.contains(&id)
+            });
+
             if muted
                 || blocked
                 || author_blocks_viewer
                 || quoted_author_blocks_viewer
                 || viewer_blocks_quoted_author
                 || viewer_blocks_retweeted_user
+                || viewer_mutes_or_blocks_ancestor
             {
                 removed.push(candidate);
             } else {
@@ -331,5 +339,78 @@ mod tests {
         assert_eq!(result.removed.len(), 2);
         assert_eq!(result.removed[0].author_id, 100);
         assert_eq!(result.removed[1].author_id, 300);
+    }
+
+    fn make_reply(tweet_id: u64, author_id: u64, ancestor_users: Vec<u64>) -> PostCandidate {
+        PostCandidate {
+            tweet_id,
+            author_id,
+            in_reply_to_tweet_id: Some(tweet_id.saturating_sub(1)),
+            ancestor_users,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_muted_ancestor_author_is_removed() {
+        let filter = AuthorSocialgraphFilter;
+        let query = make_query_with_features(UserFeatures {
+            muted_user_ids: vec![200],
+            ..Default::default()
+        });
+
+        let candidates = vec![
+            make_candidate(1, 100),
+            make_reply(2, 300, vec![200, 400]),
+        ];
+
+        let result = filter.filter(&query, candidates);
+
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].tweet_id, 1);
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 2);
+        assert_eq!(result.removed[0].author_id, 300);
+    }
+
+    #[tokio::test]
+    async fn test_blocked_ancestor_author_is_removed() {
+        let filter = AuthorSocialgraphFilter;
+        let query = make_query_with_features(UserFeatures {
+            blocked_user_ids: vec![200],
+            ..Default::default()
+        });
+
+        let candidates = vec![
+            make_candidate(1, 100),
+            make_reply(2, 300, vec![200, 400]),
+        ];
+
+        let result = filter.filter(&query, candidates);
+
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].tweet_id, 1);
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_unmuted_unblocked_ancestor_is_kept() {
+        let filter = AuthorSocialgraphFilter;
+        let query = make_query_with_features(UserFeatures {
+            muted_user_ids: vec![999],
+            blocked_user_ids: vec![888],
+            ..Default::default()
+        });
+
+        let candidates = vec![
+            make_candidate(1, 100),
+            make_reply(2, 300, vec![200, 400]),
+        ];
+
+        let result = filter.filter(&query, candidates);
+
+        assert_eq!(result.kept.len(), 2);
+        assert_eq!(result.removed.len(), 0);
     }
 }
