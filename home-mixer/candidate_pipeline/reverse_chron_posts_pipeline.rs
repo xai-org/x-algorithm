@@ -2,6 +2,7 @@ use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHy
 use crate::candidate_hydrators::conversation_gap_ancestor_hydrator::ConversationGapAncestorHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
 use crate::candidate_hydrators::following_blocked_by_hydrator::FollowingBlockedByHydrator;
+use crate::candidate_hydrators::media_info_hydrator::MediaInfoHydrator;
 use crate::candidate_hydrators::quoted_post_text_hydrator::QuotedPostTextHydrator;
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
 use crate::candidate_hydrators::vf_following_candidate_hydrator::VFFollowingCandidateHydrator;
@@ -14,6 +15,7 @@ use crate::filters::following_retweet_deduplication_filter::FollowingRetweetDedu
 use crate::filters::following_viewer_muted_keyword_filter::FollowingViewerMutedKeywordFilter;
 use crate::filters::self_reply_chain_filter::SelfReplyChainFilter;
 use crate::filters::vf_filter::VFFilter;
+use crate::filters::video_filter::VideoFilter;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::FOLLOWING_POST_FETCH_SIZE;
@@ -22,6 +24,9 @@ use crate::sources::following_night_owl_source::FollowingNightOwlSource;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
+use xai_candidate_pipeline::component_library::clients::media_info_cache_client::{
+    MediaInfoCacheClient, MockMediaInfoCacheClient, ProdMediaInfoCacheClient,
+};
 use xai_candidate_pipeline::component_library::clients::{
     MockSocialGraphClient, SocialGraphClient, SocialGraphClientOps,
 };
@@ -56,6 +61,7 @@ impl ReverseChronPostsPipeline {
             xai_vf_client,
             vf_safety_labels_client,
             socialgraph_client,
+            media_info_cache_client,
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -112,6 +118,13 @@ impl ReverseChronPostsPipeline {
                     .expect("Failed to create flock SocialGraphClient"),
                 ) as Arc<dyn SocialGraphClientOps>
             },
+            async {
+                Arc::new(
+                    ProdMediaInfoCacheClient::new(datacenter, "home-mixer")
+                        .await
+                        .expect("Failed to create MediaInfoCacheClient"),
+                ) as Arc<dyn MediaInfoCacheClient + Send + Sync>
+            },
         );
 
         Self::build(
@@ -121,6 +134,7 @@ impl ReverseChronPostsPipeline {
             xai_vf_client,
             vf_safety_labels_client,
             socialgraph_client,
+            media_info_cache_client,
         )
         .await
     }
@@ -133,6 +147,8 @@ impl ReverseChronPostsPipeline {
             Arc::new(MockVfClient) as Arc<dyn VfClient + Send + Sync>,
             Arc::new(MockTweetSafetyLabelClient) as Arc<dyn TweetSafetyLabelClient>,
             Arc::new(MockSocialGraphClient) as Arc<dyn SocialGraphClientOps>,
+            Arc::new(MockMediaInfoCacheClient::default())
+                as Arc<dyn MediaInfoCacheClient + Send + Sync>,
         )
         .await
     }
@@ -144,6 +160,7 @@ impl ReverseChronPostsPipeline {
         xai_vf_client: Arc<dyn VfClient + Send + Sync>,
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
         socialgraph_client: Arc<dyn SocialGraphClientOps>,
+        media_info_cache_client: Arc<dyn MediaInfoCacheClient + Send + Sync>,
     ) -> Self {
         let sources: Vec<Box<dyn Source<ScoredPostsQuery, PostCandidate>>> =
             vec![Box::new(FollowingNightOwlSource {
@@ -156,12 +173,14 @@ impl ReverseChronPostsPipeline {
                 &tes_client,
             ))),
             Box::new(QuotedPostTextHydrator::new(tes_client)),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client).await),
         ];
 
         let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(FollowingRetweetDeduplicationFilter),
             Box::new(FollowingViewerMutedKeywordFilter::new()),
             Box::new(SelfReplyChainFilter),
+            Box::new(VideoFilter),
         ];
 
         let post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
@@ -234,5 +253,66 @@ impl CandidatePipeline<ScoredPostsQuery, PostCandidate> for ReverseChronPostsPip
 
     fn result_size(&self) -> usize {
         FOLLOWING_POST_FETCH_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use xai_x_thrift::tweet_media_info::TweetMediaInfo;
+
+    fn video_info(video_durations_ms: Vec<i64>) -> TweetMediaInfo {
+        TweetMediaInfo::new(true, true, true, 1, video_durations_ms)
+    }
+
+    #[tokio::test]
+    async fn mock_pipeline_wires_media_info_and_video_filter() {
+        let pipeline = ReverseChronPostsPipeline::mock().await;
+        assert_eq!(pipeline.hydrators().len(), 4);
+        assert_eq!(pipeline.filters().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn exclude_videos_drops_native_video_after_media_info() {
+        let mut entries = HashMap::new();
+        entries.insert(1u64, Some(video_info(vec![5_000])));
+        let hydrator = MediaInfoHydrator::new(Arc::new(MockMediaInfoCacheClient {
+            media_info: entries,
+        }))
+        .await;
+
+        let query = ScoredPostsQuery {
+            exclude_videos: true,
+            ..Default::default()
+        };
+        let mut candidates = vec![
+            PostCandidate {
+                tweet_id: 1,
+                ..Default::default()
+            },
+            PostCandidate {
+                tweet_id: 2,
+                ..Default::default()
+            },
+        ];
+
+        let hydrated = hydrator.hydrate(&query, &candidates).await;
+        hydrator.update(&mut candidates[0], hydrated[0].clone().unwrap());
+        hydrator.update(&mut candidates[1], hydrated[1].clone().unwrap());
+        assert_eq!(candidates[0].min_video_duration_ms, Some(5_000));
+        assert_eq!(candidates[1].min_video_duration_ms, None);
+
+        let result = VideoFilter.filter(&query, candidates);
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].tweet_id, 2);
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_videos_when_exclude_videos_is_off() {
+        let query = ScoredPostsQuery::default();
+        assert!(!VideoFilter.enable(&query));
     }
 }
