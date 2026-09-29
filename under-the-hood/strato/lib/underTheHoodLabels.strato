@@ -6,101 +6,173 @@ val postLabels = Map(
       "Post detected by automated systems as one that may contain content subject to X's Adult Content policy.",
     effect =
       "Post hidden from recommendations to non-followers and from underage users, users without a stated age, and logged out users.",
+    reason = "Potentially sensitive visual media detected under Adult Content policy.",
+    restriction = "Not recommended to non-followers.",
+    scope = "Post-level",
+    affectedTarget = "Media",
   },
   "NSFW_HIGH_PRECISION" -> {
     about =
       "Post detected by automated systems or in response to a user report as likely to contain content subject to X's Adult Content policy.",
     effect =
       "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users. In India, this content is shown as restricted due to local law(s).",
+    reason = "Sexually suggestive or explicit visual media detected under Adult Content policy.",
+    restriction = "Not recommended to non-followers; content warning applied.",
+    scope = "Post-level",
+    affectedTarget = "Media",
   },
   "NSFW_TEXT" -> {
     about =
       "Post detected by automated systems as likely to contain adult sexually explicit language.",
     effect =
       "Post hidden from recommendations to non-followers, and hidden from underage users, users without a stated age, and logged out users.",
+    reason = "Sexually explicit text language detected under Adult Content policy.",
+    restriction = "Not recommended to non-followers.",
+    scope = "Post-level",
+    affectedTarget = "Text",
   },
   "NSFW_CARD_IMAGE" -> {
     about =
       "Post detected by automated systems as likely to contain content subject to X's Adult Content policy.",
     effect =
       "Post shown behind content warning and hidden from recommendations to non-followers and hidden from underage users, users without a stated age and logged out users.",
+    reason = "Sexually suggestive visual media in URL preview card.",
+    restriction = "Not recommended to non-followers; content warning applied.",
+    scope = "Post-level",
+    affectedTarget = "Link preview card",
   },
   "GORE_AND_VIOLENCE_HIGH_PRECISION" -> {
     about =
       "Post detected by automated systems or in response to a user report as likely to contain content subject to X's Violent Content policy.",
     effect =
       "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users.",
+    reason = "Violent or graphic visual media detected under Violent Content policy.",
+    restriction = "Not recommended to non-followers; content warning applied.",
+    scope = "Post-level",
+    affectedTarget = "Media",
   },
   "SPAM_HIGH_RECALL" -> {
     about = "Post detected by automated systems as one that may contain spam.",
     effect = "Post hidden from recommendations to non-followers.",
+    reason = "Automated spam or repetitive distribution pattern detected.",
+    restriction = "Not recommended to non-followers.",
+    scope = "Post-level",
+    affectedTarget = "Text & distribution",
   },
   "SPAM" -> {
     about =
       "Post identified by automated systems or in response to a user report as likely to contain content in violation of X's Authenticity policy.",
     effect = "Post is not shown on X.",
+    reason = "Platform manipulation or spam violation under Authenticity policy.",
+    restriction = "Post is withheld from display on X.",
+    scope = "Post-level",
+    affectedTarget = "Post content",
   },
   "MALICIOUS_URL" -> {
     about =
       "Post detected by automated systems as likely to contain a link to a malicious site.",
     effect = "Post hidden from recommendations to non-followers.",
+    reason = "Unsafe or malicious destination URL detected.",
+    restriction = "Not recommended to non-followers.",
+    scope = "Post-level",
+    affectedTarget = "Link",
   },
   "DO_NOT_AMPLIFY" -> {
     about =
       "Historically applied to posts detected by automated systems as likely to contain a link to a malicious site. Being replaced by MALICIOUS_URL label and then will be fully removed.",
     effect =
       "Included in this report since any posts that have this label would be hidden from recommendations to non-followers.",
+    reason = "Unsafe link or amplification restriction under Terms of Service.",
+    restriction = "Not recommended to non-followers.",
+    scope = "Post-level",
+    affectedTarget = "Link",
   },
   "PDNA" -> {
     about =
       "Post detected by automated systems as likely to contain content in violation of X's Terms of Service policy.",
     effect = "Post is not shown on X while pending further review.",
+    reason = "Severe policy violation pending review under Terms of Service.",
+    restriction = "Post is withheld from display pending review.",
+    scope = "Post-level",
+    affectedTarget = "Post content",
   },
   "BOUNCE" -> {
     about =
       "Post detected by automated systems or in response to a user report to contain content in violation of X's Terms of Service policy.",
     effect = "Post is not shown on X while pending deletion by the author.",
+    reason = "Terms of Service violation requiring deletion.",
+    restriction = "Post is withheld from display pending deletion by author.",
+    scope = "Post-level",
+    affectedTarget = "Post content",
   },
   "FOR_EMERGENCY_USE_ONLY" -> {
     about = "Emergency incident-response label with a custom notice.",
     effect =
       "Posts that have this label would be shown behind a notice and not shown in the Home timeline.",
+    reason = "Emergency incident-response mitigation.",
+    restriction = "Notice displayed; hidden from Home timeline recommendations.",
+    scope = "Post-level",
+    affectedTarget = "Post content",
   },
   "FOSNR_ABUSE" -> {
     about =
       "Post detected in response to a user report to contain content in violation of X's Abuse and Harassment policy.",
     effect =
       "Post discoverability is restricted to the author's profile. All users can see a label explaining that the post has limited visibility.",
+    reason = "Abuse or harassment violation following report.",
+    restriction = "Discoverability limited to author profile; notice applied.",
+    scope = "Post-level",
+    affectedTarget = "Text & media",
   },
   "FOSNR_HATEFUL_CONDUCT" -> {
     about =
       "Post detected by automation systems or in response to a user report to contain content in violation of X's Hateful Conduct policy.",
     effect =
       "Post discoverability is restricted to the author's profile. All users can see a label explaining that the post has limited visibility.",
+    reason = "Hateful conduct violation detected.",
+    restriction = "Discoverability limited to author profile; notice applied.",
+    scope = "Post-level",
+    affectedTarget = "Text & media",
   },
   "FOSNR_VIOLENT_SPEECH" -> {
     about =
       "Post detected in response to a user report to contain content in violation of X's Violent Content policy.",
     effect =
       "Post discoverability is restricted to the author's profile. All users can see a label explaining that the post has limited visibility.",
+    reason = "Violent speech violation detected following report.",
+    restriction = "Discoverability limited to author profile; notice applied.",
+    scope = "Post-level",
+    affectedTarget = "Text & media",
   },
   "FOSNR_CIVIC_INTEGRITY" -> {
     about =
       "Post detected in response to a user report to contain content in violation of X's Civic Integrity policy.",
     effect =
       "Post discoverability is restricted to the author's profile. All users can see a label explaining that the post has limited visibility.",
+    reason = "Civic integrity policy violation detected following report.",
+    restriction = "Discoverability limited to author profile; notice applied.",
+    scope = "Post-level",
+    affectedTarget = "Text & media",
   },
   "FOSNR_ABUSE_INSULTS" -> {
     about =
       "Post detected by automated systems or in response to a user report to contain content in violation of X's Abuse and Harassment policy.",
     effect =
       "Post hidden from recommendations to non-followers. All users can see a label explaining that the post has limited visibility.",
+    reason = "Abusive insults or harassment detected.",
+    restriction = "Not recommended to non-followers; notice applied.",
+    scope = "Post-level",
+    affectedTarget = "Text & media",
   },
   "NSFW_ADMIN" -> {
     about =
       "Post written by an account with an NsfwAdmin user label, where the account was identified in response to a user report as primarily posting content subject to X's Adult Content or Violent Content policies.",
     effect =
       "Post shown behind content warning, hidden from recommendations to non-followers and from underage users, users without a stated age, and logged out users.",
+    reason = "Account primarily publishing Adult Content per review.",
+    restriction = "Not recommended to non-followers; content warning applied.",
+    scope = "Post-level (Account-derived)",
+    affectedTarget = "Media",
   },
 )
 
@@ -114,64 +186,112 @@ val accountLabels = Map(
       "Account locked to read-only due to violation of X's Terms of Service policy that requires post removal from the platform.",
     effect =
       "The account can only read content on the platform until the post in violation is removed. The account's posts are hidden from recommendations to non-followers.",
+    reason = "Unresolved Terms of Service violation requiring post deletion.",
+    restriction = "Account locked to read-only; posts hidden from recommendations.",
+    scope = "Account-level",
+    affectedTarget = "Account state",
   },
   "Compromised" -> {
     about =
       "Account identified by automated systems or in response to a user report as compromised.",
     effect =
       "The account's posts are hidden from recommendations to non-followers. Password reset required.",
+    reason = "Suspicious login or compromised account pattern detected.",
+    restriction = "Posts hidden from recommendations to non-followers; password reset required.",
+    scope = "Account-level",
+    affectedTarget = "Account security",
   },
   "SpamHighRecall" -> {
     about = "Account detected by automated systems as likely to post spam.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "High-frequency spam or coordinated automated activity pattern.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
   "NsfwHighRecall" -> {
     about =
       "Account detected by automated systems as one that may post content subject to X's Adult Content policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Repeated adult content detections over rolling evaluation window.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
   "NsfwHighPrecision" -> {
     about =
       "Account detected by automated systems as likely to post content subject to X's Adult Content policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Multiple high-confidence adult media posts over rolling evaluation window.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
   "NsfwAvatarImage" -> {
     about =
       "Account detected by automated systems as one that may post content subject to X's Adult Content policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Profile avatar image detected under Adult Content policy.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Profile avatar image",
   },
   "NsfwNearPerfect" -> {
     about =
       "Account detected by automated systems as one that may post content subject to X's Adult Content policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Account flagged as dedicated adult content provider.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
   "NsfwBannerImage" -> {
     about =
       "Account detected by automated systems as one that may post content subject to X's Adult Content policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Profile header banner image detected under Adult Content policy.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Profile banner image",
   },
   "NsfwAdmin" -> {
     about =
       "Account identified in response to a user report as primarily posting content subject to X's Adult Content or Violent Content policies.",
     effect =
       "The account's posts are shown behind content warning, hidden from recommendations to non-followers and from underage users, users without a stated age, and logged out users.",
+    reason = "Account administratively confirmed as adult content provider following reports.",
+    restriction = "Posts hidden from non-followers; warning notice required.",
+    scope = "Account-level",
+    affectedTarget = "Account classification",
   },
   "ImpersonationHighPrecision" -> {
     about =
       "Account detected by automated systems as likely in violation of X's Authenticity policy.",
     effect = "The account's posts are hidden from recommendations to non-followers.",
+    reason = "Authenticity violation: deceptive identity or impersonation pattern.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account identity",
   },
   "AbusiveHighRecall" -> {
     about =
       "Account detected by automated systems may be in violation of X's Authenticity policy.",
     effect =
       "The account's posts are hidden from recommendations to non-followers. Security challenge required to prevent automated abuse.",
+    reason = "Automated abuse or coordinated aggressive behavior pattern.",
+    restriction = "Account posts hidden from recommendations to non-followers; challenge required.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
   "DoNotAmplify" -> {
     about =
       "Account detected by automated systems as likely to contain content in violation of X's Terms of Service policy.",
     effect =
       "The account's posts are hidden from recommendations to non-followers pending further review.",
+    reason = "Terms of Service compliance check pending.",
+    restriction = "Account posts hidden from recommendations to non-followers.",
+    scope = "Account-level",
+    affectedTarget = "Account distribution",
   },
 )
 
@@ -414,6 +534,86 @@ def accountLabelEffect(code: String): String =
     case None => ""
   }
 
+def postLabelReason(code: String): String =
+  resolvePostKey(code) match {
+    case Some(k) =>
+      postLabels.get(k) match {
+        case Some(info) => info.reason
+        case None => ""
+      }
+    case None => ""
+  }
+
+def accountLabelReason(code: String): String =
+  resolveAccountKey(code) match {
+    case Some(k) =>
+      accountLabels.get(k) match {
+        case Some(info) => info.reason
+        case None => ""
+      }
+    case None => ""
+  }
+
+def postLabelRestriction(code: String): String =
+  resolvePostKey(code) match {
+    case Some(k) =>
+      postLabels.get(k) match {
+        case Some(info) => info.restriction
+        case None => ""
+      }
+    case None => ""
+  }
+
+def accountLabelRestriction(code: String): String =
+  resolveAccountKey(code) match {
+    case Some(k) =>
+      accountLabels.get(k) match {
+        case Some(info) => info.restriction
+        case None => ""
+      }
+    case None => ""
+  }
+
+def postLabelScope(code: String): String =
+  resolvePostKey(code) match {
+    case Some(k) =>
+      postLabels.get(k) match {
+        case Some(info) => info.scope
+        case None => "Post-level"
+      }
+    case None => "Post-level"
+  }
+
+def accountLabelScope(code: String): String =
+  resolveAccountKey(code) match {
+    case Some(k) =>
+      accountLabels.get(k) match {
+        case Some(info) => info.scope
+        case None => "Account-level"
+      }
+    case None => "Account-level"
+  }
+
+def postLabelAffectedTarget(code: String): String =
+  resolvePostKey(code) match {
+    case Some(k) =>
+      postLabels.get(k) match {
+        case Some(info) => info.affectedTarget
+        case None => ""
+      }
+    case None => ""
+  }
+
+def accountLabelAffectedTarget(code: String): String =
+  resolveAccountKey(code) match {
+    case Some(k) =>
+      accountLabels.get(k) match {
+        case Some(info) => info.affectedTarget
+        case None => ""
+      }
+    case None => ""
+  }
+
 Library({
   export = {
     postLabels = postLabels,
@@ -430,6 +630,14 @@ Library({
     accountLabelAbout = accountLabelAbout,
     postLabelEffect = postLabelEffect,
     accountLabelEffect = accountLabelEffect,
+    postLabelReason = postLabelReason,
+    accountLabelReason = accountLabelReason,
+    postLabelRestriction = postLabelRestriction,
+    accountLabelRestriction = accountLabelRestriction,
+    postLabelScope = postLabelScope,
+    accountLabelScope = accountLabelScope,
+    postLabelAffectedTarget = postLabelAffectedTarget,
+    accountLabelAffectedTarget = accountLabelAffectedTarget,
     postTakedowns = postTakedowns,
     accountTakedowns = accountTakedowns,
     takedownLabelName = takedownLabelName,
@@ -441,7 +649,7 @@ Library({
     accountTakedownEffect = accountTakedownEffect,
   },
   description = PlainText(
-    "Under the Hood public label and takedown allowlists (canonical name -> about/effect) and helpers."
+    "Under the Hood public label and takedown allowlists (canonical name -> about/effect/reason/restriction/scope/affectedTarget) and helpers."
   ),
   contactInfo = sharedConfig.contactInfo,
   lifecycle = Production,
