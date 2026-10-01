@@ -135,6 +135,7 @@ impl PhoenixScoresPipeline {
         let sources: Vec<Box<dyn Source<ScoredPostsQuery, PostCandidate>>> =
             vec![Box::new(SeedCandidatesSource)];
 
+        // TES author_id before InNetwork — do not invert. See phoenix_candidate_pipeline.
         let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(CoreDataCandidateHydrator::new(tes_client.clone()).await),
             Box::new(InNetworkCandidateHydrator),
