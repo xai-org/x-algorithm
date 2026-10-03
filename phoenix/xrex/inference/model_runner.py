@@ -5007,7 +5007,7 @@ class RetrievalModelRunner(
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
         packed_seq_len: int | None = None,
-    ) -> dict[int, tuple[jax.Array, jax.Array]]:
+    ) -> dict[int, tuple[jax.Array, jax.Array, jax.Array]]:
         if self._live_swap_enabled:
             state = self.state
         forward_jit = self._forward_jit_for_bucket(bucket_size)
@@ -5174,7 +5174,7 @@ class RetrievalModelRunner(
     def reply_request(
         self,
         request: xai_recsys_engine.RetrieveRequestBatch,
-        output_dict: dict[int, tuple[np.ndarray, np.ndarray]],
+        output_dict: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
         orig_batch_size: int,
         bucket_size: int = 0,
     ) -> None:
@@ -5190,6 +5190,10 @@ class RetrievalModelRunner(
             np.array(output_dict[ds][1][:, : self.large_k], dtype=np.float32, copy=True)
             for ds in ds_types
         ]
+        all_validity = [
+            np.array(output_dict[ds][2][:, : self.large_k], dtype=np.bool_, copy=True)
+            for ds in ds_types
+        ]
 
         request.reply(
             ds_types,
@@ -5199,6 +5203,7 @@ class RetrievalModelRunner(
             self.all_author_ids,
             self.large_k,
             orig_batch_size,
+            all_validity,
         )
 
     def create_server(
@@ -5410,6 +5415,7 @@ class RetrievalModelRunner(
                 use_async_topk=self.enable_async_topk,
                 use_radix_select_topk=self.enable_radix_select_topk,
                 post_scales=post_scales,
+                return_validity=True,
             )
 
         if self.enable_int8_post_table:
