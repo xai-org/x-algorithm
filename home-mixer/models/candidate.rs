@@ -310,6 +310,7 @@ impl CandidateHelpers for PostCandidate {
             is_author_followed_by_user: is_followed_by_viewer,
             safety_label_mask: if self.retweeted_user_id.is_none()
                 && self.nsfw_author_phoenix.unwrap_or(false)
+                && (self.has_media.unwrap_or(false) || !self.safety_labels.is_empty())
             {
                 SAFETY_BIT_AUTHOR_NSFW
             } else {
@@ -440,5 +441,46 @@ mod tests {
             deserialized.safety_labels[0].label_type,
             SafetyLabelType::BOUNCE
         );
+    }
+
+    #[test]
+    fn safety_label_mask_author_nsfw_with_media_or_labels() {
+        use xai_x_thrift::tweet_safety_label::SafetyLabelType;
+
+        let candidate_with_media = PostCandidate {
+            tweet_id: 1,
+            author_id: 2,
+            nsfw_author_phoenix: Some(true),
+            has_media: Some(true),
+            ..Default::default()
+        };
+        let recsys_media = candidate_with_media.to_recsys_candidate();
+        assert_eq!(recsys_media.safety_label_mask, SAFETY_BIT_AUTHOR_NSFW);
+
+        let candidate_with_labels = PostCandidate {
+            tweet_id: 2,
+            author_id: 2,
+            nsfw_author_phoenix: Some(true),
+            has_media: Some(false),
+            safety_labels: vec![SafetyLabelInfo {
+                label_type: SafetyLabelType::NSFW_TEXT,
+                description: None,
+                source: None,
+            }],
+            ..Default::default()
+        };
+        let recsys_labels = candidate_with_labels.to_recsys_candidate();
+        assert_eq!(recsys_labels.safety_label_mask, SAFETY_BIT_AUTHOR_NSFW);
+
+        let compliant_candidate = PostCandidate {
+            tweet_id: 3,
+            author_id: 2,
+            nsfw_author_phoenix: Some(true),
+            has_media: Some(false),
+            safety_labels: vec![],
+            ..Default::default()
+        };
+        let recsys_compliant = compliant_candidate.to_recsys_candidate();
+        assert_eq!(recsys_compliant.safety_label_mask, 0);
     }
 }

@@ -2,6 +2,11 @@ export type PostLabel = {
 	label: string;
 	about: string;
 	effect: string;
+	reason?: string;
+	restriction?: string;
+	scope?: string;
+	affectedTarget?: string;
+	affectedMedia?: string;
 	posts: number;
 	totalPostsInMonth: number;
 	percentageOfPosts: string;
@@ -11,6 +16,10 @@ export type AccountLabel = {
 	label: string;
 	about: string;
 	effect: string;
+	reason?: string;
+	restriction?: string;
+	scope?: string;
+	affectedTarget?: string;
 	days: number;
 	daysInPeriod: number;
 	percentageOfDays: string;
@@ -43,6 +52,11 @@ const postLabel = (v: unknown): PostLabel | undefined => {
 		label: str(v.label),
 		about: str(v.about),
 		effect: str(v.effect),
+		reason: str(v.reason) || undefined,
+		restriction: str(v.restriction) || undefined,
+		scope: str(v.scope) || undefined,
+		affectedTarget: str(v.affectedTarget) || undefined,
+		affectedMedia: str(v.affectedMedia) || undefined,
 		posts: num(v.posts),
 		totalPostsInMonth: num(v.totalPostsInMonth),
 		percentageOfPosts: str(v.percentageOfPosts),
@@ -55,6 +69,10 @@ const accountLabel = (v: unknown): AccountLabel | undefined => {
 		label: str(v.label),
 		about: str(v.about),
 		effect: str(v.effect),
+		reason: str(v.reason) || undefined,
+		restriction: str(v.restriction) || undefined,
+		scope: str(v.scope) || undefined,
+		affectedTarget: str(v.affectedTarget) || undefined,
 		days: num(v.days),
 		daysInPeriod: num(v.daysInPeriod),
 		percentageOfDays: str(v.percentageOfDays),
