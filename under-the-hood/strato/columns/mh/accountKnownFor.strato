@@ -1,0 +1,29 @@
+import <visibility/under-the-hood/sharedConfig>
+
+type Key = Long
+type Value = com.twitter.simclusters_v2.ClustersUserIsKnownFor
+
+// Matches UserKnownForReadableStore: Athena, big-endian Long keys, compact
+// Thrift values. This reads the existing offline dataset; it creates no new job.
+Managed({
+  source = ManhattanColumn({
+    dest = "/s/manhattan/athena.native-thrift",
+    appId = "simclusters_v2",
+    dataset = "simclusters_v2_known_for_20m_145k_2020",
+    mapping = ReadOnly({
+      key = Type(Key),
+      value = Type(Value),
+      keyEncoding = NativeEncoding,
+      valueEncoding = ThriftEncoding({ encodingType = ThriftCompactEncoding }),
+    }),
+  }),
+  contactInfo = Some(sharedConfig.contactInfo),
+  lifecycle = Production,
+  accessPolicy = FromColumns(Set(
+    Path("visibility/under-the-hood/underTheHoodReport.User"),
+  )),
+  description = PlainText(
+    "Latest precomputed known-for membership for an Under the Hood report. " +
+      "Only the per-user report column may read this dataset through this column."
+  ),
+})

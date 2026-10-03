@@ -1,0 +1,68 @@
+import <visibility/under-the-hood/sharedConfig>
+
+type KnownFor = com.twitter.simclusters_v2.ClustersUserIsKnownFor
+
+// Keep this version paired with mh/accountKnownFor's dataset.
+val modelVersion = "20M_145K_2020"
+val maxPrimaryClusters = 10
+
+// Scores are model weights, not probabilities or percentages. Do not renormalize
+// the truncated list: that would change a cluster's weight as other entries change.
+def primaryClusterScores(scores: Map[Int, Option[Double]]): Seq[(Int, Double)] =
+  scores.toSeq
+    .flatMap { case (clusterId, score) =>
+      score.map { weight => (clusterId, weight) }
+    }
+    .filter { case (clusterId, weight) =>
+      // The upper bound is the largest finite Double; this also excludes NaN
+      // and infinities without allowing non-JSON numbers into the export.
+      clusterId >= 0 && weight > 0.0 && weight <= 1.7976931348623157E308
+    }
+    .sortBy { case (clusterId, weight) => (-weight, clusterId) }
+    .take(maxPrimaryClusters)
+
+def profileJson(knownFor: KnownFor, retrievedAt: String): Option[String] = {
+  if (knownFor.knownForModelVersion != modelVersion) {
+    None
+  } else {
+    val scores = knownFor.clusterIdToScores.map { case (clusterId, score) =>
+      (clusterId, score.knownForScore)
+    }
+    val primaryClusters = primaryClusterScores(scores).map { case (clusterId, weight) =>
+      { clusterId = clusterId, weight = weight }
+    }
+    Some({
+      modelVersion = knownFor.knownForModelVersion,
+      embeddingType = "knownFor",
+      retrievedAt = retrievedAt,
+      primaryClusters = primaryClusters,
+      notes = "Latest available precomputed account cluster membership, not a snapshot of the report period. " +
+        "retrievedAt is the read time, not the model computation time. " +
+        "Weights are raw known-for scores, not probabilities or reach estimates. " +
+        "Cluster IDs are specific to this model version; topic labels are not available from this source. " +
+        "An empty list means no positive finite scores were available in the record. " +
+        "This profile does not explain an individual post's distribution or establish whether visibility was limited.",
+    }.toJson)
+  }
+}
+
+// Both arguments come from object serializers in this report pipeline. Appending
+// the serialized member preserves the existing conditional total*Labels fields
+// and leaves the old JSON byte-for-byte unchanged when the profile is absent.
+def appendToReport(reportJson: String, affinityJson: Option[String]): String =
+  affinityJson match {
+    case Some(profile) =>
+      reportJson.substring(0, reportJson.length - 1) + ",\"accountAffinityProfile\":" + profile + "}"
+    case None => reportJson
+  }
+
+Library({
+  export = {
+    primaryClusterScores = primaryClusterScores,
+    profileJson = profileJson,
+    appendToReport = appendToReport,
+  },
+  description = PlainText("Bounded account known-for affinities for Under the Hood exports."),
+  contactInfo = sharedConfig.contactInfo,
+  lifecycle = Production,
+})

@@ -21,11 +21,15 @@ val underTheHoodReportMaxMonthBucket =
 val underTheHoodReportTakedownsEnabled =
   fs.booleanParam("under_the_hood_report_takedowns_enabled", false)
 
+val underTheHoodReportAccountAffinitiesEnabled =
+  fs.booleanParam("under_the_hood_report_account_affinities_enabled", false)
+
 Library({
   export = {
     underTheHoodReportEnabled = underTheHoodReportEnabled,
     underTheHoodReportMaxMonthBucket = underTheHoodReportMaxMonthBucket,
     underTheHoodReportTakedownsEnabled = underTheHoodReportTakedownsEnabled,
+    underTheHoodReportAccountAffinitiesEnabled = underTheHoodReportAccountAffinitiesEnabled,
   },
   description = PlainText("Feature switch params for Under the Hood"),
   contactInfo = <visibility/under-the-hood/sharedConfig>.contactInfo,
