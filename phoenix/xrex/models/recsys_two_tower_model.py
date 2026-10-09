@@ -20,7 +20,7 @@ from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
-from xrex.cuda.top_k_by_key import top_k_by_key
+from xrex.cuda.top_k_by_key import gather_selected_validity, top_k_by_key
 from xrex.data.cold_pool_filter import DEFAULT_COLD_START_MAX_AGE_SECONDS
 from xrex.data.recsys.constants import action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType
@@ -1787,7 +1787,8 @@ class RecsysTwoTowerModel(hk.Module):
         post_scales: jax.Array | None = None,
         dataset_capacities: tuple[int, ...] | None = None,
         mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
-    ) -> tuple[tuple[jax.Array, jax.Array], ...]:
+        return_validity: bool = False,
+    ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], ...]:
         saxis = "expert"
 
         user_representation, _, _ = self(
@@ -1874,7 +1875,7 @@ class RecsysTwoTowerModel(hk.Module):
         @shard_map(
             mesh=mesh,
             in_specs=(P(), P(), mask_in_spec, topic_bitmaps_in_spec, topic_user_bitmasks_in_spec),
-            out_specs=(P(), P()),
+            out_specs=(P(), P(), P()) if return_validity else (P(), P()),
             check_vma=False,
         )
         def mask_and_top_k(
@@ -1883,15 +1884,14 @@ class RecsysTwoTowerModel(hk.Module):
             user_eligible_mask: jax.Array,
             topic_bitmaps_shard: jax.Array,
             topic_user_bitmasks_full: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+        ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
             combined = type_mask & user_eligible_mask
-            masked_scores = jnp.where(combined, all_scores, jnp.finfo(jnp.bfloat16).min)
 
             if use_topic_filter:
                 topic_bitmaps_full = jax.lax.all_gather(
                     topic_bitmaps_shard, axis_name=saxis, axis=0, tiled=True
                 )
-                B_local = masked_scores.shape[0]
+                B_local = combined.shape[0]
                 shard_idx = jax.lax.axis_index(saxis)
                 start_idx = shard_idx * B_local
                 user_bitmasks_local = jax.lax.dynamic_slice(
@@ -1903,11 +1903,18 @@ class RecsysTwoTowerModel(hk.Module):
                 )
                 no_filter_mask = jnp.all(user_bitmasks_local == 0, axis=-1)[:, None]
                 topic_mask = jnp.where(no_filter_mask, True, topic_mask)
-                masked_scores = jnp.where(topic_mask, masked_scores, jnp.finfo(jnp.bfloat16).min)
+                combined = combined & topic_mask
 
+            masked_scores = jnp.where(combined, all_scores, jnp.finfo(jnp.bfloat16).min)
             sorted_scores, sorted_indices = local_top_k(masked_scores, top_k)
             top_k_scores = jax.lax.all_gather(sorted_scores, axis_name=saxis, axis=0, tiled=True)
             top_k_indices = jax.lax.all_gather(sorted_indices, axis_name=saxis, axis=0, tiled=True)
+            if return_validity:
+                sorted_validity = gather_selected_validity(combined, sorted_indices)
+                top_k_validity = jax.lax.all_gather(
+                    sorted_validity, axis_name=saxis, axis=0, tiled=True
+                )
+                return top_k_scores, top_k_indices, top_k_validity
             return top_k_scores, top_k_indices
 
         if post_scales is not None:
@@ -2005,7 +2012,14 @@ class RecsysTwoTowerModel(hk.Module):
                     )
 
                 top_k_scores, top_k_indices = window_and_top_k(all_scores, dataset_ranges)
-                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+                if return_validity:
+                    start, end = dataset_ranges[d, 0], dataset_ranges[d, 1]
+                    top_k_validity = (top_k_indices >= start) & (top_k_indices < end)
+                    results.append(
+                        (top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity)
+                    )
+                else:
+                    results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
             return tuple(results)
 
         use_slice_path = dataset_ranges is not None and no_per_post_filter
@@ -2031,7 +2045,13 @@ class RecsysTwoTowerModel(hk.Module):
                     return top_k_scores, top_k_indices
 
                 top_k_scores, top_k_indices = slice_and_top_k(all_scores)
-                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+                if return_validity:
+                    top_k_validity = jnp.ones_like(top_k_indices, dtype=jnp.bool_)
+                    results.append(
+                        (top_k_indices, top_k_scores.astype(jnp.float32), top_k_validity)
+                    )
+                else:
+                    results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
             return tuple(results)
 
         B = all_scores.shape[0]
@@ -2054,10 +2074,14 @@ class RecsysTwoTowerModel(hk.Module):
             _topic_user_bitmasks = (
                 topic_user_bitmasks if use_topic_filter else jnp.zeros((), dtype=jnp.int32)
             )
-            top_k_scores, top_k_indices = mask_and_top_k(
+            selected = mask_and_top_k(
                 all_scores, type_mask, user_eligible_mask, _topic_bitmaps, _topic_user_bitmasks
             )
-            results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+            top_k_scores, top_k_indices = selected[:2]
+            if return_validity:
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32), selected[2]))
+            else:
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
 
         return tuple(results)
 
