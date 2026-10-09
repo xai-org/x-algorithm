@@ -18,7 +18,7 @@ import com.twitter.botmaker.runtime.Runtime;
     arguments = {"the list"},
     returnType = "T",
     deprecated = false,
-    description = "The First element of the list",
+    description = "Returns the first element of a non-empty list.",
     actionLevel = ActionLevel.NO_ACTION,
     examples = {
         "First(List(1))"
@@ -46,6 +46,9 @@ public class First extends FunctionNode1<Runtime, List<Object>> {
 
   @Override
   public Object apply(Context<Runtime> context, List<Object> list) {
+    if (list.isEmpty()) {
+      throw new IllegalArgumentException("First() requires a non-empty list");
+    }
     return list.get(0);
   }
 }
