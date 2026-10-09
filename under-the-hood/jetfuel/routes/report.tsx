@@ -48,10 +48,16 @@ const copy = {
 		}),
 	about: l("What it means", "Caption above the description of a label on the Under the hood report page."),
 	effect: l("Effect on visibility", "Caption above the visibility effect of a label on the Under the hood report page."),
+	reason: l("Reason", "Caption above the high-level reason for a restriction on the Under the hood report page."),
+	restriction: l("Restriction", "Caption above the specific distribution restriction on the Under the hood report page."),
+	affectedTarget: l("Affected element", "Caption above the affected element or media for a restriction on the Under the hood report page."),
+	scope: l("Scope", "Caption above whether the restriction is post-level or account-level."),
 	download: l("Download this report (JSON)", "Link on the Under the hood report page that downloads the raw report file (web only)."),
 };
 
 const quietPill = "border-xs rounded-md px-2 py-1 light:border-gray-400 dark:border-gray-500 dim:border-gray-400";
+const postScopePill = "border-xs rounded-md px-2 py-0.5 light:text-blue-700 dark:text-blue-300 light:bg-blue-100 dark:bg-blue-950/60 light:border-blue-300 dark:border-blue-800 text-xs font-semibold";
+const accountScopePill = "border-xs rounded-md px-2 py-0.5 light:text-amber-700 dark:text-amber-300 light:bg-amber-100 dark:bg-amber-950/60 light:border-amber-300 dark:border-amber-800 text-xs font-semibold";
 const track = "flex-row w-full h-1.5 rounded-full clipped items-center light:bg-gray-200 dark:bg-zinc-700 dim:bg-gray-700";
 const fill = "h-1.5 rounded-full light:bg-gray-600 dark:bg-gray-300 dim:bg-gray-300";
 const valueMod = `${textPrimary} text-sm`;
@@ -72,6 +78,11 @@ const LabelCard = ({
 	stat,
 	about,
 	effect,
+	reason,
+	restriction,
+	scope,
+	affectedTarget,
+	affectedMedia,
 	part,
 	total,
 }: {
@@ -79,17 +90,47 @@ const LabelCard = ({
 	stat: Localized;
 	about: string;
 	effect: string;
+	reason?: string;
+	restriction?: string;
+	scope?: string;
+	affectedTarget?: string;
+	affectedMedia?: string;
 	part: number;
 	total: number;
 }) => (
 	<View mod={`${cardSurface} flex-col gap-2 p-4`}>
 		<View mod="flex-row flex-wrap items-center justify-between gap-3">
-			<View mod={quietPill}>
-				<Text t={code} mod={`${textPrimary} font-mono text-sm`} />
+			<View mod="flex-row items-center gap-2">
+				<View mod={quietPill}>
+					<Text t={code} mod={`${textPrimary} font-mono text-sm`} />
+				</View>
+				{scope ? (
+					<View mod={scope.toLowerCase().includes("account") ? accountScopePill : postScopePill}>
+						<Text t={scope} />
+					</View>
+				) : null}
 			</View>
 			<Text t={stat} mod={`${textPrimary} text-sm font-bold`} />
 		</View>
 		<ShareBar part={part} total={total} />
+		{reason ? (
+			<View mod="flex-col gap-0.5">
+				<Text t={copy.reason} mod={`${textSecondary} text-sm font-medium`} />
+				<Text t={reason} mod={`${textPrimary} text-sm leading-snug`} />
+			</View>
+		) : null}
+		{affectedMedia || affectedTarget ? (
+			<View mod="flex-col gap-0.5">
+				<Text t={copy.affectedTarget} mod={`${textSecondary} text-sm font-medium`} />
+				<Text t={affectedMedia ?? affectedTarget ?? ""} mod={`${textPrimary} text-sm leading-snug`} />
+			</View>
+		) : null}
+		{restriction ? (
+			<View mod="flex-col gap-0.5">
+				<Text t={copy.restriction} mod={`${textSecondary} text-sm font-medium`} />
+				<Text t={restriction} mod={`${textPrimary} text-sm leading-snug`} />
+			</View>
+		) : null}
 		<View mod="flex-col gap-0.5">
 			<Text t={copy.about} mod={`${textSecondary} text-sm`} />
 			<Text t={about} mod={`${textPrimary} text-sm leading-snug`} />
@@ -160,6 +201,11 @@ const body = (report: Report, download: string | undefined, note: TimelineRichTe
 					stat={copy.postStat(label.posts, label.totalPostsInMonth, label.percentageOfPosts)}
 					about={label.about}
 					effect={label.effect}
+					reason={label.reason}
+					restriction={label.restriction}
+					scope={label.scope ?? "Post-level"}
+					affectedTarget={label.affectedTarget}
+					affectedMedia={label.affectedMedia}
 					part={label.posts}
 					total={label.totalPostsInMonth}
 				/>
@@ -175,6 +221,10 @@ const body = (report: Report, download: string | undefined, note: TimelineRichTe
 					stat={copy.dayStat(label.days, label.daysInPeriod, label.percentageOfDays)}
 					about={label.about}
 					effect={label.effect}
+					reason={label.reason}
+					restriction={label.restriction}
+					scope={label.scope ?? "Account-level"}
+					affectedTarget={label.affectedTarget}
 					part={label.days}
 					total={label.daysInPeriod}
 				/>
