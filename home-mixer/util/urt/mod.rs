@@ -71,6 +71,7 @@ pub(crate) fn make_urt_timeline(
                 }
 
                 let mut entry = if post.ancestors.is_empty()
+                    && post.in_reply_to_tweet_id == 0
                     && post.following_replied_user_ids.is_empty()
                 {
                     post_marshaller::marshal_post(post, feed_item.position as i64, feedback_info)

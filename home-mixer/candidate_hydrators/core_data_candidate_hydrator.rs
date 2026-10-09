@@ -145,6 +145,11 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrat
         candidate.retweeted_user_id = hydrated.retweeted_user_id;
         candidate.retweeted_tweet_id = hydrated.retweeted_tweet_id;
         candidate.in_reply_to_tweet_id = hydrated.in_reply_to_tweet_id;
+        if candidate.ancestors.is_empty() {
+            if let Some(parent_id) = hydrated.in_reply_to_tweet_id {
+                candidate.ancestors.push(parent_id);
+            }
+        }
         candidate.ancestor_users = hydrated.ancestor_users;
         candidate.tweet_text = hydrated.tweet_text;
     }
@@ -166,8 +171,8 @@ fn build_ancestor_users(
     core_data: &PureCoreData,
     core_datas: &HashMap<u64, anyhow::Result<Option<PureCoreData>>>,
 ) -> Vec<u64> {
-    let mut ancestor_users = Vec::with_capacity(candidate.ancestors.len());
-    if !candidate.ancestors.is_empty()
+    let mut ancestor_users = Vec::with_capacity(candidate.ancestors.len().max(1));
+    if (!candidate.ancestors.is_empty() || core_data.in_reply_to_tweet_id.is_some())
         && let Some(parent_author) = core_data.in_reply_to_user_id
     {
         ancestor_users.push(parent_author);
