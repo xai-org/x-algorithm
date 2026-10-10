@@ -124,3 +124,37 @@ The scorer publishes an 8-wide row in `heads.HEAD_NAMES` order.
   it carries that sentinel plus the model-head suffix, not the internal
   appeal paragraph or the action types each head keys off. ActionName
   proto enums are unchanged.
+
+### Results-sink policy format
+
+Pass a reviewed policy with `--policy-file PATH`, or set `BDSM_SINK_POLICY` to
+that path. The loader falls back to `runtime/sink_policy.yaml` when neither is
+set.
+
+Each entry in `thresholds`, `cusp_heads`, `paused_liveness_thresholds`, and
+`spam_bounce_thresholds` is a two-value pair:
+
+```yaml
+thresholds:
+  FollowBot: [9.99, 9.99]  # redacted and disabled in the public policy
+```
+
+The pair is `[tau, lambda]`. A head matches only when both conditions hold:
+
+```text
+head score >= tau AND LegitimateUser score <= lambda
+```
+
+For a configured policy, both values must be finite probabilities in `[0, 1]`.
+The public `9.99` value is accepted only as a complete `[9.99, 9.99]` pair; it
+marks that entry as redacted and disabled. Mixing a real value with the
+sentinel is rejected. `cusp_delta` and `reply_spam_hard_suspend_tau` follow the
+same numeric rules, and a redacted `cusp_delta` cannot be combined with active
+cusp-head thresholds.
+
+The loader fails at startup for malformed pairs, unknown model heads,
+non-finite values, out-of-range values, and inconsistent cusp or spam-bounce
+configuration. It also emits a warning listing every redacted field that still
+disables an enforcement lane. Replace those fields only with operating points
+calibrated for your own model and data; this repository does not publish or
+recommend production threshold values.

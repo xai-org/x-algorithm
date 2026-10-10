@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import logging
+import math
 import os
 import time
 import threading
@@ -264,6 +265,101 @@ _POLICY_2TUPLE_TABLES = (
     "paused_liveness_thresholds",
     "spam_bounce_thresholds",
 )
+_REDACTED_SENTINEL = 9.99
+_POLICY_SCORE_HEADS = frozenset(HEAD_NAMES.values()) - {"LegitimateUser"}
+
+
+def _is_redacted_pair(pair) -> bool:
+    return pair == (_REDACTED_SENTINEL, _REDACTED_SENTINEL)
+
+
+def _parse_operating_point(value, source: str, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"sink policy {source}: {field_name} must be a number")
+    try:
+        point = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sink policy {source}: {field_name} must be a number") from exc
+    if not math.isfinite(point):
+        raise ValueError(f"sink policy {source}: {field_name} must be finite")
+    if point != _REDACTED_SENTINEL and not 0.0 <= point <= 1.0:
+        raise ValueError(
+            f"sink policy {source}: {field_name} must be in [0, 1] "
+            f"or use the {_REDACTED_SENTINEL} redaction sentinel"
+        )
+    return point
+
+
+def _parse_threshold_table(name: str, value, source: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"sink policy {source}: {name} must be a mapping")
+
+    parsed = {}
+    for raw_head, raw_pair in value.items():
+        head = str(raw_head)
+        if head not in _POLICY_SCORE_HEADS:
+            raise ValueError(f"sink policy {source}: {name}.{head} is not a model score head")
+        if not isinstance(raw_pair, (list, tuple)) or len(raw_pair) != 2:
+            raise ValueError(
+                f"sink policy {source}: {name}.{head} must contain exactly two values [tau, lambda]"
+            )
+        tau = _parse_operating_point(raw_pair[0], source, f"{name}.{head}[0]")
+        lam = _parse_operating_point(raw_pair[1], source, f"{name}.{head}[1]")
+        if (tau == _REDACTED_SENTINEL) != (lam == _REDACTED_SENTINEL):
+            raise ValueError(
+                f"sink policy {source}: {name}.{head} must use the redaction sentinel "
+                "for both values or neither value"
+            )
+        parsed[head] = (tau, lam)
+    return parsed
+
+
+def _validate_policy(policy: SinkPolicy) -> None:
+    if policy.min_actions_for_enforcement < 0:
+        raise ValueError(
+            f"sink policy {policy.source}: min_actions_for_enforcement must be non-negative"
+        )
+
+    if policy.cusp_delta == _REDACTED_SENTINEL:
+        configured_cusp_heads = [
+            head for head, pair in policy.cusp_heads.items() if not _is_redacted_pair(pair)
+        ]
+        if configured_cusp_heads:
+            raise ValueError(
+                f"sink policy {policy.source}: cusp_delta uses the redaction sentinel while "
+                f"cusp_heads contains configured heads {sorted(configured_cusp_heads)}"
+            )
+
+    missing_action_keys = set(policy.spam_bounce_thresholds) - set(policy.spam_bounce_action_key)
+    if missing_action_keys:
+        raise ValueError(
+            f"sink policy {policy.source}: spam_bounce_action_key is missing heads "
+            f"{sorted(missing_action_keys)}"
+        )
+
+
+def _redacted_policy_fields(policy: SinkPolicy) -> list[str]:
+    fields = []
+    for table_name in _POLICY_2TUPLE_TABLES:
+        table = getattr(policy, table_name)
+        fields.extend(
+            f"{table_name}.{head}" for head, pair in table.items() if _is_redacted_pair(pair)
+        )
+    for field_name in ("cusp_delta", "reply_spam_hard_suspend_tau"):
+        if getattr(policy, field_name) == _REDACTED_SENTINEL:
+            fields.append(field_name)
+    return fields
+
+
+def _warn_if_redacted(policy: SinkPolicy) -> None:
+    fields = _redacted_policy_fields(policy)
+    if fields:
+        log.warning(
+            "sink policy: REDACTED 9.99 sentinel present at %s; affected enforcement "
+            "lanes are disabled. Supply reviewed operating points via --policy-file or "
+            "BDSM_SINK_POLICY before enabling enforcement.",
+            ", ".join(fields),
+        )
 
 
 def _load_policy(path: str | None) -> SinkPolicy:
@@ -274,6 +370,7 @@ def _load_policy(path: str | None) -> SinkPolicy:
     )
     if not os.path.exists(resolved):
         log.info(f"sink policy: baked-in defaults (no policy file at {resolved})")
+        _warn_if_redacted(DEFAULT_POLICY)
         return DEFAULT_POLICY
     try:
         import yaml
@@ -281,9 +378,12 @@ def _load_policy(path: str | None) -> SinkPolicy:
         log.warning(
             f"sink policy: pyyaml unavailable, IGNORING {resolved}; using baked-in defaults"
         )
+        _warn_if_redacted(DEFAULT_POLICY)
         return DEFAULT_POLICY
     with open(resolved) as f:
         raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"sink policy {resolved}: document root must be a mapping")
     known = {f_.name for f_ in dataclasses.fields(SinkPolicy)} - {"source"}
     unknown = set(raw) - known - {"notes"}
     if unknown:
@@ -293,7 +393,7 @@ def _load_policy(path: str | None) -> SinkPolicy:
         if k == "notes":
             continue
         if k in _POLICY_2TUPLE_TABLES:
-            kw[k] = {h: (float(t[0]), float(t[1])) for h, t in v.items()}
+            kw[k] = _parse_threshold_table(k, v, resolved)
         elif k == "official_client_app_ids":
             kw[k] = frozenset(int(x) for x in v)
         elif k == "spam_bounce_action_key":
@@ -301,11 +401,13 @@ def _load_policy(path: str | None) -> SinkPolicy:
         elif k == "min_actions_for_enforcement":
             kw[k] = int(v)
         elif k in ("cusp_delta", "reply_spam_hard_suspend_tau"):
-            kw[k] = float(v)
+            kw[k] = _parse_operating_point(v, resolved, k)
         else:
             kw[k] = str(v)
     pol = SinkPolicy(source=resolved, **kw)
+    _validate_policy(pol)
     log.info(f"sink policy: LOADED {resolved} (version={pol.version})")
+    _warn_if_redacted(pol)
     return pol
 
 
@@ -959,6 +1061,12 @@ def _decide_hard_enforcement(
 def _cusp_lane(
     uid_int, dec, user_labels, scores_by_name, legit, total_actions_gate, pol, args, r, metrics
 ):
+    # The public policy uses 9.99 for both the head pair and delta. Without an
+    # explicit guard, subtracting the two sentinels produces a zero threshold
+    # and can make the redacted cusp lane match ordinary scores.
+    if pol.cusp_delta == _REDACTED_SENTINEL:
+        return
+
     if (
         not dec.enforcement_met
         and dec.age_gate_skip_reason is None
@@ -966,6 +1074,8 @@ def _cusp_lane(
         and not dec.tweet_create_dominant
     ):
         for _h, (_tau, _lam) in pol.cusp_heads.items():
+            if _is_redacted_pair((_tau, _lam)):
+                continue
             _bot = scores_by_name.get(_h, 0)
             if _bot >= _tau - pol.cusp_delta and legit <= _lam + pol.cusp_delta:
                 dec.cusp_met = True
