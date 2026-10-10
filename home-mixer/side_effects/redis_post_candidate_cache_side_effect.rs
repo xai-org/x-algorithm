@@ -8,7 +8,18 @@ use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 
 const REDIS_TTL_SECONDS: u64 = 180;
-const ZSTD_COMPRESSION_LEVEL: i32 = 6;
+// This payload is highly repetitive — ~750 candidates sharing one 54-field schema —
+// so zstd's fast strategy already captures nearly all of the redundancy and the
+// higher levels buy very little. Measured on a reconstructed 750-candidate slate
+// (~2.0 MB of serde_json), compression was 84% of this side effect's CPU at level 6:
+// level 1 takes the serialize-and-compress path from 11.4 ms to 3.3 ms and is also
+// ~4% smaller on the wire. Levels 2-4 are both slower *and* larger than level 1 on
+// this payload, so level 1 is not a size/speed tradeoff against them.
+// Since the entry only lives for REDIS_TTL_SECONDS, request-path CPU dominates the
+// value of a marginally smaller blob. Decompression is level-agnostic, so
+// CachedPostsQueryHydrator reads frames written at any level and no cache key
+// version bump is required.
+const ZSTD_COMPRESSION_LEVEL: i32 = 1;
 
 pub struct RedisPostCandidateCacheSideEffect {
     redis_client: Arc<dyn RedisClient>,
@@ -209,6 +220,33 @@ mod tests {
         assert_eq!(result.len(), max_posts_to_cache);
         assert_eq!(result[0].tweet_id, 1199);
         assert_eq!(result[max_posts_to_cache - 1].tweet_id, 450);
+    }
+
+    /// The cache key is not versioned by compression level, so during a rolling
+    /// deploy a host on the new level reads entries a host on the old level wrote,
+    /// and vice versa. zstd frames are self-describing, so any level decodes with
+    /// the same call — this test pins that so the level can be retuned freely.
+    #[test]
+    fn payload_written_at_any_zstd_level_round_trips() {
+        let candidates = vec![candidate(1, 100, Some(5.0)), candidate(2, 200, Some(3.0))];
+        let json = serde_json::to_vec(&candidates).expect("serialize");
+
+        // 6 is the level this cache was written with before ZSTD_COMPRESSION_LEVEL
+        // was lowered; 1 is the current level.
+        for level in [1, 3, 6, 9] {
+            let compressed = zstd::encode_all(json.as_slice(), level).expect("compress");
+            let decompressed = zstd::decode_all(compressed.as_slice()).expect("decompress");
+            assert_eq!(
+                decompressed, json,
+                "level {level} frame did not decode to the original bytes"
+            );
+
+            let decoded: Vec<PostCandidate> =
+                serde_json::from_slice(&decompressed).expect("deserialize");
+            assert_eq!(decoded.len(), 2);
+            assert_eq!(decoded[0].tweet_id, 1);
+            assert_eq!(decoded[1].tweet_id, 2);
+        }
     }
 
     #[test]
