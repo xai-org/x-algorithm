@@ -1,5 +1,5 @@
 use crate::clients::tweet_entity_service_client::TESClient;
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -30,8 +30,9 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
     fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
         &self.cache
     }
+
     fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
-        candidate.tweet_id
+        candidate.get_original_tweet_id()
     }
 
     fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
@@ -52,7 +53,10 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
     ) -> Vec<Result<PostCandidate, String>> {
         let client = &self.tes_client;
 
-        let tweet_ids: Vec<u64> = candidates.iter().map(|c| c.tweet_id).collect();
+        let tweet_ids: Vec<u64> = candidates
+            .iter()
+            .map(|c| c.get_original_tweet_id())
+            .collect();
 
         let post_features = client.get_subscription_author_ids(tweet_ids.clone()).await;
 
@@ -78,5 +82,123 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.subscription_author_id = hydrated.subscription_author_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clients::tweet_entity_service_client::MockTESClient;
+    use crate::filters::ineligible_subscription_filter::IneligibleSubscriptionFilter;
+    use std::collections::HashMap;
+    use xai_candidate_pipeline::filter::Filter;
+    use xai_candidate_pipeline::hydrator::Hydrator;
+
+    fn tes(exclusive_original: u64, author: u64) -> Arc<dyn TESClient + Send + Sync> {
+        let mut subscription_author_ids = HashMap::new();
+        subscription_author_ids.insert(exclusive_original, Some(author));
+        Arc::new(MockTESClient {
+            subscription_author_ids,
+            ..Default::default()
+        })
+    }
+
+    async fn hydrate(
+        client: Arc<dyn TESClient + Send + Sync>,
+        candidates: &[PostCandidate],
+    ) -> Vec<PostCandidate> {
+        let hydrator = SubscriptionHydrator::new(client).await;
+        let mut out = candidates.to_vec();
+        let hydrated = hydrator
+            .hydrate(&ScoredPostsQuery::default(), candidates)
+            .await;
+        hydrator.update_all(&mut out, hydrated);
+        out
+    }
+
+    #[tokio::test]
+    async fn native_exclusive_post_still_reads_wrapper_id() {
+        let out = hydrate(
+            tes(100, 7),
+            &[PostCandidate {
+                tweet_id: 100,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(out[0].subscription_author_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn in_network_retweet_reads_original_exclusive_author() {
+        let out = hydrate(
+            tes(100, 7),
+            &[PostCandidate {
+                tweet_id: 200,
+                retweeted_tweet_id: Some(100),
+                in_network: Some(true),
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(out[0].subscription_author_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn public_post_stays_none() {
+        let mut subscription_author_ids = HashMap::new();
+        subscription_author_ids.insert(300u64, None);
+        let client = Arc::new(MockTESClient {
+            subscription_author_ids,
+            ..Default::default()
+        });
+        let out = hydrate(
+            client,
+            &[PostCandidate {
+                tweet_id: 300,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(out[0].subscription_author_id, None);
+    }
+
+    #[tokio::test]
+    async fn non_subscriber_loses_retweet_of_exclusive_original() {
+        let out = hydrate(
+            tes(100, 7),
+            &[PostCandidate {
+                tweet_id: 200,
+                retweeted_tweet_id: Some(100),
+                in_network: Some(true),
+                ..Default::default()
+            }],
+        )
+        .await;
+        let mut query = ScoredPostsQuery::default();
+        query.user_features.subscribed_user_ids = vec![99];
+        let result = IneligibleSubscriptionFilter.filter(&query, out);
+        assert_eq!(result.kept.len(), 0);
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 200);
+    }
+
+    #[tokio::test]
+    async fn subscriber_keeps_retweet_of_exclusive_original() {
+        let out = hydrate(
+            tes(100, 7),
+            &[PostCandidate {
+                tweet_id: 200,
+                retweeted_tweet_id: Some(100),
+                in_network: Some(true),
+                ..Default::default()
+            }],
+        )
+        .await;
+        let mut query = ScoredPostsQuery::default();
+        query.user_features.subscribed_user_ids = vec![7];
+        let result = IneligibleSubscriptionFilter.filter(&query, out);
+        assert_eq!(result.removed.len(), 0);
+        assert_eq!(result.kept.len(), 1);
     }
 }
