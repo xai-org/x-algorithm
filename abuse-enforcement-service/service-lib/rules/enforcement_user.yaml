@@ -43,7 +43,7 @@ rules:
     then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
   - id: anchor_campaign_user
     when: '"anchor_campaign_user" in score.labels'
-    then: { kind: act_add_labels_v2, labels: ["SpamHighRecall"] }
+    then: { kind: act_add_labels_v2, labels: ["SpamHighRecall"], ttl_msec: 2592000000 }
 
   - id: anchor_campaign_suspend_cse
     when: '"anchor_campaign_suspend_cse" in score.labels'
