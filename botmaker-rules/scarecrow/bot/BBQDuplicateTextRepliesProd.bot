@@ -14,23 +14,36 @@ action: |
     val :prodJobName = Concat(jobName, "_prod");
     val :eligibleTweets = Filter(
       :tweetId,
-      {
-        !HasBigQuerytoBotmakerLabel(:prodJobName, ToString(:tweetId)) &&
-        !Contains(GetTweetRtfLabels(:tweetId), "COPYPASTA_SPAM") &&
-        TryOrElse(GetTweet(:tweetId).card2.name != "promo_video_convo", FALSE) &&
-        TryOrElse(GetTweet(:tweetId).card2.name != "promo_image_convo", FALSE)
-      },
+      TryOrElse(
+        {
+          !HasBigQuerytoBotmakerLabel(:prodJobName, ToString(:tweetId)) &&
+          !Contains(GetTweetRtfLabels(:tweetId), "COPYPASTA_SPAM") &&
+          TryOrElse(GetTweet(:tweetId).card2.name != "promo_video_convo", FALSE) &&
+          TryOrElse(GetTweet(:tweetId).card2.name != "promo_image_convo", FALSE)
+        },
+        {
+          IncrementStat("BBQDuplicateTextRepliesProd_eligibility_lookup_failed", 1);
+          FALSE
+        }
+      ),
       StringIdListToLongList(entityId)
     );
     val :actionableTweets = Filter(
       :tweetId,
-      {
-        val :tweetAuthor = GetTweetAuthorId(:tweetId);
-        !IsTestUser(:tweetAuthor) &&
-        !IsHighPageRankUser(:tweetAuthor) &&
-        !Contains(GetLongList(`AutoExpiringTempSkipList`), :tweetAuthor) &&
-        !IsUserGrayVerified(:tweetAuthor)
-      },
+      TryOrElse(
+        {
+          val :tweetAuthor = GetTweetAuthorId(:tweetId);
+          :tweetAuthor != -1 &&
+          !IsTestUser(:tweetAuthor) &&
+          !IsHighPageRankUser(:tweetAuthor) &&
+          !Contains(GetLongList(`AutoExpiringTempSkipList`), :tweetAuthor) &&
+          !IsUserGrayVerified(:tweetAuthor)
+        },
+        {
+          IncrementStat("BBQDuplicateTextRepliesProd_exemption_lookup_failed", 1);
+          FALSE
+        }
+      ),
       :eligibleTweets
     );
     val :unactionableTweets = SetDiff(ToSet(:eligibleTweets), ToSet(:actionableTweets));
@@ -41,15 +54,26 @@ action: |
       RateLimited(
         {
           for (:tweetId in :actionableTweets) {
-            TweetRtfApplyLabel("COPYPASTA_SPAM", :tweetId);
-            SetBigQuerytoBotmakerLabel(:prodJobName, ToString(:tweetId));
-          }
+            TryOrElse(
+              {
+                TweetRtfApplyLabel("COPYPASTA_SPAM", :tweetId);
+                SetBigQuerytoBotmakerLabel(:prodJobName, ToString(:tweetId));
+                TRUE
+              },
+              {
+                IncrementStat("BBQDuplicateTextRepliesProd_action_failed", 1);
+                FALSE
+              }
+            );
+          };
+          TRUE
         },
         :rateLimitTimePeriod,
         :rateLimitThreshold,
         jobName,
         {
           Log("BBQDuplicateTextRepliesProd_rate_limited", :actionableTweets);
+          FALSE
         }
       );
     }
