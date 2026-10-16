@@ -4,7 +4,7 @@ import type { Report, ReportInfo } from "./report";
 export const MOCK_INFO: ReportInfo = {
 	reportPeriod: "August 2026",
 	eligibilityChecks: [
-		{ key: "10 or more posts in the prior month", value: true },
+		{ key: "10 or more posts in the report month", value: true },
 		{ key: "Account at least 1 year old", value: true },
 	],
 };
@@ -12,9 +12,29 @@ export const MOCK_INFO: ReportInfo = {
 export const MOCK_INFO_INELIGIBLE: ReportInfo = {
 	reportPeriod: "August 2026",
 	eligibilityChecks: [
-		{ key: "10 or more posts in the prior month", value: false },
+		{ key: "10 or more posts in the report month", value: false },
 		{ key: "Account at least 1 year old", value: true },
 	],
+};
+
+export const MOCK_INFO_CURRENT: ReportInfo = {
+	...MOCK_INFO,
+	servedPeriod: "August 2026",
+	targetPeriod: "August 2026",
+	periodStatus: "current",
+	nextReportNotBefore: "2026-10-10",
+};
+
+export const MOCK_INFO_DATA_PENDING: ReportInfo = {
+	...MOCK_INFO_CURRENT,
+	targetPeriod: "September 2026",
+	periodStatus: "data_pending",
+};
+
+export const MOCK_INFO_CAPPED: ReportInfo = {
+	...MOCK_INFO_CURRENT,
+	targetPeriod: "September 2026",
+	periodStatus: "capped",
 };
 
 export const MOCK_NOTE: TimelineRichTextFragment = {
@@ -73,3 +93,37 @@ export const MOCK_LABELED: Report = {
 		},
 	],
 };
+
+export const MOCK_CURRENT: Report = {
+	...MOCK_EMPTY,
+	periodStatus: { served: "August 2026", target: "August 2026", status: "current", nextReportNotBefore: "2026-10-10" },
+};
+
+export const MOCK_DATA_PENDING: Report = {
+	...MOCK_CURRENT,
+	periodStatus: { served: "August 2026", target: "September 2026", status: "data_pending", nextReportNotBefore: "2026-10-10" },
+};
+
+export const MOCK_CAPPED: Report = {
+	...MOCK_CURRENT,
+	periodStatus: { served: "August 2026", target: "September 2026", status: "capped", nextReportNotBefore: "2026-10-10" },
+};
+
+export const MOCK_INFO_HISTORICAL: ReportInfo = {
+	...MOCK_INFO,
+	reportPeriod: "July 2026",
+	servedPeriod: "July 2026",
+	targetPeriod: "August 2026",
+	periodStatus: "historical",
+	nextReportNotBefore: "2026-09-10",
+	availableMonths: [202607, 202606],
+};
+
+export const MOCK_HISTORICAL: Report = {
+	...MOCK_EMPTY,
+	period: { startDate: "2026-07-01", endDate: "2026-07-31", timezone: "UTC" },
+	generatedAt: "2026-08-09T23:59:59Z",
+	periodStatus: { served: "July 2026", target: "August 2026", status: "historical", nextReportNotBefore: "2026-09-10" },
+};
+
+export const MOCK_OUT_OF_RANGE = { requestedMonth: 202605, historyMonths: 2, defaultMonth: 202608, status: "unavailable" as const };
