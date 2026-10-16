@@ -73,3 +73,38 @@ export const MOCK_LABELED: Report = {
 		},
 	],
 };
+
+export const MOCK_POST_IDS: Report = {
+	...MOCK_LABELED,
+	postLabels: [
+		{
+			...MOCK_LABELED.postLabels[0],
+			postIds: ["2080000000000000003", "2080000000000000002", "2080000000000000001"],
+			postIdsTruncated: false,
+			postIdsAvailable: true,
+		},
+		{
+			...MOCK_LABELED.postLabels[1],
+			postIds: ["2080000000000000004"],
+			postIdsTruncated: false,
+			postIdsAvailable: true,
+		},
+	],
+};
+
+export const MOCK_POST_IDS_TRUNCATED: Report = {
+	...MOCK_POST_IDS,
+	postLabels: [
+		{
+			...MOCK_POST_IDS.postLabels[0],
+			postIds: ["2080000000000000003", "2080000000000000002"],
+			postIdsTruncated: true,
+		},
+		MOCK_POST_IDS.postLabels[1],
+	],
+};
+
+export const MOCK_POST_IDS_UNAVAILABLE: Report = {
+	...MOCK_LABELED,
+	postLabels: MOCK_LABELED.postLabels.map((label) => ({ ...label, postIds: [], postIdsTruncated: false, postIdsAvailable: false })),
+};

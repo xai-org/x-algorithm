@@ -21,11 +21,15 @@ val underTheHoodReportMaxMonthBucket =
 val underTheHoodReportTakedownsEnabled =
   fs.booleanParam("under_the_hood_report_takedowns_enabled", false)
 
+val underTheHoodReportPostIdsMax =
+  fs.intParam("under_the_hood_report_post_ids_max", 0)
+
 Library({
   export = {
     underTheHoodReportEnabled = underTheHoodReportEnabled,
     underTheHoodReportMaxMonthBucket = underTheHoodReportMaxMonthBucket,
     underTheHoodReportTakedownsEnabled = underTheHoodReportTakedownsEnabled,
+    underTheHoodReportPostIdsMax = underTheHoodReportPostIdsMax,
   },
   description = PlainText("Feature switch params for Under the Hood"),
   contactInfo = <visibility/under-the-hood/sharedConfig>.contactInfo,

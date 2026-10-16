@@ -242,7 +242,7 @@ object UthUserMonthMhPublisherApp {
           label <- row.label
           carried <- row.carried
           removed <- row.removed
-        } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed))
+        } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed, row))
       },
       reducers
     )
@@ -279,22 +279,41 @@ object UthUserMonthMhPublisherApp {
 
           val postLabelAgg = labelsOpt
             .getOrElse(Nil)
-            .groupBy { case (label, _, _, _) => label }
+            .groupBy { case (label, _, _, _, _) => label }
             .map {
               case (label, rows) =>
-                val days = rows
-                  .groupBy { case (_, day, _, _) => day }
+                val selectedRows = rows
+                  .groupBy { case (_, day, _, _, _) => day }
                   .map {
-                    case (day, dayRows) =>
-                      val best = dayRows.maxBy {
-                        case (_, _, carried, removed) => (carried, removed)
+                    case (_, dayRows) =>
+                      dayRows.maxBy {
+                        case (_, _, carried, removed, _) => (carried, removed)
                       }
-                      UthDayCarriedRemoved(Some(day), Some(best._3), Some(best._4))
                   }
                   .toList
+                val days = selectedRows
+                  .map {
+                    case (_, day, carried, removed, _) =>
+                      UthDayCarriedRemoved(Some(day), Some(carried), Some(removed))
+                  }
                   .sortBy(_.dayOfMonth.getOrElse(0))
+                val hasPostIds = TakedownLabels.parseLabel(label).isEmpty &&
+                  selectedRows.forall(_._5.postIds.isDefined)
+                val allPostIds = selectedRows.flatMap(_._5.postIds.getOrElse(Nil)).distinct
+                val postIds = if (hasPostIds) Some(mostRecentPostIds(allPostIds)) else None
+                val postIdsTruncated =
+                  if (hasPostIds)
+                    Some(selectedRows.exists(_._5.postIdsTruncated.contains(true)) ||
+                      allPostIds.size > maxPostIdsPerLabel)
+                  else None
                 val (name, countryCodes) = TakedownLabels.splitForServing(label)
-                UthPostLabelAggregate(Some(name), Some(days), countryCodes)
+                UthPostLabelAggregate(
+                  Some(name),
+                  Some(days),
+                  countryCodes,
+                  postIds,
+                  postIdsTruncated
+                )
             }
             .toList
             .sortBy(a => (a.label.getOrElse(""), a.countryCodes.getOrElse(Nil).mkString(",")))

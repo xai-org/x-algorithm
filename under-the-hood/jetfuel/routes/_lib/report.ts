@@ -5,6 +5,9 @@ export type PostLabel = {
 	posts: number;
 	totalPostsInMonth: number;
 	percentageOfPosts: string;
+	postIds?: string[];
+	postIdsTruncated?: boolean;
+	postIdsAvailable?: boolean;
 };
 
 export type AccountLabel = {
@@ -37,6 +40,8 @@ const num = (v: unknown): number => {
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
+const postId = (v: unknown): string | undefined => (typeof v === "string" && /^[1-9][0-9]*$/.test(v) ? v : undefined);
+
 const postLabel = (v: unknown): PostLabel | undefined => {
 	if (!isRecord(v) || !str(v.label)) return undefined;
 	return {
@@ -46,6 +51,9 @@ const postLabel = (v: unknown): PostLabel | undefined => {
 		posts: num(v.posts),
 		totalPostsInMonth: num(v.totalPostsInMonth),
 		percentageOfPosts: str(v.percentageOfPosts),
+		...(Array.isArray(v.postIds) ? { postIds: list(v.postIds, postId) } : {}),
+		...(typeof v.postIdsTruncated === "boolean" ? { postIdsTruncated: v.postIdsTruncated } : {}),
+		...(typeof v.postIdsAvailable === "boolean" ? { postIdsAvailable: v.postIdsAvailable } : {}),
 	};
 };
 
