@@ -52,7 +52,10 @@ def _extract_columns_from_arrow(
 
     def _field_np(name, dtype=np.int64, fill=0):
         try:
-            field = struct_array.field(name)
+            # Filling while still in Arrow preserves integer precision. Nullable
+            # integer arrays otherwise become float64, rounding IDs above 2**53
+            # and turning nulls into the minimum signed integer on conversion.
+            field = struct_array.field(name).fill_null(fill)
             arr = field.to_numpy(zero_copy_only=False).astype(dtype)
             if np.issubdtype(arr.dtype, np.floating):
                 arr = np.nan_to_num(arr, nan=fill)
