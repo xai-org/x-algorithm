@@ -94,11 +94,11 @@ def write_artifacts(out_dir: str, seed: int = 20260721, now_ms: int | None = Non
     return {"posts": n_all, "gallery": n_eval, "dim": MM_DIM, "seed": seed}
 
 
-def _check_with_pyarrow(out: Path, seed: int) -> None:
+def _check_with_pyarrow(out: Path, seed: int, now_ms: int | None = None) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    world = generate_world(seed=seed)
+    world = generate_world(seed=seed, now_ms=now_ms)
     post_ids = np.load(out / _POST_IDS_REL)
     emb = np.load(out / _EMBEDDINGS_REL)
 
@@ -185,9 +185,9 @@ def _check_with_trainer(out: Path) -> None:
     )
 
 
-def run_self_check(out_dir: str, seed: int) -> None:
+def run_self_check(out_dir: str, seed: int, now_ms: int | None = None) -> None:
     out = Path(out_dir)
-    _check_with_pyarrow(out, seed)
+    _check_with_pyarrow(out, seed, now_ms=now_ms)
     _check_with_trainer(out)
 
 
@@ -213,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{args.out}/{_DIR_REL} (dim={summary['dim']}, seed={summary['seed']})"
     )
     if args.self_check:
-        run_self_check(args.out, args.seed)
+        run_self_check(args.out, args.seed, now_ms=args.now_ms)
     return 0
 
 
