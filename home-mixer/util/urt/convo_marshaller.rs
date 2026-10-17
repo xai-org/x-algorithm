@@ -22,6 +22,12 @@ pub(super) fn marshal_conversation_module(
     let tombstone_ids: HashSet<u64> = post.tombstone_ancestor_ids.iter().copied().collect();
 
     let mut parent_tweets: Vec<u64> = post.ancestors.clone();
+    if parent_tweets.is_empty()
+        && post.in_reply_to_tweet_id != 0
+        && post.in_reply_to_tweet_id != focal_id
+    {
+        parent_tweets.push(post.in_reply_to_tweet_id);
+    }
     parent_tweets.sort_unstable();
     parent_tweets.reverse();
 
@@ -38,7 +44,7 @@ pub(super) fn marshal_conversation_module(
     };
 
     let all_tweet_ids: Vec<i64> = {
-        let mut ids: Vec<u64> = post.ancestors.clone();
+        let mut ids: Vec<u64> = parent_tweets.clone();
         ids.push(focal_id);
         ids.sort_unstable();
         ids.iter().map(|&id| id as i64).collect()
@@ -124,3 +130,46 @@ fn following_replied_facepile(post: &ScoredPost) -> Option<TweetFacepile> {
         display_type: Some(TweetFacepileDisplayType::MUTUAL_REPLIED),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conversation_module_with_ancestors() {
+        let post = ScoredPost {
+            tweet_id: 300,
+            ancestors: vec![100, 200],
+            in_reply_to_tweet_id: 200,
+            ..Default::default()
+        };
+        let entry = marshal_conversation_module(&post, 1, None);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 3);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+            assert_eq!(module.items[1].entry_id, "tweet-200");
+            assert_eq!(module.items[2].entry_id, "tweet-300");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+
+    #[test]
+    fn test_conversation_module_fallback_when_ancestors_empty() {
+        let post = ScoredPost {
+            tweet_id: 200,
+            ancestors: vec![],
+            in_reply_to_tweet_id: 100,
+            ..Default::default()
+        };
+        let entry = marshal_conversation_module(&post, 1, None);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 2);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+            assert_eq!(module.items[1].entry_id, "tweet-200");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+}
+
