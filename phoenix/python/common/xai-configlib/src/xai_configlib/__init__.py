@@ -423,6 +423,8 @@ def cast_type(ty: Type[Any], val: str):
             return ()
         vals = val.split(",")
         tys = get_args(ty)
+        if len(tys) == 2 and tys[1] is Ellipsis:
+            return tuple(cast_type(tys[0], v) for v in vals)
         if len(vals) != len(tys):
             raise TypeError(f"Tuple {ty} has different number of arguments from given value {vals}")
         return tuple(cast_type(a_ty, v) for a_ty, v in zip(tys, vals))
