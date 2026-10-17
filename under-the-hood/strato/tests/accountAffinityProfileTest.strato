@@ -1,0 +1,85 @@
+import <visibility/under-the-hood/accountAffinityProfile>
+import <visibility/under-the-hood/sharedConfig>
+
+type KnownFor = com.twitter.simclusters_v2.ClustersUserIsKnownFor
+type Profile = {
+  modelVersion: String,
+  embeddingType: String,
+  retrievedAt: String,
+  primaryClusters: Seq[{ clusterId: Int, weight: Double }],
+  notes: String
+}
+
+val retrievedAt = "2026-09-20T12:00:00Z"
+val record: KnownFor = {
+  knownForModelVersion = "20M_145K_2020",
+  clusterIdToScores = Map(
+    1420 -> { knownForScore = Some(0.82) },
+    804 -> { knownForScore = Some(0.54) },
+    31 -> { knownForScore = Some(0.28) },
+  ),
+}
+val wrongVersion: KnownFor = {
+  knownForModelVersion = "20M_145K_updated",
+  clusterIdToScores = record.clusterIdToScores,
+}
+val emptyRecord: KnownFor = {
+  knownForModelVersion = "20M_145K_2020",
+  clusterIdToScores = Map.empty,
+}
+val profile = Json.parser[Profile]().parse(
+  accountAffinityProfile.profileJson(record, retrievedAt).getOrElse("{}"))
+val emptyProfile = Json.parser[Profile]().parse(
+  accountAffinityProfile.profileJson(emptyRecord, retrievedAt).getOrElse("{}"))
+val scores = Map(
+  12 -> Some(12.0), 11 -> Some(11.0), 10 -> Some(10.0), 9 -> Some(9.0),
+  8 -> Some(8.0), 7 -> Some(7.0), 6 -> Some(6.0), 5 -> Some(5.0),
+  4 -> Some(4.0), 3 -> Some(3.0), 2 -> Some(2.0), 1 -> Some(1.0),
+)
+val top = accountAffinityProfile.primaryClusterScores(scores)
+val baseReport = "{\"postLabels\":[],\"accountLabels\":[],\"totalPostLabels\":0,\"totalAccountLabels\":0}"
+val enriched = accountAffinityProfile.appendToReport(
+  baseReport, accountAffinityProfile.profileJson(record, retrievedAt))
+val parsedReport = Json.parser[{
+  postLabels: Seq[String],
+  accountLabels: Seq[String],
+  totalPostLabels: Int,
+  totalAccountLabels: Int,
+  accountAffinityProfile: Profile
+}]().parse(enriched)
+
+val checks = Map(
+  "empty input" -> accountAffinityProfile.primaryClusterScores(Map.empty).isEmpty,
+  "bounded top ten" -> (top.size == 10 && top.map { case (id, _) => id } ==
+    Seq(12, 11, 10, 9, 8, 7, 6, 5, 4, 3)),
+  "stable ties" -> (accountAffinityProfile.primaryClusterScores(
+    Map(8 -> Some(0.5), 3 -> Some(0.5), 1 -> Some(0.2))) ==
+    Seq((3, 0.5), (8, 0.5), (1, 0.2))),
+  "invalid entries removed" -> (accountAffinityProfile.primaryClusterScores(
+    Map(-1 -> Some(0.9), 1 -> None, 2 -> Some(-0.1), 3 -> Some(0.0), 4 -> Some(0.6))) ==
+    Seq((4, 0.6))),
+  "raw scores preserved" -> (top.map { case (_, weight) => weight } ==
+    Seq(12.0, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0)),
+  "model mismatch omitted" -> accountAffinityProfile.profileJson(wrongVersion, retrievedAt).isEmpty,
+  "empty record distinct from missing" -> emptyProfile.primaryClusters.isEmpty,
+  "model identity" -> (profile.modelVersion == "20M_145K_2020" && profile.embeddingType == "knownFor"),
+  "read timestamp" -> (profile.retrievedAt == retrievedAt),
+  "cluster serialization" -> (profile.primaryClusters.map { cluster => cluster.clusterId } ==
+    Seq(1420, 804, 31)),
+  "missing profile preserves report" -> (accountAffinityProfile.appendToReport(baseReport, None) == baseReport),
+  "enriched report round trips" -> (parsedReport.accountAffinityProfile == profile &&
+    parsedReport.totalPostLabels == 0 && parsedReport.totalAccountLabels == 0 &&
+    parsedReport.postLabels.isEmpty && parsedReport.accountLabels.isEmpty),
+)
+
+// Evaluate checks / allPassed in the internal Strato test environment. This
+// library has no feature-store dependencies and makes no live account reads.
+Library({
+  export = {
+    checks = checks,
+    allPassed = checks.toSeq.forall { case (_, passed) => passed },
+  },
+  description = PlainText("Fixture checks for Under the Hood account affinity serialization."),
+  contactInfo = sharedConfig.contactInfo,
+  lifecycle = Development,
+})
