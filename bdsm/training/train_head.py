@@ -38,6 +38,8 @@ def load_cached(split_dir: str) -> dict:
         raise FileNotFoundError(f"no cached cls parquet under {split_dir}")
     for fpath in files:
         t = pq.read_table(fpath)
+        if t.num_rows == 0:
+            continue
         strength = np.asarray(t.column("label_strength").to_pylist())
         cls_col = t.column("cls").combine_chunks()
         cls_all = (
@@ -49,6 +51,8 @@ def load_cached(split_dir: str) -> dict:
         finite = np.isfinite(cls_all).all(axis=1)
         n_nonfinite += int((~finite).sum())
         keep = (strength == "strong") & finite
+        if not keep.any():
+            continue
         cls = cls_all[keep]
         lbls = [lb for lb, k in zip(t.column("labels").to_pylist(), keep, strict=True) if k]
         xs.append(cls)
@@ -58,6 +62,8 @@ def load_cached(split_dir: str) -> dict:
             s for s, k in zip(t.column("label_source").to_pylist(), keep, strict=True) if k
         )
     log.info(f"{split_dir}: dropped {n_nonfinite} rows with non-finite CLS")
+    if not xs:
+        raise ValueError(f"no finite strong-label rows in cached cls parquet under {split_dir}")
     return {
         "x": np.concatenate(xs),
         "y": np.concatenate(ys),
