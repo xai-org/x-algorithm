@@ -97,6 +97,14 @@ where
     fn post_selection_filters(&self) -> &[Box<dyn Filter<Q, C>>];
     fn side_effects(&self) -> Arc<Vec<Box<dyn SideEffect<Q, C>>>>;
     fn result_size(&self) -> usize;
+    /// Optional per-request cap, read after query hydration. Existing pipelines
+    /// retain their behavior with `None`. `Some(0)` stops before candidate sources
+    /// and skips serving side effects. Use on the outer serving pipeline for an
+    /// authenticated, explicit session budget; nested retrieval pools need not
+    /// have the same limit as the final feed.
+    fn request_result_limit(&self, _query: &Q) -> Option<usize> {
+        None
+    }
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
 
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
@@ -126,6 +134,18 @@ where
         let hydrated_query = self.hydrate_query(query).await;
         let hydrated_query = self.hydrate_dependent_query(hydrated_query).await;
 
+        let request_result_limit = self.request_result_limit(&hydrated_query);
+        if request_result_limit == Some(0) {
+            self.stat_result_size(&[]);
+            pipeline_summary::emit(self.name(), start, 0);
+            return PipelineResult {
+                retrieved_candidates: vec![],
+                filtered_candidates: vec![],
+                selected_candidates: vec![],
+                query: Arc::new(hydrated_query),
+            };
+        }
+
         let candidates = self.fetch_candidates(&hydrated_query).await;
 
         let hydrated_candidates = self.hydrate(&hydrated_query, candidates).await;
@@ -153,6 +173,11 @@ where
         non_selected_candidates.extend(truncated_candidates);
 
         self.finalize(&hydrated_query, &mut final_candidates);
+
+        if let Some(limit) = request_result_limit {
+            let limit = limit.min(self.result_size()).min(final_candidates.len());
+            non_selected_candidates.extend(final_candidates.split_off(limit));
+        }
 
         self.stat_result_size(&final_candidates);
         pipeline_summary::emit(self.name(), start, final_candidates.len());
