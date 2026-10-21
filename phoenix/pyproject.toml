@@ -73,6 +73,11 @@ fa4 = [
     "torch>=2.8.0 ; sys_platform == 'linux'",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [tool.uv]
 environments = [
     "sys_platform == 'darwin'",
