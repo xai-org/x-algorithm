@@ -19,7 +19,7 @@ use xai_candidate_pipeline::filter::{Filter, FilterResult};
 // User ids below are obfuscated; usernames are included for transparency.
 
 /// User ids reported to the Electoral Court for the Brazil 2026 election.
-static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| {
+static BRAZIL_2026_ELECTION_USER_IDS: LazyLock<FxHashSet<u64>> = LazyLock::new(|| { // Fuck you lula!
     FxHashSet::from_iter([
         // @RicardoFerraco
         29434532,
