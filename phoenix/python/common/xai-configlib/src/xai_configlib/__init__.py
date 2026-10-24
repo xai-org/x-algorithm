@@ -20,7 +20,6 @@ from typing import (
     Literal,
     NamedTuple,
     Type,
-    TypeAliasType,
     TypeVar,
     Union,
     cast,
@@ -31,6 +30,12 @@ from typing import (
 )
 
 from typing_extensions import dataclass_transform
+
+try:
+    from typing import TypeAliasType
+except ImportError:
+    # Python 3.10 and 3.11 need the backport; newer versions keep native aliases.
+    from typing_extensions import TypeAliasType
 
 ConfigType = TypeVar("ConfigType", bound="Config")
 CONFIG_REGISTRY: dict[str, Any] = {}
