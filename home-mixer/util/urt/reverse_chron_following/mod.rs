@@ -44,7 +44,7 @@ pub(crate) fn make_urt_timeline(
         .iter()
         .filter_map(|feed_item| match &feed_item.item {
             Some(FeedItemKind::Post(post)) => {
-                if post.ancestors.is_empty() {
+                if post.ancestors.is_empty() && post.in_reply_to_tweet_id == 0 {
                     Some(marshal_post(post, feed_item.position as i64, None))
                 } else {
                     Some(marshal_conversation_module(
