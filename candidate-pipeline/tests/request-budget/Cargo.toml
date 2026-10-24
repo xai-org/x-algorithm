@@ -1,0 +1,18 @@
+[package]
+name = "request-budget-public-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+futures = "0.3"
+strum = { version = "0.27", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tracing = "0.1"
+xai-stats-macro = { path = "stats-macro" }
+
+[workspace]
