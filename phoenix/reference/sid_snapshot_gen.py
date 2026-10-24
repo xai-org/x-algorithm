@@ -62,6 +62,7 @@ def write_sid_snapshot(
             raise ValueError(
                 f"missing_mask shape {missing_mask.shape} != post_ids shape {post_ids.shape}"
             )
+        codes = codes.copy()
         codes[missing_mask] = _MISSING_SENTINEL
 
     flat = pa.array(codes.reshape(-1), type=pa.int64())
