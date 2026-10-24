@@ -4,16 +4,27 @@ import { FormatText } from "../../logged_out/components/richtext";
 import { pillSurface, textPrimary, textSecondary } from "../../../ui/themes";
 import { canMock, loadReport, type ReportState } from "./_lib/load";
 import type { EligibilityCheck } from "./_lib/report";
-import { Body, Divider, OPEN_SOURCE_URL, REPORT_PATH, Screen, downloadUrl, pilotCopy } from "./_lib/ui";
+import { Body, Divider, OPEN_SOURCE_URL, REPORT_PATH, ReportStatus, Screen, downloadUrl, pilotCopy } from "./_lib/ui";
 
 const T = t.Object({
-	mock: t.Optional(t.Union([t.Literal("none"), t.Literal("pilot"), t.Literal("ineligible"), t.Literal("empty"), t.Literal("labels")])),
+	mock: t.Optional(
+		t.Union([
+			t.Literal("none"),
+			t.Literal("pilot"),
+			t.Literal("ineligible"),
+			t.Literal("empty"),
+			t.Literal("labels"),
+			t.Literal("current"),
+			t.Literal("data_pending"),
+			t.Literal("capped"),
+		]),
+	),
 });
 
 const copy = {
 	title: l("Under the hood", "Title of the Under the hood page, where a user sees which safety labels affected their posts' reach."),
 	description: l(
-		"See aggregate stats on labels that can affect post visibility in the X algorithm, for your posts and account last month.",
+		"See aggregate stats on labels that can affect post visibility in the X algorithm, for your posts and account over the most recent available month.",
 		"Description on the Under the hood page explaining what the report contains.",
 	),
 	openSource: l(
@@ -51,6 +62,7 @@ const eligible = (state: ReportState, reportPath: string, download: string | und
 		<View mod="flex-col gap-4">
 			<Divider />
 			{info.reportPeriod ? <Body t={copy.period(info.reportPeriod)} /> : null}
+			<ReportStatus info={info} />
 			<Body t={copy.requirements} />
 			<View mod="flex-col gap-3">
 				{info.eligibilityChecks.map((check) => (

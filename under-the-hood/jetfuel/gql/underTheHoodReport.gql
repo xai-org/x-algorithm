@@ -3,6 +3,10 @@ query UserUnderTheHoodReport {
     report_json
     report_info {
       report_period
+      served_period
+      target_period
+      period_status
+      next_report_not_before
       eligibility_checks {
         key
         value

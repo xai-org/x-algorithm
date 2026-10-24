@@ -7,6 +7,10 @@ struct UnderTheHoodReportInfo {
     strato.graphql.typename = "UnderTheHoodReportEligibilityCheckEntry"
   )
   3: optional richtext.RichText note
+  4: optional string servedPeriod
+  5: optional string targetPeriod
+  6: optional string periodStatus
+  7: optional string nextReportNotBefore
 } (strato.graphql.typename = "UnderTheHoodReportInfo")
 
 struct UnderTheHoodReport {

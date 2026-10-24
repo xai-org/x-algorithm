@@ -16,12 +16,15 @@ export type AccountLabel = {
 	percentageOfDays: string;
 };
 
+export type PeriodStatus = { served: string; target: string; status: string; nextReportNotBefore: string };
+
 export type Report = {
 	period: { startDate: string; endDate: string; timezone: string };
 	generatedAt: string;
 	postCount: number;
 	postLabels: PostLabel[];
 	accountLabels: AccountLabel[];
+	periodStatus?: PeriodStatus;
 };
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
@@ -64,6 +67,11 @@ const accountLabel = (v: unknown): AccountLabel | undefined => {
 const list = <T>(v: unknown, map: (item: unknown) => T | undefined): T[] =>
 	Array.isArray(v) ? v.map(map).filter((x): x is T => x !== undefined) : [];
 
+const periodStatus = (v: unknown): PeriodStatus | undefined => {
+	if (!isRecord(v) || !str(v.served) || !str(v.target) || !str(v.status) || !str(v.nextReportNotBefore)) return undefined;
+	return { served: str(v.served), target: str(v.target), status: str(v.status), nextReportNotBefore: str(v.nextReportNotBefore) };
+};
+
 export const parseReport = (json: string | undefined): Report | undefined => {
 	if (!json) return undefined;
 	let raw: unknown;
@@ -74,15 +82,24 @@ export const parseReport = (json: string | undefined): Report | undefined => {
 	}
 	if (!isRecord(raw)) return undefined;
 	const period = isRecord(raw.period) ? raw.period : {};
+	const status = periodStatus(raw.periodStatus);
 	return {
 		period: { startDate: str(period.startDate), endDate: str(period.endDate), timezone: str(period.timezone) },
 		generatedAt: str(raw.generatedAt),
 		postCount: num(raw.postCount),
 		postLabels: list(raw.postLabels, postLabel),
 		accountLabels: list(raw.accountLabels, accountLabel),
+		...(status ? { periodStatus: status } : {}),
 	};
 };
 
 export type EligibilityCheck = { key: string; value: boolean };
 
-export type ReportInfo = { reportPeriod: string; eligibilityChecks: EligibilityCheck[] };
+export type ReportInfo = {
+	reportPeriod: string;
+	eligibilityChecks: EligibilityCheck[];
+	servedPeriod?: string;
+	targetPeriod?: string;
+	periodStatus?: string;
+	nextReportNotBefore?: string;
+};

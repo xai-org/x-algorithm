@@ -1,6 +1,7 @@
 import { jsx, Icon, List2, Nav, Page, Text, View, l, type JetElement, type Localized } from "@jetfuel";
 import { type Context, isProd } from "@serving";
 import { backgroundPrimary, divider, textPrimary, textSecondary } from "../../../../ui/themes";
+import type { ReportInfo } from "./report";
 
 export const OPEN_SOURCE_URL = "https://github.com/xai-org/x-algorithm";
 
@@ -43,5 +44,20 @@ export const Divider = () => <View mod={`h-px w-full ${divider}`} />;
 export const Body = ({ t, mod = "" }: { t: Localized | string; mod?: string }) => (
 	<Text t={t} mod={`${textSecondary} text-base leading-snug ${mod}`} />
 );
+
+export const ReportStatus = ({ info }: { info: ReportInfo }) => {
+	if (!info.servedPeriod || !info.targetPeriod || !info.periodStatus || !info.nextReportNotBefore) return null;
+	const t =
+		info.periodStatus === "current"
+			? l("Next report no earlier than {date} UTC.", "Calendar floor for the next Under the hood report, not a promise of availability.", {
+					date: info.nextReportNotBefore,
+				})
+			: l(
+					"{target} is not available yet; showing {served}. Next report no earlier than {date} UTC.",
+					"Explains a capped or data-pending Under the hood report and the next report's calendar floor.",
+					{ target: info.targetPeriod, served: info.servedPeriod, date: info.nextReportNotBefore },
+				);
+	return <Body t={t} mod="text-sm" />;
+};
 
 export const SectionTitle = ({ t }: { t: Localized }) => <Text t={t} mod={`${textPrimary} text-xl font-bold`} />;
