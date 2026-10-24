@@ -3,6 +3,7 @@ use rand::Rng;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
+use xai_value_model::compare_scores_desc;
 
 use xai_vm_ranker_proto::{
     vm_ranker_service_server::{VmRankerService, VmRankerServiceServer},
@@ -115,11 +116,7 @@ impl VmRankerService for VMRankerServiceImpl {
         }
 
         let mut top: Vec<&RankedCandidate> = result.iter().collect();
-        top.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        top.sort_by(|a, b| compare_scores_desc(a.score, b.score));
         for s in top.iter().take(50) {
             debug!("  tweet={} score={:.6}", s.tweet_id, s.score);
         }

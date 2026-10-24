@@ -1,7 +1,7 @@
 use crate::inputs::{CandidateScoringInputs, QueryScoringContext};
+use crate::score_order::compare_scores_desc;
 use crate::weights::{NEGATIVE_SCORES_OFFSET, ValueModelWeights};
 use rustc_hash::FxHashMap;
-use std::cmp::Ordering;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ValueScores {
@@ -190,7 +190,7 @@ pub fn author_pool_counts(author_ids: &[u64], ordering_scores: &[f64]) -> Vec<u3
         .enumerate()
         .map(|(i, &s)| (i, s))
         .collect();
-    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+    indexed.sort_by(|(_, a), (_, b)| compare_scores_desc(*a, *b));
 
     let mut counts = vec![0u32; author_ids.len()];
     let mut author_counts: FxHashMap<u64, u32> = FxHashMap::default();
@@ -338,6 +338,66 @@ fn add_exploration_bonus(weighted: f64, bonus: f64, weights: &ValueModelWeights)
 mod tests {
     use super::*;
     use crate::phoenix_scores::PhoenixScores;
+
+    #[test]
+    fn author_counts_nan_witness() {
+        let scores = [
+            19.0,
+            10.0,
+            7.0,
+            18.0,
+            8.0,
+            5.0,
+            2.0,
+            17.0,
+            16.0,
+            3.0,
+            15.0,
+            20.0,
+            21.0,
+            11.0,
+            6.0,
+            4.0,
+            1.0,
+            f64::NAN,
+            13.0,
+            12.0,
+            14.0,
+            9.0,
+        ];
+        let distinct_authors: Vec<u64> = (0..scores.len() as u64).collect();
+        assert_eq!(
+            author_pool_counts(&distinct_authors, &scores),
+            vec![0; scores.len()]
+        );
+        // Reusing an author makes the rank of each score observable in the counts.
+        let expected: Vec<u32> = scores
+            .iter()
+            .map(|&score| {
+                if score.is_nan() {
+                    21
+                } else {
+                    21 - score as u32
+                }
+            })
+            .collect();
+        assert_eq!(author_pool_counts(&[7; 22], &scores), expected);
+    }
+
+    #[test]
+    fn author_counts_keep_invalid_scores_after_finite_scores() {
+        let scores = [f64::NAN, 5.0, f64::INFINITY, -2.0, f64::NEG_INFINITY, 10.0];
+        assert_eq!(author_pool_counts(&[7; 6], &scores), vec![3, 1, 4, 2, 5, 0]);
+    }
+
+    #[test]
+    fn author_counts_preserve_finite_ties_and_author_groups() {
+        assert_eq!(
+            author_pool_counts(&[7, 7, 8, 7, 7], &[0.0, -0.0, 10.0, 5.0, 5.0]),
+            vec![2, 3, 0, 0, 1],
+        );
+        assert!(author_pool_counts(&[], &[]).is_empty());
+    }
 
     #[test]
     fn hand_computed_parity() {
