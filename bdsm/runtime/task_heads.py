@@ -38,8 +38,13 @@ def load_head_params(head_checkpoint: str) -> dict:
     params = {}
     for key in arrays.files:
         params[key.split("/")[-1]] = arrays[key]
-    expected = {"w0", "b0", "w1", "b1", "w2", "b2"}
-    if set(params) != expected:
+    # save_checkpoint uses the legacy w/b names for a linear head, and
+    # numbered layer pairs for each MLP width accepted by the training CLI.
+    if set(params) == {"w", "b"}:
+        params = {"w0": params["w"], "b0": params["b"]}
+    n_layers = len(params) // 2
+    expected = {f"{kind}{i}" for i in range(n_layers) for kind in ("w", "b")}
+    if not params or set(params) != expected:
         raise RuntimeError(
             f"unexpected head param layout {sorted(params)} (expected {sorted(expected)})"
         )
