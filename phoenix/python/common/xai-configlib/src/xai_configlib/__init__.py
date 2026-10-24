@@ -247,7 +247,14 @@ def from_dict(
             obj = cls(**init_values)
             return obj
         else:
-            return {k: from_dict(v, max_back_compat=max_back_compat) for k, v in value.items()}
+            return {
+                k: from_dict(
+                    v,
+                    max_back_compat=max_back_compat,
+                    ignore_unregistered_cls=ignore_unregistered_cls,
+                )
+                for k, v in value.items()
+            }
     else:
         assert not ensure_class, f'Can\'t ensure class for non-dictionary for config "{value}"'
     return value
