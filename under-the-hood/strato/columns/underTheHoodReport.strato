@@ -2,14 +2,14 @@ import <visibility/under-the-hood/sharedConfig>
 import <visibility/under-the-hood/params>
 
 type Key = Unit
-type View = Unit
+type View = { month: Option[Int] }
 type Value = com.twitter.strato.graphql.UnderTheHoodReport
 
 val fetchOp = Op.fetch[Key, View, Value] { ctx =>
   CallContext.authenticatedTwitterUserId() match {
     case Some(userId) =>
       if (params.underTheHoodReportEnabled()) {
-        Ok(#User<visibility/under-the-hood/underTheHoodReport>.fetch(userId, ()))
+        Ok(#User<visibility/under-the-hood/underTheHoodReport>.fetch(userId, ctx.view))
       } else {
         Ok.missing
       }
