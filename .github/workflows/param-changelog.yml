@@ -1,0 +1,64 @@
+name: Param changelog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - home-mixer/params/param.rs
+      - vm-ranker/params.rs
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: param-changelog
+  cancel-in-progress: false
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test the generator
+        run: |
+          python3 -m pip install pytest
+          python3 -m pytest -v home-mixer/scripts/tests
+
+      - name: Summarize this sync
+        run: |
+          {
+            echo "## Parameter changes in ${GITHUB_SHA::7}"
+            echo
+            python3 home-mixer/scripts/param_changelog.py diff "${GITHUB_SHA}^" "${GITHUB_SHA}"
+            echo
+            echo "If any weight changed, replace the placeholder note in docs/PARAM_CHANGES.md with a one-line plain-language explanation before merging."
+          } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/sync-summary.md
+
+      - name: Tag the sync
+        if: github.event_name == 'push'
+        run: |
+          tag="sync-$(TZ=UTC git show -s --date=format-local:%Y-%m-%dT%H%MZ --format=%cd "$GITHUB_SHA")"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists"
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+
+      - name: Regenerate docs/PARAM_CHANGES.md
+        run: python3 home-mixer/scripts/param_changelog.py history --output docs/PARAM_CHANGES.md
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: param-changelog
+          add-paths: docs/PARAM_CHANGES.md
+          commit-message: "docs: update PARAM_CHANGES.md for ${{ github.sha }}"
+          title: "docs: parameter changelog update"
+          body-path: /tmp/sync-summary.md
+          delete-branch: true
