@@ -1,0 +1,24 @@
+{
+  "name": "phoenix-synth-smoke",
+  "description": "Offline smoke: phoenix quickstart docs and seed constant are wired for a deterministic synth path (does not train or need a GPU).",
+  "steps": [
+    {
+      "kind": "path_exists",
+      "path": "phoenix/QUICKSTART.md"
+    },
+    {
+      "kind": "file_contains",
+      "path": "phoenix/QUICKSTART.md",
+      "needle": "--seed 20260721"
+    },
+    {
+      "kind": "file_contains",
+      "path": "phoenix/QUICKSTART.md",
+      "needle": "deterministic"
+    },
+    {
+      "kind": "path_exists",
+      "path": "verification/rules.json"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "overview",
+  "description": "Canonical snapshot of the Overview section in README.md.",
+  "source": "README.md",
+  "kind": "text-section",
+  "section_heading": "## Overview"
+}
