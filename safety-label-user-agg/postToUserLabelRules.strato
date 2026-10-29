@@ -405,7 +405,7 @@ val defaultRulesJson =
                   "windowSize": 5,
                   "minimumMatchingPosts": 3,
                   "maxPostAgeDays": 60,
-                  "mediaOnly": false,
+                  "mediaOnly": true,
                   "postLabels": {
                     "anyOf": ["NSFW_HIGH_PRECISION"],
                     "allOf": []
