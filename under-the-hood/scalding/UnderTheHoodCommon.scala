@@ -12,8 +12,20 @@ object UnderTheHoodCommon {
 
   val DayMs: Long = 86400000L
   val TwitterEpochMs: Long = 1288834974657L
+  val maxPostIdsPerLabel: Int = 20
 
   def snowflakeCreatedMs(id: Long): Long = (id >> 22) + TwitterEpochMs
+
+  def mostRecentPostIds(postIds: Seq[Long]): Seq[Long] =
+    postIds.distinct.sortBy(id => (snowflakeCreatedMs(id), id)).reverse.take(maxPostIdsPerLabel)
+
+  def mergePostIds(
+    a: (Seq[Long], Boolean),
+    b: (Seq[Long], Boolean)
+  ): (Seq[Long], Boolean) = {
+    val distinctIds = (a._1 ++ b._1).distinct
+    (mostRecentPostIds(distinctIds), a._2 || b._2 || distinctIds.size > maxPostIdsPerLabel)
+  }
 
   private def utcCal(atMsec: Long): Calendar = {
     val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))

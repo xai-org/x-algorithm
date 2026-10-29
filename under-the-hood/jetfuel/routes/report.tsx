@@ -8,7 +8,7 @@ import type { AccountLabel, PostLabel, Report } from "./_lib/report";
 import { Body, Divider, Screen, downloadUrl, pilotCopy } from "./_lib/ui";
 
 const T = t.Object({
-	mock: t.Optional(t.Union([t.Literal("none"), t.Literal("pilot"), t.Literal("ineligible"), t.Literal("empty"), t.Literal("labels")])),
+	mock: t.Optional(t.Union([t.Literal("none"), t.Literal("pilot"), t.Literal("ineligible"), t.Literal("empty"), t.Literal("labels"), t.Literal("ids"), t.Literal("ids_truncated"), t.Literal("ids_unavailable")])),
 });
 
 const copy = {
@@ -46,6 +46,9 @@ const copy = {
 			total,
 			pct,
 		}),
+	postIdsTruncated: (count: number) =>
+		l("Showing {count} most recent posts", "Note below a post-label card when the report includes only the most recent post IDs.", { count }),
+	postIdsUnavailable: l("Post IDs are not available for this label", "Note below a post-label card when post IDs were not collected for the label."),
 	about: l("What it means", "Caption above the description of a label on the Under the hood report page."),
 	effect: l("Effect on visibility", "Caption above the visibility effect of a label on the Under the hood report page."),
 	download: l("Download this report (JSON)", "Link on the Under the hood report page that downloads the raw report file (web only)."),
@@ -67,6 +70,20 @@ const ShareBar = ({ part, total }: { part: number; total: number }) => {
 	return <View mod={track}>{width ? <View mod={`${fill} ${width}`} /> : null}</View>;
 };
 
+const PostIds = ({ label }: { label: PostLabel }) =>
+	label.postIdsAvailable === false ? (
+		<Text t={copy.postIdsUnavailable} mod={`${textSecondary} text-sm`} />
+	) : label.postIds ? (
+		<View mod="flex-col gap-1">
+			{label.postIdsTruncated ? <Text t={copy.postIdsTruncated(label.postIds.length)} mod={`${textSecondary} text-sm`} /> : null}
+			{label.postIds.map((id) => (
+				<Link url={`https://x.com/i/status/${id}`} scribe:press={{ element: "labeled_post" }} mod="hover:opacity-80">
+					<Text t={id} mod={`${textPrimary} font-mono text-sm underline`} />
+				</Link>
+			))}
+		</View>
+	) : null;
+
 const LabelCard = ({
 	code,
 	stat,
@@ -74,6 +91,7 @@ const LabelCard = ({
 	effect,
 	part,
 	total,
+	postIds,
 }: {
 	code: string;
 	stat: Localized;
@@ -81,6 +99,7 @@ const LabelCard = ({
 	effect: string;
 	part: number;
 	total: number;
+	postIds?: JetElement;
 }) => (
 	<View mod={`${cardSurface} flex-col gap-2 p-4`}>
 		<View mod="flex-row flex-wrap items-center justify-between gap-3">
@@ -98,6 +117,7 @@ const LabelCard = ({
 			<Text t={copy.effect} mod={`${textSecondary} text-sm`} />
 			<Text t={effect} mod={`${textPrimary} text-sm leading-snug`} />
 		</View>
+		{postIds ?? null}
 	</View>
 );
 
@@ -162,6 +182,7 @@ const body = (report: Report, download: string | undefined, note: TimelineRichTe
 					effect={label.effect}
 					part={label.posts}
 					total={label.totalPostsInMonth}
+					postIds={label.postIds || label.postIdsAvailable === false ? <PostIds label={label} /> : undefined}
 				/>
 			))}
 		/>,

@@ -1,10 +1,10 @@
 import type { TimelineRichTextFragment } from "@bird/gql/sdk";
 import type { Context } from "@serving";
 import { isProd } from "@serving";
-import { MOCK_EMPTY, MOCK_INFO, MOCK_INFO_INELIGIBLE, MOCK_LABELED, MOCK_NOTE } from "./mock";
+import { MOCK_EMPTY, MOCK_INFO, MOCK_INFO_INELIGIBLE, MOCK_LABELED, MOCK_NOTE, MOCK_POST_IDS, MOCK_POST_IDS_TRUNCATED, MOCK_POST_IDS_UNAVAILABLE } from "./mock";
 import { parseReport, type Report, type ReportInfo } from "./report";
 
-export type Mock = "none" | "pilot" | "ineligible" | "empty" | "labels";
+export type Mock = "none" | "pilot" | "ineligible" | "empty" | "labels" | "ids" | "ids_truncated" | "ids_unavailable";
 
 export type ReportState =
 	| { status: "unavailable" }
@@ -17,6 +17,9 @@ const MOCKS: Record<Mock, ReportState> = {
 	ineligible: { status: "ok", info: MOCK_INFO_INELIGIBLE, report: undefined, rawJson: undefined, note: undefined },
 	empty: { status: "ok", info: MOCK_INFO, report: MOCK_EMPTY, rawJson: JSON.stringify(MOCK_EMPTY, null, 2), note: MOCK_NOTE },
 	labels: { status: "ok", info: MOCK_INFO, report: MOCK_LABELED, rawJson: JSON.stringify(MOCK_LABELED, null, 2), note: MOCK_NOTE },
+	ids: { status: "ok", info: MOCK_INFO, report: MOCK_POST_IDS, rawJson: JSON.stringify(MOCK_POST_IDS, null, 2), note: MOCK_NOTE },
+	ids_truncated: { status: "ok", info: MOCK_INFO, report: MOCK_POST_IDS_TRUNCATED, rawJson: JSON.stringify(MOCK_POST_IDS_TRUNCATED, null, 2), note: MOCK_NOTE },
+	ids_unavailable: { status: "ok", info: MOCK_INFO, report: MOCK_POST_IDS_UNAVAILABLE, rawJson: JSON.stringify(MOCK_POST_IDS_UNAVAILABLE, null, 2), note: MOCK_NOTE },
 };
 
 export const canMock = (ctx: Context): boolean => !isProd || ctx.isDogfood;

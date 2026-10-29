@@ -397,6 +397,109 @@ def buildReportJson(
   }
 }
 
+def buildReportJsonWithPostIds(
+    userMonth: UthUserMonthAggregate,
+    monthBucket: Int,
+    generatedAtMs: Long,
+    periodDays: Int,
+    includeTakedowns: Boolean,
+    postIdsMax: Int
+): String = {
+  val postCount = userMonth.eligiblePostAgg
+    .map { days => sumDayCounts(Some(days)) }
+    .getOrElse(0L)
+  val period = {
+    startDate = periodStartDate(monthBucket),
+    endDate = periodEndDate(monthBucket),
+    timezone = "UTC",
+  }
+
+  val postLabels = userMonth.postLabelAgg
+    .getOrElse(Seq.empty)
+    .flatMap { agg =>
+      agg.label.flatMap { raw =>
+        postLabelRow(
+          raw,
+          agg.countryCodes.getOrElse(Seq.empty),
+          sumCarried(agg.days),
+          postCount,
+          includeTakedowns).map { row =>
+            val postIdsAvailable = underTheHoodLabels.isPostLabel(raw) && agg.postIds.exists { ids => true }
+            val postIds =
+              if (postIdsAvailable) { agg.postIds.getOrElse(Seq.empty) } else { Seq.empty[Long] }
+            {
+              label = row.label,
+              about = row.about,
+              effect = row.effect,
+              posts = row.posts,
+              totalPostsInMonth = row.totalPostsInMonth,
+              percentageOfPosts = row.percentageOfPosts,
+              postIds = postIds.take(postIdsMax).map { id => id.toString },
+              postIdsTruncated = postIdsAvailable &&
+                (agg.postIdsTruncated.getOrElse(false) || postIds.size > postIdsMax),
+              postIdsAvailable = postIdsAvailable,
+            }
+          }
+      }
+    }
+
+  val accountLabels = userMonth.accountLabelAgg
+    .getOrElse(Seq.empty)
+    .flatMap { agg =>
+      agg.label.flatMap { raw =>
+        val days = agg.activeDays.map { d => d.size.toLong }.getOrElse(0L)
+        accountLabelRow(
+          raw,
+          agg.countryCodes.getOrElse(Seq.empty),
+          days,
+          periodDays,
+          includeTakedowns)
+      }
+    }
+
+  if (postLabels.isEmpty && accountLabels.isEmpty) {
+    {
+      notes = reportNoteString,
+      period = period,
+      generatedAt = formatGeneratedAtIso(generatedAtMs),
+      postCount = postCount,
+      postLabels = postLabels,
+      accountLabels = accountLabels,
+      totalPostLabels = 0,
+      totalAccountLabels = 0,
+    }.toJson
+  } else if (postLabels.isEmpty) {
+    {
+      notes = reportNoteString,
+      period = period,
+      generatedAt = formatGeneratedAtIso(generatedAtMs),
+      postCount = postCount,
+      postLabels = postLabels,
+      accountLabels = accountLabels,
+      totalPostLabels = 0,
+    }.toJson
+  } else if (accountLabels.isEmpty) {
+    {
+      notes = reportNoteString,
+      period = period,
+      generatedAt = formatGeneratedAtIso(generatedAtMs),
+      postCount = postCount,
+      postLabels = postLabels,
+      accountLabels = accountLabels,
+      totalAccountLabels = 0,
+    }.toJson
+  } else {
+    {
+      notes = reportNoteString,
+      period = period,
+      generatedAt = formatGeneratedAtIso(generatedAtMs),
+      postCount = postCount,
+      postLabels = postLabels,
+      accountLabels = accountLabels,
+    }.toJson
+  }
+}
+
 def userWithQueryFields(
   userId: Long,
   queryFields: Set[com.twitter.gizmoduck.QueryFields]
@@ -444,6 +547,8 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
 
   val primaryMonth = reportMonthBucket(now, params.underTheHoodReportMaxMonthBucket())
   val includeTakedowns = params.underTheHoodReportTakedownsEnabled()
+  val configuredPostIdsMax = params.underTheHoodReportPostIdsMax()
+  val postIdsMax = if (configuredPostIdsMax > 20) { 20 } else { configuredPostIdsMax }
   val primaryUserKey: UthUserMonthKey = {
     userId = ctx.key,
     monthBucket = primaryMonth,
@@ -519,7 +624,13 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)
         val reportJson =
           if (ageOk && hasEnoughPosts) {
-            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns))
+            Some(
+              if (postIdsMax > 0) {
+                buildReportJsonWithPostIds(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns, postIdsMax)
+              } else {
+                buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns)
+              }
+            )
           } else {
             None
           }
