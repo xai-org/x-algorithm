@@ -4,7 +4,7 @@ import type { Report, ReportInfo } from "./report";
 export const MOCK_INFO: ReportInfo = {
 	reportPeriod: "August 2026",
 	eligibilityChecks: [
-		{ key: "10 or more posts in the prior month", value: true },
+		{ key: "10 or more posts in the report month", value: true },
 		{ key: "Account at least 1 year old", value: true },
 	],
 };
@@ -12,9 +12,29 @@ export const MOCK_INFO: ReportInfo = {
 export const MOCK_INFO_INELIGIBLE: ReportInfo = {
 	reportPeriod: "August 2026",
 	eligibilityChecks: [
-		{ key: "10 or more posts in the prior month", value: false },
+		{ key: "10 or more posts in the report month", value: false },
 		{ key: "Account at least 1 year old", value: true },
 	],
+};
+
+export const MOCK_INFO_CURRENT: ReportInfo = {
+	...MOCK_INFO,
+	servedPeriod: "August 2026",
+	targetPeriod: "August 2026",
+	periodStatus: "current",
+	nextReportNotBefore: "2026-10-10",
+};
+
+export const MOCK_INFO_DATA_PENDING: ReportInfo = {
+	...MOCK_INFO_CURRENT,
+	targetPeriod: "September 2026",
+	periodStatus: "data_pending",
+};
+
+export const MOCK_INFO_CAPPED: ReportInfo = {
+	...MOCK_INFO_CURRENT,
+	targetPeriod: "September 2026",
+	periodStatus: "capped",
 };
 
 export const MOCK_NOTE: TimelineRichTextFragment = {
@@ -72,4 +92,19 @@ export const MOCK_LABELED: Report = {
 			percentageOfDays: "16.12%",
 		},
 	],
+};
+
+export const MOCK_CURRENT: Report = {
+	...MOCK_EMPTY,
+	periodStatus: { served: "August 2026", target: "August 2026", status: "current", nextReportNotBefore: "2026-10-10" },
+};
+
+export const MOCK_DATA_PENDING: Report = {
+	...MOCK_CURRENT,
+	periodStatus: { served: "August 2026", target: "September 2026", status: "data_pending", nextReportNotBefore: "2026-10-10" },
+};
+
+export const MOCK_CAPPED: Report = {
+	...MOCK_CURRENT,
+	periodStatus: { served: "August 2026", target: "September 2026", status: "capped", nextReportNotBefore: "2026-10-10" },
 };

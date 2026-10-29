@@ -18,7 +18,7 @@ val metadataUserId = -1L
 val minimumAccountAge = 365.days
 val minimumEligiblePosts = 10L
 val minDaysAfterMonthEnd = 10
-val postsCheckLabel = "10 or more posts in the prior month"
+val postsCheckLabel = "10 or more posts in the report month"
 val ageCheckLabel = "Account at least 1 year old"
 val englishMonthNames = Seq(
   "January",
@@ -80,7 +80,7 @@ def linkEntity(fromIndex: Int, linkText: String, url: String): RichTextEntity = 
   })),
 }
 
-def reportNote(): RichText = {
+def reportNote(suffix: String): RichText = {
   val built = noteSpans.foldLeft[NoteBuild]({ text = "", entities = Seq.empty[RichTextEntity] }) { (acc, span) =>
     span.url match {
       case Some(url) => {
@@ -94,7 +94,7 @@ def reportNote(): RichText = {
     }
   }
   {
-    text = built.text,
+    text = built.text + suffix,
     entities = built.entities,
   }
 }
@@ -126,6 +126,16 @@ def monthBucketBefore(monthBucket: Int): Int = {
     (year - 1) * 100 + 12
   } else {
     year * 100 + (month - 1)
+  }
+}
+
+def monthBucketAfter(monthBucket: Int): Int = {
+  val year = monthBucket / 100
+  val month = monthBucket % 100
+  if (month == 12) {
+    (year + 1) * 100 + 1
+  } else {
+    year * 100 + (month + 1)
   }
 }
 
@@ -169,6 +179,28 @@ def reportPeriodLabel(monthBucket: Int): String = {
   val month = monthBucket % 100
   englishMonthNames.apply(month - 1) + " " + year.toString
 }
+
+type PeriodStatus = {
+  served: String,
+  target: String,
+  status: String,
+  nextReportNotBefore: String
+}
+
+def nextReportNotBefore(monthBucket: Int): String =
+  utcYyyyMmDd.format(
+    utcYyyyMmDd.parse(periodEndDate(monthBucketAfter(monthBucket))).plus(minDaysAfterMonthEnd.days))
+
+def periodStatusNote(periodStatus: Option[PeriodStatus]): String =
+  periodStatus.map { status =>
+    val availability =
+      if (status.status == "current") {
+        ""
+      } else {
+        status.target + " is not available yet; showing " + status.served + ". "
+      }
+    " " + availability + "Next report no earlier than " + status.nextReportNotBefore + " UTC."
+  }.getOrElse("")
 
 def calendarDaysInMonthBucket(monthBucket: Int): Int = {
   val year = monthBucket / 100
@@ -316,11 +348,14 @@ def buildReportJson(
     monthBucket: Int,
     generatedAtMs: Long,
     periodDays: Int,
-    includeTakedowns: Boolean
+    includeTakedowns: Boolean,
+    periodStatus: Option[PeriodStatus]
 ): String = {
   val postCount = userMonth.eligiblePostAgg
     .map { days => sumDayCounts(Some(days)) }
     .getOrElse(0L)
+  val noteSuffix = periodStatusNote(periodStatus)
+  val notes = reportNoteString + noteSuffix
   val period = {
     startDate = periodStartDate(monthBucket),
     endDate = periodEndDate(monthBucket),
@@ -355,45 +390,101 @@ def buildReportJson(
     }
 
   if (postLabels.isEmpty && accountLabels.isEmpty) {
-    {
-      notes = reportNoteString,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalPostLabels = 0,
-      totalAccountLabels = 0,
-    }.toJson
+    periodStatus match {
+      case Some(status) =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalPostLabels = 0,
+          totalAccountLabels = 0,
+          periodStatus = status,
+        }.toJson
+      case None =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalPostLabels = 0,
+          totalAccountLabels = 0,
+        }.toJson
+    }
   } else if (postLabels.isEmpty) {
-    {
-      notes = reportNoteString,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalPostLabels = 0,
-    }.toJson
+    periodStatus match {
+      case Some(status) =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalPostLabels = 0,
+          periodStatus = status,
+        }.toJson
+      case None =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalPostLabels = 0,
+        }.toJson
+    }
   } else if (accountLabels.isEmpty) {
-    {
-      notes = reportNoteString,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-      totalAccountLabels = 0,
-    }.toJson
+    periodStatus match {
+      case Some(status) =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalAccountLabels = 0,
+          periodStatus = status,
+        }.toJson
+      case None =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          totalAccountLabels = 0,
+        }.toJson
+    }
   } else {
-    {
-      notes = reportNoteString,
-      period = period,
-      generatedAt = formatGeneratedAtIso(generatedAtMs),
-      postCount = postCount,
-      postLabels = postLabels,
-      accountLabels = accountLabels,
-    }.toJson
+    periodStatus match {
+      case Some(status) =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+          periodStatus = status,
+        }.toJson
+      case None =>
+        {
+          notes = notes,
+          period = period,
+          generatedAt = formatGeneratedAtIso(generatedAtMs),
+          postCount = postCount,
+          postLabels = postLabels,
+          accountLabels = accountLabels,
+        }.toJson
+    }
   }
 }
 
@@ -442,6 +533,7 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
       meetsAccountAgeMinimum(user, now)
     }).getOrElse(false)
 
+  val calendarTargetMonth = reportMonthBucket(now, 0)
   val primaryMonth = reportMonthBucket(now, params.underTheHoodReportMaxMonthBucket())
   val includeTakedowns = params.underTheHoodReportTakedownsEnabled()
   val primaryUserKey: UthUserMonthKey = {
@@ -456,6 +548,21 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
   val usePrimary = monthDataReady(primaryMonth, primaryMeta, primaryUser)
   val monthBucket =
     if (usePrimary) { primaryMonth } else { monthBucketBefore(primaryMonth) }
+  val periodStatus: Option[PeriodStatus] =
+    if (params.underTheHoodReportStatusEnabled()) {
+      Some({
+        served = reportPeriodLabel(monthBucket),
+        target = reportPeriodLabel(calendarTargetMonth),
+        status =
+          if (monthBucket == calendarTargetMonth) { "current" }
+          else if (!usePrimary) { "data_pending" }
+          else { "capped" },
+        nextReportNotBefore = nextReportNotBefore(monthBucket),
+      })
+    } else {
+      None
+    }
+  val noteSuffix = periodStatusNote(periodStatus)
   val monthMetaOpt =
     if (usePrimary) {
       primaryMeta
@@ -489,7 +596,11 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
                 postsCheckLabel -> false,
                 ageCheckLabel -> ageOk,
               )),
-              note = Some(reportNote()),
+              note = Some(reportNote("")),
+              servedPeriod = periodStatus.map { status => status.served },
+              targetPeriod = periodStatus.map { status => status.target },
+              periodStatus = periodStatus.map { status => status.status },
+              nextReportNotBefore = periodStatus.map { status => status.nextReportNotBefore },
             }
             Ok.value(Some({
               reportJson = None,
@@ -513,13 +624,17 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         val reportInfo = {
           reportPeriod = Some(reportPeriodLabel(monthBucket)),
           eligibilityChecks = Some(eligibilityChecks),
-          note = Some(reportNote()),
+          note = Some(reportNote("")),
+          servedPeriod = periodStatus.map { status => status.served },
+          targetPeriod = periodStatus.map { status => status.target },
+          periodStatus = periodStatus.map { status => status.status },
+          nextReportNotBefore = periodStatus.map { status => status.nextReportNotBefore },
         }
         val generatedAtMs = generatedAtMillis(daysIncludedForTs, now.inMillis)
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)
         val reportJson =
           if (ageOk && hasEnoughPosts) {
-            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns))
+            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns, periodStatus))
           } else {
             None
           }

@@ -1,10 +1,22 @@
 import type { TimelineRichTextFragment } from "@bird/gql/sdk";
 import type { Context } from "@serving";
 import { isProd } from "@serving";
-import { MOCK_EMPTY, MOCK_INFO, MOCK_INFO_INELIGIBLE, MOCK_LABELED, MOCK_NOTE } from "./mock";
+import {
+	MOCK_CAPPED,
+	MOCK_CURRENT,
+	MOCK_DATA_PENDING,
+	MOCK_EMPTY,
+	MOCK_INFO,
+	MOCK_INFO_CAPPED,
+	MOCK_INFO_CURRENT,
+	MOCK_INFO_DATA_PENDING,
+	MOCK_INFO_INELIGIBLE,
+	MOCK_LABELED,
+	MOCK_NOTE,
+} from "./mock";
 import { parseReport, type Report, type ReportInfo } from "./report";
 
-export type Mock = "none" | "pilot" | "ineligible" | "empty" | "labels";
+export type Mock = "none" | "pilot" | "ineligible" | "empty" | "labels" | "current" | "data_pending" | "capped";
 
 export type ReportState =
 	| { status: "unavailable" }
@@ -17,6 +29,15 @@ const MOCKS: Record<Mock, ReportState> = {
 	ineligible: { status: "ok", info: MOCK_INFO_INELIGIBLE, report: undefined, rawJson: undefined, note: undefined },
 	empty: { status: "ok", info: MOCK_INFO, report: MOCK_EMPTY, rawJson: JSON.stringify(MOCK_EMPTY, null, 2), note: MOCK_NOTE },
 	labels: { status: "ok", info: MOCK_INFO, report: MOCK_LABELED, rawJson: JSON.stringify(MOCK_LABELED, null, 2), note: MOCK_NOTE },
+	current: { status: "ok", info: MOCK_INFO_CURRENT, report: MOCK_CURRENT, rawJson: JSON.stringify(MOCK_CURRENT, null, 2), note: MOCK_NOTE },
+	data_pending: {
+		status: "ok",
+		info: MOCK_INFO_DATA_PENDING,
+		report: MOCK_DATA_PENDING,
+		rawJson: JSON.stringify(MOCK_DATA_PENDING, null, 2),
+		note: MOCK_NOTE,
+	},
+	capped: { status: "ok", info: MOCK_INFO_CAPPED, report: MOCK_CAPPED, rawJson: JSON.stringify(MOCK_CAPPED, null, 2), note: MOCK_NOTE },
 };
 
 export const canMock = (ctx: Context): boolean => !isProd || ctx.isDogfood;
@@ -36,6 +57,10 @@ export const loadReport = async (
 			status: "ok",
 			info: {
 				reportPeriod: data.report_info.report_period ?? "",
+				servedPeriod: data.report_info.served_period ?? undefined,
+				targetPeriod: data.report_info.target_period ?? undefined,
+				periodStatus: data.report_info.period_status ?? undefined,
+				nextReportNotBefore: data.report_info.next_report_not_before ?? undefined,
 				eligibilityChecks: (data.report_info.eligibility_checks ?? []).map((c) => ({ key: c.key, value: c.value })),
 			},
 			report: parseReport(data.report_json),

@@ -469,6 +469,8 @@ We're piloting a new transparency tool that lets people see aggregate statistics
 
 The tool is [available here](https://x.com/i/jf/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/). The page that renders it is in [`under-the-hood/jetfuel/`](under-the-hood/jetfuel/).
 
+Report schedule: Reports are monthly, with a deliberate one-month lag: the calendar target is the prior UTC month, available no earlier than 10 days after month end (`minDaysAfterMonthEnd`). Before that floor, the target is the preceding month. The `under_the_hood_report_max_month_bucket` feature switch can cap the target month. If that month's data is incomplete, serving falls back one month; a report is returned only for complete data. A calendar floor is a "not before" date, not a promise of availability.
+
 ---
 
 
