@@ -18,6 +18,12 @@ val underTheHoodReportEnabled =
 val underTheHoodReportMaxMonthBucket =
   fs.intParam("under_the_hood_report_max_month_bucket", 0)
 
+val underTheHoodReportHistoryMonths =
+  fs.intParam("under_the_hood_report_history_months", 0)
+
+val underTheHoodReportStatusEnabled =
+  fs.booleanParam("under_the_hood_report_status_enabled", false)
+
 val underTheHoodReportTakedownsEnabled =
   fs.booleanParam("under_the_hood_report_takedowns_enabled", false)
 
@@ -25,6 +31,8 @@ Library({
   export = {
     underTheHoodReportEnabled = underTheHoodReportEnabled,
     underTheHoodReportMaxMonthBucket = underTheHoodReportMaxMonthBucket,
+    underTheHoodReportHistoryMonths = underTheHoodReportHistoryMonths,
+    underTheHoodReportStatusEnabled = underTheHoodReportStatusEnabled,
     underTheHoodReportTakedownsEnabled = underTheHoodReportTakedownsEnabled,
   },
   description = PlainText("Feature switch params for Under the Hood"),

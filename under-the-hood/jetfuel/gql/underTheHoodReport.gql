@@ -1,8 +1,13 @@
-query UserUnderTheHoodReport {
-  user_under_the_hood_report(safety_level: FilterAll) {
+query UserUnderTheHoodReport($month: Int) {
+  user_under_the_hood_report(safety_level: FilterAll, month: $month) {
     report_json
     report_info {
       report_period
+      served_period
+      target_period
+      period_status
+      next_report_not_before
+      available_months
       eligibility_checks {
         key
         value
