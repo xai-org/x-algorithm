@@ -30,7 +30,7 @@ impl Source<ScoredPostsQuery, FeedItem> for ReverseChronPostsSource {
         let result = self.pipeline.execute(query.clone()).await;
         let response_truncated = result.retrieved_candidates.len() >= FOLLOWING_POST_FETCH_SIZE;
         let bottom_tweet_id = result
-            .selected_candidates
+            .retrieved_candidates
             .iter()
             .map(|c| c.tweet_id)
             .filter(|&id| id > 0)
