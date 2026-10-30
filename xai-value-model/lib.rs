@@ -2,6 +2,7 @@ mod inputs;
 mod phoenix_scores;
 mod proto;
 mod scoring;
+mod user_value;
 mod weights;
 
 pub use inputs::{CandidateScoringInputs, QueryScoringContext};
@@ -11,5 +12,8 @@ pub use scoring::{
     compute_value_scores, compute_value_scores_with_adjustment, compute_weighted_score,
     diversity_multiplier, fuse_heads, offset_score, post_fusion_multipliers,
     set_user_video_continuation, unoffset_score,
+};
+pub use user_value::{
+    UserValueError, UserValuePredictions, UserValueWeights, compute_value_scores_with_user_value,
 };
 pub use weights::{NEGATIVE_SCORES_OFFSET, ValueModelWeights};
