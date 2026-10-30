@@ -4,6 +4,7 @@ use std::sync::Arc;
 use half::f16;
 use log::info;
 use rand::Rng;
+use xai_value_model::compare_scores_desc;
 use xai_vm_ranker_proto::{RankCandidate, RankRequest};
 
 use super::DppContext;
@@ -68,9 +69,7 @@ fn build_dpp_inputs(
         .collect();
 
     scored.sort_unstable_by(|(i_a, _, s_a), (i_b, _, s_b)| {
-        s_b.partial_cmp(s_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| i_a.cmp(i_b))
+        compare_scores_desc(*s_a, *s_b).then_with(|| i_a.cmp(i_b))
     });
 
     scored
@@ -144,11 +143,7 @@ pub fn rank_with_memo(
 
     if debug {
         let mut sorted_inputs: Vec<&DppInput> = inputs.iter().collect();
-        sorted_inputs.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted_inputs.sort_unstable_by(|a, b| compare_scores_desc(a.score, b.score));
 
         let dropped: Vec<(usize, u64)> = sorted_inputs
             .iter()
