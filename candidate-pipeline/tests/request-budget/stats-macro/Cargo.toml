@@ -1,0 +1,9 @@
+[package]
+name = "xai-stats-macro"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true
+path = "lib.rs"
