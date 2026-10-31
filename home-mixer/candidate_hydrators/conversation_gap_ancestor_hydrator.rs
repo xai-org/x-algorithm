@@ -31,20 +31,44 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for ConversationGapAncestorHydrat
             .into_iter()
             .collect();
 
-        let ancestor_core = if ancestor_ids.is_empty() {
+        let mut ancestor_core = if ancestor_ids.is_empty() {
             HashMap::new()
         } else {
             self.tes_client.get_tweet_core_datas(ancestor_ids).await
         };
 
-        candidates
+        let expanded: Vec<Vec<u64>> = candidates
             .iter()
             .map(|candidate| {
-                let ancestors = expand_ancestors_for_gap(&candidate.ancestors, &ancestor_core)
-                    .unwrap_or_else(|_| candidate.ancestors.to_vec());
+                expand_ancestors_for_gap(&candidate.ancestors, &ancestor_core)
+                    .unwrap_or_else(|_| candidate.ancestors.to_vec())
+            })
+            .collect();
+
+        let extra_ids: Vec<u64> = expanded
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|id| !ancestor_core.contains_key(id))
+            .collect();
+        if !extra_ids.is_empty() {
+            ancestor_core.extend(self.tes_client.get_tweet_core_datas(extra_ids).await);
+        }
+
+        candidates
+            .iter()
+            .zip(expanded)
+            .map(|(candidate, ancestors)| {
                 Ok(PostCandidate {
                     tombstone_ancestor_ids: tombstone_ancestor_ids(&ancestors, &ancestor_core),
-                    ancestor_texts: ancestor_texts(&candidate.ancestors, &ancestor_core),
+                    ancestor_texts: ancestor_texts(&ancestors, &ancestor_core),
+                    ancestor_users: merge_ancestor_users(
+                        &candidate.ancestor_users,
+                        &ancestors,
+                        &ancestor_core,
+                    ),
                     ancestors,
                     ..Default::default()
                 })
@@ -56,6 +80,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for ConversationGapAncestorHydrat
         candidate.ancestors = hydrated.ancestors;
         candidate.tombstone_ancestor_ids = hydrated.tombstone_ancestor_ids;
         candidate.ancestor_texts = hydrated.ancestor_texts;
+        candidate.ancestor_users = hydrated.ancestor_users;
     }
 }
 
@@ -103,6 +128,23 @@ fn ancestor_texts(
             _ => None,
         })
         .collect()
+}
+
+fn merge_ancestor_users(
+    existing: &[u64],
+    ancestors: &[u64],
+    ancestor_core: &HashMap<u64, anyhow::Result<Option<PureCoreData>>>,
+) -> Vec<u64> {
+    let mut users = existing.to_vec();
+    for id in ancestors {
+        if let Some(Ok(Some(data))) = ancestor_core.get(id)
+            && data.author_id != 0
+            && !users.contains(&data.author_id)
+        {
+            users.push(data.author_id);
+        }
+    }
+    users
 }
 
 #[cfg(test)]
@@ -153,6 +195,39 @@ mod tests {
     async fn deep_chain_inserts_grandparent() {
         let out = run(parent_core(20, Some(15)), vec![candidate(30, vec![20, 10])]).await;
         assert_eq!(out[0].ancestors, vec![20, 15, 10]);
+    }
+
+    #[tokio::test]
+    async fn spliced_grandparent_gets_text_users_and_tombstone() {
+        let mut core_data = parent_core(20, Some(15));
+        core_data.insert(
+            15,
+            Some(PureCoreData {
+                author_id: 1500,
+                text: "muted grandparent".to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut reply = candidate(30, vec![20, 10]);
+        reply.ancestor_users = vec![2000, 1000];
+        let out = run(core_data, vec![reply]).await;
+        assert_eq!(out[0].ancestors, vec![20, 15, 10]);
+        assert_eq!(
+            out[0].ancestor_texts.get(&15).map(String::as_str),
+            Some("muted grandparent")
+        );
+        assert!(out[0].ancestor_users.contains(&1500));
+        assert!(out[0].ancestor_users.contains(&2000));
+        assert!(out[0].tombstone_ancestor_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_spliced_grandparent_is_tombstone() {
+        let mut core_data = parent_core(20, Some(15));
+        core_data.insert(15, None);
+        let out = run(core_data, vec![candidate(30, vec![20, 10])]).await;
+        assert_eq!(out[0].ancestors, vec![20, 15, 10]);
+        assert_eq!(out[0].tombstone_ancestor_ids, vec![15]);
     }
 
     #[tokio::test]
@@ -227,6 +302,7 @@ mod tests {
         assert_eq!(candidates[1].ancestors, vec![20, 15, 10]);
         assert_eq!(candidates[2].ancestors, vec![40, 35, 10]);
         assert!(candidates[3].ancestors.is_empty());
-        assert_eq!(client.call_count(), 1);
+        // Original ancestor ids, then a second TES batch for spliced grandparents.
+        assert_eq!(client.call_count(), 2);
     }
 }
