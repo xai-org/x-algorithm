@@ -1,5 +1,5 @@
 use crate::clients::tweet_entity_service_client::TESClient;
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableQuotedVqvDurationCheck;
 use std::collections::HashMap;
@@ -195,7 +195,10 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
-        let tweet_ids: Vec<u64> = candidates.iter().map(|c| c.tweet_id).collect();
+        let tweet_ids: Vec<u64> = candidates
+            .iter()
+            .map(|c| c.get_original_tweet_id())
+            .collect();
 
         let mut cache_misses: Vec<u64> = Vec::new();
         let mut resolved: Vec<(u64, Option<u64>, Option<u64>)> =
@@ -302,5 +305,91 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
         candidate.quoted_has_video = hydrated.quoted_has_video;
         candidate.quoted_media_count = hydrated.quoted_media_count;
         candidate.quoted_max_video_duration_ms = hydrated.quoted_max_video_duration_ms;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clients::tweet_entity_service_client::MockTESClient;
+    use std::collections::HashMap;
+    use xai_candidate_pipeline::component_library::clients::MockSocialGraphClient;
+    use xai_candidate_pipeline::hydrator::Hydrator;
+    use xai_core_entities::entities::QuotedTweet;
+
+    fn tes_quote(
+        quoting_id: u64,
+        quoted_id: u64,
+        quoted_user: u64,
+    ) -> Arc<dyn TESClient + Send + Sync> {
+        let mut quoted_tweets = HashMap::new();
+        quoted_tweets.insert(
+            quoting_id,
+            Some(QuotedTweet {
+                tweet_id: quoted_id,
+                user_id: quoted_user,
+            }),
+        );
+        Arc::new(MockTESClient {
+            quoted_tweets,
+            ..Default::default()
+        })
+    }
+
+    async fn hydrate(
+        tes: Arc<dyn TESClient + Send + Sync>,
+        candidates: &[PostCandidate],
+    ) -> Vec<Result<PostCandidate, String>> {
+        let hydrator = QuoteHydrator::new(
+            tes,
+            Arc::new(MockSocialGraphClient) as Arc<dyn SocialGraphClientOps>,
+        )
+        .await;
+        hydrator
+            .hydrate(&ScoredPostsQuery::default(), candidates)
+            .await
+    }
+
+    #[tokio::test]
+    async fn native_quote_still_hydrates() {
+        let tes = tes_quote(20, 30, 99);
+        let candidates = vec![PostCandidate {
+            tweet_id: 20,
+            ..Default::default()
+        }];
+        let result = hydrate(tes, &candidates).await;
+        assert_eq!(result.len(), 1);
+        let hydrated = result[0].as_ref().unwrap();
+        assert_eq!(hydrated.quoted_tweet_id, Some(30));
+        assert_eq!(hydrated.quoted_user_id, Some(99));
+    }
+
+    #[tokio::test]
+    async fn retweet_of_quote_uses_original_tweet_id() {
+        let tes = tes_quote(20, 30, 99);
+        let candidates = vec![PostCandidate {
+            tweet_id: 10,
+            retweeted_tweet_id: Some(20),
+            ..Default::default()
+        }];
+        let result = hydrate(tes, &candidates).await;
+        assert_eq!(result.len(), 1);
+        let hydrated = result[0].as_ref().unwrap();
+        assert_eq!(hydrated.quoted_tweet_id, Some(30));
+        assert_eq!(hydrated.quoted_user_id, Some(99));
+    }
+
+    #[tokio::test]
+    async fn wrapper_id_is_not_the_tes_key() {
+        let tes = tes_quote(10, 30, 99);
+        let candidates = vec![PostCandidate {
+            tweet_id: 10,
+            retweeted_tweet_id: Some(20),
+            ..Default::default()
+        }];
+        let result = hydrate(tes, &candidates).await;
+        let hydrated = result[0].as_ref().unwrap();
+        assert_eq!(hydrated.quoted_tweet_id, None);
+        assert_eq!(hydrated.quoted_user_id, None);
     }
 }
