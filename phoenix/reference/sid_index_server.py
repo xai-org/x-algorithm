@@ -22,18 +22,27 @@ import sid_lookup_pb2_grpc
 
 
 def _load_index(parquet: str) -> tuple[np.ndarray, np.ndarray]:
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     t = pq.read_table(parquet, columns=["post_id", "post_sid"])
     pid = t.column("post_id").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64)
     sid_col = t.column("post_sid").combine_chunks()
-    width = len(sid_col[0].as_py())
-    flat = sid_col.values.to_numpy(zero_copy_only=False).astype(np.int32)
-    if flat.size != pid.size * width:
+    if sid_col.null_count:
+        raise ValueError("post_sid contains null rows")
+    if pa.types.is_fixed_size_list(sid_col.type):
+        row_lengths = np.full(len(sid_col), sid_col.type.list_size)
+    else:
+        row_lengths = np.diff(sid_col.offsets.to_numpy(zero_copy_only=False))
+    width = int(row_lengths[0])
+    if (row_lengths != width).any():
         raise ValueError(
-            f"post_sid is not fixed-width {width}: {flat.size} codes for "
-            f"{pid.size} posts (ragged list column not supported)"
+            f"post_sid is not fixed-width {width} "
+            "(ragged list column not supported)"
         )
+    if sid_col.values.null_count:
+        raise ValueError("post_sid contains null elements")
+    flat = sid_col.values.to_numpy(zero_copy_only=False).astype(np.int32)
     codes = flat.reshape(pid.size, width)
     order = np.argsort(pid, kind="stable")
     return pid[order], codes[order]
