@@ -1,0 +1,6 @@
+{
+  "name": "readme",
+  "description": "Canonical text snapshot of the repository README.",
+  "source": "README.md",
+  "kind": "text-file"
+}

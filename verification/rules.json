@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "seed_constant": 20260721,
+  "required_flows": ["repo-sanity", "phoenix-synth-smoke"],
+  "required_pages": ["readme", "overview"],
+  "rules": [
+    {
+      "id": "seed-present",
+      "description": "Seed state must exist and use the fixed seed constant"
+    },
+    {
+      "id": "seed-digest-stable",
+      "description": "Re-seeding with the same inputs must produce the same digest"
+    },
+    {
+      "id": "flows-passed",
+      "description": "Every required flow must have a passing run artifact"
+    },
+    {
+      "id": "screenshots-present",
+      "description": "Every required page must have a screenshot artifact"
+    },
+    {
+      "id": "screenshots-match-golden",
+      "description": "Screenshot digests must match committed goldens"
+    },
+    {
+      "id": "no-wall-clock",
+      "description": "Artifacts must not embed wall-clock timestamps"
+    }
+  ]
+}
