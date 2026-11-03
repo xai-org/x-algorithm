@@ -43,8 +43,11 @@ impl Filter<ScoredPostsQuery, PostCandidate> for ViewerMutedKeywordFilter {
             let mut removed = Vec::new();
 
             for candidate in candidates {
-                let tweet_text_token_sequence = tokenizer.tokenize(&candidate.tweet_text);
-                if matcher.matches(&tweet_text_token_sequence) {
+                let matches = std::iter::once(candidate.tweet_text.as_str())
+                    .chain(candidate.quoted_tweet_text.as_deref())
+                    .filter(|text| !text.is_empty())
+                    .any(|text| matcher.matches(&tokenizer.tokenize(text)));
+                if matches {
                     removed.push(candidate);
                 } else {
                     kept.push(candidate);
@@ -248,6 +251,25 @@ mod tests {
         assert_eq!(result.kept.len(), 1);
         assert_eq!(result.kept[0].tweet_id, 3);
         assert_eq!(result.removed.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_quoted_post_text_match() {
+        let filter = ViewerMutedKeywordFilter::new();
+        let query = create_test_query(vec!["spam".to_string()]);
+
+        let quoting = PostCandidate {
+            quoted_tweet_text: Some("spam giveaway".to_string()),
+            ..create_test_candidate(1, "look at this")
+        };
+        let candidates = vec![quoting, create_test_candidate(2, "This is good content")];
+
+        let result = filter.filter(&query, candidates);
+
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].tweet_id, 2);
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
