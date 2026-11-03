@@ -1,6 +1,6 @@
 use crate::hydration::Lookup;
 use crate::models::{
-    Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
+    Decided, Deletion, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
     MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
     Withholding,
@@ -780,6 +780,9 @@ pub(crate) fn evaluate_tweets_state(
         Evaluation::NotFound(_) => Some(TweetFieldsResultState::NotFound(
             TweetFieldsResultNotFound::new(false, false, None),
         )),
+        Evaluation::Deleted(deletion) => Some(TweetFieldsResultState::NotFound(
+            TweetFieldsResultNotFound::new(true, *deletion == Deletion::BounceDeleted, None),
+        )),
         Evaluation::Partial { .. } | Evaluation::Failed(_) => None,
     }
 }
@@ -825,9 +828,9 @@ pub(crate) fn notification_result(
         Some(Evaluation::NotFound(Lookup::Author | Lookup::SharedAuthor)) => {
             dropped(NotificationDropReason::ActorNotFound)
         }
-        Some(Evaluation::NotFound(Lookup::Tweet | Lookup::SharedTweet)) => {
-            dropped(NotificationDropReason::PostNotFound)
-        }
+        Some(
+            Evaluation::NotFound(Lookup::Tweet | Lookup::SharedTweet) | Evaluation::Deleted(_),
+        ) => dropped(NotificationDropReason::PostNotFound),
         Some(Evaluation::Complete { .. } | Evaluation::Partial { .. } | Evaluation::Failed(_))
         | None => (Outcome::Failed(vf_pb::Failed {}), ("failed", "none")),
     };

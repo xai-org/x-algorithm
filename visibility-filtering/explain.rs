@@ -460,6 +460,7 @@ impl Explainer {
                 }
             }
             Evaluation::NotFound(lookup) => Judgement::NotFound(*lookup),
+            Evaluation::Deleted(_) => Judgement::NotFound(Lookup::Tweet),
             Evaluation::Failed(lookup) => Judgement::Failed(*lookup),
         };
         LevelOutcome::new(level.route, level.capability, judgement, level.provenance)

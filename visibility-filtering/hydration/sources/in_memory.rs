@@ -69,6 +69,7 @@ pub(crate) struct InMemorySources {
     tweets: HashMap<u64, TweetFeatures>,
     controls: HashMap<u64, ConversationControl>,
     quoted_tweets: HashMap<u64, QuotedTweet>,
+    tweet_states: HashMap<u64, TweetState>,
     labels: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,
     viewers: HashMap<u64, GizmoduckUser>,
     users: HashMap<u64, GizmoduckUserResult>,
@@ -157,6 +158,11 @@ impl InMemorySources {
     pub(crate) fn quote(mut self, outer: u64, tweet_id: u64, user_id: u64) -> Self {
         self.quoted_tweets
             .insert(outer, QuotedTweet { tweet_id, user_id });
+        self
+    }
+
+    pub(crate) fn tweet_state(mut self, tweet_id: u64, state: TweetState) -> Self {
+        self.tweet_states.insert(tweet_id, state);
         self
     }
 
@@ -538,6 +544,11 @@ impl Sources for InMemorySources {
 
     async fn quoted_tweets(&self, outer_ids: &[u64]) -> RawHydrationBatch<QuotedTweet> {
         self.keyed(Source::TesQuotedTweet, outer_ids, &self.quoted_tweets)
+            .await
+    }
+
+    async fn tweet_states(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetState> {
+        self.keyed(Source::TesTweetState, tweet_ids, &self.tweet_states)
             .await
     }
 

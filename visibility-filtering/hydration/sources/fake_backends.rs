@@ -391,6 +391,7 @@ impl Rpc for Strato {
     async fn issue3(&self, request: Request<Issue3>) -> Result<Response<ResultList>, Status> {
         use Thrift::{Bool, Set, Str, Struct, I32, I64};
         const SOFT_DELETED: i32 = 2;
+        const BOUNCE_DELETED: i32 = 15;
         fn asks(call: &Call3, id: u64) -> bool {
             let key = match call.path.as_str() {
                 "trusted-friends/visibility-filtering/isMember.TrustedFriendsList"
@@ -427,6 +428,7 @@ impl Rpc for Strato {
                 let value = match call.path.as_str() {
                     _ if asks(call, MISSING) => None,
                     "tweetypie/federated/tweetForVisibility.Tweet" => Some(tweet()),
+                    "tweetypie/federated/tweetState.Tweet" => Some(I32(BOUNCE_DELETED)),
                     "communities/moderationState.TweetCommunityRelationship"
                     | "communities/moderationState.UserCommunityRelationship" => {
                         Some(Struct(vec![(2, Struct(vec![]))]))
@@ -607,6 +609,7 @@ fn held() -> InMemorySources {
             .tweet_features(TWEET, tweet_features())
             .control(TWEET, conversation_control())
             .quote(TWEET, SOURCE_TWEET, SOURCE_AUTHOR)
+            .tweet_state(TWEET, TweetState::BounceDeleted)
             .labels(TWEET, labels())
             .labels(MISSING, vf_pb::SafetyLabelMap::default())
             .viewer(VIEWER, viewer())
@@ -702,6 +705,10 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
         Source::TesQuotedTweet => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
             shown(unanswered, &sources.quoted_tweets(&keys).await, &keys)
+        }
+        Source::TesTweetState => {
+            let keys = [TWEET, MISSING, FAILED, ABSENT];
+            shown(unanswered, &sources.tweet_states(&keys).await, &keys)
         }
         Source::SafetyLabels => {
             let keys = [TWEET, MISSING, FAILED];

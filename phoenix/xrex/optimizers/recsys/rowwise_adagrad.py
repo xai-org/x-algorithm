@@ -138,11 +138,6 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
         metrics: dict[str, jax.Array] = {}
         lazy_options: dict[str, Any] = {}
         if self._weight_decay_exempt_window > 0 or self._stochastic_rounding:
-            if not row_sharded:
-                raise ValueError(
-                    "weight_decay_exempt_window and stochastic_rounding are implemented in the "
-                    "row_emb kernel only (use_row_emb=True)"
-                )
             lazy_options = {
                 "weight_decay_exempt_window": self._weight_decay_exempt_window,
                 "stochastic_rounding": self._stochastic_rounding,

@@ -534,6 +534,7 @@ fn filter_tweets_response_is_warm(outcomes: &[PostEvaluation]) -> bool {
             Lookup::Tweet => false,
             Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
         },
+        Evaluation::Deleted(_) => false,
         Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
     })
 }

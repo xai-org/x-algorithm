@@ -8,6 +8,7 @@ use crate::hydration::hydrator::{Edge, NodeSpec, RequestRows, UserPair};
 use crate::hydration::inventory::{Answer, Effect, Source, Stake, claimed_answer_fails, classify};
 use crate::hydration::plan::Group;
 use crate::hydration::relation::{Related, Relation, Role, Trigger};
+use crate::hydration::tweet_source::TweetState;
 use crate::hydration::{
     Cause, HydratedTweet, HydratedUser, Hydration, HydrationPlan, HydrationRequest, Hydrator,
     Hydrators, QuoteEntry,
@@ -119,6 +120,7 @@ pub(super) struct Store {
     pure_cores: Fetchers<PureCore>,
     tweets: Fetcher<TweetFeatures>,
     controls: Fetcher<ConversationControl>,
+    tweet_states: Fetcher<TweetState>,
     labels: Fetchers<Arc<vf_pb::SafetyLabelMap>>,
     viewer: Fetcher<DecodedViewer>,
     authors: Fetchers<DecodedAuthor>,
@@ -339,6 +341,7 @@ impl Store {
             Source::TesTweetForVisibility => &self.tweets,
             Source::TesConversationControl => &self.controls,
             Source::TesQuotedTweet => &self.quotes.quoted_tweets,
+            Source::TesTweetState => &self.tweet_states,
             Source::SafetyLabels => self.labels.of(owner),
             Source::GizmoduckViewer => &self.viewer,
             Source::GizmoduckAuthor => self.authors.of(owner),
@@ -368,6 +371,7 @@ impl Store {
             Source::TesTweetForVisibility => &mut self.tweets,
             Source::TesConversationControl => &mut self.controls,
             Source::TesQuotedTweet => &mut self.quotes.quoted_tweets,
+            Source::TesTweetState => &mut self.tweet_states,
             Source::SafetyLabels => self.labels.of_mut(owner),
             Source::GizmoduckViewer => &mut self.viewer,
             Source::GizmoduckAuthor => self.authors.of_mut(owner),
@@ -453,6 +457,7 @@ impl Store {
             | Source::TesTweetForVisibility
             | Source::TesConversationControl
             | Source::TesQuotedTweet
+            | Source::TesTweetState
             | Source::SafetyLabels
             | Source::GizmoduckViewer
             | Source::GizmoduckAuthor
@@ -526,6 +531,7 @@ impl Store {
                 self.quotes.quoted_tweets.land(keys, quoted_tweets);
                 self.land_authors();
             }
+            Reply::TweetStates(states) => self.tweet_states.land(keys, states),
             Reply::Labels(labels) => self.labels.of_mut(owner).land(keys, labels),
             Reply::Viewer(viewer) => self.viewer.land(keys, viewer),
             Reply::Authors(authors) => {

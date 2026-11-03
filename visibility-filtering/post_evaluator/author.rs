@@ -32,6 +32,7 @@ impl AuthorJudgement {
             evaluation @ (Evaluation::Complete { .. }
             | Evaluation::Partial { .. }
             | Evaluation::NotFound(_)
+            | Evaluation::Deleted(_)
             | Evaluation::Failed(_)) => evaluation,
         })
     }

@@ -1682,6 +1682,7 @@ country_specific_nsfw_content_gating:
                             Evaluation::Complete { .. }
                             | Evaluation::Partial { .. }
                             | Evaluation::NotFound(_)
+                            | Evaluation::Deleted(_)
                             | Evaluation::Failed(_) => {}
                         }
                     }

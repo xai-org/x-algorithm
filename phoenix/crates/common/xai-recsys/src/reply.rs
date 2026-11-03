@@ -313,6 +313,10 @@ fn record_candidate_fill(feature: &str, filled: u64, total: u64) {
         .inc_by(total.saturating_sub(filled));
 }
 
+pub(crate) fn is_reply_width(n_post_int64: usize) -> bool {
+    n_post_int64 > REPLY_SELF_REPLY_INT64_INDEX
+}
+
 impl InputBuffer {
     pub fn apply_reply_features(
         &mut self,
@@ -452,7 +456,7 @@ impl InputBuffer {
             record_candidate_fill("post_language", lang_filled, candidates_to_process as u64);
         }
 
-        if n_post_int64 <= REPLY_SELF_REPLY_INT64_INDEX {
+        if !is_reply_width(n_post_int64) {
             return;
         }
         let extras = &reply.extras;

@@ -297,7 +297,8 @@ class DenseBlock(hk.Module):
                     with_bias=self.config.with_bias,
                     sharding_context=self.sharding_context,
                     pspec=weights_pspec,
-                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
+                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size)
+                    * self.scale_config.transformer_matrix_lr_scale,
                     init_scale=self.scale_config.ffn_init_scale,
                     name="gate_up_proj" + self.suffix_name,
                     dot=fp8_dot,
@@ -316,7 +317,8 @@ class DenseBlock(hk.Module):
                     with_bias=self.config.with_bias,
                     sharding_context=self.sharding_context,
                     pspec=weights_pspec,
-                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
+                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size)
+                    * self.scale_config.transformer_matrix_lr_scale,
                     init_scale=self.scale_config.ffn_init_scale,
                     name="up_proj" + self.suffix_name,
                     dot=fp8_dot,
@@ -327,7 +329,8 @@ class DenseBlock(hk.Module):
                     with_bias=self.config.with_bias,
                     sharding_context=self.sharding_context,
                     pspec=weights_pspec,
-                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
+                    lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size)
+                    * self.scale_config.transformer_matrix_lr_scale,
                     init_scale=self.scale_config.ffn_init_scale,
                     name="gate_proj" + self.suffix_name,
                     dot=fp8_dot,
@@ -342,7 +345,8 @@ class DenseBlock(hk.Module):
                 w_init=initializer,
                 with_bias=self.config.with_bias,
                 pspec=weights_pspec,
-                lr_multiplier=self.scale_config.ffn_output_lr_multiplier(ffn_size_, gated_mlp=True),
+                lr_multiplier=self.scale_config.ffn_output_lr_multiplier(ffn_size_, gated_mlp=True)
+                * self.scale_config.transformer_matrix_lr_scale,
                 init_scale=self.scale_config.ffn_init_scale,
                 sharding_context=self.sharding_context,
                 name="down_proj" + self.suffix_name,
@@ -358,7 +362,8 @@ class DenseBlock(hk.Module):
                 with_bias=self.config.with_bias,
                 sharding_context=self.sharding_context,
                 pspec=weights_pspec,
-                lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
+                lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size)
+                * self.scale_config.transformer_matrix_lr_scale,
                 name="up_proj" + self.suffix_name,
                 dot=up_dot,
             )(inputs)
@@ -370,7 +375,8 @@ class DenseBlock(hk.Module):
                 w_init=initializer,
                 with_bias=self.config.with_bias,
                 pspec=weights_pspec,
-                lr_multiplier=self.scale_config.ffn_output_lr_multiplier(ffn_size_, gated_mlp=True),
+                lr_multiplier=self.scale_config.ffn_output_lr_multiplier(ffn_size_, gated_mlp=True)
+                * self.scale_config.transformer_matrix_lr_scale,
                 sharding_context=self.sharding_context,
                 name="down_proj" + self.suffix_name,
                 dot=down_dot,

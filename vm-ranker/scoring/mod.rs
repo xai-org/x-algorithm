@@ -147,6 +147,10 @@ fn ranked_candidates(
             tweet_id: c.tweet_id,
             score,
             weighted_score: weighted.map(|vm| vm.weighted[i]),
+            top_heads: weighted
+                .and_then(|vm| vm.top_heads.as_ref())
+                .map(|heads| heads[i].clone())
+                .unwrap_or_default(),
         })
         .collect()
 }

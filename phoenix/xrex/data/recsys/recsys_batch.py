@@ -1658,6 +1658,15 @@ def from_record_batch(
         alloc=alloc,
     )
 
+    if not reply_parent_mode:
+        hist_request_sec, cand_request_sec, cand_latest_history_sec = compute_time_gap_timestamps(
+            history_seq, candidate_seq_with_negatives, max_candidate_post_action_pairs
+        )
+        cand_int64 = candidate_seq_with_negatives["int64_features"]
+        history_seq["int64_features"][..., Int64Feature.requestTimeSecSeq] = hist_request_sec
+        cand_int64[..., Int64Feature.requestTimeSecSeq] = cand_request_sec
+        cand_int64[..., Int64Feature.latestHistoryImpressionTimeSecSeq] = cand_latest_history_sec
+
     user_ip_ids = np.zeros(batch_size, dtype=np.int64)
     for user_idx in range(batch_size):
         for ip_arr in (candidate_ip_ids, history_ip_ids):
@@ -2372,6 +2381,27 @@ def compute_local_time_features(
     return (
         np.where(valid, hour + 1, 0).astype(np.int16),
         np.where(valid, dow + 1, 0).astype(np.int16),
+    )
+
+
+def compute_time_gap_timestamps(
+    history_seq: PostSeq, candidate_seq: PostSeq, num_own_candidates: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    hist_ts = history_seq["impr_ts"].astype(np.int64)
+    cand_ts = candidate_seq["impr_ts"].astype(np.int64)
+    hist_real = history_seq["post_hashes"][..., 0] != 0
+    cand_real = candidate_seq["post_hashes"][..., 0] != 0
+
+    no_ts = np.iinfo(np.int64).max
+    own_ts = np.where(cand_real & (cand_ts > 0), cand_ts, no_ts)[:, :num_own_candidates]
+    request = own_ts.min(axis=1, keepdims=True, initial=no_ts)
+    request = np.where(request == no_ts, 0, request)
+    hist_counts = hist_real & (hist_ts > 0) & (hist_ts <= request)
+    latest = np.where(hist_counts, hist_ts, 0).max(axis=1, keepdims=True, initial=0)
+    return (
+        np.where(hist_real, request, 0),
+        np.where(cand_real, request, 0),
+        np.where(cand_real, latest, 0),
     )
 
 

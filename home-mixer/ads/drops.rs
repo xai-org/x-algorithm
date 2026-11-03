@@ -23,6 +23,9 @@ impl AdDrops {
 pub(crate) fn logged_ad_info(ad: &AdIndexInfo) -> AdIndexInfo {
     AdIndexInfo {
         account_id: ad.account_id,
+        line_item_id: ad.line_item_id,
+        campaign_id: ad.campaign_id,
+        line_item_objective: ad.line_item_objective,
         insert_position: ad.insert_position,
         ad_adjacency_control: ad
             .ad_adjacency_control
@@ -41,8 +44,6 @@ pub(crate) fn dropped_ad(ad: &AdIndexInfo, reason: AdDropReason) -> DroppedAd {
         impression_id: ad.impression_id as u64,
         drop_reason: reason.into(),
         ad_info: Some(AdIndexInfo {
-            line_item_id: ad.line_item_id,
-            campaign_id: ad.campaign_id,
             funnel_traced: ad.funnel_traced,
             ..logged_ad_info(ad)
         }),

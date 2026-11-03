@@ -40,6 +40,7 @@ from xrex.data.recsys.constants import (
     NEGATIVE_FEEDBACK_HEAD_INDICES,
     PURCHASE_VALUE_ACTION_INDEX,
     SEARCH_RELEVANCE_ACTION_INDICES,
+    VIEW_LOSS_ACTION_INDICES,
     LineItemObjective,
     action_type_map,
     engagement_to_ids,
@@ -1317,6 +1318,8 @@ class RecsysAggregatedModelConfig(Config):
     serve_late_window_composed: bool = False
 
     mact_in_app_loss_weight: float = 1.0
+
+    view_loss_weight: float = 1.0
 
     condition_search_relevance_on_prompt: bool = False
 
@@ -3294,7 +3297,7 @@ class RecsysAggregatedModel(hk.Module):
             dtype=jnp.float32,
             init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
             pspec=out_pspec,
-            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(emb_size),
+            lr_multiplier=_config.model_config.scale_config.head_lr_multiplier(emb_size),
             rms_clip_axes=(-1, -2),
         )
         self.unembed_mat: jax.Array = with_sharding_constraint_unless_manual(unembed_mat, out_pspec)
@@ -3332,7 +3335,7 @@ class RecsysAggregatedModel(hk.Module):
             dtype=jnp.float32,
             init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
             pspec=out_pspec,
-            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(emb_size),
+            lr_multiplier=_config.model_config.scale_config.head_lr_multiplier(emb_size),
             rms_clip_axes=(-1, -2),
         )
         return with_sharding_constraint_unless_manual(unembed_mat, out_pspec)
@@ -3459,7 +3462,7 @@ class RecsysAggregatedModel(hk.Module):
             dtype=jnp.float32,
             init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
             pspec=P(None, None),
-            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(emb_size),
+            lr_multiplier=_config.model_config.scale_config.head_lr_multiplier(emb_size),
             rms_clip_axes=(-1, -2),
         )
         cread_logits = jnp.dot(inputs.astype(unembed_mat.dtype), unembed_mat)
@@ -4997,6 +5000,14 @@ class RecsysAggregatedModel(hk.Module):
             )
             loss_mask = loss_mask * mact_w
 
+        if self.config.view_loss_weight != 1.0:
+            view_w = (
+                jnp.ones(num_actions)
+                .at[jnp.array(VIEW_LOSS_ACTION_INDICES)]
+                .set(self.config.view_loss_weight)
+            )
+            loss_mask = loss_mask * view_w
+
         if self.config.condition_search_relevance_on_prompt:
             prompt_shown = jnp.any(targets[:, :, SEARCH_RELEVANCE_ACTION_INDICES], axis=-1)
             no_prompt = 1 - prompt_shown
@@ -5377,6 +5388,7 @@ class RecsysAggregatedModel(hk.Module):
             1.0 if self.config.safety_filter_mode != "off" else 0.0
         )
         stats["mact-in-app-loss-weight"] = jnp.float32(self.config.mact_in_app_loss_weight)
+        stats["view-loss-weight"] = jnp.float32(self.config.view_loss_weight)
 
         conversion_delay_ms = None
         if self.config.conversion_delay_slices():

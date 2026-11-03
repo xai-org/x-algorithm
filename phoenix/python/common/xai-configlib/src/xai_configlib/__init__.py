@@ -385,6 +385,8 @@ def replace_recursive(
                 elif dataclasses.is_dataclass(item):
                     new_item = replace_recursive(item, item_path, key_path, value, used)
                     new_dict[k] = new_item
+                elif isinstance(item, dict):
+                    new_dict[k] = _replace_in_nested_dict(item, item_path, key_path, value, used)
                 else:
                     new_dict[k] = item
             if attr != new_dict:
@@ -398,6 +400,27 @@ def replace_recursive(
                 new_dcls = dataclasses.replace(new_dcls, **{name: cast_type(ty, value)})
             used.append(path)
     return new_dcls
+
+
+def _replace_in_nested_dict(
+    mapping: dict[object, object],
+    current_path: tuple[str, ...],
+    key_path: tuple[str, ...],
+    value: str,
+    used: list[tuple[str, ...]],
+) -> dict[object, object]:
+    new_mapping: dict[object, object] = {}
+    for k, item in mapping.items():
+        item_path = current_path + (str(k),)
+        if item_path[-len(key_path) :] == key_path:
+            is_scalar = isinstance(item, (bool, int, float))
+            new_mapping[k] = cast_type(type(item), value) if is_scalar else value
+            used.append(item_path)
+        elif isinstance(item, dict):
+            new_mapping[k] = _replace_in_nested_dict(item, item_path, key_path, value, used)
+        else:
+            new_mapping[k] = item
+    return new_mapping
 
 
 def cast_type(ty: Type[Any], val: str):

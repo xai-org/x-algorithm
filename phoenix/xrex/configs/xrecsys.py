@@ -486,6 +486,24 @@ MODEL_CFGS = {
             "candidate_only_attn_impl": "cutedsl_ranker_candidate_only_attn",
             "fp8_gemms": Fp8Gemms.ALL,
             "metrics_ndcg_shared_sorts": True,
+            "view_loss_weight": 0.5,
+            "feature_prep": replace(
+                _home_direct_packed_base()["feature_prep"],
+                enable_time_gap=True,
+                time_gap_lr_scale=4.0,
+            ),
+            "optim_config": replace(_H100_OVERRIDES["optim_config"], clip_by_global_norm=1.4),
+            "emb_optim_config": RecsysEmbeddingOptimConfig(
+                rowwise_adagrad=replace(
+                    _H100_OVERRIDES["emb_optim_config"].rowwise_adagrad,
+                    weight_decay=5.6e-4,
+                    weight_decay_exempt_window=37,
+                    stochastic_rounding=True,
+                ),
+            ),
+            "scale_config": ScaleConfig(
+                transformer_matrix_lr_scale=0.25, head_lr_scale=0.25, hidden_proj_lr_scale=0.25
+            ),
         },
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
@@ -689,7 +707,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
         user_features_mlp=mparams.get("user_features_mlp", False),
     )
 
-    scale_config = _default_recsys_scaling()
+    scale_config = mparams.get("scale_config", _default_recsys_scaling())
     feature_prep = _make_feature_prep_config(mparams, scale_config)
     use_user_embedding = mparams.get("use_user_embedding", True)
     use_post_embedding = mparams.get("use_post_embedding", True)
@@ -754,6 +772,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             wallclock_recency=mparams.get("wallclock_recency", False),
             ads_counts_emb_dim=mparams.get("ads_counts_emb_dim", 0),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
+            view_loss_weight=mparams.get("view_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
             value_loss_normalization=mparams.get("value_loss_normalization", "valid_rows"),
