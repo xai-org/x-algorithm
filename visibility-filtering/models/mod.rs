@@ -14,7 +14,7 @@ pub use tweet::{
     TweetFeatures,
 };
 pub use verdict::{
-    Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
+    Decided, Deletion, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
     MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
     Withholding,

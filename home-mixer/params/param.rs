@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-30T22:59:56Z
+// mirrored from config feature-switch defaults; last sync 2026-11-02T16:00:39Z
 use xai_feature_switches::param;
 
 param!(
@@ -938,7 +938,7 @@ param!(
     AdsBlenderType,
     String,
     "rust_home_mixer_ads_blender",
-    "slot_spread"
+    "multi_risk"
 );
 
 param!(
@@ -1247,6 +1247,12 @@ param!(
     bool,
     "rust_home_mixer_enable_video_carousel_high_risk_filter",
     true
+);
+param!(
+    EnableVideoCarouselMediumRiskFilter,
+    bool,
+    "rust_home_mixer_enable_video_carousel_medium_risk_filter",
+    false
 );
 param!(
     EnableVideoCarouselCandidatesLogging,

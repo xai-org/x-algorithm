@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::scorer::Scorer;
 use xai_stats_receiver::global_stats_receiver;
-use xai_vm_ranker_proto::{RankRequest, RankResponse};
+use xai_vm_ranker_proto::{RankRequest, RankResponse, RankedCandidate};
 
 const METRIC_PREFIX: &str = "VMRanker";
 
@@ -113,18 +113,23 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             }
         };
 
-        let returned: FxHashMap<u64, (f64, Option<f64>)> = response
+        let mut returned: FxHashMap<u64, RankedCandidate> = response
             .candidates
-            .iter()
-            .map(|sc| (sc.tweet_id, (sc.score, sc.weighted_score)))
+            .into_iter()
+            .map(|sc| (sc.tweet_id, sc))
             .collect();
 
         let mut missing = 0;
         for (c, out) in candidates.iter().zip(scored.iter_mut()) {
-            match returned.get(&c.tweet_id) {
-                Some(&(score, weighted)) => {
-                    out.score = Some(score);
-                    out.weighted_score = weighted.or(out.weighted_score);
+            match returned.remove(&c.tweet_id) {
+                Some(sc) => {
+                    out.score = Some(sc.score);
+                    out.weighted_score = sc.weighted_score.or(out.weighted_score);
+                    out.top_heads = sc
+                        .top_heads
+                        .into_iter()
+                        .map(|h| (h.head, h.contribution, h.share))
+                        .collect();
                 }
                 None => missing += 1,
             }
@@ -140,6 +145,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         candidate.score = scored.score;
         candidate.cold_start_lift_to_rank = scored.cold_start_lift_to_rank;
         candidate.slate_context = scored.slate_context;
+        candidate.top_heads = scored.top_heads;
     }
 }
 

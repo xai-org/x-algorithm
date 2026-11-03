@@ -250,7 +250,7 @@ impl TweetypieReference {
                     verdict,
                     fail_open_defaults,
                 } => !matches!(verdict, Verdict::Withheld(_)) && fail_open_defaults.is_empty(),
-                Evaluation::NotFound(_) => true,
+                Evaluation::NotFound(_) | Evaluation::Deleted(_) => true,
                 Evaluation::Partial { .. } | Evaluation::Failed(_) => false,
             })
             .map(|outcome| outcome.tweet_id)
@@ -549,7 +549,7 @@ fn vf_status(evaluation: &Evaluation) -> &'static str {
     match evaluation {
         Evaluation::Complete { .. } => "Evaluated",
         Evaluation::Partial { .. } => "Failed",
-        Evaluation::NotFound(_) => "NotFound",
+        Evaluation::NotFound(_) | Evaluation::Deleted(_) => "NotFound",
         Evaluation::Failed(_) => "LookupFailed",
     }
 }

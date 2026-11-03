@@ -340,7 +340,7 @@ fn outcome(evaluation: &Evaluation) -> (&'static str, Vec<&'static str>) {
     let completeness = match evaluation {
         Evaluation::Complete { .. } => "Complete",
         Evaluation::Partial { .. } => "Partial",
-        Evaluation::NotFound(_) => "NotFound",
+        Evaluation::NotFound(_) | Evaluation::Deleted(_) => "NotFound",
         Evaluation::Failed(_) => "Failed",
     };
     let kinds = match evaluation.verdict() {

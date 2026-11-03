@@ -68,9 +68,13 @@ class Int64Feature(enum.IntEnum):
     firstDpaProductKeyHash2 = 12
     webConvTimeOnSiteInferredMsSeq = 13
     webConvTimeOnSiteMeasuredMsSeq = 14
+    requestTimeSecSeq = 15
+    latestHistoryImpressionTimeSecSeq = 16
 
 
-COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset({"firstDpaProductKeyHash2"})
+COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset(
+    {"firstDpaProductKeyHash2", "requestTimeSecSeq", "latestHistoryImpressionTimeSecSeq"}
+)
 
 
 ADS_PRODUCT_KEY_TABLE_SIZE = 10_000_000

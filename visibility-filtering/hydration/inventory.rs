@@ -75,6 +75,7 @@ pub(crate) enum Source {
     TesTweetForVisibility,
     TesConversationControl,
     TesQuotedTweet,
+    TesTweetState,
     SafetyLabels,
     GizmoduckViewer,
     GizmoduckAuthor,
@@ -103,6 +104,7 @@ impl Source {
             | Source::GizmoduckActor => true,
             Source::TesConversationControl
             | Source::TesQuotedTweet
+            | Source::TesTweetState
             | Source::SafetyLabels
             | Source::GizmoduckViewer
             | Source::Flock

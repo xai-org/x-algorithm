@@ -2,10 +2,11 @@ use crate::models::viewer::Client;
 use crate::result_label::{debug_label, state_label, Label, NONE};
 use anyhow::{anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
+use xai_safety_label_store::types::{label_meta, label_type_from_ident};
 use xai_visibility_filtering::evaluated::EvaluationResult;
 use xai_visibility_filtering::vf_client::XaiVfClient;
 use xai_visibility_filtering_proto as vf_pb;
@@ -14,6 +15,7 @@ use xai_x_thrift::action::{Action, InterstitialAction, MediaInterstitial};
 use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
 use xai_x_thrift::safety_level::SafetyLevel;
 use xai_x_thrift::safety_result::FilteredReason;
+use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
 pub const GRPC_PORT: u16 = 50051;
 
@@ -24,6 +26,8 @@ const CALL_TIMEOUT_MS: u64 = 5_000;
 struct CaseFile {
     fixtures: BTreeMap<String, u64>,
     cases: Vec<CaseSpec>,
+    #[serde(default)]
+    safety_labels: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +81,13 @@ pub struct VerdictFields {
     reason: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+enum Expect {
+    Verdict(VerdictFields),
+    SafetyLabels(BTreeSet<String>),
+}
+
 pub struct Case {
     name: String,
     viewer_id: Option<u64>,
@@ -85,7 +96,7 @@ pub struct Case {
     client: Client,
     quoted_in: Option<u64>,
     filter_tweets_at: Option<FilterLevel>,
-    expect: VerdictFields,
+    expect: Expect,
 }
 
 pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
@@ -123,7 +134,7 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
                 client: case.client,
                 quoted_in: case.quoted_in.as_deref().map(id).transpose()?,
                 filter_tweets_at,
-                expect: expect.clone(),
+                expect: Expect::Verdict(expect.clone()),
             })
         };
         calls.push(call(name.clone(), None, &case.expect)?);
@@ -132,32 +143,63 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
             calls.push(call(on, Some(*level), expect)?);
         }
     }
+    for (post, labels) in &file.safety_labels {
+        if let Some(unknown) = labels.iter().find(|l| label_type_from_ident(l).is_none()) {
+            bail!("{post}: no label type {unknown}");
+        }
+        calls.push(Case {
+            name: format!("{post} on get_safety_labels"),
+            viewer_id: None,
+            post_id: id(post)?,
+            country: us(),
+            client: Client::Web,
+            quoted_in: None,
+            filter_tweets_at: None,
+            expect: Expect::SafetyLabels(labels.clone()),
+        });
+    }
     Ok(calls)
 }
 
 pub enum Answer {
     EvaluateTweets(anyhow::Result<Vec<EvaluationResult>>),
     FilterTweets(anyhow::Result<vf_pb::VisibilityFilterResponse>),
+    GetSafetyLabels(anyhow::Result<vf_pb::GetSafetyLabelsResponse>),
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 enum CaseResult {
-    Pass { got: VerdictFields },
-    Wrong { got: VerdictFields },
+    Pass { got: Expect },
+    Wrong { got: Expect },
     CallFailed { error: String },
 }
 
 #[derive(Serialize)]
 pub struct CaseLine<'a> {
     case: &'a str,
-    expect: &'a VerdictFields,
+    expect: &'a Expect,
     #[serde(flatten)]
     result: CaseResult,
 }
 
 impl Case {
     pub async fn ask(&self, channel: &Channel) -> Answer {
+        if let Expect::SafetyLabels(_) = self.expect {
+            return Answer::GetSafetyLabels(
+                async {
+                    let mut request = tonic::Request::new(vf_pb::GetSafetyLabelsRequest {
+                        tweet_ids: vec![self.post_id],
+                    });
+                    request.set_timeout(Duration::from_millis(CALL_TIMEOUT_MS));
+                    let response = VisibilityFilteringServiceClient::new(channel.clone())
+                        .get_safety_labels(request)
+                        .await?;
+                    anyhow::Ok(response.into_inner())
+                }
+                .await,
+            );
+        }
         let Some(level) = self.filter_tweets_at else {
             return Answer::EvaluateTweets(
                 async {
@@ -224,14 +266,15 @@ impl Case {
     }
 
     pub fn judge(&self, answer: &Answer) -> CaseLine<'_> {
-        let verdict = |(class, reason): Label| {
-            let got = VerdictFields { class, reason };
+        let judged = |got: Expect| {
             if got == self.expect {
                 CaseResult::Pass { got }
             } else {
                 CaseResult::Wrong { got }
             }
         };
+        let verdict =
+            |(class, reason): Label| judged(Expect::Verdict(VerdictFields { class, reason }));
         let failed = |error: String| CaseResult::CallFailed { error };
         let result = match answer {
             Answer::EvaluateTweets(answer) => {
@@ -248,6 +291,16 @@ impl Case {
             Answer::FilterTweets(answer) => match answer.as_ref().map(|r| r.results.first()) {
                 Ok(Some(result)) => verdict(filter_label(result)),
                 Ok(None) => failed("no result".to_string()),
+                Err(err) => failed(format!("{err:#}")),
+            },
+            Answer::GetSafetyLabels(answer) => match answer {
+                Ok(response) if response.failed_ids.contains(&self.post_id) => {
+                    failed("VF answered failed".to_string())
+                }
+                Ok(response) => match response.results.get(&self.post_id) {
+                    Some(labels) => judged(Expect::SafetyLabels(label_types(labels))),
+                    None => failed("no result".to_string()),
+                },
                 Err(err) => failed(format!("{err:#}")),
             },
         };
@@ -305,6 +358,15 @@ fn filter_label(result: &vf_pb::TweetVisibilityResult) -> Label {
     )
 }
 
+fn label_types(labels: &vf_pb::SafetyLabelMap) -> BTreeSet<String> {
+    labels
+        .labels
+        .keys()
+        .filter_map(|&value| label_meta(SafetyLabelType::from(value)))
+        .map(|meta| meta.ident.to_owned())
+        .collect()
+}
+
 impl CaseLine<'_> {
     pub fn call_failed(&self) -> bool {
         matches!(self.result, CaseResult::CallFailed { .. })
@@ -332,11 +394,11 @@ mod tests {
         alias: Option<String>,
     }
 
-    fn fields(class: &str, reason: &str) -> VerdictFields {
-        VerdictFields {
+    fn fields(class: &str, reason: &str) -> Expect {
+        Expect::Verdict(VerdictFields {
             class: class.to_string(),
             reason: reason.to_string(),
-        }
+        })
     }
 
     fn case(quoted_in: Option<u64>) -> Case {
@@ -407,16 +469,17 @@ mod tests {
         let calls = parse_cases(text).unwrap();
         let named: Vec<_> = calls
             .iter()
-            .map(|call| (call.name.as_str(), call.expect.class.as_str()))
+            .map(|call| (call.name.as_str(), call.expect.clone()))
             .collect();
+        let allow = fields("allow", "none");
         assert_eq!(
             named,
             [
-                ("v x p", "allow"),
-                ("v x p on filter_tweets/timeline_home", "allow"),
+                ("v x p", allow.clone()),
+                ("v x p on filter_tweets/timeline_home", allow),
                 (
                     "v x p on filter_tweets/timeline_home_recommendations",
-                    "drop"
+                    fields("drop", "contain_nsfw_media")
                 ),
             ]
         );
@@ -606,6 +669,85 @@ mod tests {
             Answer::FilterTweets(Ok(vf_pb::VisibilityFilterResponse { results: vec![] })),
         ] {
             assert!(case.judge(&answer).call_failed());
+        }
+    }
+
+    #[test]
+    fn parse_adds_a_get_safety_labels_call_per_listed_post() {
+        let text = r#"{"fixtures": {"p": 2, "q": 3}, "cases": [],
+            "safety_labels": {"p": ["NSFW_HIGH_PRECISION", "BOUNCE"], "q": []}}"#;
+        let sent: Vec<_> = parse_cases(text)
+            .unwrap()
+            .into_iter()
+            .map(|call| (call.name, call.post_id, call.expect))
+            .collect();
+        let labels = |names: &[&str]| {
+            Expect::SafetyLabels(names.iter().map(|name| name.to_string()).collect())
+        };
+        assert_eq!(
+            sent,
+            [
+                (
+                    "p on get_safety_labels".to_string(),
+                    2,
+                    labels(&["BOUNCE", "NSFW_HIGH_PRECISION"])
+                ),
+                ("q on get_safety_labels".to_string(), 3, labels(&[])),
+            ]
+        );
+        for unknown in [
+            r#"{"fixtures": {}, "cases": [], "safety_labels": {"p": []}}"#,
+            r#"{"fixtures": {"p": 2}, "cases": [], "safety_labels": {"p": ["BOUNC"]}}"#,
+        ] {
+            assert!(parse_cases(unknown).is_err(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn judge_compares_the_post_s_label_type_names() {
+        let case = parse_cases(
+            r#"{"fixtures": {"p": 2}, "cases": [], "safety_labels": {"p": ["BOUNCE", "NSFW_HIGH_PRECISION"]}}"#,
+        )
+        .unwrap()
+        .remove(0);
+        let label_map = |types: &[SafetyLabelType]| vf_pb::SafetyLabelMap {
+            labels: types
+                .iter()
+                .map(|&label_type| (i32::from(label_type), vf_pb::SafetyLabel::default()))
+                .collect(),
+        };
+        let answer = |results: Vec<(u64, vf_pb::SafetyLabelMap)>, failed_ids| {
+            Answer::GetSafetyLabels(Ok(vf_pb::GetSafetyLabelsResponse {
+                results: results.into_iter().collect(),
+                failed_ids,
+            }))
+        };
+        let both = label_map(&[
+            SafetyLabelType::NSFW_HIGH_PRECISION,
+            SafetyLabelType::BOUNCE,
+        ]);
+        assert_eq!(
+            case.judge(&answer(vec![(2, both)], vec![])).result,
+            CaseResult::Pass {
+                got: case.expect.clone()
+            }
+        );
+        let unmapped = label_map(&[
+            SafetyLabelType::BOUNCE,
+            SafetyLabelType::HIGH_SPAMMY_TWEET_CONTENT_SCORE,
+        ]);
+        assert_eq!(
+            case.judge(&answer(vec![(2, unmapped)], vec![])).result,
+            CaseResult::Wrong {
+                got: Expect::SafetyLabels(BTreeSet::from(["BOUNCE".to_string()]))
+            }
+        );
+        for failed in [
+            answer(vec![(3, label_map(&[]))], vec![]),
+            answer(vec![], vec![2]),
+            Answer::GetSafetyLabels(Err(anyhow!("deadline exceeded"))),
+        ] {
+            assert!(case.judge(&failed).call_failed());
         }
     }
 }

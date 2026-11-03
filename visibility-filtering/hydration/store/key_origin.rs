@@ -4,7 +4,7 @@ use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::UserPair;
 use crate::hydration::relation::Related;
 use crate::hydration::{Cause, Hydrator, Hydrators, RequestRows};
-use crate::models::{AuthorId, ClientSwitch, TweetId};
+use crate::models::{AuthorId, ClientSwitch, RetweetMerge, TweetId};
 use std::fmt;
 use std::num::NonZeroU64;
 use strum::VariantArray;
@@ -36,6 +36,7 @@ pub(in crate::hydration) enum KeyOrigin {
     QuotedAuthorToQuotingAuthor,
     QuotingAuthorToProtectedQuotedAuthor,
     OuterOfMissingQuote,
+    MissingRequestTweet,
     UserIfViewerFiltersNoConfirmedEmail,
     UserIfViewerFiltersNoConfirmedPhone,
     AuthorIfViewerFiltersNoConfirmedEmail,
@@ -425,6 +426,20 @@ impl KeyOrigin {
                             store.existence_miss(H::PureCore, tweet_id.0) == Some(Cause::NotFound)
                         })
                         .map(|outer| outer.0)
+                }),
+            },
+            K::MissingRequestTweet => Spec {
+                label: "missing_request_tweet",
+                input: Some(H::Tweet),
+                also_reads: NOTHING,
+                names: Names::Post,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| {
+                    let tweet_id = row.tweet_id()?;
+                    let missing = store.retweet_merge == RetweetMerge::Merged
+                        && store.requested_tweet_ids.contains(&tweet_id)
+                        && store.existence_miss(H::Tweet, tweet_id.0) == Some(Cause::NotFound);
+                    missing.then_some(tweet_id.0)
                 }),
             },
             K::UserIfViewerFiltersNoConfirmedEmail => Spec {

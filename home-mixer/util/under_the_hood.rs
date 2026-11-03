@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use xai_candidate_pipeline::pipeline_summary::{ComponentTrace, PipelineTrace, StageTrace};
 use xai_home_mixer_proto as pb;
 
@@ -78,16 +76,14 @@ pub fn post_scores(query: &ScoredPostsQuery, candidate: &PostCandidate) -> pb::U
     pb::UnderTheHoodScores {
         weighted_score: candidate.weighted_score,
         value_model: value_model.to_string(),
-        head_scores: head_scores(candidate),
-    }
-}
-
-fn head_scores(candidate: &PostCandidate) -> HashMap<String, f64> {
-    match serde_json::to_value(&candidate.phoenix_scores) {
-        Ok(serde_json::Value::Object(fields)) => fields
-            .into_iter()
-            .filter_map(|(name, value)| value.as_f64().map(|v| (name, v)))
+        top_heads: candidate
+            .top_heads
+            .iter()
+            .map(|&(ref head, contribution, share)| pb::HeadContribution {
+                head: head.clone(),
+                contribution,
+                share,
+            })
             .collect(),
-        _ => HashMap::new(),
     }
 }

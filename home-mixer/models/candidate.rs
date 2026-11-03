@@ -28,6 +28,8 @@ pub struct PostCandidate {
     #[serde(default)]
     pub cold_start_lift_to_rank: Option<u32>,
     pub slate_context: Option<SlateContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_heads: Vec<(String, f64, f64)>,
     #[serde(default)]
     pub served_slate_context: Option<SlateContext>,
     #[serde(default)]

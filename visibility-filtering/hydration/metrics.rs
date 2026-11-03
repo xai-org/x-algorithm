@@ -3,11 +3,13 @@ use std::hash::Hash;
 
 use tracing::debug;
 
-use crate::hydration::batch::{Hydrated, HydrationBatch};
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::sources::Expired;
+use crate::hydration::tweet_source::TweetState;
 use crate::metrics::families::{
     FALLBACK_CACHE_KEYS, FALLBACK_CACHE_RESIDENT_KEYS, FLOCK_MISSING_KEYS, HYDRATOR_KEYS,
-    HYDRATOR_LATENCY_MS, HYDRATOR_REQUESTS, HYDRATOR_TWEET_IDS, REQUEST_COUNTRY, VIEWER_COUNTRY,
+    HYDRATOR_LATENCY_MS, HYDRATOR_REQUESTS, HYDRATOR_TWEET_IDS, REQUEST_COUNTRY, TWEET_STATE,
+    VIEWER_COUNTRY,
 };
 use crate::metrics::{Metrics, RequestMetrics};
 use crate::params::CountryList;
@@ -157,6 +159,26 @@ pub(crate) fn record_keyed_hydrator_request<K, V>(
 
 pub(crate) fn record_viewer_country(metrics: &RequestMetrics, result: &'static str) {
     metrics.count(&VIEWER_COUNTRY, [result], 1);
+}
+
+pub(crate) fn record_tweet_states(
+    metrics: &RequestMetrics,
+    states: RawHydrationBatch<TweetState>,
+) -> RawHydrationBatch<TweetState> {
+    let answers = states.into_hydrated();
+    let mut keys_by_state: FxHashMap<&'static str, u64> = FxHashMap::default();
+    for answer in answers.values() {
+        let state = match answer {
+            Hydrated::Found(state) | Hydrated::Partial(state) => (*state).into(),
+            Hydrated::NotFound => TweetState::NotFound.into(),
+            Hydrated::Failed | Hydrated::Unanswered => "failed",
+        };
+        *keys_by_state.entry(state).or_default() += 1;
+    }
+    for (state, keys) in keys_by_state {
+        metrics.count(&TWEET_STATE, [state], keys);
+    }
+    HydrationBatch::from_hydrated(answers)
 }
 
 const REQUEST_COUNTRY_EXTRA: [&str; 28] = [

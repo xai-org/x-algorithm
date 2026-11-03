@@ -234,6 +234,9 @@ pub(crate) const VIEWER_COUNTRY: Counter<1, ByRequest> =
 pub(crate) const VIEWER_STATE: Counter<1, ByRequest> =
     Counter::by_request("vf_viewer_state", &["state"]);
 
+pub(crate) const TWEET_STATE: Counter<1, ByRequest> =
+    Counter::by_request("vf_tweet_state", &["state"]);
+
 pub(crate) const REQUEST_COUNTRY: Counter<1, Plain> =
     Counter::plain("vf_request_country", &["country"]);
 
@@ -384,6 +387,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     REQUEST_LATENCY_MS.family,
     REQUESTS.family,
     REQUESTS_BY_CALLER.family,
+    TWEET_STATE.family,
     TWEETYPIE_REFERENCE_BATCHES.family,
     TWEETYPIE_REFERENCE_COMPARE.family,
     UNRESOLVED_TWEETS.family,

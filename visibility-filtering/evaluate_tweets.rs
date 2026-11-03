@@ -533,6 +533,117 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_requested_post_tes_reports_missing_sends_its_deletion_state_when_tweet_state_answers(
+    ) {
+        use crate::hydration::fallback_cache::FallbackCaches;
+        use crate::hydration::tweet_source::TweetState;
+        use crate::hydration::BEST_EFFORT_HYDRATION_TIMEOUT;
+        use crate::metrics::families::TWEET_STATE;
+        use crate::quote::{QuotePassMode, QuotePassRunner};
+        use crate::scenario::{raw, Scenario};
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .retweet(8, 10, 9, Some(10))
+                .tweet(11, 99)
+                .authors(&[10])
+                .tweet_state(2, TweetState::BounceDeleted)
+                .tweet_state(3, TweetState::Deleted)
+                .tweet_state(4, TweetState::NotFound)
+                .tweet_state(5, TweetState::Found)
+                .tweet_state(6, TweetState::BounceDeleted)
+                .fail_key(Source::TesTweetState, 6)
+                .tweet_state(9, TweetState::Deleted)
+        };
+        let deleted = |bounce_deleted| {
+            encoded(&TweetFieldsResultState::NotFound(
+                TweetFieldsResultNotFound::new(true, bounce_deleted, None),
+            ))
+        };
+        let sources = Arc::new(world());
+        let (metrics, recording) = Metrics::recording();
+        let wire = Wire::serving(
+            Arc::<InMemorySources>::clone(&sources),
+            FallbackCaches::default(),
+            None,
+            QuotePassRunner::new(QuotePassMode::Off),
+            metrics,
+        );
+        let sent = wire
+            .send(vf_pb::EvaluateTweetsRequest {
+                safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
+                viewer_id: Some(VIEWER),
+                tweets: [1, 2, 3, 4, 5, 6, 7, 8, 11]
+                    .map(|tweet_id| tweet_data(tweet_id, None))
+                    .to_vec(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sent,
+            [
+                shown(),
+                deleted(true),
+                deleted(false),
+                not_found(),
+                not_found(),
+                not_found(),
+                not_found(),
+                not_found(),
+                not_found(),
+            ]
+        );
+        assert_eq!(
+            sources.keys(Source::TesTweetState),
+            [vec![2, 3, 4, 5, 6, 7]]
+        );
+        let mut states: Vec<(String, f64)> = recording
+            .take(&TWEET_STATE.family)
+            .into_iter()
+            .map(|sample| (sample.label("state").unwrap().to_owned(), sample.value))
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = [
+            ("bounce_deleted", 1.0),
+            ("deleted", 1.0),
+            ("failed", 1.0),
+            ("found", 1.0),
+            ("not_found", 2.0),
+        ];
+        assert_eq!(
+            states,
+            expected.map(|(state, keys)| (state.to_owned(), keys))
+        );
+
+        let filter_tweets = Scenario::new(world(), SafetyLevel::TimelineHomeHydration);
+        let filtered = filter_tweets.sources();
+        filter_tweets.hydrate(&[raw(2, None)]).await;
+        assert!(filtered.keys(Source::TesTweetState).is_empty());
+
+        let hung = world().fault(Source::TesTweetState, Fault::Hangs);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            evaluate_tweets(hung, ThriftLevel::TIMELINE_HOME_HYDRATION, &[1, 2]).await,
+            [shown(), not_found()]
+        );
+        assert_eq!(started.elapsed(), BEST_EFFORT_HYDRATION_TIMEOUT);
+
+        let budget = BEST_EFFORT_HYDRATION_TIMEOUT / 2;
+        let hung = Scenario::new(
+            world().fault(Source::TesTweetState, Fault::Hangs),
+            SafetyLevel::TimelineHomeHydration,
+        )
+        .retweet_merge(RetweetMerge::Merged);
+        let started = tokio::time::Instant::now();
+        xai_x_rpc::CallContext {
+            deadline: Some(started + budget),
+        }
+        .scope(hung.hydrate(&[raw(2, None)]))
+        .await;
+        assert_eq!(started.elapsed(), budget);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_hung_flock_call_fails_a_post_only_through_a_must_have_node_it_carries() {
         use crate::hydration::{
             Hydrator, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT, INBOUND_ALLOWANCE,

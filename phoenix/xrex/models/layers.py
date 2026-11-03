@@ -158,7 +158,10 @@ class MultiHeadAttention(hk.Module):
         assert num_q_heads % num_kv_heads == 0
 
         input_size = input_to_query.shape[-1]
-        lr_multiplier = self.scale_config.hidden_lr_multiplier(input_size)
+        lr_multiplier = (
+            self.scale_config.hidden_lr_multiplier(input_size)
+            * self.scale_config.transformer_matrix_lr_scale
+        )
 
         qkv_pspec = P(
             self.data_axis,
@@ -319,7 +322,10 @@ class MultiHeadAttention(hk.Module):
             ),
         )
 
-        lr_multiplier = self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+        lr_multiplier = (
+            self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+            * self.scale_config.transformer_matrix_lr_scale
+        )
 
         embeddings = self._out_projection(
             attn,
@@ -348,7 +354,8 @@ class MultiHeadAttention(hk.Module):
             with_bias=self.config.with_bias,
             name=f"qkv{self.name_suffix}",
             pspec=P(None, None),
-            lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size),
+            lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size)
+            * self.scale_config.transformer_matrix_lr_scale,
             sharding_context=self.sharding_context,
             dot=Fp8Dot(self.fp8_gemms),
         )
@@ -688,7 +695,8 @@ class CandidateOnlyAttention(MultiHeadAttention):
             w_init=self.w_init,
             with_bias=config.with_bias,
             pspec=P(None, None),
-            lr_multiplier=self.scale_config.attn_output_lr_multiplier(attn.shape[-1]),
+            lr_multiplier=self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+            * self.scale_config.transformer_matrix_lr_scale,
             rms_clip_axes=(-2, -1),
             name=f"out{self.name_suffix}",
         )

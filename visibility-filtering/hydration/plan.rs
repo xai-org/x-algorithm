@@ -3,7 +3,7 @@ use crate::hydration::fetcher::{AskedFields, FetcherId};
 use crate::hydration::hydrator::{Edge, Part, RequestRows};
 use crate::hydration::relation::{Relation, Role};
 use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
-use crate::rules::{Expansion, SafetyLevel};
+use crate::rules::{Expansion, Rpc, SafetyLevel};
 use std::fmt;
 use std::iter;
 use std::time::Duration;
@@ -32,7 +32,15 @@ pub(super) struct Group {
 
 impl HydrationPlan {
     pub(crate) fn new(level: SafetyLevel, hydrators: Hydrators) -> Self {
-        Self::with_rows(level, level.spec().rows(), hydrators)
+        let rows = level.spec().rows();
+        let asks_tweet_state = level.is_carried_by(Rpc::EvaluateTweets)
+            && hydrators.closed(rows).contains(Hydrator::Tweet);
+        let hydrators = if asks_tweet_state {
+            hydrators.with(Hydrator::TweetState)
+        } else {
+            hydrators
+        };
+        Self::with_rows(level, rows, hydrators)
     }
 
     pub(crate) fn with_rows(level: SafetyLevel, rows: RequestRows, hydrators: Hydrators) -> Self {

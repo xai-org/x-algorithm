@@ -304,6 +304,7 @@ fn record_unresolved<'a>(
     for evaluation in evaluations {
         let unresolved = match *evaluation {
             Evaluation::NotFound(lookup) => (lookup, Cause::NotFound),
+            Evaluation::Deleted(_) => (Lookup::Tweet, Cause::NotFound),
             Evaluation::Failed(lookup) => (lookup, Cause::Failed),
             Evaluation::Complete { .. } | Evaluation::Partial { .. } => continue,
         };
