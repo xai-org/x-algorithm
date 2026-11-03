@@ -16,7 +16,8 @@ pub(crate) struct RequestShape {
 impl RequestShape {
     pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
         Self {
-            debias: !query.has_cached_posts && query.params.get(VMRankerSendDebiasInputs),
+            debias: (!query.has_cached_posts || query.is_under_the_hood_request)
+                && query.params.get(VMRankerSendDebiasInputs),
             pacing: query.params.get(VMRankerSendPacingInputs),
             history_topics: query.params.get(VMRankerSendHistoryTopics)
                 && query.history_topics.is_some(),
@@ -41,6 +42,7 @@ impl RequestShape {
             compute_value_model: true,
             viewer: query.fs_recipient_inputs.as_ref().map(viewer_context_proto),
             topic_request: query.is_topic_request(),
+            include_top_heads: query.is_under_the_hood_request,
             ..Default::default()
         };
         if self.debias || self.history_topics {

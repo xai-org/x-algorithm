@@ -253,6 +253,8 @@ fn head_field(head: &str) -> Option<ScoreField> {
         "click" => |s| &mut s.click_score,
         "profile_click" => |s| &mut s.profile_click_score,
         "share" => |s| &mut s.share_score,
+        "share_copylink" => |s| &mut s.share_via_copy_link_score,
+        "share_dm" => |s| &mut s.share_via_dm_score,
         "open_link" => |s| &mut s.open_link_score,
         "video_open" => |s| &mut s.video_open_score,
         "post_unexplored" => |s| &mut s.post_unexplored_score,

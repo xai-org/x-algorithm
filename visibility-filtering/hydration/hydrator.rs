@@ -54,6 +54,7 @@ pub enum Hydrator {
     AuthorFollowsViewer,
     AuthorConfirmedEmail,
     AuthorVerifiedPhone,
+    TweetState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -529,6 +530,13 @@ impl Hydrator {
                 K::UserIfViewerFiltersNoConfirmedPhone,
                 ("notifinfra", "actor_phones"),
                 MustHave,
+            ),
+            H::TweetState => node(
+                S::TesTweetState,
+                Part::Column,
+                K::MissingRequestTweet,
+                ("tes", "tweet_state"),
+                Absent(Tier::BestEffort),
             ),
         }
     }

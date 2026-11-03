@@ -165,44 +165,23 @@ mod tests {
     use crate::hydration::sources::InMemorySources;
     use crate::metrics::Metrics;
     use crate::params::ClientSwitches;
-    use crate::safety_label_source::metrics::LabelMetrics;
-    use crate::safety_label_source::remote::{FailureKind, LookupResults, RemoteLabels};
-    use crate::safety_label_source::LookupError;
-    use crate::safety_label_source::SafetyLabelSource;
     use crate::scenario::{tweet_data, Wire};
     use std::collections::HashMap;
+    use xai_safety_label_source::testing::FakeLabels;
     use xai_visibility_filtering::vf_client::XaiVfClient;
     use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
     use xai_x_thrift::safety_result::FilteredReason;
+    use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
     use xai_x_thrift::tweet_service::{
         TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,
         TweetFieldsResultState,
     };
 
-    struct NoLabels;
-
-    #[tonic::async_trait]
-    impl RemoteLabels for NoLabels {
-        async fn get(&self, ids: &[u64]) -> LookupResults {
-            ids.iter().map(|&id| (id, Ok(Default::default()))).collect()
-        }
-    }
-
-    struct LabelsForPostOne;
-
-    #[tonic::async_trait]
-    impl RemoteLabels for LabelsForPostOne {
-        async fn get(&self, ids: &[u64]) -> LookupResults {
-            ids.iter()
-                .map(|&id| {
-                    let result = if id == 1 {
-                        Ok(post_one_labels())
-                    } else {
-                        Err(LookupError::new(FailureKind::ManhattanFetch, "down"))
-                    };
-                    (id, result)
-                })
-                .collect()
+    fn post_one_label() -> SafetyLabel {
+        SafetyLabel {
+            score: Some(0.5.into()),
+            source: Some("botmaker".to_owned()),
+            ..Default::default()
         }
     }
 
@@ -231,11 +210,7 @@ mod tests {
                 None,
             ),
             get_safety_labels: GetSafetyLabelsEndpoint::new(
-                Arc::new(SafetyLabelSource::new(
-                    Arc::new(NoLabels),
-                    Some(1024),
-                    LabelMetrics::default(),
-                )),
+                Arc::new(FakeLabels::default().into_source()),
                 Metrics::none(),
             ),
         }
@@ -314,11 +289,12 @@ mod tests {
     async fn get_safety_labels_loopback() {
         let (channel, handle) = serve(VFServer {
             get_safety_labels: GetSafetyLabelsEndpoint::new(
-                Arc::new(SafetyLabelSource::new(
-                    Arc::new(LabelsForPostOne),
-                    Some(1024),
-                    LabelMetrics::default(),
-                )),
+                Arc::new(
+                    FakeLabels::default()
+                        .label(1, SafetyLabelType::from(3), post_one_label())
+                        .failing(2)
+                        .into_source(),
+                ),
                 Metrics::none(),
             ),
             ..server(InMemorySources::default())

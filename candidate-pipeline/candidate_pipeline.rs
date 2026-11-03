@@ -97,6 +97,9 @@ where
     fn post_selection_filters(&self) -> &[Box<dyn Filter<Q, C>>];
     fn side_effects(&self) -> Arc<Vec<Box<dyn SideEffect<Q, C>>>>;
     fn result_size(&self) -> usize;
+    fn result_size_for(&self, _query: &Q) -> usize {
+        self.result_size()
+    }
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
 
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
@@ -148,8 +151,10 @@ where
             self.filter_post_selection(&hydrated_query, post_selection_hydrated_candidates);
         filtered_candidates.extend(post_selection_filtered_candidates);
 
-        let truncated_candidates =
-            final_candidates.split_off(self.result_size().min(final_candidates.len()));
+        let truncated_candidates = final_candidates.split_off(
+            self.result_size_for(&hydrated_query)
+                .min(final_candidates.len()),
+        );
         non_selected_candidates.extend(truncated_candidates);
 
         self.finalize(&hydrated_query, &mut final_candidates);

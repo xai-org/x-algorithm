@@ -17,6 +17,7 @@ import jax
 import numpy as np
 
 from xai_checkpointing.tree_util import tree_to_dict
+from xrex.data.recsys.ads_late_window import compose_late_engagement_log_probs
 from xrex.models.model_utils import unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
@@ -693,6 +694,8 @@ def _make_forward_fn(
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
         outputs = model.forward(batch, recsys_embeddings, page_decode)
         log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.bfloat16).astype(jnp.float32)
+        if getattr(model_config, "serve_late_window_composed", False):
+            log_probs = compose_late_engagement_log_probs(log_probs)
         cont_preds = outputs[1].astype(jnp.bfloat16).astype(jnp.float32)
         has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
         return log_probs, cont_preds, has_nan, *outputs[2:]

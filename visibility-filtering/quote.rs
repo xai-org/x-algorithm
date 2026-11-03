@@ -242,12 +242,13 @@ fn pass(
             }
             | Evaluation::Partial { .. }
             | Evaluation::NotFound(_)
+            | Evaluation::Deleted(_)
             | Evaluation::Failed(_),
         ) => return PassOutcome::OuterWithheld,
     }
     match (inner, author, judge(level, author)) {
         (
-            Evaluation::NotFound(_),
+            Evaluation::NotFound(_) | Evaluation::Deleted(_),
             Some(
                 AuthorJudgement::Judged(_)
                 | AuthorJudgement::Unresolved(Unresolved {
@@ -257,7 +258,9 @@ fn pass(
             ),
             judged @ (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),
         ) => judged,
-        (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,
+        (Evaluation::NotFound(_) | Evaluation::Deleted(_) | Evaluation::Failed(_), _, _) => {
+            PassOutcome::InnerUnresolved
+        }
         (Evaluation::Complete { .. } | Evaluation::Partial { .. }, _, judged) => judged,
     }
 }
@@ -275,9 +278,10 @@ fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
             verdict: Verdict::Shown { .. },
             ..
         } => PassOutcome::Passed,
-        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {
-            PassOutcome::FailedOpen
-        }
+        Evaluation::Partial { .. }
+        | Evaluation::NotFound(_)
+        | Evaluation::Deleted(_)
+        | Evaluation::Failed(_) => PassOutcome::FailedOpen,
     }
 }
 

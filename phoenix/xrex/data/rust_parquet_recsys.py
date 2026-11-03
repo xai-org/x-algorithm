@@ -420,6 +420,7 @@ class RustParquetDataset(PhoenixDataset):
                 ads_head_masking=dataset.ads_head_masking,
                 dump_keep_rate_per_10000=dataset.dump_keep_rate_per_10000,
                 ads_pixel_head_masking=dataset.ads_pixel_head_masking,
+                ads_late_window_heads=dataset.ads_late_window_heads,
                 reply_parent_mode=dataset.reply_parent_mode,
                 page_records=dataset.page_records,
                 id_list_specs=dataset.id_list_specs or None,

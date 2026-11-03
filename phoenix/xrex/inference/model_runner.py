@@ -46,6 +46,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
+from xrex.data.recsys.ads_late_window import compose_late_engagement_log_probs
 from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
@@ -4464,6 +4465,8 @@ class RankingModelRunner(
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
             outputs = model.forward(batch, recsys_embeddings, page_decode, run_decoder=run_decoder)
             log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.float32)
+            if self.model_config.serve_late_window_composed:
+                log_probs = compose_late_engagement_log_probs(log_probs)
             cont_preds = outputs[1].astype(jnp.float32)
             has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
             return log_probs, cont_preds, *outputs[2:], has_nan

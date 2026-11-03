@@ -1,6 +1,7 @@
 pub mod about_this_account_client;
 pub mod article_client;
 pub mod gizmoduck_client;
+pub(crate) mod label_warm_client;
 pub mod socialgraph_client;
 pub(crate) mod strato;
 pub mod trusted_friends_client;

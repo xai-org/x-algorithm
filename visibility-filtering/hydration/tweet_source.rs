@@ -1,7 +1,7 @@
 use crate::clients::strato;
-use crate::models::{MediaFeature, NsfwFeature, ReactionContext, TweetFeatures};
+use crate::models::{Deletion, MediaFeature, NsfwFeature, ReactionContext, TweetFeatures};
 use crate::thrift_read::{read_fields, skip_elements, SKIP_DEPTH};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
 
 const COLUMN: &str = "tweetypie/federated/tweetForVisibility.Tweet";
+const STATE_COLUMN: &str = "tweetypie/federated/tweetState.Tweet";
 
 pub(crate) struct TweetSource {
     pub(crate) grpc_client: Arc<StratoGrpc>,
@@ -20,12 +21,60 @@ pub(crate) struct TweetSource {
 
 impl TweetSource {
     pub(crate) async fn get_tweet_values(&self, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
+        self.fetch(COLUMN, tweet_ids).await
+    }
+
+    pub(crate) async fn get_tweet_states(&self, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
+        self.fetch(STATE_COLUMN, tweet_ids).await
+    }
+
+    async fn fetch(&self, column: &str, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
         let keys = tweet_ids
             .iter()
-            .map(|tweet_id| (COLUMN, encode(&(*tweet_id, ()))));
+            .map(|tweet_id| (column, encode(&(*tweet_id, ()))));
         let result_batch = strato::fetch_each(&self.grpc_client, keys, None).await;
         tweet_ids.iter().copied().zip(result_batch).collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum TweetState {
+    Found,
+    NotFound,
+    Deleted,
+    BounceDeleted,
+}
+
+impl TweetState {
+    pub(crate) fn deletion(self) -> Option<Deletion> {
+        match self {
+            Self::Deleted => Some(Deletion::Deleted),
+            Self::BounceDeleted => Some(Deletion::BounceDeleted),
+            Self::Found | Self::NotFound => None,
+        }
+    }
+}
+
+struct StatusState(i32);
+
+impl StratoRead for StatusState {
+    fn read(proto: &mut MValProtocol<'_>) -> thrift::Result<Self> {
+        proto.read_i32().map(Self)
+    }
+}
+
+pub(crate) fn decode_tweet_state(bytes: &[u8]) -> Result<Option<TweetState>> {
+    let Some(StatusState(state)) = strato::row(strato_decode(bytes)?)? else {
+        return Ok(None);
+    };
+    Ok(Some(match state {
+        0 => TweetState::Found,
+        1 => TweetState::NotFound,
+        14 => TweetState::Deleted,
+        15 => TweetState::BounceDeleted,
+        other => bail!("unexpected StatusState {other}"),
+    }))
 }
 
 pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
@@ -357,6 +406,23 @@ mod tests {
 
     fn narrowcast_place(id: &str) -> (i16, Thrift) {
         (172, Struct(vec![(1, Str(id.into()))]))
+    }
+
+    #[test]
+    fn a_tweet_state_decodes_from_its_status_state_value() {
+        use TweetState::{BounceDeleted, Deleted, Found, NotFound};
+        for (value, state) in [
+            (0, Found),
+            (1, NotFound),
+            (14, Deleted),
+            (15, BounceDeleted),
+        ] {
+            let decoded = decode_tweet_state(&found(Thrift::I32(value))).unwrap();
+            assert_eq!(decoded, Some(state), "{value}");
+        }
+        assert_eq!(decode_tweet_state(&no_row()).unwrap(), None);
+        let failed = 4;
+        assert!(decode_tweet_state(&found(Thrift::I32(failed))).is_err());
     }
 
     fn encode_tweet(core_data: Vec<(i16, Thrift)>, rest: Vec<(i16, Thrift)>) -> Vec<u8> {

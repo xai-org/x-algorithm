@@ -13,19 +13,18 @@ const MH_CLUSTER: &str = "nash";
 const MH_APP_ID: &str = "phoenix_online_training_mm";
 const MH_DATASET: &str = "tweet_multimodal_embeddings";
 const MH_TIMEOUT: Duration = Duration::from_millis(100);
-const EMBEDDING_VERSION: &str = "v8_search_1";
 const EMBEDDING_DIM: usize = 1024;
 
 #[async_trait]
 pub trait PostV8SearchEmbeddingClient: Send + Sync {
-    async fn fetch_embeddings(&self, post_ids: &[u64]) -> HashMap<u64, Vec<f32>>;
+    async fn fetch_embeddings(&self, post_ids: &[u64], version: &str) -> HashMap<u64, Vec<f32>>;
 }
 
 pub struct NoopPostV8SearchEmbeddingClient;
 
 #[async_trait]
 impl PostV8SearchEmbeddingClient for NoopPostV8SearchEmbeddingClient {
-    async fn fetch_embeddings(&self, _post_ids: &[u64]) -> HashMap<u64, Vec<f32>> {
+    async fn fetch_embeddings(&self, _post_ids: &[u64], _version: &str) -> HashMap<u64, Vec<f32>> {
         HashMap::new()
     }
 }
@@ -54,11 +53,11 @@ impl ManhattanPostV8SearchEmbeddingClient {
 
 #[async_trait]
 impl PostV8SearchEmbeddingClient for ManhattanPostV8SearchEmbeddingClient {
-    async fn fetch_embeddings(&self, post_ids: &[u64]) -> HashMap<u64, Vec<f32>> {
+    async fn fetch_embeddings(&self, post_ids: &[u64], version: &str) -> HashMap<u64, Vec<f32>> {
         if post_ids.is_empty() {
             return HashMap::new();
         }
-        let version = EMBEDDING_VERSION.as_bytes().to_vec();
+        let version = version.as_bytes().to_vec();
         let keys: Vec<(Key<'_>, Key<'_>)> = post_ids
             .iter()
             .map(|&post_id| {

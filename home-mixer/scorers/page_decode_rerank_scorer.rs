@@ -2,9 +2,9 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     ClickWeight, ContDwellTimeWeight, EnablePageDecodeRerank, FavoriteWeight, MinVideoDurationMs,
-    NotDwelledWeight, NotInterestedWeight, PageDecodePoolN, PageDecodeSteps, PageDecodeTemperature,
-    ProfileClickWeight, QuoteWeight, ReplyWeight, ReportWeight, RetweetWeight, ShareWeight,
-    VqvWeight,
+    NotDwelledWeight, NotInterestedWeight, PageDecodePoolN, PageDecodeRewardHead, PageDecodeSteps,
+    PageDecodeTemperature, ProfileClickWeight, QuoteWeight, ReplyWeight, ReportWeight,
+    RetweetWeight, ShareWeight, VqvWeight,
 };
 use std::cmp::Ordering;
 use tonic::async_trait;
@@ -26,6 +26,7 @@ pub(crate) fn page_decode_params(query: &ScoredPostsQuery) -> PageDecodeParams {
         temperature: query.params.get(PageDecodeTemperature) as f32,
         ranking_score_weights: Some(ranking_score_weights(query)),
         diversity_weight: None,
+        reward_head: Some(query.params.get(PageDecodeRewardHead)),
     }
 }
 

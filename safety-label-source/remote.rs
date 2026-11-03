@@ -37,7 +37,7 @@ pub(crate) enum FallbackReason {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, enum_map::Enum, strum::IntoStaticStr,
 )]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum FailureKind {
+pub enum FailureKind {
     ManhattanFetch,
     ManhattanDecode,
 }
@@ -53,12 +53,12 @@ pub(crate) enum TwemcacheOutcome {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{kind:?}: {message}")]
 pub struct LookupError {
-    pub(crate) kind: FailureKind,
+    pub kind: FailureKind,
     pub(crate) message: String,
 }
 
 impl LookupError {
-    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -394,11 +394,11 @@ mod tests {
     use xai_manhattan::ManhattanError;
     use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
-    use crate::safety_label_source::decode::RawSafetyLabel;
-    use crate::safety_label_source::decode::tests::{
+    use crate::decode::RawSafetyLabel;
+    use crate::decode::tests::{
         cached_value_found_mval, cached_value_not_found, minimal_mval, mval_with_score, raw_label,
     };
-    use crate::safety_label_source::mh_client::FetchResult;
+    use crate::mh_client::FetchResult;
 
     struct FakeCache {
         results: HashMap<Key, CacheOpResult<Option<Value>>>,

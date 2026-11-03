@@ -256,11 +256,14 @@ impl PostEvaluator {
             (
                 Some(HydratedTweet::Unresolved {
                     reason: Unresolved { lookup, cause },
+                    deletion,
                     ..
                 }),
                 _,
             ) => match cause {
-                Cause::NotFound => Evaluation::NotFound(*lookup),
+                Cause::NotFound => {
+                    deletion.map_or(Evaluation::NotFound(*lookup), Evaluation::Deleted)
+                }
                 Cause::Failed => Evaluation::Failed(*lookup),
             },
             (Some(HydratedTweet::Resolved { .. }), None) | (None, _) => {

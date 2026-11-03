@@ -211,6 +211,8 @@ message PageDecodeParams {
   RankingScoreWeights rankingScoreWeights = 4;
 
   optional float diversityWeight = 5;
+
+  optional uint32 rewardHead = 6;
 }
 
 message RankingScoreWeights {
@@ -553,6 +555,8 @@ enum ActionName {
   LLM_JUDGE_NOT_RELEVANT_TO_SEARCH = 109;
   CLIENT_NOTIFICATION_SETTING_OPT_OUT = 110;
   CLIENT_TWEET_VIDEO_SESSION = 111;
+  ADS_OPEN_LINK_LATE_WINDOW = 112;
+  ADS_LONG_DWELL_LATE_WINDOW = 113;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -1712,6 +1716,8 @@ message AdInfo {
   string url_domain = 27;
 
   AdTargeting targeting = 28;
+
+  int64 ad_taxonomy_id = 29;
 }
 
 message AdTargeting {
@@ -1942,6 +1948,7 @@ enum UserActionAggregationType {
   DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
   IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
   DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
+  DENSE_WITH_LONG_DWELL_DEDUP_ATTRIBUTION = 33;
 }
 
 message UserActionAggregationResponse {

@@ -160,7 +160,10 @@ fn merge_source(
                     )
                 }
                 Some(
-                    Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_),
+                    Evaluation::Partial { .. }
+                    | Evaluation::NotFound(_)
+                    | Evaluation::Deleted(_)
+                    | Evaluation::Failed(_),
                 )
                 | None => (
                     Evaluation::Partial {
@@ -188,9 +191,10 @@ fn merge_source(
 fn requested_selection(evaluation: &Evaluation) -> MergeSelection {
     match evaluation {
         Evaluation::Partial { .. } => MergeSelection::RequestedIncomplete,
-        Evaluation::Complete { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {
-            MergeSelection::RequestedOnly
-        }
+        Evaluation::Complete { .. }
+        | Evaluation::NotFound(_)
+        | Evaluation::Deleted(_)
+        | Evaluation::Failed(_) => MergeSelection::RequestedOnly,
     }
 }
 
@@ -243,9 +247,9 @@ mod tests {
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup, Relation};
     use crate::models::{
-        ClientCapability, ClientSwitch, DropReason, LimitedEngagement, LimitedEngagementReason,
-        MediaFeature, MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate,
-        SafetyLabelType, TombstoneReason, TweetFeatures,
+        ClientCapability, ClientSwitch, Deletion, DropReason, LimitedEngagement,
+        LimitedEngagementReason, MediaFeature, MediaInterstitial, MediaRestriction, NsfwFeature,
+        Placement, RawCandidate, SafetyLabelType, TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
     use crate::rules::{RuleId, SafetyLevel};
@@ -635,6 +639,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         Complete,
         Partial,
         NotFound(Lookup),
+        Deleted(Deletion),
         Failed(Lookup),
     }
 
@@ -645,6 +650,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
                 Evaluation::Complete { .. } => Arm::Complete,
                 Evaluation::Partial { .. } => Arm::Partial,
                 Evaluation::NotFound(lookup) => Arm::NotFound(lookup),
+                Evaluation::Deleted(deletion) => Arm::Deleted(deletion),
                 Evaluation::Failed(lookup) => Arm::Failed(lookup),
             })
             .collect()

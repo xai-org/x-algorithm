@@ -31,6 +31,11 @@ impl Store {
             },
             Err(reason) => HydratedTweet::Unresolved {
                 reason,
+                deletion: self
+                    .tweet_states
+                    .get(id.0)
+                    .filter(|_| reason.lookup == Lookup::Tweet && reason.cause == Cause::NotFound)
+                    .and_then(|state| state.deletion()),
                 safety_labels,
             },
         }

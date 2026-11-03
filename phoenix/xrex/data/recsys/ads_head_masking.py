@@ -6,9 +6,12 @@ import numpy as np
 import numpy.typing as npt
 
 from xrex.data.recsys.ads_late_window import (
+    ADS_LATE_ENGAGEMENT_TWIN_COUNTERPART,
+    ADS_LATE_ENGAGEMENT_TWIN_HEAD_INDICES,
     ADS_LATE_WINDOW_TWIN_HEAD_INDICES,
     ADS_LATE_WINDOW_TWIN_SUPPRESSOR,
     ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES,
+    LATE_WINDOW_STREAM_ID,
 )
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
@@ -78,6 +81,7 @@ def build_trained_candidate_mask(
     trained_actions_bits: npt.NDArray[np.uint8],
     *,
     ads_head_masking: bool,
+    ads_late_window_heads: bool = False,
 ) -> npt.NDArray[np.bool_]:
     rows, _, num_actions = actions.shape
     keep_web = ((trained_actions_bits & CONVERSION_KEEP_WEB) != 0)[:, :, None]
@@ -92,7 +96,8 @@ def build_trained_candidate_mask(
         source = np.asarray(sample_source).reshape(rows, 1, 1)
     fresh = source == FRESH_STREAM_ID
     late = source == LATE_SPLIT_STREAM_ID
-    early = ~fresh & ~late
+    late_window = source == LATE_WINDOW_STREAM_ID
+    early = ~fresh & ~late & ~late_window
 
     actions = actions.astype(np.bool_, copy=False)
     click = actions[:, :, CLICK_ACTION_INDEX][:, :, None]
@@ -105,11 +110,17 @@ def build_trained_candidate_mask(
     app_vt = _head_indicator(MMP_CLICK_VIEW_THROUGH_ACTION_INDICES, num_actions)
     twins = _head_indicator(ADS_LATE_WINDOW_TWIN_HEAD_INDICES, num_actions)
     vt_twins = _head_indicator(ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES, num_actions)
-    engagement = ~(fresh_ct | web_ct | web_vt | app_ct | app_vt | twins | vt_twins)
+    late_eng = _head_indicator(
+        ADS_LATE_ENGAGEMENT_TWIN_HEAD_INDICES if ads_late_window_heads else [], num_actions
+    )
+    engagement = ~(fresh_ct | web_ct | web_vt | app_ct | app_vt | twins | vt_twins | late_eng)
 
     suppressor_index = list(range(num_actions))
     for twin, suppressor in ADS_LATE_WINDOW_TWIN_SUPPRESSOR.items():
         suppressor_index[twin] = suppressor
+    if ads_late_window_heads:
+        for twin, counterpart in ADS_LATE_ENGAGEMENT_TWIN_COUNTERPART.items():
+            suppressor_index[twin] = counterpart
     no_early_counterpart = ~actions[:, :, suppressor_index]
 
     kept = keep_web | keep_app
@@ -122,4 +133,6 @@ def build_trained_candidate_mask(
         | (app_vt & early & keep_app & ~app_click)
         | (twins & late & click & no_early_counterpart & kept)
         | (vt_twins & late & keep_web & ~click & no_early_counterpart)
+        | (late_eng & fresh & kept & no_early_counterpart)
+        | (late_eng & late_window & actions)
     )

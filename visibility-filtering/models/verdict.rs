@@ -310,14 +310,21 @@ pub enum Evaluation {
         fail_open_defaults: Hydrators,
     },
     NotFound(Lookup),
+    Deleted(Deletion),
     Failed(Lookup),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deletion {
+    Deleted,
+    BounceDeleted,
 }
 
 impl Evaluation {
     pub fn verdict(&self) -> &Verdict {
         match self {
             Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
-            Self::NotFound(_) => &NOT_FOUND,
+            Self::NotFound(_) | Self::Deleted(_) => &NOT_FOUND,
             Self::Failed(_) => &LOOKUP_FAILED,
         }
     }
@@ -326,7 +333,7 @@ impl Evaluation {
     pub fn into_verdict(self) -> Verdict {
         match self {
             Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
-            Self::NotFound(_) => Verdict::not_found(),
+            Self::NotFound(_) | Self::Deleted(_) => Verdict::not_found(),
             Self::Failed(_) => Verdict::lookup_failed(),
         }
     }
@@ -346,7 +353,7 @@ impl Evaluation {
             | Self::Partial {
                 fail_open_defaults, ..
             } => *fail_open_defaults,
-            Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
+            Self::NotFound(_) | Self::Deleted(_) | Self::Failed(_) => Hydrators::empty(),
         }
     }
 }

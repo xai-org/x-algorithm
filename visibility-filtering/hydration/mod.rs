@@ -15,7 +15,7 @@ pub mod tweet_source;
 
 use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, ClientCapability, EdgeSet, Placement, PostCandidate, Quote, RawCandidate,
+    AuthorId, ClientCapability, Deletion, EdgeSet, Placement, PostCandidate, Quote, RawCandidate,
     RetweetMerge, TweetId, UserCandidate, UserEntity, ViewerFeatures,
 };
 pub(crate) use decode::author::AuthorNotFound;
@@ -270,6 +270,7 @@ pub(crate) enum HydratedTweet {
     },
     Unresolved {
         reason: Unresolved,
+        deletion: Option<Deletion>,
         safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
     },
 }

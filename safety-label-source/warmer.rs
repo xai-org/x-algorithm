@@ -3,43 +3,16 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::async_trait;
-use xai_strato::{encode, StratoGrpc};
 
 use super::metrics::{self, LabelMetrics, WarmKeyResult};
-use crate::clients::strato;
 
-const WARM_COLUMN_PATH: &str = "visibility/baseTweetSafetyLabelMap";
 const WARM_CHANNEL_CAPACITY: usize = 1024;
 const WARM_LINGER: Duration = Duration::from_millis(500);
 const WARM_FETCH_MAX_KEYS: usize = 50;
 
 #[async_trait]
-pub(crate) trait WarmFetcher: Send + Sync {
+pub trait WarmFetcher: Send + Sync {
     async fn fetch(&self, ids: &[u64]) -> usize;
-}
-
-pub(crate) struct StratoWarmFetcher {
-    grpc: StratoGrpc,
-}
-
-impl StratoWarmFetcher {
-    pub(crate) fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
-}
-
-#[async_trait]
-impl WarmFetcher for StratoWarmFetcher {
-    async fn fetch(&self, ids: &[u64]) -> usize {
-        let keys = ids
-            .iter()
-            .map(|id| (WARM_COLUMN_PATH, encode(&(id.cast_signed(), ()))));
-        strato::fetch_each(&self.grpc, keys, None)
-            .await
-            .iter()
-            .filter(|result| result.is_err())
-            .count()
-    }
 }
 
 pub(crate) struct CacheWarmer {

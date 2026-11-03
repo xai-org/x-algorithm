@@ -428,11 +428,33 @@ type AppealSpan = {
   url: Option[String]
 }
 
+type WithholdAppealForm = {
+  name: String,
+  countries: Set[String],
+  url: String
+}
+
 val appealFromPost = "If the post still has this label, you can appeal from the post."
+val enforcementEmail = "Instructions provided in email notification at the time of enforcement."
 val counterNoticeUrl = "https://help.x.com/forms/ipi/dmca-counternotice"
-val brazilAppealUrl = "https://help.x.com/en/forms/br/appeal"
-val withheldHelpUrl = "https://help.x.com/rules-and-policies/post-withheld-by-country"
-val brazilCode = "br"
+val japanAppealUrl = "https://help.x.com/forms/ld/appeal"
+val japanCode = "jp"
+
+val euCountryCodes = Set(
+  "at", "be", "bg", "cy", "cz", "de", "dk", "ee", "es", "fi", "fr", "gr", "hr", "hu",
+  "ie", "it", "lt", "lu", "lv", "mt", "nl", "pl", "pt", "ro", "se", "si", "sk",
+)
+
+val bystanderAppealForms: Seq[WithholdAppealForm] = Seq(
+  { name = "the UK", countries = Set("gb"), url = "https://help.x.com/forms/osa/appeal" },
+  { name = "the EU", countries = euCountryCodes, url = "https://help.x.com/forms/dsa/appeal" },
+  {
+    name = "Australia",
+    countries = Set("au"),
+    url = "https://help.x.com/forms/australia-report/appeal",
+  },
+  { name = "Brazil", countries = Set("br"), url = "https://help.x.com/forms/br/appeal" },
+)
 
 val fosnrPostLabels = Set(
   "FOSNR_ABUSE",
@@ -447,39 +469,53 @@ def textSpan(text: String): AppealSpan = { text = text, url = None : Option[Stri
 
 def linkSpan(text: String, url: String): AppealSpan = { text = text, url = Some(url) }
 
+def linkedSentence(text: String, url: String): Seq[AppealSpan] =
+  Seq(textSpan(" "), linkSpan(text, url), textSpan("."))
+
 def postLabelAppeal(code: String, sensitiveMediaAppealFromPost: Boolean): Option[Seq[AppealSpan]] =
   resolvePostKey(code) match {
     case Some(k)
         if fosnrPostLabels.contains(k) ||
           (sensitiveMediaAppealFromPost && sensitiveMediaPostLabels.contains(k)) =>
       Some(Seq(textSpan(appealFromPost)))
+    case Some(k) if k == "BOUNCE" =>
+      Some(Seq(textSpan(enforcementEmail)))
     case _ =>
       None
   }
 
-def countryWithholdAppeal(countryCodes: Seq[String]): Seq[AppealSpan] = {
-  val inBrazil = countryCodes.exists { c => c == brazilCode }
-  val elsewhere = countryCodes.exists { c => c != brazilCode }
-  if (inBrazil && elsewhere) {
-    Seq(
-      linkSpan("Appeal this withholding in Brazil", brazilAppealUrl),
-      textSpan(". For other countries, "),
-      linkSpan("see instructions in our Help Center", withheldHelpUrl),
-      textSpan("."),
-    )
-  } else if (inBrazil) {
-    Seq(linkSpan("Appeal this withholding in Brazil", brazilAppealUrl))
+def bystanderReportAppeal(countryCodes: Seq[String]): Option[Seq[AppealSpan]] = {
+  val forms = bystanderAppealForms.filter { f => countryCodes.exists { c => f.countries.contains(c) } }
+  if (forms.isEmpty) {
+    None
   } else {
-    Seq(linkSpan("See instructions in our Help Center", withheldHelpUrl))
+    Some(Seq(textSpan(enforcementEmail)) ++ forms.map { f =>
+      linkedSentence("Appeal this withholding in " + f.name, f.url)
+    }.flatten)
+  }
+}
+
+def legalRequestAppeal(countryScoped: Boolean, countryCodes: Seq[String]): Seq[AppealSpan] = {
+  val reply = Seq(textSpan(enforcementEmail + " Appeal by responding to the email."))
+  if (countryScoped && countryCodes.contains(japanCode)) {
+    reply ++ linkedSentence("Appeal this withholding in Japan", japanAppealUrl)
+  } else {
+    reply
   }
 }
 
 def takedownAppeal(label: String, countryCodes: Seq[String]): Option[Seq[AppealSpan]] =
-  takedownCopyKey(label, countryCodes).map { k =>
+  takedownCopyKey(label, countryCodes).flatMap { k =>
     if (takedownNamesWithoutCountries.contains(k) || k == label + "(xy)") {
-      Seq(linkSpan("Submit a copyright counter-notice", counterNoticeUrl))
+      Some(
+        Seq(textSpan(enforcementEmail)) ++
+          linkedSentence("Appeal by submitting a counter-notice", counterNoticeUrl))
+    } else if (label == "BystanderReport") {
+      bystanderReportAppeal(countryCodes)
+    } else if (label == "LegalRequest") {
+      Some(legalRequestAppeal(k == label + "(country)", countryCodes))
     } else {
-      countryWithholdAppeal(countryCodes)
+      None
     }
   }
 

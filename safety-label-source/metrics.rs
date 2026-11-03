@@ -137,24 +137,3 @@ pub(crate) fn record_expired_labels(metrics: &LabelMetrics, count: usize) {
 pub(crate) fn record_batch_size(metrics: &LabelMetrics, stage: BatchStage, size: usize) {
     metrics.observe(BATCH_SIZE, &[("stage", stage.into())], size as f64);
 }
-
-#[cfg(test)]
-mod tests {
-    use xai_visibility_filtering::tweet_safety_label::{
-        BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
-    };
-    use xai_visibility_filtering::vf_client::FILTER_TWEETS_LATENCY_VM_METRIC;
-
-    #[test]
-    fn dashboard_generator_pins_the_client_vm_latency_metrics() {
-        let dashboard =
-            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
-        for pin in [
-            format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
-            format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),
-            format!("VF_CLIENT_FT_LATENCY_VM_METRIC = \"{FILTER_TWEETS_LATENCY_VM_METRIC}\""),
-        ] {
-            assert!(dashboard.contains(&pin), "dashboard.py is missing `{pin}`");
-        }
-    }
-}

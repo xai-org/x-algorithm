@@ -5,10 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::warn;
 use xai_feature_switches::{AuthorRulesEvaluator, Params};
 use xai_value_model::{
-    compute_value_scores, set_user_video_continuation, CandidateScoringInputs, PhoenixScores,
-    QueryScoringContext, ValueModelWeights, ValueScores,
+    compute_value_scores, set_user_video_continuation, weighted_terms, CandidateScoringInputs,
+    PhoenixScores, QueryScoringContext, ValueModelWeights, ValueScores,
 };
-use xai_vm_ranker_proto::RankRequest;
+use xai_vm_ranker_proto::{HeadContribution, RankRequest};
 
 use crate::metrics::{
     AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM, SAMPLED_CANDIDATES,
@@ -28,6 +28,7 @@ pub struct ValueModelOutput {
     pub weighted: Vec<f64>,
     pub scores: Vec<f64>,
     pub debiased: bool,
+    pub top_heads: Option<Vec<Vec<HeadContribution>>>,
 }
 
 struct Fallback {
@@ -182,27 +183,60 @@ fn compute_or_fallback(
         "heads"
     };
     VALUE_MODEL_STAGE.with_label_values(&[stage]).inc();
-    if cached_weighted {
+    if cached_weighted && !req.include_top_heads {
         return Ok(ValueModelOutput {
             weighted: raw.weighted,
             scores: raw.scores,
             debiased: false,
+            top_heads: None,
         });
     }
 
-    let Some(recentered) = debias::recenter(req, params, debias.user.as_deref(), &inputs) else {
+    let recentered = debias::recenter(req, params, debias.user.as_deref(), &inputs);
+    let scored_inputs = recentered.as_deref().unwrap_or(&inputs);
+    let top_heads = req.include_top_heads.then(|| {
+        scored_inputs
+            .iter()
+            .map(|c| top_heads(&weights, c))
+            .collect()
+    });
+    if cached_weighted || recentered.is_none() {
         return Ok(ValueModelOutput {
             weighted: raw.weighted,
             scores: raw.scores,
             debiased: false,
+            top_heads,
         });
-    };
-    let debiased = compute_value_scores(&weights, &ctx, &recentered);
+    }
+    let debiased = compute_value_scores(&weights, &ctx, scored_inputs);
     Ok(ValueModelOutput {
         weighted: debiased.weighted,
         scores: debiased.scores,
         debiased: true,
+        top_heads,
     })
+}
+
+const TOP_HEADS: usize = 3;
+const MIN_HEAD_SHARE: f64 = 0.10;
+
+fn top_heads(
+    weights: &ValueModelWeights,
+    candidate: &CandidateScoringInputs,
+) -> Vec<HeadContribution> {
+    let mut terms = weighted_terms(weights, candidate);
+    let total: f64 = terms.iter().map(|(_, c)| c.abs()).sum();
+    terms.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+    terms
+        .iter()
+        .take(TOP_HEADS)
+        .map(|&(head, contribution)| HeadContribution {
+            head: head.to_string(),
+            contribution,
+            share: contribution.abs() / total,
+        })
+        .take_while(|h| h.share >= MIN_HEAD_SHARE)
+        .collect()
 }
 
 fn set_author_exploration_bonuses(

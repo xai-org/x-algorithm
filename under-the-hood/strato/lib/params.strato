@@ -27,6 +27,15 @@ val underTheHoodReportAppealsEnabled =
 val sensitiveMediaAppealAuthorWarningEnabled =
   fs.booleanParam("sensitive_media_appeal_author_warning_enabled", false)
 
+val underTheHoodReportPostIdsEnabled =
+  fs.booleanParam("under_the_hood_report_post_ids_enabled", false)
+val underTheHoodReportPostIdsAlwaysShowUpTo =
+  fs.intParam("under_the_hood_report_post_ids_always_show_up_to", 3)
+val underTheHoodReportPostIdsMaxSharePct =
+  fs.intParam("under_the_hood_report_post_ids_max_share_pct", 5)
+val underTheHoodReportPostIdsMaxPerLabel =
+  fs.intParam("under_the_hood_report_post_ids_max_per_label", 50)
+
 Library({
   export = {
     underTheHoodReportEnabled = underTheHoodReportEnabled,
@@ -34,6 +43,10 @@ Library({
     underTheHoodReportTakedownsEnabled = underTheHoodReportTakedownsEnabled,
     underTheHoodReportAppealsEnabled = underTheHoodReportAppealsEnabled,
     sensitiveMediaAppealAuthorWarningEnabled = sensitiveMediaAppealAuthorWarningEnabled,
+    underTheHoodReportPostIdsEnabled = underTheHoodReportPostIdsEnabled,
+    underTheHoodReportPostIdsAlwaysShowUpTo = underTheHoodReportPostIdsAlwaysShowUpTo,
+    underTheHoodReportPostIdsMaxSharePct = underTheHoodReportPostIdsMaxSharePct,
+    underTheHoodReportPostIdsMaxPerLabel = underTheHoodReportPostIdsMaxPerLabel,
   },
   description = PlainText("Feature switch params for Under the Hood"),
   contactInfo = <visibility/under-the-hood/sharedConfig>.contactInfo,

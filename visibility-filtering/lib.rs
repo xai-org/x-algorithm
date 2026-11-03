@@ -71,7 +71,6 @@ pub(crate) mod post_evaluator;
 pub(crate) mod quote;
 pub(crate) mod result_label;
 pub(crate) mod rules;
-pub(crate) mod safety_label_source;
 #[cfg(test)]
 mod scenario;
 pub mod server;

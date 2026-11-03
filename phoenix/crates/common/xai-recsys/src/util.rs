@@ -164,6 +164,12 @@ use crate::feature_config::int64_feature::{
 };
 #[cfg(recsys_ads_dpa)]
 use crate::feature_config::int64_feature::{FIRST_DPA_PRODUCT_KEY, FIRST_DPA_PRODUCT_KEY_HASH2};
+#[cfg(recsys_time_gap)]
+use crate::feature_config::int64_feature::{
+    LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ, REQUEST_TIME_SEC_SEQ,
+};
+#[cfg(recsys_time_gap)]
+use crate::reply::is_reply_width;
 
 pub const PRODUCT_SURFACE_CATEGORICAL_IDX: usize = PRODUCT_SURFACE_SEQ;
 const TIMEZONE_IDX: usize = TIMEZONE_SEQ;
@@ -399,6 +405,45 @@ const TZ_ENUM_TO_UTC_OFFSET_SECS: [i64; 32] = [
     32400, 19800, 28800, 32400, 25200, 25200, 14400, 10800, 28800, 28800, 39600, -36000, -25200,
     -18000, -21600, -10800, 3600, 0,
 ];
+
+#[cfg(recsys_time_gap)]
+pub fn stamp_time_gap_timestamps(
+    history_impr_ts: &[i32],
+    candidate_impr_ts: &[i32],
+    history_int64_features: &mut [i64],
+    candidate_int64_features: &mut [i64],
+    n_post_int64: usize,
+) {
+    if n_post_int64 <= LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ || is_reply_width(n_post_int64) {
+        return;
+    }
+    let request_sec = candidate_impr_ts
+        .iter()
+        .filter(|&&ts| ts > 0)
+        .min()
+        .map_or(0, |&ts| ts as i64);
+    let latest_history_sec = history_impr_ts
+        .iter()
+        .map(|&ts| ts as i64)
+        .filter(|&ts| ts > 0 && ts <= request_sec)
+        .max()
+        .unwrap_or(0);
+    for row in history_int64_features
+        .chunks_exact_mut(n_post_int64)
+        .take(history_impr_ts.len())
+    {
+        row[REQUEST_TIME_SEC_SEQ] = request_sec;
+    }
+    for (row, &ts) in candidate_int64_features
+        .chunks_exact_mut(n_post_int64)
+        .zip(candidate_impr_ts)
+    {
+        if ts > 0 {
+            row[REQUEST_TIME_SEC_SEQ] = request_sec;
+            row[LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ] = latest_history_sec;
+        }
+    }
+}
 
 pub fn compute_local_time(utc_epoch_secs: i64, tz_enum: i16) -> (i16, i16) {
     let offset = if tz_enum > 0 && (tz_enum as usize) < TZ_ENUM_TO_UTC_OFFSET_SECS.len() {
@@ -1149,6 +1194,17 @@ impl InputBuffer {
             }
         }
 
+        #[cfg(recsys_time_gap)]
+        let mut candidate_int64_features = candidate_int64_features;
+        #[cfg(recsys_time_gap)]
+        stamp_time_gap_timestamps(
+            &history_impr_ts[..valid_entry_count],
+            &candidate_impr_ts,
+            &mut history_int64_features,
+            &mut candidate_int64_features,
+            n_post_int64,
+        );
+
         if sid_num_levels > 0 {
             let present = (0..valid_entry_count)
                 .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)
@@ -1611,6 +1667,17 @@ impl InputBuffer {
 
             valid_entry_count += 1;
         }
+
+        #[cfg(recsys_time_gap)]
+        let mut candidate_int64_features = candidate_int64_features;
+        #[cfg(recsys_time_gap)]
+        stamp_time_gap_timestamps(
+            &history_impr_ts[..valid_entry_count],
+            &candidate_impr_ts,
+            &mut history_int64_features,
+            &mut candidate_int64_features,
+            n_post_int64,
+        );
 
         if sid_num_levels > 0 {
             let present = (0..valid_entry_count)
@@ -2893,6 +2960,152 @@ mod tests {
             };
             let f = InputBuffer::extract_user_features(&cfg, None, Some(&ctx));
             assert_eq!(f.categorical_features[gender_idx], g as i16, "{g:?}");
+        }
+    }
+
+    #[cfg(recsys_time_gap)]
+    #[test]
+    fn time_gap_timestamps() {
+        let stamp = |n: usize| {
+            let (mut hist, mut cand) = (vec![0i64; 3 * n], vec![0i64; 3 * n]);
+            let hist_ts = [1_600_000_000, 0, 1_600_000_002];
+            let cand_ts = [1_600_000_001, 1_600_000_001, 0];
+            stamp_time_gap_timestamps(&hist_ts, &cand_ts, &mut hist, &mut cand, n);
+            (hist, cand)
+        };
+        let n = LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ + 1;
+        let col = |v: &[i64], slot: usize| v.chunks(n).map(|row| row[slot]).collect::<Vec<_>>();
+        let (hist, cand) = stamp(n);
+        assert_eq!(col(&hist, REQUEST_TIME_SEC_SEQ), [1_600_000_001; 3]);
+        assert_eq!(col(&hist, LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ), [0; 3]);
+        assert_eq!(
+            col(&cand, REQUEST_TIME_SEC_SEQ),
+            [1_600_000_001, 1_600_000_001, 0]
+        );
+        let latest = col(&cand, LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ);
+        assert_eq!(latest, [1_600_000_000, 1_600_000_000, 0]);
+
+        assert!(!is_reply_width(n));
+        let reply_width = (n..).find(|&w| is_reply_width(w)).unwrap();
+        for width in [n - 1, reply_width] {
+            let (hist, cand) = stamp(width);
+            assert!(hist.iter().chain(&cand).all(|&v| v == 0), "width {width}");
+        }
+    }
+
+    #[cfg(recsys_time_gap)]
+    #[test]
+    fn proto_and_columnar_history_stamp_time_gap_timestamps() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let now_sec = 1_600_000_010;
+        let impressed_ms = [1_600_000_000_000i64, 1_600_000_005_000, 1_600_000_015_000];
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.num_post_int64_features =
+            LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ + 1;
+        let n = model_config.hash_table.num_post_int64_features;
+        let mut candidate_set = pb::CandidateSet::default();
+        for tweet_id in [101, 102] {
+            candidate_set.candidates.push(pb::TweetInfo {
+                tweet_id,
+                author_id: 2000,
+                ..Default::default()
+            });
+        }
+
+        let sequence = Some(pb::UserActionSequence {
+            user_actions_data: Some(pb::UserActionSequenceDataContainer {
+                data: Some(
+                    pb::user_action_sequence_data_container::Data::OrderedAggregatedUserActionsList(
+                        pb::AggregatedUserActionList {
+                            aggregated_user_actions: impressed_ms
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &ms)| pb::AggregatedUserAction {
+                                    tweet_info: Some(pb::TweetInfo {
+                                        tweet_id: 11 + i as u64,
+                                        author_id: 21,
+                                        ..Default::default()
+                                    }),
+                                    impressed_time_ms: ms,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        });
+        let history = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+                Field::new("impressedTimeMs", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 12, 13])),
+                Arc::new(Int64Array::from(vec![21i64, 21, 21])),
+                Arc::new(Int64Array::from(impressed_ms.to_vec())),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, history.schema().as_ref()).unwrap();
+        writer.write(&history).unwrap();
+        writer.finish().unwrap();
+
+        let proto = with_fixed_now_sec(now_sec, || {
+            InputBuffer::compute_for_item(
+                &model_config,
+                &sequence,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+        let columnar = with_fixed_now_sec(now_sec, || {
+            InputBuffer::compute_from_columnar_bytes(
+                &model_config,
+                &bytes,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        for buf in [&proto, &columnar] {
+            assert_eq!(buf.num_history, 3);
+            for i in 0..3 {
+                assert_eq!(
+                    buf.history_int64_features[i * n + REQUEST_TIME_SEC_SEQ],
+                    now_sec as i64
+                );
+            }
+            for j in 0..2 {
+                assert_eq!(
+                    buf.candidate_int64_features[j * n + REQUEST_TIME_SEC_SEQ],
+                    now_sec as i64
+                );
+                assert_eq!(
+                    buf.candidate_int64_features[j * n + LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ],
+                    1_600_000_005
+                );
+            }
+            assert!(
+                buf.candidate_int64_features[2 * n..]
+                    .iter()
+                    .all(|&v| v == 0)
+            );
         }
     }
 }

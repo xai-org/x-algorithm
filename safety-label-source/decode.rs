@@ -16,9 +16,9 @@ pub(crate) enum CachedLabels {
 }
 
 #[derive(Debug, Clone)]
-pub struct RawSafetyLabel {
-    pub lkey: [u8; 4],
-    pub mval: Vec<u8>,
+pub(crate) struct RawSafetyLabel {
+    pub(crate) lkey: [u8; 4],
+    pub(crate) mval: Vec<u8>,
 }
 
 pub(crate) fn cached_value(bytes: &[u8]) -> Option<CachedLabels> {
@@ -138,7 +138,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn cached_value_not_found() -> Vec<u8> {
-        cached_value_blob(CachedValueStatus::NOT_FOUND, None)
+        crate::testing::cached_value_not_found().unwrap()
     }
 
     pub(crate) fn cached_value_found_mval() -> Vec<u8> {
@@ -149,11 +149,8 @@ pub(crate) mod tests {
         cached_value_blob(CachedValueStatus::FOUND, Some(mval_blob))
     }
 
-    pub(crate) fn mval(label: &SafetyLabel) -> Vec<u8> {
-        let mut buf = vec![0x0C, 0x00, 0x04];
-        buf.extend(xai_x_thrift::serialize_binary(label).unwrap());
-        buf.push(0x00);
-        buf
+    fn mval(label: &SafetyLabel) -> Vec<u8> {
+        crate::testing::mval(label).unwrap()
     }
 
     pub(crate) fn minimal_mval() -> Vec<u8> {

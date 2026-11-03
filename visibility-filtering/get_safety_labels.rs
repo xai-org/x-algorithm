@@ -1,7 +1,5 @@
 use crate::metrics::families::{LOOKUP_FAILURES, LOOKUP_TWEET_IDS};
 use crate::metrics::Metrics;
-use crate::safety_label_source::remote::FailureKind;
-use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
 use prost::bytes::BufMut;
 use prost::encoding::{hash_map, message, uint64};
@@ -11,6 +9,7 @@ use std::sync::Arc;
 use tonic::codec::{Codec, EncodeBuf, Encoder};
 use tonic::{Request, Response, Status};
 use tonic_prost::ProstDecoder;
+use xai_safety_label_source::{FailureKind, LookupError, SafetyLabelSource};
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct GetSafetyLabelsEndpoint {

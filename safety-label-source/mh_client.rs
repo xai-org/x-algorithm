@@ -12,10 +12,10 @@ const SCAN_LIMIT: u32 = 512;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
 const DEFAULT_RETRIES: usize = 1;
 
-pub type FetchResult = Result<Vec<RawSafetyLabel>, ManhattanError>;
+pub(crate) type FetchResult = Result<Vec<RawSafetyLabel>, ManhattanError>;
 
 #[async_trait]
-pub trait ManhattanLabelFetcher: Send + Sync {
+pub(crate) trait ManhattanLabelFetcher: Send + Sync {
     async fn fetch_labels(&self, tweet_ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError>;
 }
 
@@ -25,12 +25,12 @@ static TENANT: LazyLock<Tenant> = LazyLock::new(|| Tenant {
     dataset: "tweet_labels".to_string(),
 });
 
-pub struct MhLabelClient {
+pub(crate) struct MhLabelClient {
     mh: NativeManhattanClient,
 }
 
 impl MhLabelClient {
-    pub async fn new(
+    pub(crate) async fn new(
         dc: &str,
         s2s: S2sConfig,
         deterministic_aperture: bool,

@@ -145,6 +145,7 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
         read_ads_engagement_counts=mparams.get("read_ads_engagement_counts", False),
         page_records=_page_records(mparams),
@@ -177,6 +178,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         max_redistribution_bytes=mparams.get("max_redistribution_bytes", 256 << 20),
         read_ads_engagement_counts=mparams.get("read_ads_engagement_counts", False),
         page_records=_page_records(mparams),
@@ -213,6 +215,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         page_records=_page_records(mparams),
     )
 
@@ -236,6 +239,7 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         page_records=_page_records(mparams),
     )
 
@@ -259,6 +263,7 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         page_records=_page_records(mparams),
     )
 
@@ -286,6 +291,7 @@ def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, conf
         sid_num_levels=sid_num_levels,
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
     )
 
 

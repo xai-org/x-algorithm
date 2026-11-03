@@ -1,4 +1,3 @@
-use crate::models::tweet_timestamp_ms;
 use quanta::Clock;
 use quick_cache::sync::Cache;
 use rustc_hash::FxHashMap;
@@ -11,6 +10,12 @@ use super::metrics::{self, BatchStage, CacheResult, CacheTier, LabelMetrics};
 use super::remote::{LookupError, LookupResults, RemoteLabels};
 
 const TTL: Duration = Duration::from_secs(10);
+
+fn tweet_timestamp_ms(tweet_id: u64) -> u64 {
+    const SNOWFLAKE_EPOCH_MS: u64 = 1288834974657;
+    const SNOWFLAKE_TIMESTAMP_SHIFT: u32 = 22;
+    (tweet_id >> SNOWFLAKE_TIMESTAMP_SHIFT) + SNOWFLAKE_EPOCH_MS
+}
 
 fn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {
     UNIX_EPOCH
@@ -210,7 +215,7 @@ impl SafetyLabelSource {
 mod tests {
     use super::*;
 
-    use crate::safety_label_source::remote::FailureKind;
+    use crate::remote::FailureKind;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tonic::async_trait;

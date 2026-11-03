@@ -65,6 +65,21 @@ __device__ __forceinline__ bool segment_in_range(int32_t segment, int64_t num_un
   return segment >= 0 && segment < num_unique;
 }
 
+__device__ __forceinline__ uint32_t hash_u32(uint32_t x) {
+  x = (x ^ (x >> 16)) * 0x7feb352du;
+  x = (x ^ (x >> 15)) * 0x846ca68bu;
+  return x ^ (x >> 16);
+}
+
+__device__ __forceinline__ __nv_bfloat16
+stochastic_round_bf16(float value, uint32_t step, uint32_t row, uint32_t col) {
+  const uint32_t base = hash_u32(hash_u32(step) ^ hash_u32(row));
+  const uint32_t rand = (col * 0x9e3779b1u + base) >> 16;
+  __nv_bfloat16_raw raw;
+  raw.x = static_cast<uint16_t>((__float_as_uint(value) + rand) >> 16);
+  return raw;
+}
+
 }
 
 __global__ void lookup_dispatch(
@@ -429,7 +444,9 @@ __global__ void rowwise_adagrad_apply(
     if (lazy) {
       const float delta = fmaxf(0.f, float(clock - last_step[token]));
       accum_factor = expf(-adagrad.accum_decay_rate * delta);
-      wd = row_sq_sum > 0.f ? expf(-adagrad.weight_decay_rate * delta) : 1.f;
+      wd = (row_sq_sum > 0.f && delta > adagrad.weight_decay_exempt_window)
+               ? expf(-adagrad.weight_decay_rate * delta)
+               : 1.f;
       last_step[token] = clock;
     } else {
       wd = row_sq_sum > 0.f ? adagrad.weight_decay_factor : 1.f;
@@ -457,9 +474,22 @@ __global__ void rowwise_adagrad_apply(
 #pragma unroll
     for (int col = 0; col < kShardWidth; ++col) {
       const float grad = __bfloat162float(__float2bfloat16(grads[col]));
-      const float delta = __bfloat162float(__float2bfloat16(step * grad));
-      const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(cells[col]) * wd));
-      cells[col] = __float2bfloat16(decayed + delta);
+
+      if (adagrad.stochastic_rounding) {
+        const float candidate =
+            __fadd_rn(__fmul_rn(__bfloat162float(cells[col]), wd), __fmul_rn(step, grad));
+
+        cells[col] = stochastic_round_bf16(
+            candidate,
+            static_cast<uint32_t>(clock),
+            static_cast<uint32_t>(token),
+            static_cast<uint32_t>(adagrad.col_offset + col)
+        );
+      } else {
+        const float delta = __bfloat162float(__float2bfloat16(step * grad));
+        const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(cells[col]) * wd));
+        cells[col] = __float2bfloat16(decayed + delta);
+      }
     }
     copy_row(table_row, cells, kShardWidth, 0, 1);
     row_state[token] = accum;

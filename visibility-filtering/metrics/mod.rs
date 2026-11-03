@@ -304,6 +304,7 @@ fn record_unresolved<'a>(
     for evaluation in evaluations {
         let unresolved = match *evaluation {
             Evaluation::NotFound(lookup) => (lookup, Cause::NotFound),
+            Evaluation::Deleted(_) => (Lookup::Tweet, Cause::NotFound),
             Evaluation::Failed(lookup) => (lookup, Cause::Failed),
             Evaluation::Complete { .. } | Evaluation::Partial { .. } => continue,
         };
@@ -574,7 +575,24 @@ mod tests {
     use crate::rules::fixtures::allow;
     use crate::rules::RuleId;
     use xai_visibility_filtering::models::FilteredReason;
+    use xai_visibility_filtering::tweet_safety_label::{
+        BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
+    };
+    use xai_visibility_filtering::vf_client::FILTER_TWEETS_LATENCY_VM_METRIC;
     use xai_x_thrift::action::InterstitialReason;
+
+    #[test]
+    fn dashboard_generator_pins_the_client_vm_latency_metrics() {
+        let dashboard =
+            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
+        for pin in [
+            format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
+            format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),
+            format!("VF_CLIENT_FT_LATENCY_VM_METRIC = \"{FILTER_TWEETS_LATENCY_VM_METRIC}\""),
+        ] {
+            assert!(dashboard.contains(&pin), "dashboard.py is missing `{pin}`");
+        }
+    }
 
     fn drop_by(rule: &'static str) -> Verdict {
         Verdict::Withheld(Decided {

@@ -1939,6 +1939,7 @@ class PhoenixDataset(Dataset):
     ads_head_masking: bool = False
     dump_keep_rate_per_10000: int | None = None
     ads_pixel_head_masking: bool = False
+    ads_late_window_heads: bool = False
     page_records: bool = False
     read_ads_engagement_counts: bool = False
 
@@ -2472,6 +2473,7 @@ class PhoenixDataset(Dataset):
                         ads_head_masking=self.ads_head_masking,
                         dump_keep_rate_per_10000=self.dump_keep_rate_per_10000,
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
+                        ads_late_window_heads=self.ads_late_window_heads,
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
                         id_list_specs=id_list_specs,

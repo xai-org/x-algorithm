@@ -16,10 +16,9 @@ use crate::hydration::decode::tweet::pure_core;
 use crate::hydration::decode::viewer::decode_viewer;
 pub(crate) use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::fetcher::Owner;
-use crate::hydration::tweet_source::{decode_tweet, TweetSource};
+use crate::hydration::tweet_source::{decode_tweet, decode_tweet_state, TweetSource, TweetState};
 use crate::models::{ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures};
 use crate::post_card::{PostCard, PostCards};
-use crate::safety_label_source::SafetyLabelSource;
 use futures::future::join;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +30,7 @@ use wingman_client::Exists;
 use xai_core_entities::entities::{ConversationControl, GizmoduckUser, QuotedTweet};
 use xai_core_entities::gizmoduck_client::QueryFields;
 use xai_core_entities::tweet_entity_service_client::TESClient;
+use xai_safety_label_source::SafetyLabelSource;
 use xai_strato::Bytes;
 use xai_visibility_filtering_proto as vf_pb;
 
@@ -51,6 +51,8 @@ pub(crate) trait Sources: Send + Sync {
     ) -> RawHydrationBatch<ConversationControl>;
 
     async fn quoted_tweets(&self, outer_ids: &[u64]) -> RawHydrationBatch<QuotedTweet>;
+
+    async fn tweet_states(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetState>;
 
     async fn safety_labels(
         &self,
@@ -172,13 +174,14 @@ fn edge_batches(
         .collect()
 }
 
-fn tweet_batch(
+fn tweet_batch<V>(
     tweet_ids: &[u64],
     values: HashMap<u64, anyhow::Result<Bytes>>,
-) -> RawHydrationBatch<TweetFeatures> {
+    decode: fn(&[u8]) -> anyhow::Result<Option<V>>,
+) -> RawHydrationBatch<V> {
     let tweets: FxHashMap<_, _> = values
         .into_iter()
-        .map(|(id, value)| (id, value.and_then(|bytes| decode_tweet(&bytes))))
+        .map(|(id, value)| (id, value.and_then(|bytes| decode(&bytes))))
         .collect();
     HydrationBatch::from_results(tweet_ids.iter().copied(), tweets)
 }
@@ -260,7 +263,7 @@ impl Sources for ProdSources {
 
     async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures> {
         let values = self.backends.tweets.get_tweet_values(tweet_ids).await;
-        tweet_batch(tweet_ids, values)
+        tweet_batch(tweet_ids, values, decode_tweet)
     }
 
     async fn conversation_controls(
@@ -282,6 +285,11 @@ impl Sources for ProdSources {
             .get_quoted_tweets(outer_ids.to_vec())
             .await;
         HydrationBatch::from_results(outer_ids.iter().copied(), quoted)
+    }
+
+    async fn tweet_states(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetState> {
+        let values = self.backends.tweets.get_tweet_states(tweet_ids).await;
+        tweet_batch(tweet_ids, values, decode_tweet_state)
     }
 
     async fn safety_labels(

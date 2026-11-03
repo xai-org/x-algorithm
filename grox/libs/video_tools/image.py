@@ -161,6 +161,7 @@ _MOTION_REVEAL_WORK_MAX_DIM = 640
 _MOTION_REVEAL_OVERVIEW_FRAMES = 9
 _MOTION_REVEAL_DETAIL_STILLS = 6
 _MOTION_REVEAL_PLAIN_STILLS = 2
+_MOTION_REVEAL_MAX_OPAQUE_MOTION_SHARE = 0.35
 _MOTION_REVEAL_JPEG_QUALITY = 90
 _MOTION_REVEAL_MAX_RESIDUAL_P99 = 100.0
 _MOTION_REVEAL_DENOISE_ENERGY = (1.0, 3.0, 8.0)
@@ -188,7 +189,7 @@ _OVERLAY_OPAQUE_NCC = 0.25
 _OVERLAY_GLOBAL_WEIGHTS = (2.164, 0.581, -8.755, 22.971, -5.714, -9.539, 0.928)
 _OVERLAY_LOCAL_WEIGHTS = (4.049, -0.254, 9.51, 21.771, 0.616, -1.785, 0.232)
 _OVERLAY_BIAS = -4.374
-_OVERLAY_MIN_SCORE = -1.75
+_OVERLAY_MIN_SCORE = -1.0
 _OVERLAY_LOCAL_OPAQUE_MARGIN = 0.05
 _MOTION_REVEAL_SKIN_LAB_AB = (143.0, 148.0)
 _MOTION_REVEAL_SKIN_AXIS_MAX_DISTANCE = 12.0
@@ -251,6 +252,42 @@ def _plain_reveal(residual: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(stretched, cv2.COLOR_BGR2LAB)
     lab[..., 0] = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(lab[..., 0])
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _opaque_motion_share(frames: np.ndarray, radius: int | None) -> float:
+    def grey(image: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(
+            np.clip(image, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32)
+
+    def local(x: np.ndarray) -> np.ndarray:
+        return cv2.GaussianBlur(x, (0, 0), 3.0)
+
+    shares = []
+    for t, frame in enumerate(frames):
+        if radius is not None or t == 0:
+            cover = _temporal_median(
+                frames
+                if radius is None
+                else frames[max(0, t - radius) : t + radius + 1]
+            )
+            cover_grey = grey(cover)
+            c = _band_pass(cover_grey)
+            textured = np.sqrt(local(c * c)) > _OVERLAY_MIN_COVER_TEXTURE
+        frame_grey = grey(frame)
+        f = _band_pass(frame_grey)
+        see_through = local(f * c) / np.sqrt(local(f * f) * local(c * c) + 1e-3)
+        opaque = (
+            (see_through < _OVERLAY_OPAQUE_NCC)
+            & (local(np.abs(frame_grey - cover_grey)) > 6.0)
+            & textured
+        )
+        opaque = np.clip(
+            cv2.GaussianBlur(opaque.astype(np.float32), (0, 0), 4.0) * 1.5, 0.0, 1.0
+        )
+        change = np.abs(frame.astype(np.float32) - cover).mean(axis=-1)
+        shares.append(float((change * opaque).sum() / (change.sum() + 1e-6)))
+    return float(np.median(shares))
 
 
 def _encode_reveal(bgr: np.ndarray) -> bytes | None:
@@ -581,7 +618,11 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
     if float(np.median(raw_p99)) > _MOTION_REVEAL_MAX_RESIDUAL_P99:
         return []
     is_overlay, cover_radius = _overlay_cover_radius(originals_u8)
-    if not is_overlay:
+    if (
+        not is_overlay
+        or _opaque_motion_share(originals_u8, cover_radius)
+        > _MOTION_REVEAL_MAX_OPAQUE_MOTION_SHARE
+    ):
         return []
 
     reference_gray = _to_gray_u8(raw_median)

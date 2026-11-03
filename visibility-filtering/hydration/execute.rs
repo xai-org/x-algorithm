@@ -8,11 +8,12 @@ use crate::hydration::hydrator::Edge;
 use crate::hydration::inventory::Source;
 use crate::hydration::metrics::{
     record_flock_missing_keys, record_keyed_hydrator_request, record_request_country,
-    record_viewer_country,
+    record_tweet_states, record_viewer_country,
 };
 use crate::hydration::plan::Group;
 use crate::hydration::sources::{Expired, Sources};
 use crate::hydration::store::{CallRequest, Landing, Store};
+use crate::hydration::tweet_source::TweetState;
 use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator};
 use crate::metrics::families::{
     HYDRATOR_EXPANDED_BATCHES, HYDRATOR_EXPANDED_KEYS, HYDRATOR_LATENCY_MS,
@@ -129,6 +130,7 @@ pub(super) enum Reply {
     Tweets(RawHydrationBatch<TweetFeatures>),
     Controls(RawHydrationBatch<ConversationControl>),
     QuotedTweets(RawHydrationBatch<QuotedTweet>),
+    TweetStates(RawHydrationBatch<TweetState>),
     Labels(RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>>),
     Viewer(RawHydrationBatch<DecodedViewer>),
     Authors(RawHydrationBatch<DecodedAuthor>),
@@ -315,6 +317,12 @@ impl HydrationPlan {
                 |call| sources.quoted_tweets(&call.keys),
                 identity,
                 Reply::QuotedTweets,
+            ),
+            Source::TesTweetState => timed.keyed(
+                call,
+                |call| sources.tweet_states(&call.keys),
+                move |states| record_tweet_states(metrics, states),
+                Reply::TweetStates,
             ),
             Source::SafetyLabels => timed.keyed(
                 call,
@@ -2526,12 +2534,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hung_source_delays_only_the_calls_waiting_on_it() {
         use SafetyLevel::{TimelineHome, TimelineHomeHydration};
-        let raw = [raw(1, None), raw(2, None), raw(3, None), raw(4, None)];
+        let raw = [
+            raw(1, None),
+            raw(2, None),
+            raw(3, None),
+            raw(4, None),
+            raw(5, None),
+        ];
         let engine = RuleEngine::for_tests();
         let mut rendered = String::new();
+        let merged = |sources, level| {
+            executor(sources, level, Some(VIEWER)).retweet_merge(RetweetMerge::Merged)
+        };
         for level in [TimelineHome, TimelineHomeHydration] {
             let healthy = every_source_world();
-            let scenario = executor(healthy, level, Some(VIEWER));
+            let scenario = merged(healthy, level);
             let healthy = scenario.sources();
             scenario.hydrate(&raw).await;
             let every_call = call_labels(healthy);
@@ -2546,7 +2563,7 @@ mod tests {
             for hung in planned {
                 let sources = every_source_world().fault(hung, Fault::Hangs);
                 let started = tokio::time::Instant::now();
-                let scenario = executor(sources, level, Some(VIEWER));
+                let scenario = merged(sources, level);
                 let sources = scenario.sources();
                 let hydration = scenario.hydrate(&raw);
                 tokio::pin!(hydration);

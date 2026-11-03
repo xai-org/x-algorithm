@@ -49,6 +49,7 @@ class FeaturePrepStreams(NamedTuple):
 
 
 POST_AGE_MAX_MINUTES = 4800
+TIME_GAP_CARDINALITY = 19
 
 
 def _compute_post_age_bucket_linear(
@@ -67,6 +68,14 @@ def _compute_post_age_bucket_linear(
         bucket,
     )
     return bucket.astype(jnp.int32)
+
+
+def _compute_time_gap_bucket(request_ts: jax.Array, impr_ts: jax.Array) -> jax.Array:
+    gap = request_ts - impr_ts
+    edges = jnp.asarray([60 * 2**k for k in range(TIME_GAP_CARDINALITY - 2)], dtype=gap.dtype)
+    bucket = 1 + jnp.searchsorted(edges, gap, side="right", method="compare_all")
+    known = (request_ts > 0) & (impr_ts > 0) & (gap >= 0)
+    return jnp.where(known, bucket, 0).astype(jnp.int32)
 
 
 DTYPE_BY_NAME = {
@@ -176,6 +185,8 @@ class FeaturePrepConfig(Config):
 
     enable_product_surface: bool = True
     enable_post_age: bool = True
+    enable_time_gap: bool = False
+    time_gap_lr_scale: float = 1.0
     enable_timezone: bool = True
     enable_dwell_time: bool = True
     dwell_time_norm_scale: float = 30.0
@@ -277,7 +288,11 @@ def _feature_scale_spec(
         lr = scale_config.emb_lr_multiplier(dim) if scale_config is not None else 1.0
         return eis / math.sqrt(dim), lr
     if role == "hidden_proj":
-        lr = scale_config.hidden_lr_multiplier(dim) if scale_config is not None else 1.0
+        lr = (
+            scale_config.hidden_lr_multiplier(dim) * scale_config.hidden_proj_lr_scale
+            if scale_config is not None
+            else 1.0
+        )
         return eis / math.sqrt(dim), lr
     if role == "input_proj":
         lr = scale_config.emb_lr_multiplier(D) if scale_config is not None else 1.0
@@ -317,6 +332,7 @@ def _get_emb_table(
     config: FeaturePrepConfig,
     *,
     zero_init: bool = False,
+    lr_scale: float = 1.0,
 ) -> jax.Array:
     _, lr_multiplier = _feature_scale_spec(
         config.scale_config, config.embed_init_scale, config.emb_size, "embedding", dim
@@ -334,7 +350,7 @@ def _get_emb_table(
             dtype=jnp.float32,
             init=init,
             pspec=P(),
-            lr_multiplier=lr_multiplier,
+            lr_multiplier=lr_multiplier * lr_scale,
             rms_clip_axes=(-2, -1),
         ),
     )
@@ -378,8 +394,12 @@ def _embed_categorical(
     config: FeaturePrepConfig,
     *,
     one_hot_dtype: jnp.dtype = jnp.float32,
+    zero_init: bool = False,
+    lr_scale: float = 1.0,
 ) -> jax.Array:
-    table = _get_emb_table(name, cardinality, config.emb_size, config)
+    table = _get_emb_table(
+        name, cardinality, config.emb_size, config, zero_init=zero_init, lr_scale=lr_scale
+    )
     one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality, dtype=one_hot_dtype)
     return jnp.dot(one_hot, table)
 
@@ -1003,6 +1023,21 @@ def _add_history_features(
                     fprop_dtype
                 )
 
+    if config.enable_time_gap:
+        int64_feats = batch["history_seq"].get("int64_features")
+        request_idx = Int64Feature.requestTimeSecSeq
+        if int64_feats is not None and int64_feats.shape[-1] > request_idx:
+            request_ts = _cast_jax(int64_feats)[:, :, request_idx]
+            impr_ts = _cast_jax(batch["history_seq"]["impr_ts"])
+            result = result + _embed_categorical(
+                _compute_time_gap_bucket(request_ts, impr_ts),
+                TIME_GAP_CARDINALITY,
+                "hist_time_gap_emb",
+                config,
+                zero_init=True,
+                lr_scale=config.time_gap_lr_scale,
+            ).astype(fprop_dtype)
+
     return result
 
 
@@ -1044,6 +1079,23 @@ def _add_candidate_features(
             role="input_proj",
         )
         result = result + jnp.dot(sq.astype(proj.dtype), proj).astype(fprop_dtype)
+
+    if config.enable_time_gap:
+        int64_feats = batch["candidate_seq"].get("int64_features")
+        request_idx = Int64Feature.requestTimeSecSeq
+        latest_idx = Int64Feature.latestHistoryImpressionTimeSecSeq
+        if int64_feats is not None and int64_feats.shape[-1] > latest_idx:
+            int64_feats = _cast_jax(int64_feats)
+            result = result + _embed_categorical(
+                _compute_time_gap_bucket(
+                    int64_feats[:, :, request_idx], int64_feats[:, :, latest_idx]
+                ),
+                TIME_GAP_CARDINALITY,
+                "cand_time_since_history_emb",
+                config,
+                zero_init=True,
+                lr_scale=config.time_gap_lr_scale,
+            ).astype(fprop_dtype)
 
     return result
 
