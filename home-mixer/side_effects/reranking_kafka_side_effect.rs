@@ -146,6 +146,7 @@ fn build_scored_candidate(candidate: &PostCandidate, position: i32) -> pb::Score
     );
     insert_score(&mut prediction_scores, "pdwell", s.post_unexplored_score);
     insert_score(&mut prediction_scores, "post_video", s.post_video_score);
+    insert_score(&mut prediction_scores, "grok_analyze", s.grok_analyze_score);
     insert_score(&mut prediction_scores, "dwell_time", s.dwell_time);
     insert_score(
         &mut prediction_scores,

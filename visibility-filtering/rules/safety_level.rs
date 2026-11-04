@@ -2,6 +2,7 @@ use crate::hydration::{AuthorNotFound, RequestRows};
 use crate::models::NotificationKind;
 use crate::rules::levels;
 use crate::rules::levels::{LevelRules, PostRules};
+use crate::rules::notification_kind::{self, Judged};
 use crate::rules::rule_spec::rule::UserRule;
 use crate::rules::RuleId;
 use strum::VariantArray;
@@ -47,9 +48,7 @@ pub(crate) enum LevelSpec {
     },
     Notifications {
         thrift: ThriftLevel,
-        kind: NotificationKind,
         rules: UserRules,
-        post_kinds: &'static [(NotificationKind, PostRules)],
     },
 }
 
@@ -147,28 +146,11 @@ impl SafetyLevel {
             },
             SafetyLevel::NotificationsFollow => LevelSpec::Notifications {
                 thrift: ThriftLevel::NOTIFICATIONS_FOLLOW,
-                kind: NotificationKind::Follow,
                 rules: UserRules(levels::NOTIFICATIONS_FOLLOW),
-                post_kinds: &[],
             },
             SafetyLevel::NotificationsWriterV2 => LevelSpec::Notifications {
                 thrift: ThriftLevel::NOTIFICATIONS_WRITER_V2,
-                kind: NotificationKind::FollowRequestAccepted,
                 rules: UserRules(levels::NOTIFICATIONS_WRITER_V2),
-                post_kinds: &[
-                    (
-                        NotificationKind::Mention,
-                        levels::NOTIFICATIONS_WRITER_V2_MENTION,
-                    ),
-                    (
-                        NotificationKind::Reply,
-                        levels::NOTIFICATIONS_WRITER_V2_REPLY,
-                    ),
-                    (
-                        NotificationKind::MediaTagged,
-                        levels::NOTIFICATIONS_WRITER_V2_MEDIA_TAGGED,
-                    ),
-                ],
             },
         }
     }
@@ -197,24 +179,25 @@ impl SafetyLevel {
         })
     }
 
-    pub(crate) fn notification_rows(self, kind: NotificationKind) -> Option<RequestRows> {
-        match self.spec() {
-            LevelSpec::Notifications {
-                kind: user_kind,
-                post_kinds,
-                ..
-            } => {
-                if kind == user_kind {
-                    Some(RequestRows::Users)
-                } else {
-                    post_kinds
-                        .iter()
-                        .any(|&(post_kind, _)| post_kind == kind)
-                        .then_some(RequestRows::ActorPosts)
-                }
-            }
-            LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => None,
-        }
+    pub(crate) fn judges(self, kind: NotificationKind) -> bool {
+        matches!(self.spec(), LevelSpec::Notifications { thrift, .. } if thrift == kind.level())
+    }
+
+    pub(super) fn post_kinds(self) -> impl Iterator<Item = (NotificationKind, PostRules)> {
+        NotificationKind::VARIANTS
+            .iter()
+            .copied()
+            .filter(move |&kind| self.judges(kind))
+            .filter_map(|kind| match notification_kind::judged(kind) {
+                Judged::ActorPost(rules) => Some((kind, rules)),
+                Judged::Actor => None,
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn rule_lists(self) -> impl Iterator<Item = levels::LevelLists> {
+        std::iter::once(self.spec().rules().lists())
+            .chain(self.post_kinds().map(|(_, rules)| rules.lists()))
     }
 
     fn served_where(serves: impl Fn(&LevelSpec) -> bool) -> Result<Self, LevelError> {
@@ -255,19 +238,6 @@ impl LevelSpec {
                 ..
             } => LevelRules::UserOnly(rules),
         }
-    }
-
-    pub(super) const fn post_kinds(&self) -> &'static [(NotificationKind, PostRules)] {
-        match self {
-            Self::Notifications { post_kinds, .. } => post_kinds,
-            Self::Posts(_) | Self::QuotePass { .. } => &[],
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn rule_lists(&self) -> impl Iterator<Item = levels::LevelLists> + use<> {
-        std::iter::once(self.rules().lists())
-            .chain(self.post_kinds().iter().map(|&(_, rules)| rules.lists()))
     }
 
     pub(crate) const fn rows(&self) -> RequestRows {

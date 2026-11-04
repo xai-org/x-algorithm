@@ -18,8 +18,7 @@ use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
 use crate::metrics::{Endpoint, Metrics, RequestLevel};
 use crate::models::{
-    ClientCapability, Evaluation, PlacedCandidate, RawCandidate, RequestViewer, RetweetMerge,
-    TweetId,
+    Evaluation, PlacedCandidate, RawCandidate, RequestFacts, RetweetMerge, TweetId,
 };
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
@@ -517,8 +516,7 @@ const WARM_FILTER_TWEETS_SLEEP: Duration = Duration::from_millis(500);
 
 fn warm_filter_tweets_request() -> PostBatch {
     PostBatch {
-        viewer: RequestViewer::default(),
-        client_capability: ClientCapability::default(),
+        facts: RequestFacts::default(),
         safety_level: SafetyLevel::TimelineHomeRecommendations,
         candidates: vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),

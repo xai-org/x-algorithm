@@ -3,8 +3,8 @@ use super::PostEvaluator;
 use crate::hydration::{Cause, HydratedTweet, HydrationRequest, Lookup, Unresolved};
 use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, ClientCapability, Evaluation, NotificationKind, Placement, RawCandidate,
-    RetweetMerge, TweetId,
+    AuthorId, Evaluation, NotificationKind, Placement, RawCandidate, RequestFacts, RetweetMerge,
+    TweetId,
 };
 use crate::rules::SafetyLevel;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ impl PostEvaluator {
     pub(crate) async fn evaluate_post_notifications(
         &self,
         level: SafetyLevel,
-        viewer_id: u64,
+        facts: RequestFacts,
         posts: &[(TweetId, NotificationKind, AuthorId)],
         metrics: &RequestMetrics,
     ) -> HashMap<(TweetId, NotificationKind, AuthorId), Option<Evaluation>> {
@@ -39,9 +39,7 @@ impl PostEvaluator {
             .hydrate(
                 &*self.sources,
                 HydrationRequest::new(
-                    Some(viewer_id),
-                    None,
-                    ClientCapability::default(),
+                    facts,
                     raw,
                     RetweetMerge::Unmerged,
                     &self.fallback_caches,

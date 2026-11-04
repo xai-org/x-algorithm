@@ -11,8 +11,6 @@ KAFKA_RUST_BOOTSTRAP: str = os.environ.get("XREX_KAFKA_RUST_BOOTSTRAP", "phoenix
 
 KAFKA_DISPATCHER_HOST_TEMPLATE: str = os.environ.get("XREX_KAFKA_DISPATCHER_HOST_TEMPLATE", "")
 
-GRPC_DATALOADER_ADDRESS: str = os.environ.get("XREX_GRPC_DATALOADER_ADDRESS", "")
-
 OTEL_ENDPOINT: str = os.environ.get("XREX_OTEL_ENDPOINT", "")
 
 RANKING_KAFKA_TOPIC: str = os.environ.get("XREX_RANKING_KAFKA_TOPIC", "recsys_ranking_training")

@@ -101,8 +101,8 @@ impl FilterTweetsEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::inventory::Source;
     use crate::hydration::sources::InMemorySources;
+    use crate::hydration::sources::Source;
     use crate::metrics::Metrics;
     use crate::rules::RuleEngine;
     use std::sync::Mutex;

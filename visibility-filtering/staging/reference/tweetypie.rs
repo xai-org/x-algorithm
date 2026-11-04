@@ -569,7 +569,7 @@ mod tests {
     use crate::metrics::{Metrics, Recorded};
     use crate::models::{Decided, DropReason, Withholding};
     use crate::rules::RuleId;
-    use crate::rules::fixtures::CLIENT_CLASSES;
+    use crate::rules::fixtures::{CLIENT_CLASSES, allow};
     use strum::VariantArray;
     use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;
     use xai_x_thrift::action::{
@@ -592,14 +592,6 @@ mod tests {
             source_tweet_id: None,
             evaluation: Evaluation::complete(verdict),
             safety_labels: None,
-        }
-    }
-
-    pub(super) fn shown() -> Verdict {
-        Verdict::Shown {
-            notice: None,
-            media: None,
-            engagement: None,
         }
     }
 
@@ -630,10 +622,10 @@ mod tests {
         };
         let vf = PostEvaluation {
             evaluation: Evaluation::Complete {
-                verdict: shown(),
+                verdict: allow(),
                 fail_open_defaults: Hydrators::of(Hydrator::Follows),
             },
-            ..outcome(shown())
+            ..outcome(allow())
         };
         assert_eq!(
             compared(&tp, Some(&vf)).bucket().vf,
@@ -645,9 +637,9 @@ mod tests {
     fn the_record_names_each_evaluation() {
         assert_eq!(
             [
-                Evaluation::complete(shown()),
+                Evaluation::complete(allow()),
                 Evaluation::Partial {
-                    verdict: shown(),
+                    verdict: allow(),
                     fail_open_defaults: Hydrators::empty(),
                 },
                 Evaluation::NotFound(Lookup::Tweet),
@@ -715,13 +707,13 @@ mod tests {
         });
         assert_eq!(rate_limited.label, pair("failed", "rate_limited"));
 
+        let shown = outcome(allow());
         let allow = TpResult {
             label: pair("allow", "safety_result_reason_14"),
             result: None,
             strato_error: None,
             quoted: None,
         };
-        let shown = outcome(shown());
         assert_eq!(
             compared(&allow, Some(&shown)).bucket(),
             Bucket {
@@ -831,7 +823,7 @@ mod tests {
         ] {
             let vf = PostEvaluation {
                 placement,
-                ..outcome(shown())
+                ..outcome(allow())
             };
             let compared = Compared {
                 lens,
@@ -869,7 +861,7 @@ mod tests {
             strato_error: None,
             quoted: None,
         };
-        let vf = outcome(shown());
+        let vf = outcome(allow());
         let compared = compared(&tp, Some(&vf));
         let bucket = compared.bucket();
         let mut emitted = json!({

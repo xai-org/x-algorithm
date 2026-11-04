@@ -114,7 +114,6 @@ impl ClientSwitches {
                 .copied()
                 .filter(|&switch| on(key(switch), switch.default_on()))
                 .collect(),
-            soft_nsfw_new_user_drop: false,
         }
     }
 

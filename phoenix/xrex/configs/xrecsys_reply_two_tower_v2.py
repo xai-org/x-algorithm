@@ -45,8 +45,10 @@ MODEL_CFGS = {
 }
 
 
-def _build(config_name: str, mparams: dict) -> RecsysTrainer:
-    trainer = xrecsys.make_trainer(config_name, mparams, "aggregated_kafka")
+def _build(
+    config_name: str, mparams: dict, dataset_type: str = "aggregated_kafka"
+) -> RecsysTrainer:
+    trainer = xrecsys.make_trainer(config_name, mparams, dataset_type)
     base = trainer.model_config
     model_config = RecsysReplyTwoTowerV2Config(
         **{
@@ -74,5 +76,7 @@ def _build(config_name: str, mparams: dict) -> RecsysTrainer:
 
 
 CONFIGS = {
-    f"{name}_aggregated_kafka": _build(name, mparams) for name, mparams in MODEL_CFGS.items()
+    f"{name}_{dataset_type}": _build(name, mparams, dataset_type)
+    for name, mparams in MODEL_CFGS.items()
+    for dataset_type in ("aggregated_kafka", "rust_kafka")
 }

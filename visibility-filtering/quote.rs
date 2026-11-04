@@ -74,8 +74,7 @@ fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
         .copied()
         .collect();
     (!quotes.is_empty()).then(|| PostBatch {
-        viewer: request.viewer.clone(),
-        client_capability: request.client_capability,
+        facts: request.facts.clone(),
         safety_level: SafetyLevel::QuotedTweetRules,
         candidates: quotes,
         retweet_merge: RetweetMerge::Unmerged,
@@ -232,7 +231,7 @@ fn pass(
     match outer {
         None => return PassOutcome::OuterAbsent,
         Some(Evaluation::Complete {
-            verdict: Verdict::Shown { .. },
+            verdict: Verdict::Fosnr(_) | Verdict::Shown { .. },
             ..
         }) => {}
         Some(
@@ -275,7 +274,7 @@ fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
             ..
         } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),
         Evaluation::Complete {
-            verdict: Verdict::Shown { .. },
+            verdict: Verdict::Fosnr(_) | Verdict::Shown { .. },
             ..
         } => PassOutcome::Passed,
         Evaluation::Partial { .. }
@@ -322,7 +321,7 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeFrom, EdgeQuery, Graph};
     use crate::evaluate_tweets::EntryComparator;
     use crate::hydration::fallback_cache::FallbackCaches;
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{suspended, Fault, InMemorySources};
     use crate::hydration::tweet_fallback_cache;
     use crate::hydration::Relation;

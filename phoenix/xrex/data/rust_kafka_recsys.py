@@ -41,6 +41,8 @@ class RustKafkaDataset(PhoenixKafkaDataset):
 
     num_converter_threads: int = 1
 
+    max_partition_fetch_bytes: int = 50 << 20
+
     keep_per_factor: float = 1.0
 
     drop_catchup_window_secs: float = 7200.0
@@ -187,6 +189,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                 ssl_certificate_location=auth.cert_path,
                 ssl_key_location=auth.key_path,
                 auto_offset_reset=self.auto_offset_reset,
+                max_partition_fetch_bytes=self.max_partition_fetch_bytes,
                 queue_size=self.queue_size,
                 reset_to_latest=self.reset_to_latest,
                 seek_to_offsets=(None if self.reset_to_latest else self.seek_to_offset),

@@ -1,5 +1,4 @@
 use crate::hydration::Cause;
-use strum::VariantArray;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stake {
@@ -67,61 +66,6 @@ pub(super) const fn classify(stake: Stake, answer: Answer) -> Effect {
 
 pub(super) const fn claimed_answer_fails(stake: Stake, answer: Answer) -> bool {
     !matches!(answer, Answer::Unclaimed) && classify(stake, answer).fails_node()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
-pub(crate) enum Source {
-    TesPureCoreData,
-    TesTweetForVisibility,
-    TesConversationControl,
-    TesQuotedTweet,
-    TesTweetState,
-    SafetyLabels,
-    GizmoduckViewer,
-    GizmoduckAuthor,
-    Flock,
-    ViewerCountry,
-    Wingman,
-    CommunityModeration,
-    CommunityModerator,
-    CommunityViewerRemoved,
-    ArticleLifecycle,
-    ArticleMediaEntities,
-    ArticleCoverMedia,
-    TrustedFriends,
-    UserLocation,
-    GizmoduckActor,
-    ActorEmails,
-    ActorPhones,
-}
-
-impl Source {
-    pub(super) const fn decides_existence(self) -> bool {
-        match self {
-            Source::TesPureCoreData
-            | Source::TesTweetForVisibility
-            | Source::GizmoduckAuthor
-            | Source::GizmoduckActor => true,
-            Source::TesConversationControl
-            | Source::TesQuotedTweet
-            | Source::TesTweetState
-            | Source::SafetyLabels
-            | Source::GizmoduckViewer
-            | Source::Flock
-            | Source::ViewerCountry
-            | Source::Wingman
-            | Source::CommunityModeration
-            | Source::CommunityModerator
-            | Source::CommunityViewerRemoved
-            | Source::ArticleLifecycle
-            | Source::ArticleMediaEntities
-            | Source::ArticleCoverMedia
-            | Source::TrustedFriends
-            | Source::UserLocation
-            | Source::ActorEmails
-            | Source::ActorPhones => false,
-        }
-    }
 }
 
 #[cfg(test)]

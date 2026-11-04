@@ -2,10 +2,6 @@ use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{PostCandidate, SafetyLabelType};
 use crate::rules::fixtures::{allow, candidate, dropped, CandidateBuilder};
-use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
-};
 use xai_visibility_filtering::models::FilteredReason;
 
 pub(super) fn rows() -> Vec<Row> {
@@ -15,50 +11,29 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(exclusive_candidate(candidate())),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
                     dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
                 ),
-                (TimelineHome, Role::Author, allow()),
-                (
-                    TimelineHome,
-                    Role::LoggedOut,
-                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![],
         },
         Row {
             name: "exclusive_super_followed",
             subject: Subject::Post(exclusive_candidate(
                 candidate().with_edge(Hydrator::SuperFollowsExclusive),
             )),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "exclusive_retweet",
             subject: Subject::Post(exclusive_candidate(candidate().retweet_of(2))),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::Author,
-                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::Author,
-                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-                ),
-            ],
+            expect: vec![(
+                Role::Author,
+                dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
+            )],
+            at: vec![],
         },
         Row {
             name: "exclusive_nsfw_high_precision_media",
@@ -67,24 +42,14 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_media()
                     .with_label(SafetyLabelType::NSFW_HIGH_PRECISION),
             )),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ContainNsfwMedia,
-                        "creator_tweet_nsfw/drop/nsfw_media",
-                    ),
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::LoggedOut]),
+                dropped(
+                    FilteredReason::ContainNsfwMedia,
+                    "creator_tweet_nsfw/drop/nsfw_media",
                 ),
-                (
-                    TimelineHomeHydration,
-                    Role::LoggedOut,
-                    dropped(
-                        FilteredReason::ContainNsfwMedia,
-                        "creator_tweet_nsfw/drop/nsfw_media",
-                    ),
-                ),
-            ],
+            )],
+            at: vec![],
         },
         Row {
             name: "exclusive_nsfw_high_precision_media_super_followed",
@@ -95,13 +60,13 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_edge(Hydrator::SuperFollowsExclusive),
             )),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 dropped(
                     FilteredReason::ContainNsfwMedia,
                     "creator_tweet_nsfw/drop/nsfw_media",
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "exclusive_super_followed_author_blocks_viewer",
@@ -112,15 +77,15 @@ pub(super) fn rows() -> Vec<Row> {
             )),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "author_blocks_viewer_exclusive_content/drop/unspecified",
                     ),
                 ),
-                (TimelineHomeHydration, Role::Author, allow()),
+                (Role::Author, allow()),
             ],
+            at: vec![],
         },
         Row {
             name: "exclusive_author_blocks_viewer",
@@ -128,10 +93,10 @@ pub(super) fn rows() -> Vec<Row> {
                 candidate().with_edge(Hydrator::BlockedByAuthor),
             )),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
             )],
+            at: vec![],
         },
     ]
 }

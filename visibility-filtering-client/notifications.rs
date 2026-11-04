@@ -14,6 +14,51 @@ use crate::vf_client::{
     xds_channel_params, XAI_VF_DEFAULT_TIMEOUT_MS,
 };
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum NotificationKind {
+    Follow,
+    FollowRequestAccepted,
+    Mention,
+    Reply,
+    MediaTagged,
+}
+
+impl NotificationKind {
+    pub const fn level(self) -> SafetyLevel {
+        match self {
+            Self::Follow => SafetyLevel::NOTIFICATIONS_FOLLOW,
+            Self::FollowRequestAccepted | Self::Mention | Self::Reply | Self::MediaTagged => {
+                SafetyLevel::NOTIFICATIONS_WRITER_V2
+            }
+        }
+    }
+
+    pub fn of_proto(kind: &vf_pb::notification::Kind) -> (Self, Option<u64>) {
+        use vf_pb::notification::Kind;
+        match kind {
+            Kind::Follow(_) => (Self::Follow, None),
+            Kind::FollowRequestAccepted(_) => (Self::FollowRequestAccepted, None),
+            Kind::Mention(vf_pb::Mention { post_id }) => (Self::Mention, Some(*post_id)),
+            Kind::Reply(vf_pb::Reply { post_id }) => (Self::Reply, Some(*post_id)),
+            Kind::MediaTagged(vf_pb::MediaTagged { post_id }) => {
+                (Self::MediaTagged, Some(*post_id))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notification {
     Follow { actor_id: u64 },
@@ -49,6 +94,16 @@ pub enum PostKind {
     Mention,
     Reply,
     MediaTagged,
+}
+
+impl PostKind {
+    const fn kind(self) -> NotificationKind {
+        match self {
+            Self::Mention => NotificationKind::Mention,
+            Self::Reply => NotificationKind::Reply,
+            Self::MediaTagged => NotificationKind::MediaTagged,
+        }
+    }
 }
 
 impl PostNotification {
@@ -127,8 +182,11 @@ impl NotificationsClient {
         recipient_id: u64,
         notifications: &[PostNotification],
     ) -> Result<Vec<NotificationOutcome>> {
+        let Some(first) = notifications.first() else {
+            return Ok(Vec::new());
+        };
         self.filter_notifications_recording(
-            SafetyLevel::NOTIFICATIONS_WRITER_V2,
+            first.kind.kind().level(),
             recipient_id,
             notifications.iter().map(|n| n.into_proto()).collect(),
             RequestMetrics::start(ClientRpc::FilterNotifications),

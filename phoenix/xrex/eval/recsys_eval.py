@@ -102,7 +102,7 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
     )
     candidate_seq_len: int = 64
     target_dataset_type: RetrievalDataset = RetrievalDataset.HOME
-    query_head_weights: Optional[Tuple[float, float]] = None
+    query_head_weights: Optional[Tuple[float, ...]] = None
     recall_ema_half_life_reports: float = 50.0
 
     positive_actions: List[int] = field(default_factory=lambda: list())

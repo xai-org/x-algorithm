@@ -10,6 +10,7 @@ pub(crate) mod fixtures;
 #[cfg(test)]
 mod golden_corpus;
 mod levels;
+pub(crate) mod notification_kind;
 mod rule_spec;
 mod safety_level;
 mod tweet_rules;

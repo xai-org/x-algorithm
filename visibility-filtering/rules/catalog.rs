@@ -46,7 +46,7 @@ pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let level_name: &'static str = level.into();
-        for listed in level.spec().rule_lists() {
+        for listed in level.rule_lists() {
             for entry in catalog_rules(&listed.user).chain(catalog_rules(&listed.post)) {
                 match rules.iter_mut().find(|(other, _)| *other == entry) {
                     Some((_, levels)) if levels.last() == Some(&level_name) => {}
@@ -133,7 +133,7 @@ fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E
         if band != Some(kind) {
             band = Some(kind);
             match slot {
-                "withholding" => writeln!(doc, "- {list}, {kind}, withholding:"),
+                "withholding" | "fosnr" => writeln!(doc, "- {list}, {kind}, {slot}:"),
                 _ => writeln!(doc, "- {list}, {kind}, {slot} slot:"),
             }
             .unwrap();

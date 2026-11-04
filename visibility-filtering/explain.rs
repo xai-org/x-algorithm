@@ -24,7 +24,8 @@ use crate::hydration::{request_context, HydratedTweet, Hydration};
 use crate::ingress;
 use crate::metrics::{Endpoint, Metrics, RequestLevel};
 use crate::models::{
-    EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, RequestViewer, Viewer,
+    EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, RequestFacts, RequestViewer,
+    Viewer,
 };
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_card::PostCards;
@@ -314,8 +315,7 @@ impl Explainer {
 
 struct RouteRun {
     route: Route,
-    viewer: RequestViewer,
-    capability: ClientCapability,
+    facts: RequestFacts,
     hydrated: HydratedRequest,
     provenance: Provenance,
 }
@@ -390,8 +390,7 @@ impl Explainer {
                 Endpoint::EvaluateTweets,
             ),
         };
-        let capability = request.client_capability;
-        let viewer = request.viewer.clone();
+        let facts = request.facts.clone();
         let metrics = self
             .post_evaluator
             .metrics()
@@ -427,8 +426,7 @@ impl Explainer {
                 };
                 RouteRun {
                     route,
-                    viewer,
-                    capability,
+                    facts,
                     hydrated,
                     provenance,
                 }
@@ -440,10 +438,11 @@ impl Explainer {
         let evaluation = &level.provenance.evaluation;
         let judgement = match evaluation {
             Evaluation::Complete { verdict, .. } | Evaluation::Partial { verdict, .. } => {
+                let viewer = level.facts.viewer();
                 let policies = self.client_switches.limited_actions_policies(
-                    level.viewer.context(),
-                    level.viewer.id(),
-                    level.viewer.country_code(),
+                    viewer.context(),
+                    viewer.id(),
+                    viewer.country_code(),
                     verdict.limited_engagement_reasons(),
                     &Metrics::none(),
                 );
@@ -463,7 +462,12 @@ impl Explainer {
             Evaluation::Deleted(_) => Judgement::NotFound(Lookup::Tweet),
             Evaluation::Failed(lookup) => Judgement::Failed(*lookup),
         };
-        LevelOutcome::new(level.route, level.capability, judgement, level.provenance)
+        LevelOutcome::new(
+            level.route,
+            level.facts.client_capability(),
+            judgement,
+            level.provenance,
+        )
     }
 
     fn viewer_facts<const N: usize>(ask: &Ask<N>, evaluated: &[RouteRun]) -> ViewerFacts {

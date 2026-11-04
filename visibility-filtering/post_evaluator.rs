@@ -5,8 +5,7 @@ use crate::hydration::{
 };
 use crate::metrics::{self as ft_metrics, Metrics, RequestMetrics, RetweetSources, Stage};
 use crate::models::{
-    ClientCapability, Evaluation, EvaluationKey, PlacedCandidate, Placement, RequestViewer,
-    RetweetMerge, TweetId,
+    Evaluation, EvaluationKey, PlacedCandidate, Placement, RequestFacts, RetweetMerge, TweetId,
 };
 use crate::rules::engine::Admitted;
 use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
@@ -24,8 +23,7 @@ pub(crate) use retweet::hydrate_and_trace;
 pub use retweet::MergeSelection;
 
 pub struct PostBatch {
-    pub(crate) viewer: RequestViewer,
-    pub client_capability: ClientCapability,
+    pub(crate) facts: RequestFacts,
     pub safety_level: SafetyLevel,
     pub candidates: Vec<PlacedCandidate>,
     pub retweet_merge: RetweetMerge,
@@ -38,9 +36,7 @@ impl PostBatch {
         metrics: &'a RequestMetrics,
     ) -> HydrationRequest<'a> {
         HydrationRequest::new(
-            self.viewer.id(),
-            self.viewer.country_code().map(str::to_owned),
-            self.client_capability,
+            self.facts.clone(),
             self.candidates
                 .iter()
                 .map(|placed| placed.candidate)
@@ -339,7 +335,7 @@ impl HydratedRequest {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeQuery, Graph};
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{control, found_user, Fault, InMemorySources};
     use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator, Hydrators};
     use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};

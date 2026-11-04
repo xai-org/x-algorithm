@@ -3,9 +3,9 @@ use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ClientSwitch, ClientSwitchSet,
     ConversationControlFeatures, Decided, DropReason, EdgeSet, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, SafetyLabelMap,
-    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
-    Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
+    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, PublicInterest,
+    RequestFacts, SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity,
+    Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::rules::RuleId;
 use std::collections::HashSet;
@@ -47,7 +47,6 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
         let mut capability = ClientCapability {
             verify_blur_support: Some(verify_blur_support),
             switches_on,
-            ..ClientCapability::DEFAULT
         };
         if matches!(app_id, RWEB | IPHONE | ANDROID) {
             capability = capability.with(CommunityViewerRemovedLimits);
@@ -139,7 +138,7 @@ fn id_of(by: &str) -> RuleId {
 
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
-        notice: None,
+        label_interstitial: None,
         media: None,
         engagement: None,
     }
@@ -151,8 +150,8 @@ pub(crate) fn label_interstitial(
     engagement: Option<(LimitedEngagementReason, &'static str)>,
 ) -> Verdict {
     Verdict::Shown {
-        notice: Some(Decided {
-            value: Notice::LabelInterstitial(interstitial),
+        label_interstitial: Some(Decided {
+            value: interstitial,
             id: id_of(by),
             by,
         }),
@@ -177,8 +176,8 @@ pub(crate) fn with_label_interstitial(
         panic!("a label interstitial joins a shown verdict");
     };
     Verdict::Shown {
-        notice: Some(Decided {
-            value: Notice::LabelInterstitial(interstitial),
+        label_interstitial: Some(Decided {
+            value: interstitial,
             id: id_of(by),
             by,
         }),
@@ -187,21 +186,17 @@ pub(crate) fn with_label_interstitial(
     }
 }
 
-pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
-    Verdict::Shown {
-        notice: Some(Decided {
-            value: Notice::SoftIntervention(FosnrReason {
-                policy: AppealablePolicy::ABUSE,
-                level: 1,
-                proactive,
-                appeal_submitted,
-            }),
-            id: id_of(by),
-            by,
+pub(crate) fn fosnr(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
+    Verdict::Fosnr(Decided {
+        value: Notice::SoftIntervention(FosnrReason {
+            policy: AppealablePolicy::ABUSE,
+            level: 1,
+            proactive,
+            appeal_submitted,
         }),
-        media: None,
-        engagement: None,
-    }
+        id: id_of(by),
+        by,
+    })
 }
 
 pub(crate) fn appealed(
@@ -231,23 +226,19 @@ pub(crate) fn appealed(
             A::ListsAddRemove,
         ]
     };
-    Verdict::Shown {
-        notice: Some(Decided {
-            value: Notice::Appealable {
-                reason: FosnrReason {
-                    policy,
-                    level,
-                    proactive,
-                    appeal_submitted,
-                },
-                limited_actions,
+    Verdict::Fosnr(Decided {
+        value: Notice::Appealable {
+            reason: FosnrReason {
+                policy,
+                level,
+                proactive,
+                appeal_submitted,
             },
-            id: id_of(by),
-            by,
-        }),
-        media: None,
-        engagement: None,
-    }
+            limited_actions,
+        },
+        id: id_of(by),
+        by,
+    })
 }
 
 pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
@@ -292,7 +283,7 @@ fn media_blurred(
     by: &'static str,
 ) -> Verdict {
     Verdict::Shown {
-        notice: None,
+        label_interstitial: None,
         media: Some(Decided {
             value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                 legacy: FilteredReason::ContainNsfwMedia,
@@ -308,7 +299,7 @@ fn media_blurred(
 
 pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
     Verdict::Shown {
-        notice: None,
+        label_interstitial: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
             id: id_of(by),
@@ -329,7 +320,7 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
         value.add(reason);
     }
     Verdict::Shown {
-        notice: None,
+        label_interstitial: None,
         media: None,
         engagement: Some(Decided {
             value,
@@ -339,10 +330,110 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
     }
 }
 
+pub(crate) fn builder_call(verdict: &Verdict) -> String {
+    let built = match verdict {
+        Verdict::Withheld(Decided { value, by, .. }) => match value {
+            Withholding::Drop(DropReason::Legacy(reason)) => {
+                Some(format!("dropped(FilteredReason::{reason:?}, {by:?})"))
+            }
+            Withholding::Drop(DropReason::NsfwViewer(reason)) => Some(format!(
+                "nsfw_viewer_dropped(NsfwViewerDropReason::{reason:?}, {by:?})"
+            )),
+            Withholding::Tombstone(reason) => {
+                Some(format!("tombstoned(TombstoneReason::{reason:?}, {by:?})"))
+            }
+        },
+        Verdict::Fosnr(Decided { value, by, .. }) => {
+            let (call, rebuilt) = match value {
+                Notice::SoftIntervention(reason) => (
+                    format!(
+                        "fosnr({}, {}, {by:?})",
+                        reason.proactive, reason.appeal_submitted
+                    ),
+                    fosnr(reason.proactive, reason.appeal_submitted, by),
+                ),
+                Notice::Appealable { reason, .. } => (
+                    format!(
+                        "appealed({:?}, {}, {}, {}, {by:?})",
+                        reason.policy, reason.level, reason.proactive, reason.appeal_submitted
+                    ),
+                    appealed(
+                        reason.policy,
+                        reason.level,
+                        reason.proactive,
+                        reason.appeal_submitted,
+                        by,
+                    ),
+                ),
+            };
+            (rebuilt == *verdict).then_some(call)
+        }
+        Verdict::Shown {
+            label_interstitial: None,
+            media,
+            engagement,
+        } => Some(slots_call(media.as_ref(), engagement.as_ref())),
+        Verdict::Shown {
+            label_interstitial: Some(Decided { value, by, .. }),
+            media,
+            engagement,
+        } => pasteable_interstitial(value).map(|interstitial| match (media, engagement) {
+            (None, None) => format!("label_interstitial({interstitial}, {by:?}, None)"),
+            (media, engagement) => format!(
+                "with_label_interstitial({}, {interstitial}, {by:?})",
+                slots_call(media.as_ref(), engagement.as_ref())
+            ),
+        }),
+    };
+    built.unwrap_or_else(|| format!("{verdict:?}"))
+}
+
+fn slots_call(
+    media: Option<&Decided<MediaRestriction>>,
+    engagement: Option<&Decided<LimitedEngagement>>,
+) -> String {
+    let media_call = media.map(|Decided { value, by, .. }| match value {
+        MediaRestriction::NsfwInterstitial => format!("legacy_interstitial({by:?})"),
+        MediaRestriction::MediaInterstitial(blur) => {
+            let call = if blur.prompt.is_some() {
+                "verify_blurred"
+            } else {
+                "blurred"
+            };
+            format!("{call}(InterstitialReason::{:?}, {by:?})", blur.reason)
+        }
+    });
+    let limit_call = engagement.map(|Decided { value, by, .. }| {
+        let reasons: Vec<String> = value
+            .reasons()
+            .map(|reason| format!("LimitedEngagementReason::{reason:?}"))
+            .collect();
+        format!("limited_for(&[{}], {by:?})", reasons.join(", "))
+    });
+    match (media_call, limit_call) {
+        (None, None) => "allow()".to_owned(),
+        (Some(call), None) | (None, Some(call)) => call,
+        (Some(blur), Some(limit)) => format!("blurred_and_limited({blur}, {limit})"),
+    }
+}
+
+fn pasteable_interstitial(interstitial: &LabelInterstitial) -> Option<String> {
+    match interstitial {
+        LabelInterstitial::PublicInterest(PublicInterest { reason, limit }) => Some(format!(
+            "LabelInterstitial::PublicInterest(PublicInterest {{ reason: {reason:?}, limit: {} }})",
+            limit.map_or_else(
+                || "None".to_owned(),
+                |limit| format!("Some(LimitedEngagementReason::{limit:?})")
+            )
+        )),
+        LabelInterstitial::EmergencyDynamic(_) => None,
+    }
+}
+
 pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
     match (blur, limit) {
         (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => Verdict::Shown {
-            notice: None,
+            label_interstitial: None,
             media,
             engagement,
         },
@@ -428,7 +519,7 @@ pub(super) fn controlled_root(arm: ConversationControlArm) -> ConversationContro
 
 pub(super) fn viewer_in_country(code: &str) -> ViewerFeatures {
     ViewerFeatures {
-        country_code: Some(code.to_string()),
+        facts: RequestFacts::default().with_country(code),
         ..viewer(VIEWER_ID)
     }
 }
@@ -439,8 +530,10 @@ pub(super) fn on_client(class_name: &str, country: &str, base: ViewerFeatures) -
         .find(|class| class.name == class_name)
         .unwrap_or_else(|| panic!("no client class {class_name}"));
     ViewerFeatures {
-        country_code: Some(country.to_string()),
-        client_capability: class.capability,
+        facts: base
+            .facts
+            .with_country(country)
+            .with_client(class.capability),
         ..base
     }
 }

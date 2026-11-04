@@ -4,6 +4,7 @@ use crate::hydration::decode::author::{DecodedActor, DecodedAuthor};
 use crate::hydration::fetcher::Fetcher;
 use crate::hydration::inventory::Stake;
 use crate::hydration::relation::Relation;
+use crate::hydration::sources::source;
 use crate::hydration::{
     Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, RequestRows, Unresolved,
 };
@@ -23,7 +24,10 @@ impl Store {
         tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> HydratedTweet {
-        let safety_labels = self.labels.request().get(id.0).cloned();
+        let safety_labels = self
+            .request_fetcher::<source::SafetyLabels>()
+            .get(id.0)
+            .cloned();
         match self.resolve(row, id, tweet_misses) {
             Ok(author_id) => HydratedTweet::Resolved {
                 candidate: self.candidate(row, position, id, author_id, unclaimed),
@@ -32,7 +36,7 @@ impl Store {
             Err(reason) => HydratedTweet::Unresolved {
                 reason,
                 deletion: self
-                    .tweet_states
+                    .request_fetcher::<source::TesTweetState>()
                     .get(id.0)
                     .filter(|_| reason.lookup == Lookup::Tweet && reason.cause == Cause::NotFound)
                     .and_then(|state| state.deletion()),
@@ -70,7 +74,9 @@ impl Store {
         };
         match tweet_misses.get(&id) {
             Some(&Some(Cause::NotFound)) => {
-                self.quotes.quoted_author(id).map_err(tweet)?;
+                self.quotes
+                    .quoted_author(self.request_fetcher::<source::TesQuotedTweet>(), id)
+                    .map_err(tweet)?;
             }
             Some(&Some(Cause::Failed)) => return Err(tweet(Cause::Failed)),
             Some(None) | None => {}
@@ -100,8 +106,7 @@ impl Store {
         tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
     ) -> Option<(Option<Cause>, Option<Cause>)> {
         let core = self
-            .pure_cores
-            .request()
+            .request_fetcher::<source::TesPureCoreData>()
             .get(tweet_id.0)
             .filter(|_| self.is_on(Relation::RetweetSource))?;
         let source_id = core.source_tweet_id?;
@@ -149,8 +154,7 @@ impl Store {
 
     fn author(&self, author_id: AuthorId) -> UserEntity {
         let DecodedAuthor { features, labels } = self
-            .authors
-            .request()
+            .request_fetcher::<source::GizmoduckAuthor>()
             .get(author_id.get())
             .copied()
             .unwrap_or_default();
@@ -166,7 +170,11 @@ impl Store {
         let DecodedActor {
             author: DecodedAuthor { features, labels },
             profile,
-        } = self.actors.get(user.get()).copied().unwrap_or_default();
+        } = self
+            .request_fetcher::<source::GizmoduckActor>()
+            .get(user.get())
+            .copied()
+            .unwrap_or_default();
         let lacks = |fetcher: &Fetcher<bool>, origin| {
             self.key(origin, row)
                 .and_then(|key| fetcher.get(key))
@@ -178,11 +186,11 @@ impl Store {
             labels,
             profile,
             lacks_confirmed_email: lacks(
-                &self.actor_emails,
+                self.request_fetcher::<source::ActorEmails>(),
                 self.origin(Hydrator::AuthorConfirmedEmail),
             ),
             lacks_verified_phone: lacks(
-                &self.actor_phones,
+                self.request_fetcher::<source::ActorPhones>(),
                 self.origin(Hydrator::AuthorVerifiedPhone),
             ),
         }
@@ -224,64 +232,84 @@ impl Store {
                 source_tweet_id: self.source_tweet_id(tweet_id).map(|source| source.0),
                 tweet_features: TweetFeatures::default(),
                 safety_labels: self
-                    .labels
-                    .request()
+                    .request_fetcher::<source::SafetyLabels>()
                     .get(id)
                     .map(|labels| SafetyLabelMap::from_proto_label_types(labels))
                     .unwrap_or_default(),
                 conversation_control: self.control(row).cloned().map(|control| {
                     ConversationControlFeatures {
                         viewer_country: self
-                            .viewer_id
+                            .facts
+                            .viewer_id()
                             .filter(|_| control.arm == ConversationControlArm::Co)
-                            .and_then(|viewer_id| self.viewer_country.get(viewer_id))
+                            .and_then(|viewer_id| {
+                                self.request_fetcher::<source::ViewerCountry>()
+                                    .get(viewer_id)
+                            })
                             .cloned(),
                         control,
                     }
                 }),
                 community_moderation: self
-                    .community_moderations
+                    .request_fetcher::<source::CommunityModeration>()
                     .get(id)
                     .copied()
                     .unwrap_or_default(),
                 viewer_is_community_moderator: self
                     .key(KeyOrigin::ModeratedCommunity, row)
-                    .and_then(|community_id| self.community_moderators.get(community_id))
+                    .and_then(|community_id| {
+                        self.request_fetcher::<source::CommunityModerator>()
+                            .get(community_id)
+                    })
                     .copied(),
                 viewer_is_removed_from_community: self
                     .key(KeyOrigin::TweetCommunity, row)
-                    .and_then(|community_id| self.community_viewer_removals.get(community_id))
+                    .and_then(|community_id| {
+                        self.request_fetcher::<source::CommunityViewerRemoved>()
+                            .get(community_id)
+                    })
                     .copied()
                     .unwrap_or_default(),
                 article_has_media_entities: self
                     .key(KeyOrigin::TweetArticle, row)
-                    .and_then(|article_id| self.article_media_entities.get(article_id))
+                    .and_then(|article_id| {
+                        self.request_fetcher::<source::ArticleMediaEntities>()
+                            .get(article_id)
+                    })
                     .copied()
                     .unwrap_or_default(),
                 article_has_cover_media: self
                     .key(KeyOrigin::TweetArticle, row)
-                    .and_then(|article_id| self.article_cover_media.get(article_id))
+                    .and_then(|article_id| {
+                        self.request_fetcher::<source::ArticleCoverMedia>()
+                            .get(article_id)
+                    })
                     .copied()
                     .unwrap_or_default(),
                 article_lifecycle: self
                     .key(KeyOrigin::TweetArticle, row)
-                    .and_then(|article_id| self.article_lifecycles.get(article_id))
+                    .and_then(|article_id| {
+                        self.request_fetcher::<source::ArticleLifecycle>()
+                            .get(article_id)
+                    })
                     .copied(),
                 reacted_to_post_safety_labels: self
                     .read_key(Hydrator::ReactedToPostSafetyLabels, position)
                     .and_then(|post_id| {
-                        self.labels
-                            .of(self.owner(Hydrator::ReactedToPostSafetyLabels))
-                            .get(post_id)
+                        self.fetcher_of::<source::SafetyLabels>(
+                            self.owner(Hydrator::ReactedToPostSafetyLabels),
+                        )
+                        .get(post_id)
                     })
                     .map(|labels| SafetyLabelMap::from_proto_label_types(labels))
                     .unwrap_or_default(),
                 reacted_to_author_is_protected: self
                     .read_key(Hydrator::ReactedToAuthorSafety, position)
                     .and_then(|user_id| {
-                        self.authors
-                            .of(self.owner(Hydrator::ReactedToAuthorSafety))
-                            .get(user_id)
+                        self.fetcher_of::<source::GizmoduckAuthor>(
+                            self.owner(Hydrator::ReactedToAuthorSafety),
+                        )
+                        .get(user_id)
                     })
                     .is_some_and(|author| author.features.is_protected),
                 conversation_root_author_blocks_viewer:

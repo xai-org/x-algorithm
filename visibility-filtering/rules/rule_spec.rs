@@ -149,7 +149,7 @@ pub(super) mod engine;
 pub(super) mod features;
 pub(super) mod inputs;
 #[cfg(test)]
-mod laws;
+pub(super) mod laws;
 pub(super) mod observed;
 mod predicates;
 pub(super) mod rule;
@@ -486,13 +486,13 @@ pub(super) const fn legacy_nsfw_interstitial<E: Engine>() -> RuleAction<E> {
 impl<E: Engine> ActionSpec<E> {
     pub(super) const fn kind_and_slot(&self) -> (&'static str, &'static str) {
         match self {
-            ActionSpec::Appealable(_) => ("appealable", "notice"),
+            ActionSpec::Appealable(_) => ("appealable", "fosnr"),
             ActionSpec::Drop(_) => ("drop", "withholding"),
             ActionSpec::Tombstone(_) => ("tombstone", "withholding"),
             ActionSpec::MediaRestriction(_) => ("media restriction", "media"),
-            ActionSpec::SoftIntervention(_) => ("soft intervention", "notice"),
+            ActionSpec::SoftIntervention(_) => ("soft intervention", "fosnr"),
             ActionSpec::LimitedEngagement(_) => ("limited engagement", "engagement"),
-            ActionSpec::LabelInterstitial(_) => ("label interstitial", "notice"),
+            ActionSpec::LabelInterstitial(_) => ("label interstitial", "label-interstitial"),
         }
     }
 
@@ -538,6 +538,7 @@ pub enum Contribution {
     Media(MediaRestriction),
     Engagement(LimitedEngagementReason),
     Notice(Notice),
+    LabelInterstitial(LabelInterstitial),
 }
 
 impl<E: Fold> ActionSpec<E> {
@@ -586,9 +587,7 @@ impl<E: Fold> ActionSpec<E> {
                         LabelInterstitialSpec::PublicInterest => public_interest(labels),
                         LabelInterstitialSpec::EmergencyDynamic => emergency_dynamic(labels),
                     }
-                    .map(|interstitial| {
-                        Contribution::Notice(Notice::LabelInterstitial(interstitial))
-                    })
+                    .map(Contribution::LabelInterstitial)
                 },
             ),
         }
@@ -846,7 +845,8 @@ mod tests {
     use super::*;
     use crate::hydration::Hydrator;
     use crate::models::{
-        ClientCapability, ClientSwitch, PostCandidate, VerifyBlurSupport, Viewer, ViewerFeatures,
+        ClientCapability, ClientSwitch, PostCandidate, RequestFacts, VerifyBlurSupport, Viewer,
+        ViewerFeatures,
     };
     use crate::rules::fixtures::{
         candidate, logged_out_viewer, viewer, viewer_with_profile, VIEWER_ID,
@@ -885,7 +885,9 @@ mod tests {
     #[test]
     fn age_verified_is_the_label_or_idv_premium_and_the_request_country_is_never_unknown() {
         let in_country = |country: Option<&str>, profile: ViewerProfile| ViewerFeatures {
-            country_code: country.map(str::to_string),
+            facts: country.map_or_else(RequestFacts::default, |country| {
+                RequestFacts::default().with_country(country)
+            }),
             ..viewer_with_profile(profile)
         };
         let labeled = ViewerFeatures {
@@ -954,11 +956,10 @@ mod tests {
         use strum::VariantArray;
         use VerifyBlurSupport::{IosNeedsUpdate, Supported};
         let viewer = ViewerFeatures {
-            client_capability: ClientCapability {
+            facts: RequestFacts::default().with_client(ClientCapability {
                 verify_blur_support: Some(IosNeedsUpdate),
                 switches_on: ClientSwitch::VARIANTS.iter().copied().collect(),
-                soft_nsfw_new_user_drop: false,
-            },
+            }),
             ..viewer(VIEWER_ID)
         };
         let mut failed = candidate().build();

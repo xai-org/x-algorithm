@@ -7,8 +7,9 @@ use xai_x_thrift::safety_result::SafetyResultReason;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
     Withheld(Decided<Withholding>),
+    Fosnr(Decided<Notice>),
     Shown {
-        notice: Option<Decided<Notice>>,
+        label_interstitial: Option<Decided<LabelInterstitial>>,
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     },
@@ -21,20 +22,6 @@ pub enum Notice {
         reason: FosnrReason,
         limited_actions: &'static [LimitedActionType],
     },
-    LabelInterstitial(LabelInterstitial),
-}
-
-impl Notice {
-    pub fn is_whole_verdict(&self) -> bool {
-        !matches!(self, Self::LabelInterstitial(_))
-    }
-
-    pub fn limited_engagement_reason(&self) -> Option<LimitedEngagementReason> {
-        match self {
-            Self::SoftIntervention(_) | Self::Appealable { .. } => None,
-            Self::LabelInterstitial(interstitial) => Some(interstitial.limited_engagement_reason()),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
@@ -263,18 +250,20 @@ impl Verdict {
     pub(crate) fn limited_engagement_reasons(
         &self,
     ) -> impl Iterator<Item = LimitedEngagementReason> + '_ {
-        let (notice, limit) = match self {
+        let (interstitial, limit) = match self {
             Self::Shown {
-                notice, engagement, ..
+                label_interstitial,
+                engagement,
+                ..
             } => (
-                notice
+                label_interstitial
                     .as_ref()
-                    .and_then(|notice| notice.value.limited_engagement_reason()),
+                    .map(|interstitial| interstitial.value.limited_engagement_reason()),
                 engagement.as_ref(),
             ),
-            Self::Withheld(_) => (None, None),
+            Self::Withheld(_) | Self::Fosnr(_) => (None, None),
         };
-        notice
+        interstitial
             .into_iter()
             .chain(limit.into_iter().flat_map(|limit| limit.value.reasons()))
     }

@@ -9,7 +9,7 @@ use crate::rules::fixtures::{
     sensitive_opt_in_viewer, tweet_candidate, viewer_with_age, AUTHOR_ID,
 };
 use crate::rules::SafetyLevel::{
-    self, FilterAll, ImmersiveExpandedRecommendations, NotificationsFollow, NotificationsWriterV2,
+    FilterAll, ImmersiveExpandedRecommendations, NotificationsFollow, NotificationsWriterV2,
     QuotedTweetRules, TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations,
 };
 use std::num::NonZeroU64;
@@ -22,12 +22,12 @@ fn article_post(lifecycle: Option<ArticleLifecycle>) -> PostCandidate {
     candidate
 }
 
-fn home_hydration_only(verdict: fn() -> Verdict) -> Vec<(SafetyLevel, Role, Verdict)> {
+fn every_role(verdict: fn() -> Verdict) -> Vec<(Role, Verdict)> {
     vec![
-        (TimelineHomeHydration, Role::NonFollower, verdict()),
-        (TimelineHomeHydration, Role::Follower, verdict()),
-        (TimelineHomeHydration, Role::LoggedOut, verdict()),
-        (TimelineHomeHydration, Role::Author, verdict()),
+        (Role::NonFollower, verdict()),
+        (Role::Follower, verdict()),
+        (Role::LoggedOut, verdict()),
+        (Role::Author, verdict()),
     ]
 }
 
@@ -47,27 +47,32 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "article_draft",
             subject: Subject::Post(article_post(Some(ArticleLifecycle::Draft))),
-            expect: home_hydration_only(unpublished),
+            expect: every_role(unpublished),
+            at: vec![],
         },
         Row {
             name: "article_soft_deleted",
             subject: Subject::Post(article_post(Some(ArticleLifecycle::SoftDeleted))),
-            expect: home_hydration_only(unpublished),
+            expect: every_role(unpublished),
+            at: vec![],
         },
         Row {
             name: "article_without_lifecycle",
             subject: Subject::Post(article_post(None)),
-            expect: home_hydration_only(unpublished),
+            expect: every_role(unpublished),
+            at: vec![],
         },
         Row {
             name: "article_published",
             subject: Subject::Post(article_post(Some(ArticleLifecycle::Published))),
-            expect: home_hydration_only(allow),
+            expect: every_role(allow),
+            at: vec![],
         },
         Row {
             name: "no_article",
             subject: Subject::Post(tweet_candidate(|_| {})),
-            expect: home_hydration_only(allow),
+            expect: every_role(allow),
+            at: vec![],
         },
     ];
     for (name, body, cover, flagged, restricts) in [
@@ -243,7 +248,8 @@ pub(super) fn rows() -> Vec<Row> {
         rows.push(Row {
             name,
             subject: Subject::Post(post),
-            expect,
+            expect: vec![],
+            at: expect,
         });
     }
     let mut creator = candidate()
@@ -259,7 +265,6 @@ pub(super) fn rows() -> Vec<Row> {
         subject: Subject::Post(creator),
         expect: vec![
             (
-                TimelineHomeHydration,
                 Role::As(
                     "sensitive_opt_in",
                     on_client("web", "us", sensitive_opt_in_viewer()),
@@ -270,7 +275,6 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
             ),
             (
-                TimelineHomeHydration,
                 Role::As(
                     "author_sensitive_opt_in",
                     on_client("web", "us", author_sensitive_opt_in),
@@ -278,6 +282,7 @@ pub(super) fn rows() -> Vec<Row> {
                 allow(),
             ),
         ],
+        at: vec![],
     });
     rows
 }

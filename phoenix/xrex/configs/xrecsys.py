@@ -260,6 +260,59 @@ def _sequence_len(mparams, dataset, num_user_prefix_tokens: int) -> int:
     )
 
 
+_HOME_SURFACES = (
+    recsys_pb2.ProductSurface.PRODUCT_SURFACE_HOME_TIMELINE_RANKING,
+    recsys_pb2.ProductSurface.PRODUCT_SURFACE_HOME_TIMELINE_RANKED_FOLLOWING,
+)
+HOME_VIDEO_CONTINUATION_ACTION_INDEX = 3
+HOME_PROFILE_VISIT_SECS_ACTION_INDEX = 0
+
+
+def _home_excursion_loss(
+    action_index: int, metric_name: str, loss_weight: float, condition_action_index: int
+) -> ContinuousActionLossConfig:
+    return ContinuousActionLossConfig(
+        action_index=action_index,
+        metric_name=metric_name,
+        loss_weight=loss_weight,
+        condition_action_index=condition_action_index,
+        loss_type="cread",
+        cread_log_min_threshold=2.0,
+        cread_log_num_thresholds=30,
+        cread_restoration_weight=0.5,
+        cread_restoration_loss="huber",
+        cread_huber_delta_sec=5.0,
+        cread_mask_sentinel_labels=False,
+        product_surfaces=_HOME_SURFACES,
+        norm_config=NormConfig(norm_scale=300.0, use_log=False),
+    )
+
+
+def _home_excursion_losses(mparams) -> list[ContinuousActionLossConfig]:
+    losses = []
+    continuation_weight = mparams.get("home_video_continuation_loss_weight", 0.0)
+    if continuation_weight > 0:
+        losses.append(
+            _home_excursion_loss(
+                HOME_VIDEO_CONTINUATION_ACTION_INDEX,
+                "home-video-continuation-cread",
+                continuation_weight,
+                recsys_pb2.ActionName.CLIENT_TWEET_VIDEO_OPEN,
+            )
+        )
+    profile_weight = mparams.get("home_profile_visit_secs_loss_weight", 0.0)
+    if profile_weight > 0:
+        losses.append(
+            _home_excursion_loss(
+                HOME_PROFILE_VISIT_SECS_ACTION_INDEX,
+                "home-profile-visit-secs-cread",
+                profile_weight,
+                recsys_pb2.ActionName.CLIENT_TWEET_CLICK_PROFILE,
+            )
+        )
+    return losses
+
+
 def _home_direct_packed_base() -> dict:
     return {
         "history_seq_len": 1022,
@@ -487,10 +540,13 @@ MODEL_CFGS = {
             "fp8_gemms": Fp8Gemms.ALL,
             "metrics_ndcg_shared_sorts": True,
             "view_loss_weight": 0.5,
+            "home_video_continuation_loss_weight": 0.013,
+            "home_profile_visit_secs_loss_weight": 0.0035,
             "feature_prep": replace(
                 _home_direct_packed_base()["feature_prep"],
                 enable_time_gap=True,
                 time_gap_lr_scale=4.0,
+                enable_home_excursion_history=True,
             ),
             "optim_config": replace(_H100_OVERRIDES["optim_config"], clip_by_global_norm=1.4),
             "emb_optim_config": RecsysEmbeddingOptimConfig(
@@ -647,9 +703,6 @@ CONFIGS: dict[str, RecsysTrainer] = _ConfigRegistry()
 
 def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTrainer:
     config_name_gen = f"{config_name}_{dataset_type}"
-
-    if dataset_type == "grpc_recsys" and mparams.get("enable_stale_post", False):
-        mparams = {**mparams, "enable_stale_post": False}
 
     hash_table = HashTable(
         hash_keys=HashKeys(
@@ -855,6 +908,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                     product_surfaces=(recsys_pb2.ProductSurface.PRODUCT_SURFACE_GALLERY_PAGE,),
                     norm_config=NormConfig(norm_scale=240.0, use_log=False),
                 ),
+                *_home_excursion_losses(mparams),
             ],
             context_features=ContextFeaturesConfig(
                 enabled=mparams.get("enable_context_features", True),

@@ -8,9 +8,9 @@ pub enum Effect {
     AfterTerminal,
     FilledMedia,
     KeptEarlierMedia,
-    KeptEarlierMediaInsteadOfNotice,
-    FilledNotice,
-    KeptEarlierNotice,
+    KeptEarlierMediaInsteadOfFosnr,
+    FilledLabelInterstitial,
+    KeptEarlierLabelInterstitial,
     FilledEngagement,
     AddedEngagementReason,
     DuplicateEngagementReason,
@@ -27,12 +27,16 @@ impl Bucket {
     fn relied_on_by(self, verdict: &Verdict) -> bool {
         let notice = match verdict {
             Verdict::Withheld(_) => return matches!(self, Self::Withholding),
-            Verdict::Shown { notice, .. } => notice.as_ref().map(|notice| &notice.value),
+            Verdict::Fosnr(notice) => &notice.value,
+            Verdict::Shown { .. } => return true,
         };
         match self {
             Self::Withholding => true,
-            Self::Media => !matches!(notice, Some(Notice::Appealable { .. })),
-            Self::Engagement => !notice.is_some_and(Notice::is_whole_verdict),
+            Self::Media => match notice {
+                Notice::SoftIntervention(_) => true,
+                Notice::Appealable { .. } => false,
+            },
+            Self::Engagement => false,
         }
     }
 }

@@ -21,16 +21,15 @@ pub(super) fn rows() -> Vec<Row> {
         ByInvitation, Co, Community, Followers, MyNetwork, Subscribers, Verified,
     };
     let limits = |rule| limited(LimitedEngagementReason::ConversationControl, rule);
-    let hydration = |role, verdict| (TimelineHomeHydration, role, verdict);
     [
         (
             ByInvitation,
             vec![
-                hydration(
+                (
                     Role::NonFollower,
                     limits("limit_replies_by_invitation/limited_engagement/conversation_control"),
                 ),
-                hydration(
+                (
                     Role::As("read_only", read_only_viewer(VIEWER_ID)),
                     limited_for(
                         &[
@@ -49,7 +48,7 @@ pub(super) fn rows() -> Vec<Row> {
         ),
         (
             Community,
-            vec![hydration(
+            vec![(
                 Role::NonFollower,
                 limits("limit_replies_community/limited_engagement/conversation_control"),
             )],
@@ -61,7 +60,7 @@ pub(super) fn rows() -> Vec<Row> {
         ),
         (
             Followers,
-            vec![hydration(
+            vec![(
                 Role::NonFollower,
                 limits("limit_replies_followers/limited_engagement/conversation_control"),
             )],
@@ -73,7 +72,7 @@ pub(super) fn rows() -> Vec<Row> {
         ),
         (
             Subscribers,
-            vec![hydration(
+            vec![(
                 Role::NonFollower,
                 limits("limit_replies_subscribers/limited_engagement/conversation_control"),
             )],
@@ -86,11 +85,11 @@ pub(super) fn rows() -> Vec<Row> {
         (
             Verified,
             vec![
-                hydration(
+                (
                     Role::NonFollower,
                     limits("limit_replies_verified/limited_engagement/conversation_control"),
                 ),
-                hydration(
+                (
                     Role::As(
                         "verified",
                         viewer_with_profile(ViewerProfile {
@@ -109,7 +108,7 @@ pub(super) fn rows() -> Vec<Row> {
         ),
         (
             MyNetwork,
-            vec![hydration(
+            vec![(
                 Role::NonFollower,
                 limits("limit_replies_my_network/limited_engagement/conversation_control"),
             )],
@@ -131,13 +130,14 @@ pub(super) fn rows() -> Vec<Row> {
     ]
     .into_iter()
     .flat_map(|(arm, mut root_expect, [root, invited, retweet])| {
-        root_expect.push(hydration(Role::Author, allow()));
-        root_expect.push(hydration(Role::LoggedOut, allow()));
+        root_expect.push((Role::Author, allow()));
+        root_expect.push((Role::LoggedOut, allow()));
         [
             Row {
                 name: root,
                 subject: Subject::Post(controlled_candidate(controlled_root(arm))),
                 expect: root_expect,
+                at: vec![],
             },
             Row {
                 name: invited,
@@ -148,7 +148,8 @@ pub(super) fn rows() -> Vec<Row> {
                     },
                     ..controlled_root(arm)
                 })),
-                expect: vec![hydration(Role::NonFollower, allow())],
+                expect: vec![(Role::NonFollower, allow())],
+                at: vec![],
             },
             Row {
                 name: retweet,
@@ -158,7 +159,8 @@ pub(super) fn rows() -> Vec<Row> {
                         .with_conversation_control(controlled_root(arm))
                         .build(),
                 ),
-                expect: vec![hydration(Role::NonFollower, allow())],
+                expect: vec![(Role::NonFollower, allow())],
+                at: vec![],
             },
         ]
     })
@@ -172,7 +174,9 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(ByInvitation))
                     .build(),
             ),
-            expect: vec![hydration(
+            expect: vec![],
+            at: vec![(
+                TimelineHomeHydration,
                 Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
                 blurred_and_limited(
                     blurred(
@@ -189,10 +193,11 @@ pub(super) fn rows() -> Vec<Row> {
                 ByInvitation,
                 REPLY_ROOT_AUTHOR_ID,
             ))),
-            expect: vec![hydration(
+            expect: vec![(
                 Role::Author,
                 limits("limit_replies_by_invitation/limited_engagement/conversation_control"),
             )],
+            at: vec![],
         },
         Row {
             name: "community_conversation_followed_viewer",
@@ -202,7 +207,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(Community))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "followers_conversation_follower",
@@ -212,7 +218,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(Followers))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "my_network_conversation_followed_viewer",
@@ -222,7 +229,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(MyNetwork))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "my_network_conversation_second_degree_viewer",
@@ -232,7 +240,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(MyNetwork))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "subscribers_conversation_super_follower",
@@ -242,41 +251,47 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(Subscribers))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "co_conversation_outside_allowed_countries",
             subject: Subject::Post(controlled_candidate(co_root(&["EUR", "BR"], Some("US")))),
-            expect: vec![hydration(
+            expect: vec![(
                 Role::NonFollower,
                 limits("limit_replies_co/limited_engagement/conversation_control"),
             )],
+            at: vec![],
         },
         Row {
             name: "co_conversation_unknown_viewer_country",
             subject: Subject::Post(controlled_candidate(co_root(&["US"], None))),
-            expect: vec![hydration(
+            expect: vec![(
                 Role::NonFollower,
                 limits("limit_replies_co/limited_engagement/conversation_control"),
             )],
+            at: vec![],
         },
         Row {
             name: "co_conversation_no_allowed_country",
             subject: Subject::Post(controlled_candidate(co_root(&[], Some("US")))),
-            expect: vec![hydration(
+            expect: vec![(
                 Role::NonFollower,
                 limits("limit_replies_co/limited_engagement/conversation_control"),
             )],
+            at: vec![],
         },
         Row {
             name: "co_conversation_allowed_country",
             subject: Subject::Post(controlled_candidate(co_root(&["BR"], Some("br")))),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "co_conversation_allowed_region",
             subject: Subject::Post(controlled_candidate(co_root(&["NAM"], Some("US")))),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
     ])
     .collect()

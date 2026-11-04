@@ -260,10 +260,9 @@ impl FallbackCacheCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::execute::Reply;
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::{Reply, Source};
     use crate::hydration::store::Store;
-    use crate::models::{ClientCapability, RawCandidate, RetweetMerge, TweetFeatures, TweetId};
+    use crate::models::{RawCandidate, RequestFacts, RetweetMerge, TweetFeatures, TweetId};
     use crate::rules::RuleEngine;
     use crate::rules::SafetyLevel;
     use std::collections::HashMap;
@@ -369,8 +368,7 @@ mod tests {
         }];
         let mut store = Store::new(
             plan,
-            Some(50),
-            ClientCapability::default(),
+            RequestFacts::logged_in(50),
             &raw,
             RetweetMerge::Unmerged,
         );
@@ -386,7 +384,11 @@ mod tests {
         };
         let landed =
             HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(circle)))]));
-        store.land(&tweets, Reply::Tweets(landed), Duration::ZERO);
+        store.land(
+            &tweets,
+            Reply::TesTweetForVisibility(landed),
+            Duration::ZERO,
+        );
 
         let call = store.offer(group(Source::TrustedFriends)).unwrap();
         let failed: HydrationBatch<u64, bool> =

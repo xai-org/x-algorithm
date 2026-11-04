@@ -229,7 +229,7 @@ fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
         (Verdict::Withheld(_), _) => MergeSelection::RequestedWithheld,
         (
             Verdict::Shown {
-                notice: None,
+                label_interstitial: None,
                 media: None,
                 engagement: None,
             },
@@ -243,15 +243,15 @@ fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup, Relation};
     use crate::models::{
-        ClientCapability, ClientSwitch, Deletion, DropReason, LimitedEngagement,
-        LimitedEngagementReason, MediaFeature, MediaInterstitial, MediaRestriction, NsfwFeature,
-        Placement, RawCandidate, SafetyLabelType, TombstoneReason, TweetFeatures,
+        ClientCapability, ClientSwitch, Deletion, DropReason, LimitedEngagementReason,
+        MediaFeature, NsfwFeature, Placement, RawCandidate, SafetyLabelType, TombstoneReason,
+        TweetFeatures,
     };
-    use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
+    use crate::rules::fixtures::{allow, blurred, fosnr, legacy_interstitial, limited};
     use crate::rules::{RuleId, SafetyLevel};
     use crate::scenario::{raw, Scenario};
     use std::time::Duration;
@@ -272,34 +272,16 @@ mod tests {
             id: RuleId::NsfwHighPrecision,
             by: "nsfw_high_precision/tombstone/local_regulations",
         });
-        let blurred = Verdict::Shown {
-            notice: None,
-            media: Some(Decided {
-                value: MediaRestriction::MediaInterstitial(MediaInterstitial {
-                    legacy: FilteredReason::ContainNsfwMedia,
-                    reason: InterstitialReason::Sensitive(true),
-                    prompt: None,
-                }),
-                id: RuleId::NsfwUser,
-                by: "nsfw_user/blur/sensitive_user",
-            }),
-            engagement: None,
-        };
-        let limited = Verdict::Shown {
-            notice: None,
-            media: None,
-            engagement: Some(Decided {
-                value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
-                id: RuleId::LimitRepliesByInvitation,
-                by: "limit_replies_by_invitation/limited_engagement/conversation_control",
-            }),
-        };
-        let unrestricted = Verdict::Shown {
-            notice: None,
-            media: None,
-            engagement: None,
-        };
-        let noticed = noticed(
+        let blurred = blurred(
+            InterstitialReason::Sensitive(true),
+            "nsfw_user/blur/sensitive_user",
+        );
+        let limited = limited(
+            LimitedEngagementReason::ConversationControl,
+            "limit_replies_by_invitation/limited_engagement/conversation_control",
+        );
+        let unrestricted = allow();
+        let fosnr = fosnr(
             true,
             false,
             "fosnr_abuse_insults_follower/soft_intervention/abuse",
@@ -312,8 +294,8 @@ mod tests {
             (&dropped, &limited, &dropped),
             (&unrestricted, &limited, &limited),
             (&blurred, &limited, &blurred),
-            (&unrestricted, &noticed, &noticed),
-            (&limited, &noticed, &limited),
+            (&unrestricted, &fosnr, &fosnr),
+            (&limited, &fosnr, &limited),
         ] {
             let retweet = PostEvaluation {
                 tweet_id: TweetId(1),
@@ -410,7 +392,10 @@ mod tests {
                             1,
                             GizmoduckUser {
                                 user_id: 1,
-                                extended_profile: Some(ExtendedProfile { age_in_years: age }),
+                                extended_profile: Some(ExtendedProfile {
+                                    age_in_years: age,
+                                    ..Default::default()
+                                }),
                                 ..Default::default()
                             },
                         )
@@ -1068,7 +1053,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
 
     #[tokio::test]
     async fn a_follower_of_the_source_author_sees_its_fosnr_notice_on_any_retweet() {
-        let fosnr = vf_pb::SafetyLabelMap {
+        let fosnr_labels = vf_pb::SafetyLabelMap {
             labels: HashMap::from([(
                 SafetyLabelType::FOSNR_ABUSE_INSULTS.0,
                 vf_pb::SafetyLabel::default(),
@@ -1077,13 +1062,13 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         let sources = InMemorySources::default()
             .retweet(1, 10, 5, Some(20))
             .tweet(5, 20)
-            .labels(5, fosnr)
+            .labels(5, fosnr_labels)
             .authors(&[10, 20])
             .edge(Graph::Follows, 1, 20);
         let evaluated = evaluate_tweets(sources).evaluate(&requested(&[1])).await;
         assert_eq!(
             evaluated.evaluations(),
-            [Evaluation::complete(noticed(
+            [Evaluation::complete(fosnr(
                 true,
                 false,
                 "fosnr_abuse_insults_follower/soft_intervention/abuse"

@@ -1,7 +1,7 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, ClientCapability, Placement, PostCandidate, PostEntity, Quote, UserEntity,
-    ViewerFeatures,
+    tweet_timestamp_ms, ClientCapability, Placement, PostCandidate, PostEntity, Quote,
+    RequestFacts, UserEntity, ViewerFeatures,
 };
 use crate::params::{CountryList, CountryLists};
 use crate::rules::rule_spec::engine::Candidate;
@@ -18,8 +18,7 @@ pub(crate) struct RuleContext<'a, C = PostCandidate> {
 #[derive(Clone, Copy)]
 pub(super) struct CoreFacts<'a> {
     viewer_id: Option<u64>,
-    request_country: Option<&'a str>,
-    client_capability: ClientCapability,
+    request_facts: &'a RequestFacts,
     placement: Placement,
     country_lists: &'a CountryLists,
 }
@@ -37,8 +36,7 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
         Self {
             facts: CoreFacts {
                 viewer_id: viewer.viewer.user_id(),
-                request_country: viewer.country_code.as_deref(),
-                client_capability: viewer.client_capability,
+                request_facts: &viewer.facts,
                 placement,
                 country_lists,
             },
@@ -150,12 +148,17 @@ impl<'a> CoreFacts<'a> {
 
     #[inline]
     pub(super) fn request_country(self) -> Option<&'a str> {
-        self.request_country
+        self.request_facts.request_country()
     }
 
     #[inline]
     pub(super) fn client_capability(self) -> ClientCapability {
-        self.client_capability
+        self.request_facts.client_capability()
+    }
+
+    #[inline]
+    pub(super) fn soft_nsfw_new_user_drop(self) -> bool {
+        self.request_facts.soft_nsfw_new_user_drop()
     }
 
     #[inline]

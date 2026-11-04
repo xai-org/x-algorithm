@@ -179,14 +179,14 @@ enum Answer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
     use crate::metrics::Metrics;
     use crate::models::{
         ClientSwitch, PlacedCandidate, RawCandidate, RetweetMerge, TweetFeatures, TweetId,
     };
     use crate::post_evaluator::PostBatch;
-    use crate::rules::{NoTrace, RuleEngine, RuleId};
+    use crate::rules::{NoTrace, RuleEngine};
     use crate::scenario::{tweet_data, Wire};
     use std::collections::HashMap;
     use xai_core_entities::entities::{
@@ -648,7 +648,7 @@ mod tests {
         use crate::hydration::{
             Hydrator, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT, INBOUND_ALLOWANCE,
         };
-        use crate::models::{ClientCapability, SafetyLabelType};
+        use crate::models::{RequestFacts, SafetyLabelType};
         use crate::rules::fixtures::{allow, dropped};
         use xai_visibility_filtering::models::FilteredReason;
         let protected = GizmoduckUserResult {
@@ -717,8 +717,7 @@ mod tests {
                 Metrics::none(),
             );
             let request = |retweet_merge| PostBatch {
-                viewer: RequestViewer::new(Some(VIEWER), None),
-                client_capability: ClientCapability::default(),
+                facts: RequestFacts::logged_in(VIEWER),
                 safety_level: level,
                 candidates: [1, 2, 3]
                     .map(|tweet_id| {
@@ -794,27 +793,14 @@ mod tests {
     #[test]
     fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
         use crate::models::LimitedEngagementReason::ConversationControl;
-        use crate::models::{Decided, LimitedEngagement, MediaRestriction, Verdict};
-        use crate::rules::fixtures::limited;
+        use crate::rules::fixtures::{blurred_and_limited, legacy_interstitial, limited};
         use xai_x_thrift::action::{
             AnyInterstitial, CtaLimitedActionPrompt, Interstitial, InterstitialReason,
             LimitedAction, LimitedActionCtaType, LimitedActionPrompt, LimitedActionsPolicy,
             LimitedEngagements, TweetInterstitial,
         };
         let limit = limited(ConversationControl, "rule");
-        let composite = Verdict::Shown {
-            notice: None,
-            media: Some(Decided {
-                value: MediaRestriction::NsfwInterstitial,
-                id: RuleId::FilterAll,
-                by: "nsfw_rule",
-            }),
-            engagement: Some(Decided {
-                value: LimitedEngagement::new(ConversationControl),
-                id: RuleId::FilterAll,
-                by: "rule",
-            }),
-        };
+        let composite = blurred_and_limited(legacy_interstitial("nsfw_rule"), limit.clone());
         for (language, subtext) in [
             ("", "Only some accounts can reply."),
             ("ja", "一部のアカウントのみが返信できます。"),

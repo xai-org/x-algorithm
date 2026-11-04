@@ -486,6 +486,7 @@ pub(crate) fn insert_cluster_scores(
         ("post_unexplored", s.post_unexplored_score),
         ("pdwell", s.post_unexplored_score),
         ("post_video", s.post_video_score),
+        ("grok_analyze", s.grok_analyze_score),
         ("dwell_time", s.dwell_time),
         ("click_dwell_time", s.click_dwell_time),
     ];

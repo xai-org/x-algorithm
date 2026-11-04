@@ -379,21 +379,20 @@ fn cases(
 
 impl Case {
     fn rows(self, level: SafetyLevel) -> [Row; 2] {
-        let subject = |edges| {
-            Subject::User(UserCandidate {
-                user: self.actor.clone(),
-                edges,
-                quote: None,
-                failed: Hydrators::empty(),
-            })
+        let user = |edges| UserCandidate {
+            user: self.actor.clone(),
+            edges,
+            quote: None,
+            failed: Hydrators::empty(),
         };
         let as_recipient = |name, id| Role::As(name, recipient(id, self.recipient.clone()));
         let follower = self.edges.with(Hydrator::Follows);
         [
             Row {
                 name: self.name,
-                subject: subject(self.edges),
-                expect: once((
+                subject: Subject::User(user(self.edges)),
+                expect: vec![],
+                at: once((
                     level,
                     as_recipient("non_follower", VIEWER_ID),
                     self.non_follower,
@@ -406,8 +405,9 @@ impl Case {
             },
             Row {
                 name: self.name,
-                subject: subject(follower),
-                expect: vec![(level, as_recipient("follower", VIEWER_ID), self.follower)],
+                subject: Subject::User(user(follower)),
+                expect: vec![],
+                at: vec![(level, as_recipient("follower", VIEWER_ID), self.follower)],
             },
         ]
     }
@@ -433,7 +433,7 @@ pub(super) fn rows() -> Vec<Row> {
     .collect()
 }
 
-pub(super) fn post_kind_cases(kind: NotificationKind) -> Vec<CorpusCase> {
+pub(super) fn post_kind_cases(level: SafetyLevel, kind: NotificationKind) -> Vec<CorpusCase> {
     cases(
         |_| dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
         "only_people_i_follow_outside_community/drop/unspecified",
@@ -448,8 +448,8 @@ pub(super) fn post_kind_cases(kind: NotificationKind) -> Vec<CorpusCase> {
             })
         };
         let as_recipient = |role, id, edges, expected| CorpusCase {
-            name: format!("{}/{NotificationsWriterV2:?}/{kind:?}/{role}", case.name),
-            level: NotificationsWriterV2,
+            name: format!("{}/{level:?}/{kind:?}/{role}", case.name),
+            level,
             kind: Some(kind),
             viewer: recipient(id, case.recipient.clone()),
             subject: post(edges),

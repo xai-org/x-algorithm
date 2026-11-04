@@ -166,12 +166,13 @@ fn quote_comparisons(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{compared, counted, outcome, pair, shown};
+    use super::super::tests::{compared, counted, outcome, pair};
     use super::super::{tp_failed, tp_result};
     use super::*;
     use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};
     use crate::quote::{PassOutcome, Rerendered};
     use crate::result_label::Failure;
+    use crate::rules::fixtures::allow;
     use crate::rules::{RerenderReason, RuleId};
     use strum::VariantArray;
     use xai_strato::strato_thrift::StratoResult;
@@ -237,14 +238,14 @@ mod tests {
         };
         let vf = PostEvaluation {
             placement: Placement::InnerQuoted { outer: TweetId(7) },
-            ..outcome(shown())
+            ..outcome(allow())
         };
         let muted = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::ViewerMutesAuthor)),
             id: RuleId::QuotedViewerMutesAuthorNotFollowing,
             by: "quoted_viewer_mutes_author_not_following/drop",
         }));
-        let allowed = Evaluation::complete(shown());
+        let allowed = Evaluation::complete(allow());
         let pass = |author| QuotePass {
             key: vf.key(),
             outcome: PassOutcome::Passed,
@@ -278,7 +279,7 @@ mod tests {
         let entry = |tweet_id, placement| PostEvaluation {
             tweet_id: TweetId(tweet_id),
             placement,
-            ..outcome(shown())
+            ..outcome(allow())
         };
         let quoting = |outer| Placement::InnerQuoted {
             outer: TweetId(outer),
@@ -356,7 +357,7 @@ mod tests {
         };
         let inner = PostEvaluation {
             placement: Placement::InnerQuoted { outer: TweetId(7) },
-            ..outcome(shown())
+            ..outcome(allow())
         };
         let suspended = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),

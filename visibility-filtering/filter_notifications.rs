@@ -84,7 +84,7 @@ impl FilterNotificationsEndpoint {
             return HashMap::new();
         }
         self.post_evaluator
-            .evaluate_users(level, notifications.recipient, actors, metrics)
+            .evaluate_users(level, notifications.facts.clone(), actors, metrics)
             .await
     }
 
@@ -102,7 +102,7 @@ impl FilterNotificationsEndpoint {
         posts.sort_unstable_by_key(|&(post, kind, actor)| (post, kind, actor.0));
         posts.dedup();
         self.post_evaluator
-            .evaluate_post_notifications(level, notifications.recipient, &posts, metrics)
+            .evaluate_post_notifications(level, notifications.facts.clone(), &posts, metrics)
             .await
     }
 }
@@ -142,7 +142,7 @@ fn respond<'a>(
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::Graph;
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{found_user, suspended, Fault, InMemorySources};
     use crate::metrics::families::{
         EVALUATED_CANDIDATES, NOTIFICATION_RESULTS, REQUESTS, REQUESTS_BY_CALLER,

@@ -1458,6 +1458,7 @@ message TweetInfo {
   SearchAuthorMatch searchAuthorMatch = 46;
   bool hasVideo = 47;
   bool hasImage = 48;
+  EngagementCounts authorEngagementCounts = 49;
 }
 
 message SearchLexicalMatch {

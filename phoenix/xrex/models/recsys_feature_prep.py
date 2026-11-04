@@ -198,6 +198,8 @@ class FeaturePrepConfig(Config):
     enable_bridge_prob: bool = False
     enable_click_dwell_time: bool = False
     click_dwell_time_norm_scale: float = 60.0
+    enable_home_excursion_history: bool = False
+    home_excursion_history_norm_scale: float = 300.0
     enable_web_conv_time_on_site: bool = False
     web_conv_time_on_site_norm_scale: float = 1800.0
     enable_web_conv_tracking_integration: bool = False
@@ -356,7 +358,9 @@ def _get_emb_table(
     )
 
 
-def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.Array:
+def _get_learned_vector(
+    name: str, dim: int, config: FeaturePrepConfig, *, zero_init: bool = False
+) -> jax.Array:
     _, lr_multiplier = _feature_scale_spec(
         config.scale_config, config.embed_init_scale, config.emb_size, "embedding", dim
     )
@@ -366,7 +370,11 @@ def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.A
             name,
             [dim],
             dtype=jnp.float32,
-            init=hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out"),
+            init=(
+                hk.initializers.Constant(0.0)
+                if zero_init
+                else hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out")
+            ),
             pspec=P(),
             lr_multiplier=lr_multiplier,
         ),
@@ -995,6 +1003,28 @@ def _add_history_features(
             result = result + _embed_scalar_times_vector(
                 cd_normalized, "hist_click_dwell_time_vec", config
             ).astype(fprop_dtype)
+
+    if config.enable_home_excursion_history:
+        from xai_proto import recsys_pb2
+
+        cont_actions = batch["history_seq"].get("continuous_actions")
+        scale = config.home_excursion_history_norm_scale
+        for slot, name in (
+            (
+                recsys_pb2.ContinuousActionName.HOME_VIDEO_CONTINUATION_SECS,
+                "hist_home_video_continuation_vec",
+            ),
+            (
+                recsys_pb2.ContinuousActionName.HOME_PROFILE_VISIT_SECS,
+                "hist_home_profile_visit_vec",
+            ),
+        ):
+            if cont_actions is None or cont_actions.shape[-1] <= slot:
+                continue
+            raw = _cast_jax(cont_actions)[:, :, slot].astype(jnp.float32)
+            normalized = jnp.log1p(jnp.clip(raw, 0.0, scale)) / jnp.log1p(scale)
+            vec = _get_learned_vector(name, config.emb_size, config, zero_init=True)
+            result = result + (normalized[..., None] * vec).astype(fprop_dtype)
 
     if config.enable_web_conv_tracking_integration:
         cat_features = batch["history_seq"].get("categorical_features")

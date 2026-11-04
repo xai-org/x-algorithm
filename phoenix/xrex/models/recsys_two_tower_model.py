@@ -21,7 +21,7 @@ from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
 from xrex.cuda.top_k_by_key import top_k_by_key
 from xrex.data.cold_pool_filter import DEFAULT_COLD_START_MAX_AGE_SECONDS
-from xrex.data.recsys.constants import action_type_map
+from xrex.data.recsys.constants import VIDEO_CREATIVE_BIT, LineItemObjective, action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType
 from xrex.data.recsys.safety_filter import (
     SafetyFilterMode,
@@ -71,6 +71,60 @@ rank_logger = logging.getLogger("rank")
 QUERY_HEAD_RECENCY_SCALE_TOKENS = 16.0
 EPS = 1e-12
 INF = 1e12
+
+BLEND_HEAD_ORDER: tuple[str, ...] = ("ld", "tweet_click")
+CREATIVE_FORMATS = ("video", "nonvideo")
+
+
+def blend_heads(head_names: typing.Sequence[str]) -> list[str]:
+    return [name for name in BLEND_HEAD_ORDER if name in head_names]
+
+
+def objective_slot_multipliers(
+    spec: str, serving_weights: typing.Sequence[float]
+) -> dict[tuple[int, str | None], npt.NDArray[np.float64]]:
+    base = np.asarray(serving_weights, dtype=np.float64)
+    multipliers: dict[tuple[int, str | None], npt.NDArray[np.float64]] = {}
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        name, _, values = entry.partition(":")
+        obj_name, _, fmt = name.strip().partition("@")
+        if obj_name not in LineItemObjective.__members__ or fmt not in ("", *CREATIVE_FORMATS):
+            raise ValueError(f"objective_head_weights entry {entry!r} is not OBJECTIVE[@FORMAT]:w")
+        w = np.array([float(v) for v in values.split("/")])
+        if w.shape != base.shape or not np.all(w >= 0) or np.any((base == 0) & (w > 0)):
+            raise ValueError(
+                f"objective_head_weights {name}: need {len(base)} weights >= 0, zero where the "
+                f"serving weights {tuple(base)} are zero"
+            )
+        key = (LineItemObjective[obj_name].value, fmt or None)
+        if key in multipliers:
+            raise ValueError(f"objective_head_weights lists {name} twice")
+        multipliers[key] = np.divide(w, base, out=np.ones_like(w), where=base != 0)
+    return multipliers
+
+
+def objective_slot_scales(
+    objective_bits: npt.ArrayLike,
+    multipliers: typing.Mapping[tuple[int, str | None], npt.ArrayLike],
+    num_slots: int,
+) -> npt.NDArray[np.float32]:
+    raw = np.asarray(objective_bits, dtype=np.int64).reshape(-1)
+    is_video = (raw & VIDEO_CREATIVE_BIT) != 0
+    bits = raw & ~VIDEO_CREATIVE_BIT
+    scales = np.ones((len(bits), num_slots), dtype=np.float32)
+    for (objective, fmt), m in sorted(multipliers.items(), key=lambda kv: kv[0][1] is not None):
+        rows = bits == (1 << objective)
+        if fmt is not None:
+            rows &= is_video == (fmt == "video")
+        scales[rows] = m
+    return scales
+
+
+def scale_post_table_slots(table: jax.Array, slot_scales: jax.Array) -> jax.Array:
+    rows, width = table.shape
+    num_slots = slot_scales.shape[1]
+    slots = table.reshape(rows, num_slots, width // num_slots).astype(jnp.float32)
+    return (slots * slot_scales[:, :, None]).reshape(rows, width).astype(table.dtype)
 
 
 def user_tower_segment_ids(
@@ -2240,7 +2294,7 @@ class RecsysTwoTowerModel(hk.Module):
         post_scales: jax.Array | None = None,
         dataset_capacities: tuple[int, ...] | None = None,
         mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
-        query_head_weights: tuple[float, float] | None = None,
+        query_head_weights: tuple[float, ...] | None = None,
     ) -> tuple[tuple[jax.Array, jax.Array], ...]:
         saxis = "expert"
 
@@ -2292,9 +2346,11 @@ class RecsysTwoTowerModel(hk.Module):
 
         slot_weights = (
             (1.0,)
-            if self.config.ld_head is None
+            if self.config.num_table_slots == 1
             else (query_head_weights or self.config.query_head_weights)
         )
+        if len(slot_weights) != self.config.num_table_slots:
+            raise ValueError(f"{slot_weights=} needs {self.config.num_table_slots} slot weights")
 
         def _over_slots(score_slot, posts: jax.Array, side, full_rows: bool = False) -> jax.Array:
             return score_over_slots(score_slot, posts, side, slot_weights, full_rows)
@@ -2904,24 +2960,42 @@ class RecsysTwoTowerModelConfig(Config):
         default_factory=lambda: RecsysTwoTowerModelConfig.get_soft_negative_actions()
     )
 
+    tweet_click_positive_actions: list[int] = field(
+        default_factory=lambda: [recsys_pb2.ActionName.CLIENT_TWEET_CLICK]
+    )
+
     head_dataset_mapping: dict[str, int] | None = None
 
     head_names: list[str] = field(default_factory=lambda: ["home"])
 
     w_fav: float = 1.0
     w_ld: float = 0.0
+    w_tweet_click: float = 0.0
+
+    objective_head_weights: str = ""
 
     @property
-    def ld_head(self) -> int | None:
-        return self.head_names.index("ld") if "ld" in self.head_names else None
+    def blend_heads(self) -> list[str]:
+        return blend_heads(self.head_names)
 
     @property
     def num_table_slots(self) -> int:
-        return 1 + (self.ld_head is not None)
+        return 1 + len(self.blend_heads)
 
     @property
-    def query_head_weights(self) -> tuple[float, float]:
-        return (self.w_fav, self.w_ld)
+    def query_head_weights(self) -> tuple[float, ...]:
+        weights = {"ld": self.w_ld, "tweet_click": self.w_tweet_click}
+        return (self.w_fav, *(weights[name] for name in self.blend_heads))
+
+    @property
+    def serving_slot_weights(self) -> tuple[float, ...]:
+        return (1.0,) if self.num_table_slots == 1 else self.query_head_weights
+
+    def objective_slot_scales(self, objective_bits: npt.ArrayLike) -> npt.NDArray[np.float32]:
+        multipliers = objective_slot_multipliers(
+            self.objective_head_weights, self.serving_slot_weights
+        )
+        return objective_slot_scales(objective_bits, multipliers, self.num_table_slots)
 
     @property
     def mol_side_table_width(self) -> int:
@@ -2962,6 +3036,11 @@ class RecsysTwoTowerModelConfig(Config):
                 self.ld_positive_actions,
                 self.ld_hard_negative_actions,
                 self.ld_soft_negative_actions,
+            ),
+            "tweet_click": (
+                self.tweet_click_positive_actions,
+                self.hard_negative_actions,
+                self.soft_negative_actions,
             ),
         }
         return [actions[name] for name in self.head_names]
@@ -3044,13 +3123,17 @@ class RecsysTwoTowerModelConfig(Config):
                 f"head_names {self.head_names} must name each of the "
                 f"{self.candidate_tower_config.num_candidate_heads} candidate heads"
             )
-        if self.ld_head == 0:
-            raise ValueError("'ld' must not be the first head; head 0 fills slot 0 of HOME rows")
-        if self.ld_head is not None and self.ld_head in (self.head_dataset_mapping or {}).values():
-            raise ValueError(
-                f"ld_head={self.ld_head} fills the second table slot; it must not own a dataset "
-                "in head_dataset_mapping"
-            )
+        if self.objective_head_weights:
+            if self.mol_item_components > 0:
+                raise ValueError("objective_head_weights needs linear (non-MoL) scoring")
+            objective_slot_multipliers(self.objective_head_weights, self.serving_slot_weights)
+        dataset_heads = set((self.head_dataset_mapping or {}).values())
+        for name in self.blend_heads:
+            head = self.head_names.index(name)
+            if head == 0 or head in dataset_heads:
+                raise ValueError(
+                    f"{name!r} fills its own table slot; it cannot be head 0 or own a dataset"
+                )
 
         user_tower = self.user_tower_config.make(sharding_context)
 

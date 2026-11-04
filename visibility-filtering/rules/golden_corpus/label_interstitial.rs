@@ -41,10 +41,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, one_off()),
-                (TimelineHomeHydration, Role::Author, one_off()),
+                (Role::each([Role::NonFollower, Role::Author]), one_off()),
                 (
-                    TimelineHomeHydration,
                     Role::As("read_only", read_only_viewer(VIEWER_ID)),
                     label_interstitial(
                         public_interest(
@@ -59,6 +57,7 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
             ],
+            at: vec![],
         },
         Row {
             name: "low_quality_label_episodic_source",
@@ -69,7 +68,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 label_interstitial(
                     public_interest(
@@ -80,6 +78,7 @@ pub(super) fn rows() -> Vec<Row> {
                     None,
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "low_quality_label_with_sensitive_and_violent_media",
@@ -91,29 +90,26 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)
                     .build(),
             ),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
-                    with_label_interstitial(
-                        blurred(
-                            InterstitialReason::Sensitive(true),
-                            "nsfw_high_precision/blur/sensitive",
-                        ),
-                        one_off_notice(),
-                        "public_interest/label_interstitial",
-                    ),
+            expect: vec![(
+                Role::As("no_client_context", viewer(VIEWER_ID)),
+                with_label_interstitial(
+                    legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
+                    one_off_notice(),
+                    "public_interest/label_interstitial",
                 ),
-                (
-                    TimelineHomeHydration,
-                    Role::As("no_client_context", viewer(VIEWER_ID)),
-                    with_label_interstitial(
-                        legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
-                        one_off_notice(),
-                        "public_interest/label_interstitial",
+            )],
+            at: vec![(
+                TimelineHomeHydration,
+                Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
+                with_label_interstitial(
+                    blurred(
+                        InterstitialReason::Sensitive(true),
+                        "nsfw_high_precision/blur/sensitive",
                     ),
+                    one_off_notice(),
+                    "public_interest/label_interstitial",
                 ),
-            ],
+            )],
         },
         Row {
             name: "misinfo_civic_label_limiting_replies",
@@ -124,7 +120,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 label_interstitial(
                     public_interest(
@@ -135,6 +130,7 @@ pub(super) fn rows() -> Vec<Row> {
                     None,
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "low_quality_label_before_public_interest_labels",
@@ -144,7 +140,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_label_source(SafetyLabelType::LOW_QUALITY, "OneOff")
                     .build(),
             ),
-            expect: vec![(TimelineHomeHydration, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "misinfo_civic_label_without_source",
@@ -155,7 +152,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 label_interstitial(
                     public_interest(SafetyResultReason::MISINFO_CIVIC, None),
@@ -163,6 +159,7 @@ pub(super) fn rows() -> Vec<Row> {
                     None,
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "for_emergency_use_only_label_with_copy",
@@ -174,28 +171,25 @@ pub(super) fn rows() -> Vec<Row> {
                     )
                     .build(),
             ),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
-                    label_interstitial(
-                        LabelInterstitial::EmergencyDynamic(Box::new(EmergencyCopy {
-                            copy: "Stay safe.".to_owned(),
-                            link: Some("https://help.x.com/emergency".to_owned()),
-                        })),
-                        "for_emergency_use_only/label_interstitial",
-                        None,
-                    ),
+            expect: vec![(
+                Role::NonFollower,
+                label_interstitial(
+                    LabelInterstitial::EmergencyDynamic(Box::new(EmergencyCopy {
+                        copy: "Stay safe.".to_owned(),
+                        link: Some("https://help.x.com/emergency".to_owned()),
+                    })),
+                    "for_emergency_use_only/label_interstitial",
+                    None,
                 ),
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "for_emergency_use_only/drop/unspecified",
-                    ),
+            )],
+            at: vec![(
+                TimelineHome,
+                Role::NonFollower,
+                dropped(
+                    FilteredReason::UnspecifiedReason,
+                    "for_emergency_use_only/drop/unspecified",
                 ),
-            ],
+            )],
         },
         Row {
             name: "for_emergency_use_only_label_with_rule_source",
@@ -204,7 +198,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_label_source(SafetyLabelType::FOR_EMERGENCY_USE_ONLY, "bot_id_7")
                     .build(),
             ),
-            expect: vec![(TimelineHomeHydration, Role::NonFollower, allow())],
+            expect: vec![],
+            at: vec![(TimelineHomeHydration, Role::NonFollower, allow())],
         },
     ]
 }

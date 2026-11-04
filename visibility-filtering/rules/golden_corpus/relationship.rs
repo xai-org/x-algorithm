@@ -2,10 +2,6 @@ use super::{Role, Row, Subject};
 use crate::hydration::Hydrator::{BlockedByAuthor, Blocks, MuteRetweets, Mutes};
 use crate::models::LimitedEngagementReason;
 use crate::rules::fixtures::{allow, candidate, controlled_root, dropped, limited, limited_for};
-use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
-};
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -14,109 +10,56 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "viewer_blocks_author",
             subject: Subject::Post(candidate().with_edge(Blocks).build()),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerBlocksAuthor,
-                        "viewer_blocks_author/drop",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerBlocksAuthor,
-                        "viewer_blocks_author/drop",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerBlocksAuthor,
-                        "viewer_blocks_author/drop",
-                    ),
-                ),
-            ],
-        },
-        Row {
-            name: "viewer_mutes_author",
-            subject: Subject::Post(candidate().with_edge(Mutes).build()),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerMutesAuthor,
-                        "viewer_mutes_author/drop",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerMutesAuthor,
-                        "viewer_mutes_author/drop",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ViewerMutesAuthor,
-                        "viewer_mutes_author/drop",
-                    ),
-                ),
-            ],
-        },
-        Row {
-            name: "viewer_blocks_and_mutes_author",
-            subject: Subject::Post(candidate().with_edge(Blocks).with_edge(Mutes).build()),
             expect: vec![(
-                TimelineHome,
                 Role::NonFollower,
                 dropped(
                     FilteredReason::ViewerBlocksAuthor,
                     "viewer_blocks_author/drop",
                 ),
             )],
+            at: vec![],
+        },
+        Row {
+            name: "viewer_mutes_author",
+            subject: Subject::Post(candidate().with_edge(Mutes).build()),
+            expect: vec![(
+                Role::NonFollower,
+                dropped(
+                    FilteredReason::ViewerMutesAuthor,
+                    "viewer_mutes_author/drop",
+                ),
+            )],
+            at: vec![],
+        },
+        Row {
+            name: "viewer_blocks_and_mutes_author",
+            subject: Subject::Post(candidate().with_edge(Blocks).with_edge(Mutes).build()),
+            expect: vec![(
+                Role::NonFollower,
+                dropped(
+                    FilteredReason::ViewerBlocksAuthor,
+                    "viewer_blocks_author/drop",
+                ),
+            )],
+            at: vec![],
         },
         Row {
             name: "muted_retweets_retweet",
             subject: Subject::Post(candidate().with_edge(MuteRetweets).retweet_of(2).build()),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "viewer_mutes_retweets/drop/unspecified",
-                    ),
+            expect: vec![(
+                Role::NonFollower,
+                dropped(
+                    FilteredReason::UnspecifiedReason,
+                    "viewer_mutes_retweets/drop/unspecified",
                 ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "viewer_mutes_retweets/drop/unspecified",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "viewer_mutes_retweets/drop/unspecified",
-                    ),
-                ),
-            ],
+            )],
+            at: vec![],
         },
         Row {
             name: "muted_retweets_original",
             subject: Subject::Post(candidate().with_edge(MuteRetweets).build()),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "author_and_root_author_block",
@@ -127,7 +70,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 limited_for(
                     &[
@@ -137,23 +79,25 @@ pub(super) fn rows() -> Vec<Row> {
                     "blocked_viewer/limited_engagement",
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "author_block",
             subject: Subject::Post(candidate().with_edge(BlockedByAuthor).build()),
-            expect: vec![(TimelineHomeHydration, Role::Author, allow())],
+            expect: vec![(Role::Author, allow())],
+            at: vec![],
         },
         Row {
             name: "root_author_block",
             subject: Subject::Post(candidate().root_author_blocks_viewer().build()),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::Author,
                 limited(
                     LimitedEngagementReason::RootAuthorBlockedViewer,
                     "blocked_viewer/limited_engagement/root_author_blocked_viewer",
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "root_author_block_community_conversation",
@@ -164,7 +108,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 limited_for(
                     &[
@@ -174,6 +117,7 @@ pub(super) fn rows() -> Vec<Row> {
                     "blocked_viewer/limited_engagement/root_author_blocked_viewer",
                 ),
             )],
+            at: vec![],
         },
     ]
 }

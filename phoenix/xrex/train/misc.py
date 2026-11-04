@@ -6,7 +6,10 @@ from typing import Literal, NamedTuple, Protocol
 
 import haiku as hk
 import jax
+import numpy as np
 import optax
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xrex.models.model_utils import Parameter
@@ -53,6 +56,7 @@ class CheckpointConfig(Config):
     checkpoint_chunked: bool = True
     checkpoint_compressed: bool = True
     checkpoint_chunk_size_bytes: int = 1024 * 1024 * 4
+    checkpoint_ocdbt_target_data_file_size: int | None = None
     encrypt: bool = False
     encryption_key_id: str | None = None
     encryption_context: dict[str, str] = field(default_factory=dict)
@@ -114,6 +118,12 @@ class PostEmbeddings(NamedTuple):
     embeddings: Parameter
     dataset_types: jax.Array
     mol_side_table: Parameter | None = None
+
+
+def replicated_global_array(host_array: np.ndarray, mesh: Mesh) -> jax.Array:
+    return jax.make_array_from_callback(
+        host_array.shape, NamedSharding(mesh, P(None, None)), lambda index: host_array[index]
+    )
 
 
 class RecsysInferenceState(NamedTuple):

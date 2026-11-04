@@ -1,6 +1,7 @@
 use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::inventory::Answer;
+use crate::hydration::sources::source;
 use crate::hydration::{Cause, Hydrator, Hydrators};
 use crate::models::{AuthorId, ReplyTo, TweetId};
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
@@ -70,7 +71,11 @@ impl Store {
         row: &RequestRow,
     ) -> Option<ConversationRootAuthor> {
         let id = row.tweet_id()?.0;
-        let (conversation_id, parent_id) = match self.pure_cores.request().get(id)?.reply_to? {
+        let (conversation_id, parent_id) = match self
+            .request_fetcher::<source::TesPureCoreData>()
+            .get(id)?
+            .reply_to?
+        {
             ReplyTo::Root { root_author_id, .. } => {
                 return Some(ConversationRootAuthor::PureCore(root_author_id));
             }
@@ -82,7 +87,8 @@ impl Store {
         if let Some(author) = self.root_author_in_batch(conversation_id, parent_id) {
             return Some(ConversationRootAuthor::PureCore(author));
         }
-        let root = match (self.controls.get(id), self.controls.answer(id)) {
+        let controls = self.request_fetcher::<source::TesConversationControl>();
+        let root = match (controls.get(id), controls.answer(id)) {
             (Some(control), _) => ConversationRootAuthor::ConversationControl(AuthorId(
                 control.conversation_tweet_author_id,
             )),
@@ -106,8 +112,7 @@ impl Store {
         parent_id: TweetId,
     ) -> Option<AuthorId> {
         let row_core = |id: TweetId| {
-            self.pure_cores
-                .request()
+            self.request_fetcher::<source::TesPureCoreData>()
                 .get(id.0)
                 .filter(|_| self.requested_tweet_ids.contains(&id))
         };

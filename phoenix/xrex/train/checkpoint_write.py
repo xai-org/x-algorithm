@@ -156,6 +156,7 @@ def save_checkpoint(
         chunked=self.checkpoint_config.checkpoint_chunked,
         compressed=self.checkpoint_config.checkpoint_compressed,
         chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,
+        ocdbt_target_data_file_size=self.checkpoint_config.checkpoint_ocdbt_target_data_file_size,
         tracer=tracer,
         save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,
         kms_client=kms_client,

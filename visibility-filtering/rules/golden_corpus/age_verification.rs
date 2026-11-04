@@ -6,14 +6,13 @@ use crate::models::VerifyBlurSupport::{
 };
 use crate::models::{
     AuthorFeatures, ClientCapability, ClientSwitch, LimitedEngagementReason, NsfwFeature,
-    NsfwViewerDropReason, PostCandidate, SafetyLabelType, TombstoneReason, TweetFeatures, Verdict,
-    VerifyBlurSupport, Viewer, ViewerFeatures, ViewerProfile,
+    NsfwViewerDropReason, PostCandidate, RequestFacts, SafetyLabelType, TombstoneReason,
+    TweetFeatures, Verdict, VerifyBlurSupport, Viewer, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
     allow, author_viewer, blurred, blurred_and_limited, candidate, labeled, legacy_interstitial,
     limited, nsfw_high_precision_media, nsfw_viewer_dropped, on_client, sensitive_opt_in_viewer,
-    tombstoned, verify_blurred, viewer, viewer_in_country, viewer_with_profile, AUTHOR_ID,
-    CLIENT_CLASSES, VIEWER_ID,
+    tombstoned, verify_blurred, viewer, viewer_with_profile, AUTHOR_ID, CLIENT_CLASSES, VIEWER_ID,
 };
 use crate::rules::SafetyLevel::{self, TimelineHome, TimelineHomeHydration};
 use xai_x_thrift::action::InterstitialReason;
@@ -28,10 +27,7 @@ fn per_client_class(
                 .capability
                 .verify_blur_support
                 .expect("every client class resolves a Verify blur support");
-            let viewer = ViewerFeatures {
-                client_capability: class.capability,
-                ..viewer_in_country("fr")
-            };
+            let viewer = on_client(class.name, "fr", viewer(VIEWER_ID));
             (
                 TimelineHomeHydration,
                 Role::As(class.name, viewer),
@@ -147,19 +143,27 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "nsfw_high_precision_media_per_client_class",
             subject: Subject::Post(nsfw_high_precision_media()),
-            expect: per_client_class(high_precision_tombstone),
+            expect: vec![],
+            at: per_client_class(high_precision_tombstone),
         },
         Row {
             name: "nsfw_high_precision_media_for_an_ios_outdated_viewer",
             subject: Subject::Post(nsfw_high_precision_media()),
-            expect: vec![
+            expect: vec![(
+                Role::As(
+                    "sensitive_opt_in_ios_outdated_in_fr",
+                    on_client("ios_outdated", "fr", sensitive_opt_in_viewer()),
+                ),
+                high_precision_ios_tombstone(),
+            )],
+            at: vec![
                 (
-                    TimelineHomeHydration,
+                    TimelineHome,
                     Role::As(
-                        "sensitive_opt_in_ios_outdated_in_fr",
-                        on_client("ios_outdated", "fr", sensitive_opt_in_viewer()),
+                        "ios_outdated_in_fr",
+                        on_client("ios_outdated", "fr", viewer(VIEWER_ID)),
                     ),
-                    high_precision_ios_tombstone(),
+                    plain_high_precision(),
                 ),
                 (
                     TimelineHomeHydration,
@@ -177,6 +181,14 @@ pub(super) fn rows() -> Vec<Row> {
                                 ..ViewerFeatures::default()
                             },
                         ),
+                    ),
+                    plain_high_precision(),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::As(
+                        "author_ios_outdated_in_fr",
+                        on_client("ios_outdated", "fr", author_viewer()),
                     ),
                     plain_high_precision(),
                 ),
@@ -203,28 +215,13 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                     plain_high_precision(),
                 ),
-                (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "author_ios_outdated_in_fr",
-                        on_client("ios_outdated", "fr", author_viewer()),
-                    ),
-                    plain_high_precision(),
-                ),
-                (
-                    TimelineHome,
-                    Role::As(
-                        "ios_outdated_in_fr",
-                        on_client("ios_outdated", "fr", viewer(VIEWER_ID)),
-                    ),
-                    plain_high_precision(),
-                ),
             ],
         },
         Row {
             name: "nsfw_admin_flag_media_per_client_class",
             subject: Subject::Post(nsfw_admin_flag_media()),
-            expect: per_client_class(|support| match support {
+            expect: vec![],
+            at: per_client_class(|support| match support {
                 Unsupported => tombstoned(
                     TombstoneReason::SensitiveViewerAgeVerification,
                     "nsfw_account/tombstone/age_verification",
@@ -246,7 +243,8 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "nsfw_card_image_label_per_client_class",
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_CARD_IMAGE)),
-            expect: per_client_class(|support| match support {
+            expect: vec![],
+            at: per_client_class(|support| match support {
                 Unsupported => tombstoned(
                     TombstoneReason::SensitiveViewerAgeVerification,
                     "nsfw_card_image/tombstone/age_verification",
@@ -268,7 +266,8 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "gore_and_violence_label_per_client_class",
             subject: Subject::Post(labeled(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)),
-            expect: per_client_class(|support| match support {
+            expect: vec![],
+            at: per_client_class(|support| match support {
                 Unsupported => {
                     legacy_interstitial("gore_and_violence_high_precision/legacy_interstitial")
                 }
@@ -290,12 +289,30 @@ pub(super) fn rows() -> Vec<Row> {
             name: "nsfw_high_precision_media_for_a_web_viewer",
             subject: Subject::Post(nsfw_high_precision_media()),
             expect: vec![
-                (TimelineHomeHydration, web_in_fr(), verify_high_precision()),
                 (
-                    TimelineHomeHydration,
-                    sensitive_opt_in_web_in_fr(),
+                    Role::each([web_in_fr(), sensitive_opt_in_web_in_fr()]),
                     verify_high_precision(),
                 ),
+                (
+                    sensitive_opt_in_author("sensitive_opt_in_author_web_in_fr", "fr"),
+                    allow(),
+                ),
+                (
+                    Role::As(
+                        "logged_out_web_in_fr",
+                        ViewerFeatures {
+                            viewer: Viewer::LoggedOut,
+                            ..on_client("web", "fr", viewer(VIEWER_ID))
+                        },
+                    ),
+                    nsfw_viewer_dropped(
+                        NsfwViewerDropReason::LoggedOut,
+                        "sensitive_viewer_logged_out/drop",
+                    ),
+                ),
+            ],
+            at: vec![
+                (TimelineHome, web_in_fr(), plain_high_precision()),
                 (
                     TimelineHomeHydration,
                     Role::As(
@@ -309,6 +326,11 @@ pub(super) fn rows() -> Vec<Row> {
                             ..on_client("web", "fr", viewer(VIEWER_ID))
                         },
                     ),
+                    plain_high_precision(),
+                ),
+                (
+                    TimelineHomeHydration,
+                    author_web_in_fr(),
                     plain_high_precision(),
                 ),
                 (
@@ -327,31 +349,6 @@ pub(super) fn rows() -> Vec<Row> {
                     plain_high_precision(),
                 ),
                 (TimelineHomeHydration, web_in_us(), plain_high_precision()),
-                (
-                    TimelineHomeHydration,
-                    author_web_in_fr(),
-                    plain_high_precision(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    sensitive_opt_in_author("sensitive_opt_in_author_web_in_fr", "fr"),
-                    allow(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "logged_out_web_in_fr",
-                        ViewerFeatures {
-                            viewer: Viewer::LoggedOut,
-                            ..on_client("web", "fr", viewer(VIEWER_ID))
-                        },
-                    ),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::LoggedOut,
-                        "sensitive_viewer_logged_out/drop",
-                    ),
-                ),
-                (TimelineHome, web_in_fr(), plain_high_precision()),
             ],
         },
         Row {
@@ -363,17 +360,16 @@ pub(super) fn rows() -> Vec<Row> {
                 candidate
             }),
             expect: vec![
-                (TimelineHomeHydration, web_in_fr(), verify_high_precision()),
+                (web_in_fr(), verify_high_precision()),
                 (
-                    TimelineHomeHydration,
                     Role::As(
                         "ios_outdated_in_fr",
                         on_client("ios_outdated", "fr", viewer(VIEWER_ID)),
                     ),
                     high_precision_ios_tombstone(),
                 ),
-                (TimelineHomeHydration, web_in_us(), plain_high_precision()),
             ],
+            at: vec![(TimelineHomeHydration, web_in_us(), plain_high_precision())],
         },
         Row {
             name: "nsfw_high_precision_media_from_a_blocking_author",
@@ -385,7 +381,6 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 web_in_fr(),
                 blurred_and_limited(
                     verify_high_precision(),
@@ -395,6 +390,7 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "nsfw_high_precision_adult_media",
@@ -407,13 +403,15 @@ pub(super) fn rows() -> Vec<Row> {
             ),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     web_in_fr(),
                     verify_blurred(
                         InterstitialReason::Nudity(true),
                         "nsfw_high_precision/blur/nudity/age_prompt",
                     ),
                 ),
+                (sensitive_opt_in_web_in_us(), allow()),
+            ],
+            at: vec![
                 (
                     TimelineHomeHydration,
                     web_in_us(),
@@ -430,7 +428,6 @@ pub(super) fn rows() -> Vec<Row> {
                         "nsfw_high_precision/blur/nudity",
                     ),
                 ),
-                (TimelineHomeHydration, sensitive_opt_in_web_in_us(), allow()),
                 (
                     TimelineHomeHydration,
                     author_web_in_fr(),
@@ -446,13 +443,15 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_CARD_IMAGE)),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     web_in_fr(),
                     verify_blurred(
                         InterstitialReason::Sensitive(true),
                         "nsfw_card_image/blur/sensitive/age_prompt",
                     ),
                 ),
+                (sensitive_opt_in_web_in_us(), allow()),
+            ],
+            at: vec![
                 (
                     TimelineHomeHydration,
                     web_in_us(),
@@ -461,7 +460,6 @@ pub(super) fn rows() -> Vec<Row> {
                         "nsfw_card_image/blur/sensitive",
                     ),
                 ),
-                (TimelineHomeHydration, sensitive_opt_in_web_in_us(), allow()),
                 (
                     TimelineHomeHydration,
                     author_web_in_fr(),
@@ -477,13 +475,15 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(nsfw_admin_flag_media()),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     web_in_fr(),
                     verify_blurred(
                         InterstitialReason::Sensitive(true),
                         "nsfw_admin/blur/sensitive/age_prompt",
                     ),
                 ),
+                (sensitive_opt_in_web_in_us(), allow()),
+            ],
+            at: vec![
                 (
                     TimelineHomeHydration,
                     web_in_us(),
@@ -492,7 +492,6 @@ pub(super) fn rows() -> Vec<Row> {
                         "nsfw_admin/blur/sensitive",
                     ),
                 ),
-                (TimelineHomeHydration, sensitive_opt_in_web_in_us(), allow()),
                 (
                     TimelineHomeHydration,
                     author_web_in_fr(),
@@ -515,7 +514,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_media()
                     .build(),
             ),
-            expect: per_client_class(|_| allow())
+            expect: vec![],
+            at: per_client_class(|_| allow())
                 .into_iter()
                 .chain([
                     (TimelineHomeHydration, web_in_us(), allow()),
@@ -554,15 +554,14 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_media()
                     .build(),
             ),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    web_in_fr(),
-                    verify_blurred(
-                        InterstitialReason::SensitiveUser(true),
-                        "nsfw_user/blur/sensitive_user/age_prompt",
-                    ),
+            expect: vec![(
+                web_in_fr(),
+                verify_blurred(
+                    InterstitialReason::SensitiveUser(true),
+                    "nsfw_user/blur/sensitive_user/age_prompt",
                 ),
+            )],
+            at: vec![
                 (
                     TimelineHomeHydration,
                     web_in_us(),
@@ -593,51 +592,65 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_media()
                     .build(),
             ),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    web_in_fr(),
-                    verify_blurred(
-                        InterstitialReason::Sensitive(true),
-                        "nsfw_admin/blur/sensitive/age_prompt",
-                    ),
+            expect: vec![(
+                web_in_fr(),
+                verify_blurred(
+                    InterstitialReason::Sensitive(true),
+                    "nsfw_admin/blur/sensitive/age_prompt",
                 ),
-                (
-                    TimelineHomeHydration,
-                    web_in_us(),
-                    blurred(
-                        InterstitialReason::Sensitive(true),
-                        "nsfw_admin/blur/sensitive",
-                    ),
+            )],
+            at: vec![(
+                TimelineHomeHydration,
+                web_in_us(),
+                blurred(
+                    InterstitialReason::Sensitive(true),
+                    "nsfw_admin/blur/sensitive",
                 ),
-            ],
+            )],
         },
         Row {
             name: "gore_and_violence_label_for_a_web_viewer",
             subject: Subject::Post(labeled(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)),
             expect: vec![
                 (
+                    Role::each([sensitive_opt_in_web_in_fr(), sensitive_opt_in_web_in_us()]),
+                    blurred(
+                        InterstitialReason::Violence(true),
+                        "gore_and_violence_ignoring_settings/blur",
+                    ),
+                ),
+                (
+                    sensitive_opt_in_author("sensitive_opt_in_author_web_in_us", "us"),
+                    allow(),
+                ),
+                (
+                    Role::As(
+                        "sensitive_opt_in_without_the_ignore_settings_switch_in_fr",
+                        ViewerFeatures {
+                            facts: RequestFacts::default().with_country("fr").with_client(
+                                ClientCapability {
+                                    verify_blur_support: Some(Supported),
+                                    ..ClientCapability::DEFAULT
+                                        .with(ClientSwitch::ModernBlur)
+                                        .with(ClientSwitch::CommunityViewerRemovedLimits)
+                                },
+                            ),
+                            ..sensitive_opt_in_viewer()
+                        },
+                    ),
+                    verify_blurred(
+                        InterstitialReason::Violence(true),
+                        "gore_and_violence_high_precision/blur/age_prompt",
+                    ),
+                ),
+            ],
+            at: vec![
+                (
                     TimelineHomeHydration,
                     web_in_fr(),
                     blurred(
                         InterstitialReason::Violence(true),
                         "gore_and_violence_high_precision/blur",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    sensitive_opt_in_web_in_fr(),
-                    blurred(
-                        InterstitialReason::Violence(true),
-                        "gore_and_violence_ignoring_settings/blur",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    sensitive_opt_in_web_in_us(),
-                    blurred(
-                        InterstitialReason::Violence(true),
-                        "gore_and_violence_ignoring_settings/blur",
                     ),
                 ),
                 (
@@ -646,31 +659,6 @@ pub(super) fn rows() -> Vec<Row> {
                     blurred(
                         InterstitialReason::Violence(true),
                         "gore_and_violence_high_precision/blur",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    sensitive_opt_in_author("sensitive_opt_in_author_web_in_us", "us"),
-                    allow(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "sensitive_opt_in_without_the_ignore_settings_switch_in_fr",
-                        ViewerFeatures {
-                            country_code: Some("fr".into()),
-                            client_capability: ClientCapability {
-                                verify_blur_support: Some(Supported),
-                                ..ClientCapability::DEFAULT
-                                    .with(ClientSwitch::ModernBlur)
-                                    .with(ClientSwitch::CommunityViewerRemovedLimits)
-                            },
-                            ..sensitive_opt_in_viewer()
-                        },
-                    ),
-                    verify_blurred(
-                        InterstitialReason::Violence(true),
-                        "gore_and_violence_high_precision/blur/age_prompt",
                     ),
                 ),
             ],
