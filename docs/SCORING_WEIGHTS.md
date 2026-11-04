@@ -84,6 +84,38 @@ that are not replies or reposts and whose author follows the viewer back
 | reply boost | `bidirectional_follow_reply_weight_boost` | 15.0 |
 | dwell boost | `bidirectional_follow_dwell_weight_boost` | 0.0 |
 
+### 2.1 What a like-only viewer can reach
+
+The 19 terms in `positive_sum` (43.345 with the defaults above) are not distributed evenly by
+what a viewer has to do to make a term non-zero:
+
+| group | terms | total | share of `positive_sum` |
+| --- | --- | --- | --- |
+| inferred from passive behaviour | `click` 0.3, `open_link` 0.2, `photo_expand` 0.05, `video_open` 0.02, `dwell` 0.05, `quoted_click` 0.05, `profile_click` 0, `vqv` 0, `quoted_vqv` 0 | 0.670 | 1.55% |
+| like | `favorite` 0.66 | 0.660 | 1.52% |
+| high-effort explicit | `share_via_copy_link` 20, `reply` 5, `quote` 5, `share_via_dm` 5, `follow_author` 4, `share` 2, `retweet` 1 | 42.000 | 96.90% |
+| post property | `post_unexplored` 0.015 | 0.015 | 0.03% |
+
+Two things follow, and they are worth keeping in mind when reading a score:
+
+- A viewer whose strongest action is a like is confined to the 1.5% at the bottom of the ladder.
+  Liking more does not change the weight, because the score uses `P(like)` rather than the like
+  count, and `P(like)` saturates.
+- Per unit probability the attention group is as large as the like term — `click` +
+  `click_dwell_time` + `dwell` = 0.3 + 0.4 + 0.05 = 0.75 against `favorite` = 0.66 — while the
+  probabilities are not comparable: `P(click)` and `P(dwell)` on a post that was only scrolled
+  past sit far above `P(like)`.
+
+The same asymmetry is in the model input, not just the weights: every history row carries a dwell
+value (`hist_dwell_time_vec` in
+[`phoenix/xrex/models/recsys_feature_prep.py`](../phoenix/xrex/models/recsys_feature_prep.py)), so
+a full sequence is up to 1024 attention samples against a handful of likes.
+
+The negative side of the attention family is much weaker than the positive side: 10 s of
+`dwell_time` is +0.06, while `not_dwelled` at `P = 1` is −0.02 (and is a recap event — see §5).
+"Rendered, read, rejected" therefore has no label; the only expressible rejection is the
+`not_interested` head, which is a separate term and not a counterpart to attention.
+
 ## 3. The transform applied to the sum
 
 `offset_score()` in [`xai-value-model/scoring.rs`](../xai-value-model/scoring.rs):
