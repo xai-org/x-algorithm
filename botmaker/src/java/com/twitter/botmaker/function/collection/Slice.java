@@ -10,6 +10,7 @@ import com.twitter.botmaker.ASTNode;
 import com.twitter.botmaker.Context;
 import com.twitter.botmaker.compiler.ActionLevel;
 import com.twitter.botmaker.compiler.BotMakerFunction;
+import com.twitter.botmaker.compiler.exceptions.FunctionFailure;
 import com.twitter.botmaker.compiler.exceptions.SemanticCheckFailure;
 import com.twitter.botmaker.compiler.types.Type;
 import com.twitter.botmaker.function.FunctionNode2O1;
@@ -73,6 +74,7 @@ public class Slice extends FunctionNode2O1<Runtime, Object, Long, Long> {
   @Override
   protected Object apply(
       Context<Runtime> context, Object input, Long beginIndex, Long endIndex) {
+    validateSliceBounds(context, input, beginIndex, endIndex);
     if (input instanceof String) {
       return ((String) input).substring(beginIndex.intValue(), endIndex.intValue());
     } else if (input instanceof List) {
@@ -93,6 +95,37 @@ public class Slice extends FunctionNode2O1<Runtime, Object, Long, Long> {
       return apply(context, list, beginIndex, Long.valueOf(list.size()));
     } else {
       throw new IllegalArgumentException(mkErrorMessage(input.getClass()));
+    }
+  }
+
+  private void validateSliceBounds(
+      Context<Runtime> context, Object input, Long beginIndex, Long endIndex) {
+    if (beginIndex == null || endIndex == null) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException("Slice() requires non-null begin and end indices"));
+    }
+    int begin = beginIndex.intValue();
+    int end = endIndex.intValue();
+    final int max;
+    if (input instanceof String) {
+      max = ((String) input).length();
+    } else if (input instanceof List) {
+      max = ((List<?>) input).size();
+    } else {
+      throw new IllegalArgumentException(mkErrorMessage(input.getClass()));
+    }
+    if (begin < 0 || end < 0 || begin > end || end > max) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException(
+              String.format(
+                  "Slice() indices out of range: begin=%d end=%d length=%d",
+                  begin,
+                  end,
+                  max)));
     }
   }
 
