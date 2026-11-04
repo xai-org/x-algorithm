@@ -1,9 +1,11 @@
+mod attention_rewards;
 mod inputs;
 mod phoenix_scores;
 mod proto;
 mod scoring;
 mod weights;
 
+pub use attention_rewards::AttentionRewardScaleError;
 pub use inputs::{CandidateScoringInputs, QueryScoringContext};
 pub use phoenix_scores::PhoenixScores;
 pub use scoring::{
