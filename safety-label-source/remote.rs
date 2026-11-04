@@ -326,9 +326,19 @@ impl ManhattanSource {
                 for (i, &tweet_id) in ids.iter().enumerate() {
                     match fetch_results.get(i) {
                         Some(Ok(raw_items)) => match decode::raw_labels(raw_items) {
-                            Some(label_map) => {
+                            Some(Ok(label_map)) => {
                                 successes += 1;
                                 results.insert(tweet_id, Ok(label_map));
+                            }
+                            Some(Err(e)) => {
+                                failures += 1;
+                                results.insert(
+                                    tweet_id,
+                                    Err(LookupError::new(
+                                        FailureKind::ManhattanDecode,
+                                        e,
+                                    )),
+                                );
                             }
                             None => {
                                 failures += 1;

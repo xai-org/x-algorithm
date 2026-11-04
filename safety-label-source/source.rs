@@ -33,7 +33,7 @@ fn system_unix_ms() -> i64 {
 
 fn label_is_live(expires_at_msec: Option<i64>, now_ms: i64) -> bool {
     match expires_at_msec {
-        Some(expires_at_msec) => expires_at_msec.wrapping_sub(now_ms) > 0,
+        Some(expires_at_msec) => expires_at_msec > now_ms,
         None => true,
     }
 }
