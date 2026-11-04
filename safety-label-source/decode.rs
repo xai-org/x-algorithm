@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use tracing::debug;
+use tracing::{debug, warn};
 use xai_safety_label_store::mval_safety_label_map::decode_mval;
 use xai_safety_label_store::types::{decode_lkey_bytes, SafetyLabelMap};
 use xai_visibility_filtering_proto as vf_pb;
@@ -48,20 +48,26 @@ fn contain_decode_panic<T>(decode: impl FnOnce() -> T) -> Option<T> {
     catch_unwind(AssertUnwindSafe(decode)).ok()
 }
 
-fn raw_labels_inner(items: &[RawSafetyLabel]) -> SafetyLabelMap {
+fn raw_labels_inner(items: &[RawSafetyLabel]) -> Result<SafetyLabelMap, String> {
     let mut map = HashMap::with_capacity(items.len());
     for item in items {
         let label_type = decode_lkey_bytes(item.lkey);
         let label = match xai_x_thrift::deserialize_mval(&item.mval) {
             Ok(l) => l,
             Err(e) => {
-                debug!(label_type = ?label_type, error = %e, "skipping label value with corrupt mval from manhattan");
-                SafetyLabel::default()
+                return Err(format!(
+                    "corrupt mval for label_type {:?}: {}",
+                    label_type, e
+                ));
             }
         };
         map.insert(label_type, label);
     }
-    map
+    Ok(map)
+}
+
+pub(crate) fn raw_labels(items: &[RawSafetyLabel]) -> Option<Result<vf_pb::SafetyLabelMap, String>> {
+    contain_decode_panic(|| raw_labels_inner(items)).map(|r| r.map(label_map_to_proto))
 }
 
 fn label_to_proto(label: SafetyLabel) -> vf_pb::SafetyLabel {
@@ -88,7 +94,10 @@ fn label_to_proto(label: SafetyLabel) -> vf_pb::SafetyLabel {
                 },
             ),
         ),
-        _ => None,
+        _ => {
+            warn!(source = ?src, "unhandled SafetyLabelSource variant; label source will be omitted");
+            None
+        }
     });
 
     vf_pb::SafetyLabel {
@@ -201,22 +210,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn raw_labels_preserves_label_type_on_corrupt_mval() {
+    fn raw_labels_returns_error_on_corrupt_mval() {
         let items = vec![
             raw_label(SafetyLabelType::SPAM, minimal_mval()),
             raw_label(SafetyLabelType::BOUNCE, vec![0xDE, 0xAD]),
             raw_label(SafetyLabelType::NSFW_HIGH_PRECISION, mval_with_score(0.9)),
         ];
-        let map = raw_labels(&items).unwrap();
-        assert_eq!(map.labels.len(), 3);
+        let result = raw_labels(&items).unwrap();
+        assert!(result.is_err(), "corrupt mval should produce an error, got: {:?}", result);
+    }
+
+    #[test]
+    fn raw_labels_returns_all_valid_labels() {
+        let items = vec![
+            raw_label(SafetyLabelType::SPAM, minimal_mval()),
+            raw_label(SafetyLabelType::NSFW_HIGH_PRECISION, mval_with_score(0.9)),
+        ];
+        let result = raw_labels(&items).unwrap();
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(map.labels.len(), 2);
         assert!(map.labels.contains_key(&i32::from(SafetyLabelType::SPAM)));
-        assert!(map.labels.contains_key(&i32::from(SafetyLabelType::BOUNCE)));
         assert!(map
             .labels
             .contains_key(&i32::from(SafetyLabelType::NSFW_HIGH_PRECISION)));
-        assert_eq!(
-            map.labels[&i32::from(SafetyLabelType::BOUNCE)],
-            vf_pb::SafetyLabel::default()
-        );
     }
 }

@@ -67,9 +67,19 @@ impl ManhattanLabelFetcher for MhLabelClient {
             .batch_scan(TENANT.clone(), pkeys, selector, SCAN_LIMIT)
             .await?;
 
-        Ok(all_results
+        debug_assert_eq!(
+            all_results.len(),
+            pkeys.len(),
+            "batch_scan returned a different number of result batches than input keys"
+        );
+
+        Ok(pkeys
             .into_iter()
-            .map(|scan_result| {
+            .zip(all_results.into_iter())
+            .map(|(_pkey, scan_result)| {
+                // NOTE: We depend on batch_scan returning results in the same
+                // order as the input keys. If that contract ever changes,
+                // labels could be attributed to the wrong tweet ID.
                 scan_result.map(|items| {
                     items
                         .into_iter()

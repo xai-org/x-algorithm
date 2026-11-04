@@ -36,13 +36,15 @@ impl CacheWarmer {
 
     pub(crate) fn warm(&self, miss_ids: Vec<u64>) {
         let record = |result, count| metrics::record_cache_warm_keys(&self.metrics, result, count);
-        record(WarmKeyResult::EligibleMiss, miss_ids.len());
         if miss_ids.is_empty() {
             return;
         }
         let count = miss_ids.len();
         match self.tx.try_send(miss_ids) {
-            Ok(()) => record(WarmKeyResult::Enqueued, count),
+            Ok(()) => {
+                record(WarmKeyResult::EligibleMiss, count);
+                record(WarmKeyResult::Enqueued, count);
+            }
             Err(_) => record(WarmKeyResult::DroppedChannelFull, count),
         }
     }
