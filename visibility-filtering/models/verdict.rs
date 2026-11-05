@@ -1,8 +1,21 @@
 use crate::hydration::{Hydrators, Lookup};
-use crate::rules::RuleId;
+use crate::rules::{ActionKind, RuleId};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 use xai_x_thrift::safety_result::SafetyResultReason;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum VerdictAction {
+    Allow,
+    Drop,
+    Tombstone,
+    Interstitial,
+    LimitedEngagement,
+    TweetInterstitial,
+    SoftIntervention,
+    Appealable,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
@@ -22,6 +35,15 @@ pub enum Notice {
         reason: FosnrReason,
         limited_actions: &'static [LimitedActionType],
     },
+}
+
+impl Notice {
+    pub(crate) const fn kind(&self) -> ActionKind {
+        match self {
+            Self::SoftIntervention(_) => ActionKind::SoftIntervention,
+            Self::Appealable { .. } => ActionKind::Appealable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
@@ -103,6 +125,15 @@ pub struct Decided<T> {
 pub enum Withholding {
     Drop(DropReason),
     Tombstone(TombstoneReason),
+}
+
+impl Withholding {
+    pub(crate) const fn kind(&self) -> ActionKind {
+        match self {
+            Self::Drop(_) => ActionKind::Drop,
+            Self::Tombstone(_) => ActionKind::Tombstone,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,6 +237,7 @@ pub enum LimitedEngagementReason {
     CommunityTweetCommunityDeleted,
     CommunityTweetCommunitySuspended,
     CommunityTweetViewerRemoved,
+    DynamicProductAd,
     LocalTweet,
 }
 
@@ -224,6 +256,7 @@ impl LimitedEngagementReason {
             Self::CommunityTweetCommunityDeleted => "community_tweet_community_deleted",
             Self::CommunityTweetCommunitySuspended => "community_tweet_community_suspended",
             Self::CommunityTweetViewerRemoved => "community_tweet_viewer_removed",
+            Self::DynamicProductAd => "dynamic_product_ad",
             Self::LocalTweet => "local_tweet",
         }
     }
@@ -266,6 +299,29 @@ impl Verdict {
         interstitial
             .into_iter()
             .chain(limit.into_iter().flat_map(|limit| limit.value.reasons()))
+    }
+
+    pub(crate) fn decided(&self) -> impl Iterator<Item = (ActionKind, &'static str)> + '_ {
+        let (first, second, third) = match self {
+            Self::Withheld(decided) => (Some((decided.value.kind(), decided.by)), None, None),
+            Self::Fosnr(decided) => (Some((decided.value.kind(), decided.by)), None, None),
+            Self::Shown {
+                label_interstitial,
+                media,
+                engagement,
+            } => (
+                label_interstitial
+                    .as_ref()
+                    .map(|decided| (ActionKind::LabelInterstitial, decided.by)),
+                media
+                    .as_ref()
+                    .map(|decided| (ActionKind::MediaRestriction, decided.by)),
+                engagement
+                    .as_ref()
+                    .map(|decided| (ActionKind::LimitedEngagement, decided.by)),
+            ),
+        };
+        first.into_iter().chain(second).chain(third)
     }
 
     pub const fn not_found() -> Self {

@@ -12,6 +12,9 @@ from strato_http.queries.data_types import (
 )
 
 
+MENTION_HANDLE = re.compile(r"(?<!\w)@(\w{1,15})", re.ASCII)
+
+
 class AffiliatedBusiness(BaseModel):
     name: str | None = None
     url: str | None = None
@@ -732,6 +735,21 @@ class Post(BaseModel):
     chat_group_metadata: ChatGroupMetadata | None = None
     space_metadata: SpaceMetadata | None = None
     mentioned_users: list[User] | None = None
+    media_tag_mentioned_users: list[User] | None = None
+
+    @property
+    def text_mention_handles(self) -> set[str]:
+        return {h.lower() for h in MENTION_HANDLE.findall(self.full_text or "")}
+
+    @property
+    def media_tag_handles(self) -> set[str]:
+        return {
+            u.handle.lower() for u in self.media_tag_mentioned_users or [] if u.handle
+        }
+
+    @property
+    def notified_handles(self) -> set[str]:
+        return self.text_mention_handles | self.media_tag_handles
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -886,6 +904,12 @@ class Post(BaseModel):
                 User.from_thrift_model(m) for m in post_metadata.mentionedUsersMetadata
             ]
             if post_metadata.mentionedUsersMetadata
+            else None,
+            media_tag_mentioned_users=[
+                User.from_thrift_model(m)
+                for m in post_metadata.mediaTagMentionedUsersMetadata
+            ]
+            if post_metadata.mediaTagMentionedUsersMetadata
             else None,
         )
 

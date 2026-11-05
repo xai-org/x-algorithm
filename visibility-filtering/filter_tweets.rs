@@ -1,36 +1,23 @@
 use crate::ingress;
 use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, RequestMetrics};
-use crate::models::RequestViewer;
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{PostEvaluation, PostEvaluator};
+use crate::post_evaluator::PostEvaluator;
 use crate::rules::{NoTrace, SafetyLevel, WireLevel};
 use crate::treatment;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
-pub(crate) type FinishComparison = Box<dyn FnOnce(&[PostEvaluation]) + Send>;
-
-pub(crate) trait Comparator: Send + Sync {
-    fn begin(&self, viewer: &RequestViewer, safety_level: SafetyLevel) -> Option<FinishComparison>;
-}
-
 pub struct FilterTweetsEndpoint {
     post_evaluator: Arc<PostEvaluator>,
     client_switches: ClientSwitches,
-    comparator: Option<Box<dyn Comparator>>,
 }
 
 impl FilterTweetsEndpoint {
-    pub(crate) fn new(
-        post_evaluator: Arc<PostEvaluator>,
-        client_switches: ClientSwitches,
-        comparator: Option<Box<dyn Comparator>>,
-    ) -> Self {
+    pub(crate) fn new(post_evaluator: Arc<PostEvaluator>, client_switches: ClientSwitches) -> Self {
         Self {
             post_evaluator,
             client_switches,
-            comparator,
         }
     }
 
@@ -64,11 +51,6 @@ impl FilterTweetsEndpoint {
         let request = ingress::filter_tweets(req);
         ft_metrics::record_viewer_state(metrics.plain(), raw_viewer_id, request.viewer.id());
 
-        let finish_comparison = self
-            .comparator
-            .as_ref()
-            .and_then(|comparator| comparator.begin(&request.viewer, safety_level));
-
         let request = ingress::filter_tweets_batch(
             self.post_evaluator.rule_engine(),
             &self.client_switches,
@@ -84,10 +66,6 @@ impl FilterTweetsEndpoint {
             outcomes.iter().map(|outcome| &outcome.evaluation),
             0,
         );
-
-        if let Some(finish_comparison) = finish_comparison {
-            finish_comparison(&outcomes);
-        }
 
         let results = outcomes
             .into_iter()
@@ -105,7 +83,6 @@ mod tests {
     use crate::hydration::sources::Source;
     use crate::metrics::Metrics;
     use crate::rules::RuleEngine;
-    use std::sync::Mutex;
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let sources = Arc::new(InMemorySources::default());
@@ -117,7 +94,6 @@ mod tests {
                 Metrics::none(),
             )),
             ClientSwitches::for_tests(),
-            None,
         );
         let response = endpoint
             .handle(Request::new(vf_pb::VisibilityFilterRequest {
@@ -145,105 +121,5 @@ mod tests {
         assert_eq!(gizmoduck_calls(Some(0)).await, logged_out);
         assert_eq!(gizmoduck_calls(Some(u64::MAX)).await, logged_out);
         assert_eq!(gizmoduck_calls(Some(42)).await, logged_out + 1);
-    }
-
-    #[derive(Default)]
-    struct ViewerIds(Arc<Mutex<Vec<Option<u64>>>>);
-
-    impl Comparator for ViewerIds {
-        fn begin(
-            &self,
-            viewer: &RequestViewer,
-            _safety_level: SafetyLevel,
-        ) -> Option<FinishComparison> {
-            self.0.lock().unwrap().push(viewer.id());
-            None
-        }
-    }
-
-    #[tokio::test]
-    async fn comparator_sees_the_normalized_viewer_id() {
-        let viewer_ids = ViewerIds::default();
-        let seen = Arc::clone(&viewer_ids.0);
-        let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::new(InMemorySources::default()),
-                RuleEngine::for_tests(),
-                Arc::default(),
-                Metrics::none(),
-            )),
-            ClientSwitches::for_tests(),
-            Some(Box::new(viewer_ids)),
-        );
-        for viewer_id in [Some(0), Some(42)] {
-            endpoint
-                .handle(Request::new(vf_pb::VisibilityFilterRequest {
-                    safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
-                    tweets: vec![vf_pb::TweetInput {
-                        tweet_id: 2,
-                        author_id: Some(20),
-                    }],
-                    viewer_id,
-                    country_code: None,
-                }))
-                .await
-                .unwrap();
-        }
-        assert_eq!(*seen.lock().unwrap(), vec![None, Some(42)]);
-    }
-
-    #[derive(Default)]
-    struct FinishedResults(Arc<Mutex<Vec<Vec<vf_pb::TweetVisibilityResult>>>>);
-
-    impl Comparator for FinishedResults {
-        fn begin(
-            &self,
-            _viewer: &RequestViewer,
-            _safety_level: SafetyLevel,
-        ) -> Option<FinishComparison> {
-            let finished = Arc::clone(&self.0);
-            Some(Box::new(move |outcomes: &[PostEvaluation]| {
-                finished.lock().unwrap().push(
-                    outcomes
-                        .iter()
-                        .cloned()
-                        .map(treatment::filter_tweets_result)
-                        .collect(),
-                );
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn comparator_finishes_with_the_served_outcomes() {
-        let comparator = FinishedResults::default();
-        let finished = Arc::clone(&comparator.0);
-        let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::new(InMemorySources::default()),
-                RuleEngine::for_tests(),
-                Arc::default(),
-                Metrics::none(),
-            )),
-            ClientSwitches::for_tests(),
-            Some(Box::new(comparator)),
-        );
-        let served = endpoint
-            .handle(Request::new(vf_pb::VisibilityFilterRequest {
-                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
-                tweets: [(2, 20), (3, 30)]
-                    .map(|(tweet_id, author_id)| vf_pb::TweetInput {
-                        tweet_id,
-                        author_id: Some(author_id),
-                    })
-                    .into(),
-                viewer_id: Some(42),
-                country_code: None,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .results;
-        assert_eq!(*finished.lock().unwrap(), vec![served]);
     }
 }

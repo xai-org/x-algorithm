@@ -39,6 +39,12 @@ pub struct Args {
     #[arg(long, default_value_t = 300)]
     pub user_debias_reload_secs: u64,
 
+    #[arg(long)]
+    pub carousel_model_dir: Option<std::path::PathBuf>,
+
+    #[arg(long, default_value_t = 60)]
+    pub carousel_model_reload_secs: u64,
+
     #[arg(long, default_value_t = false)]
     pub config_sync_enabled: bool,
 

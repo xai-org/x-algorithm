@@ -598,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retweet_is_explained_through_every_route_as_its_handler_answers() {
-        use MergeSelection::{RequestedOnly, SourceWithheld};
+        use MergeSelection::{RequestedOnly, SourceRestrictions, SourceWithheld};
         use Rpc::{EvaluateTweets, FilterTweets};
         use SafetyLevel::*;
         let sources = Arc::new(
@@ -618,21 +618,23 @@ mod tests {
                     .filter_map(move |&level| Route::new(rpc, level).ok())
             })
             .collect();
-        let ask = Ask::<8> {
+        let ask = Ask::<9> {
             viewer: NonZeroU64::new(VIEWER),
             post: 4,
             country: Some("us".to_owned()),
             client: Client::Web,
             routes: routes.try_into().unwrap(),
         };
-        let explanation = Explainer::new(
-            Arc::clone(&sources),
-            FallbackCaches::default(),
-            Arc::new(CountryLists::starting_at_default()),
-            ClientSwitches::for_tests(),
-            Metrics::none(),
+        let explanation = Box::pin(
+            Explainer::new(
+                Arc::clone(&sources),
+                FallbackCaches::default(),
+                Arc::new(CountryLists::starting_at_default()),
+                ClientSwitches::for_tests(),
+                Metrics::none(),
+            )
+            .explain(&ask),
         )
-        .explain(&ask)
         .await;
 
         assert_eq!(explanation.post.map(|card| card.id), Some(4));
@@ -710,6 +712,12 @@ mod tests {
                     author_suspended,
                     SourceWithheld
                 ),
+                (
+                    EvaluateTweets,
+                    TimelineHomePromotedHydration,
+                    allowed,
+                    SourceRestrictions
+                ),
             ]
             .map(|(rpc, level, (class, reason), selection)| {
                 (rpc, level, (class.to_owned(), reason.to_owned()), selection)
@@ -720,7 +728,6 @@ mod tests {
         let filter_tweets = FilterTweetsEndpoint::new(
             Arc::clone(wire.post_evaluator()),
             ClientSwitches::for_tests(),
-            None,
         );
         for level in &explanation.levels {
             let route = level.route;

@@ -1,5 +1,6 @@
 use crate::ads::following_ad_blender::*;
 use crate::ads::util::MIN_POSTS_FOR_ADS;
+use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
 use xai_home_mixer_proto::{feed_item, BrandSafetyVerdict, FeedItem, ScoredPost};
 use xai_recsys_proto::{AdAdjacencyControl, AdIndexInfo, BrandSafetyRiskLevel};
 
@@ -116,7 +117,102 @@ fn blend(
     spacing: usize,
     result_size: usize,
 ) -> Vec<FeedItem> {
-    blend_with_spacing(posts, ads, MIN_POSTS_FOR_ADS, result_size, spacing)
+    blend_with_spacing(
+        posts,
+        ads,
+        MIN_POSTS_FOR_ADS,
+        result_size,
+        spacing,
+        &mut Vec::new(),
+    )
+}
+
+fn blend_recording_drops(
+    posts: Vec<ScoredPost>,
+    ads: Vec<AdIndexInfo>,
+    spacing: usize,
+    result_size: usize,
+) -> (Vec<i64>, Vec<DroppedAd>) {
+    let mut drops = Vec::new();
+    let out = blend_with_spacing(
+        posts,
+        ads,
+        MIN_POSTS_FOR_ADS,
+        result_size,
+        spacing,
+        &mut drops,
+    );
+    (ad_ids(&out), drops)
+}
+
+fn drop_reasons(drops: &[DroppedAd]) -> Vec<(u64, AdDropReason)> {
+    drops
+        .iter()
+        .map(|drop| (drop.tweet_id, drop.drop_reason()))
+        .collect()
+}
+
+#[test]
+fn records_adjacency_drops_with_blocking_post() {
+    let posts: Vec<_> = (1..=12)
+        .map(|i| make_post_with(i, BrandSafetyVerdict::LowRisk, 777, "crypto scandal"))
+        .collect();
+    let ads = vec![
+        make_ad_with(101, 0, None, vec![777], vec![]),
+        make_ad_with(102, 0, None, vec![], vec!["crypto"]),
+        make_ad_with(103, 0, Some(BrandSafetyRiskLevel::BsrLow), vec![], vec![]),
+        make_ad(104),
+    ];
+    let (served, drops) = blend_recording_drops(posts, ads, 3, 50);
+    assert_eq!(served, vec![104]);
+    assert_eq!(
+        drop_reasons(&drops),
+        vec![
+            (101, AdDropReason::ExcludedHandle),
+            (102, AdDropReason::ExcludedKeyword),
+            (103, AdDropReason::LowRiskNeighbour),
+        ]
+    );
+    assert_eq!(drops[0].matched_user_id, 777);
+    assert_eq!(drops[1].matched_keyword, "crypto");
+    assert!(drops.iter().all(|drop| drop.blocking_tweet_id == 11));
+}
+
+#[test]
+fn records_no_room_drops() {
+    let few: Vec<_> = (1..=4).map(make_post).collect();
+    let (served, drops) = blend_recording_drops(few, vec![make_ad(101)], 3, 50);
+    assert!(served.is_empty());
+    assert_eq!(drop_reasons(&drops), vec![(101, AdDropReason::TooFewPosts)]);
+
+    let posts: Vec<_> = (1..=8).map(make_post).collect();
+    let ads: Vec<_> = (101..=104).map(make_ad).collect();
+    let (served, drops) = blend_recording_drops(posts, ads, 3, 50);
+    assert_eq!(served, vec![101, 102, 103]);
+    assert_eq!(drop_reasons(&drops), vec![(104, AdDropReason::SpacingCap)]);
+
+    let mut posts: Vec<_> = (1..=8).map(make_post).collect();
+    for post in &mut posts[2..] {
+        post.brand_safety_verdict = BrandSafetyVerdict::MediumRisk.into();
+    }
+    let (served, drops) = blend_recording_drops(posts, vec![make_ad(101), make_ad(102)], 3, 50);
+    assert_eq!(served, vec![101]);
+    assert_eq!(
+        drop_reasons(&drops),
+        vec![(102, AdDropReason::NoEligibleNeighbours)]
+    );
+
+    let posts: Vec<_> = (1..=20).map(make_post).collect();
+    let ads: Vec<_> = (101..=105).map(make_ad).collect();
+    let (served, drops) = blend_recording_drops(posts, ads, 2, 10);
+    assert_eq!(served, vec![101, 102, 103]);
+    assert_eq!(
+        drop_reasons(&drops),
+        vec![
+            (104, AdDropReason::Truncated),
+            (105, AdDropReason::Truncated)
+        ]
+    );
 }
 
 #[test]

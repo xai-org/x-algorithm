@@ -14,26 +14,23 @@ use crate::rules::fixtures::{
     limited, nsfw_high_precision_media, nsfw_viewer_dropped, on_client, sensitive_opt_in_viewer,
     tombstoned, verify_blurred, viewer, viewer_with_profile, AUTHOR_ID, CLIENT_CLASSES, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::{self, TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_x_thrift::action::InterstitialReason;
 
-fn per_client_class(
-    verdict: impl Fn(VerifyBlurSupport) -> Verdict,
-) -> Vec<(SafetyLevel, Role, Verdict)> {
-    CLIENT_CLASSES
-        .into_iter()
-        .map(|class| {
-            let support = class
-                .capability
-                .verify_blur_support
-                .expect("every client class resolves a Verify blur support");
-            let viewer = on_client(class.name, "fr", viewer(VIEWER_ID));
-            (
-                TimelineHomeHydration,
-                Role::As(class.name, viewer),
-                verdict(support),
-            )
-        })
+fn client_classes() -> impl Iterator<Item = (VerifyBlurSupport, Role)> {
+    CLIENT_CLASSES.into_iter().map(|class| {
+        let support = class
+            .capability
+            .verify_blur_support
+            .expect("every client class resolves a Verify blur support");
+        let viewer = on_client(class.name, "fr", viewer(VIEWER_ID));
+        (support, Role::As(class.name, viewer))
+    })
+}
+
+fn per_client_class(verdict: impl Fn(VerifyBlurSupport) -> Verdict) -> Vec<(Role, Verdict)> {
+    client_classes()
+        .map(|(support, role)| (role, verdict(support)))
         .collect()
 }
 
@@ -139,12 +136,29 @@ pub(super) fn rows() -> Vec<Row> {
         ),
         Supported => verify_high_precision(),
     };
+    let gore = |support| match support {
+        Unsupported => legacy_interstitial("gore_and_violence_high_precision/legacy_interstitial"),
+        IosNeedsUpdate => tombstoned(
+            TombstoneReason::UpdateAppIos,
+            "gore_and_violence_high_precision/tombstone/update_app_ios",
+        ),
+        AndroidNeedsUpdate => tombstoned(
+            TombstoneReason::UpdateAppAndroid,
+            "gore_and_violence_high_precision/tombstone/update_app_android",
+        ),
+        Supported => blurred(
+            InterstitialReason::Violence(true),
+            "gore_and_violence_high_precision/blur",
+        ),
+    };
+    let (gore_blur_classes, gore_other_classes): (Vec<_>, Vec<_>) =
+        client_classes().partition(|(support, _)| matches!(support, Supported));
     vec![
         Row {
             name: "nsfw_high_precision_media_per_client_class",
             subject: Subject::Post(nsfw_high_precision_media()),
-            expect: vec![],
-            at: per_client_class(high_precision_tombstone),
+            expect: per_client_class(high_precision_tombstone),
+            at: vec![],
         },
         Row {
             name: "nsfw_high_precision_media_for_an_ios_outdated_viewer",
@@ -220,8 +234,7 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "nsfw_admin_flag_media_per_client_class",
             subject: Subject::Post(nsfw_admin_flag_media()),
-            expect: vec![],
-            at: per_client_class(|support| match support {
+            expect: per_client_class(|support| match support {
                 Unsupported => tombstoned(
                     TombstoneReason::SensitiveViewerAgeVerification,
                     "nsfw_account/tombstone/age_verification",
@@ -239,12 +252,12 @@ pub(super) fn rows() -> Vec<Row> {
                     "nsfw_admin/blur/sensitive/age_prompt",
                 ),
             }),
+            at: vec![],
         },
         Row {
             name: "nsfw_card_image_label_per_client_class",
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_CARD_IMAGE)),
-            expect: vec![],
-            at: per_client_class(|support| match support {
+            expect: per_client_class(|support| match support {
                 Unsupported => tombstoned(
                     TombstoneReason::SensitiveViewerAgeVerification,
                     "nsfw_card_image/tombstone/age_verification",
@@ -262,28 +275,19 @@ pub(super) fn rows() -> Vec<Row> {
                     "nsfw_card_image/blur/sensitive/age_prompt",
                 ),
             }),
+            at: vec![],
         },
         Row {
             name: "gore_and_violence_label_per_client_class",
             subject: Subject::Post(labeled(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)),
-            expect: vec![],
-            at: per_client_class(|support| match support {
-                Unsupported => {
-                    legacy_interstitial("gore_and_violence_high_precision/legacy_interstitial")
-                }
-                IosNeedsUpdate => tombstoned(
-                    TombstoneReason::UpdateAppIos,
-                    "gore_and_violence_high_precision/tombstone/update_app_ios",
-                ),
-                AndroidNeedsUpdate => tombstoned(
-                    TombstoneReason::UpdateAppAndroid,
-                    "gore_and_violence_high_precision/tombstone/update_app_android",
-                ),
-                Supported => blurred(
-                    InterstitialReason::Violence(true),
-                    "gore_and_violence_high_precision/blur",
-                ),
-            }),
+            expect: gore_other_classes
+                .into_iter()
+                .map(|(support, role)| (role, gore(support)))
+                .collect(),
+            at: gore_blur_classes
+                .into_iter()
+                .map(|(support, role)| (TimelineHomeHydration, role, gore(support)))
+                .collect(),
         },
         Row {
             name: "nsfw_high_precision_media_for_a_web_viewer",
@@ -515,8 +519,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![],
-            at: per_client_class(|_| allow())
-                .into_iter()
+            at: client_classes()
+                .map(|(_, role)| (TimelineHomeHydration, role, allow()))
                 .chain([
                     (TimelineHomeHydration, web_in_us(), allow()),
                     (

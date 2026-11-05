@@ -1134,6 +1134,13 @@ pub(super) const COMMUNITY_TWEET_VIEWER_REMOVED_LIMITED_ENGAGEMENT: Rule = Rule 
     action: limit(LimitedEngagementReason::CommunityTweetViewerRemoved),
 };
 
+pub(super) const DYNAMIC_PRODUCT_AD_LIMITED_ENGAGEMENT: Rule = Rule {
+    id: RuleId::DynamicProductAd,
+    audience: Everyone,
+    when: all![TweetHasLabel(SafetyLabelType::DYNAMIC_PRODUCT_AD)],
+    action: limit(LimitedEngagementReason::DynamicProductAd),
+};
+
 pub(super) const LOCAL_TWEET_LIMITED_ENGAGEMENT: Rule = Rule {
     id: RuleId::LocalTweet,
     audience: Everyone,

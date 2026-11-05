@@ -23,6 +23,7 @@ pub enum SafetyLevel {
     TimelineHome,
     TimelineHomeRecommendations,
     TimelineHomeHydration,
+    TimelineHomePromotedHydration,
     ImmersiveExpandedRecommendations,
     QuotedTweetRules,
     NotificationsFollow,
@@ -66,7 +67,8 @@ pub(crate) struct PostLevel {
 #[derive(Clone, Copy)]
 pub(crate) enum QuoteEntries {
     NotJudged,
-    Judged {
+    Judged,
+    JudgedWithQuotePass {
         rerenders: &'static [(RuleId, RerenderReason)],
     },
 }
@@ -130,9 +132,16 @@ impl SafetyLevel {
                 evaluate_tweets: Some(ThriftLevel::TIMELINE_HOME_HYDRATION),
                 rules: levels::TIMELINE_HOME_HYDRATION,
                 unspecified_drop_is_exact: false,
-                quote_entries: QuoteEntries::Judged {
+                quote_entries: QuoteEntries::JudgedWithQuotePass {
                     rerenders: &TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS,
                 },
+            }),
+            SafetyLevel::TimelineHomePromotedHydration => LevelSpec::Posts(PostLevel {
+                proto: None,
+                evaluate_tweets: Some(ThriftLevel::TIMELINE_HOME_PROMOTED_HYDRATION),
+                rules: levels::TIMELINE_HOME_PROMOTED_HYDRATION,
+                unspecified_drop_is_exact: false,
+                quote_entries: QuoteEntries::Judged,
             }),
             SafetyLevel::ImmersiveExpandedRecommendations => LevelSpec::Posts(PostLevel {
                 proto: Some(vf_pb::SafetyLevel::ImmersiveExpandedRecommendations),
@@ -336,6 +345,10 @@ mod tests {
                     ThriftLevel::TIMELINE_HOME_HYDRATION,
                     SafetyLevel::TimelineHomeHydration
                 ),
+                (
+                    ThriftLevel::TIMELINE_HOME_PROMOTED_HYDRATION,
+                    SafetyLevel::TimelineHomePromotedHydration
+                ),
             ]
         );
     }
@@ -361,6 +374,7 @@ mod tests {
                 Some(8),
                 Some(61),
                 Some(82),
+                Some(124),
                 None,
                 None,
                 Some(246),
@@ -411,7 +425,8 @@ mod tests {
             .collect();
         rules.sort_unstable();
         for &level in SafetyLevel::VARIANTS {
-            let QuoteEntries::Judged { rerenders } = level.spec().quote_entries() else {
+            let QuoteEntries::JudgedWithQuotePass { rerenders } = level.spec().quote_entries()
+            else {
                 continue;
             };
             let mut rows: Vec<&str> = rerenders.iter().map(|&(rule, _)| rule.into()).collect();

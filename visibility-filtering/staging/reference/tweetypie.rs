@@ -1,26 +1,22 @@
 use super::{
     ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
+    Sample,
 };
 use crate::config::ENV_REFERENCE;
-use crate::hydration::{HYDRATION_TIMEOUT, request_context};
-use crate::ingress;
+use crate::hydration::HYDRATION_TIMEOUT;
+use crate::metrics::Metrics;
 use crate::metrics::families::{TWEETYPIE_REFERENCE_BATCHES, TWEETYPIE_REFERENCE_COMPARE};
-use crate::metrics::{Endpoint, RequestLevel};
-use crate::models::viewer::Client;
-use crate::models::{
-    Evaluation, PlacedCandidate, Placement, RawCandidate, RequestViewer, TweetId, Verdict,
-};
-use crate::params::{ClientSwitches, LimitedActionsPolicies};
-use crate::post_evaluator::{PostEvaluation, PostEvaluator};
+use crate::models::{Evaluation, Placement, TweetId};
+use crate::params::LimitedActionsPolicies;
+use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
 use crate::result_label::{
     Class, Failure, Label, NONE, failed, label, quote_label, renders_alike, state_label,
 };
-use crate::rules::{NoTrace, SafetyLevel};
+use crate::rules::SafetyLevel;
 use crate::server_deps::init_client_with_retry;
 use crate::treatment;
 use anyhow::Context;
-use futures::future::join;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -28,7 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::spawn;
 use tokio::sync::Semaphore;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 use tracing::warn;
 use xai_build_version::current_build_information;
@@ -50,7 +46,7 @@ pub(crate) mod quotes;
 
 const COLUMN: &str = "tweetypie/getTweetFields.Tweet";
 const TWEETYPIE_MAX_BATCH_SIZE: usize = 250;
-const MAX_IN_FLIGHT: usize = 32;
+const MAX_IN_FLIGHT: usize = 256;
 const TWEETYPIE_TIMEOUT: Duration = Duration::from_millis(1500);
 const RECORD_LINE_MARKER: &str = "vf_tweetypie_reference_record";
 pub(crate) const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
@@ -121,16 +117,16 @@ impl Bucket {
 
 pub(super) async fn build(
     init_deadline: Instant,
-    post_evaluator: &Arc<PostEvaluator>,
-    client_switches: ClientSwitches,
+    sample: Sample,
+    metrics: Metrics,
     metadata: Option<&MetadataMap>,
 ) -> Arc<TweetypieReference> {
     let tweetypie = connect(init_deadline, metadata).await;
-    warn!("reference comparator: tweetypie enabled");
+    warn!("reference comparator: tweetypie enabled, sample {sample:?}");
     Arc::new(TweetypieReference {
         tweetypie,
-        post_evaluator: Arc::clone(post_evaluator),
-        client_switches,
+        sample,
+        metrics,
         permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         sampler: Mutex::default(),
         build_sha: resolve_build_sha(
@@ -215,8 +211,8 @@ fn sha_prefix(s: &str) -> Option<&str> {
 
 pub(super) struct TweetypieReference {
     tweetypie: StratoGrpc,
-    post_evaluator: Arc<PostEvaluator>,
-    client_switches: ClientSwitches,
+    sample: Sample,
+    metrics: Metrics,
     permits: Arc<Semaphore>,
     sampler: Mutex<(u64, HashMap<Bucket, u32>)>,
     build_sha: String,
@@ -224,45 +220,6 @@ pub(super) struct TweetypieReference {
 }
 
 impl TweetypieReference {
-    pub(super) fn spawn(
-        self: &Arc<Self>,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        safety_level: SafetyLevel,
-        outcomes: &[PostEvaluation],
-    ) {
-        let Some(viewer_id) = viewer_id else {
-            return;
-        };
-        match safety_level {
-            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations => {}
-            SafetyLevel::FilterAll
-            | SafetyLevel::TimelineHomeHydration
-            | SafetyLevel::ImmersiveExpandedRecommendations
-            | SafetyLevel::QuotedTweetRules
-            | SafetyLevel::NotificationsFollow
-            | SafetyLevel::NotificationsWriterV2 => return,
-        }
-        let tweet_ids: Vec<TweetId> = outcomes
-            .iter()
-            .filter(|outcome| match &outcome.evaluation {
-                Evaluation::Complete {
-                    verdict,
-                    fail_open_defaults,
-                } => !matches!(verdict, Verdict::Withheld(_)) && fail_open_defaults.is_empty(),
-                Evaluation::NotFound(_) | Evaluation::Deleted(_) => true,
-                Evaluation::Partial { .. } | Evaluation::Failed(_) => false,
-            })
-            .map(|outcome| outcome.tweet_id)
-            .collect();
-        if tweet_ids.is_empty() {
-            return;
-        }
-        self.detach(move |reference| async move {
-            reference.compare(viewer_id, country_code, tweet_ids).await
-        });
-    }
-
     fn detach<F>(self: &Arc<Self>, comparison: impl FnOnce(Arc<Self>) -> F)
     where
         F: Future<Output = BatchOutcome> + Send + 'static,
@@ -278,63 +235,6 @@ impl TweetypieReference {
             let outcome = comparison.await;
             reference.count(outcome);
         });
-    }
-
-    async fn compare(
-        &self,
-        viewer_id: u64,
-        country_code: Option<String>,
-        tweet_ids: Vec<TweetId>,
-    ) -> BatchOutcome {
-        let candidates = tweet_ids
-            .iter()
-            .map(|&tweet_id| {
-                PlacedCandidate::standalone(RawCandidate {
-                    tweet_id,
-                    request_author_id: None,
-                })
-            })
-            .collect();
-        let client = Client::Web.context(Some(viewer_id), country_code.as_deref());
-        let request = ingress::evaluate_tweets_batch(
-            &self.client_switches,
-            RequestViewer::with_context(Some(viewer_id), Some(client.clone())),
-            SAFETY_LEVEL,
-            candidates,
-        );
-        let metrics = self
-            .post_evaluator
-            .metrics()
-            .request(Endpoint::EvaluateTweets, RequestLevel::Named(SAFETY_LEVEL));
-        let rust = request_context(Instant::now(), None).scope(async {
-            let (_, outcomes) = self
-                .post_evaluator
-                .run(request, &metrics, &mut NoTrace)
-                .await;
-            outcomes
-        });
-        let tp = timeout(
-            TWEETYPIE_TIMEOUT,
-            get_tweet_fields(&self.tweetypie, &client, &tweet_ids),
-        );
-        let (rust, tp) = join(rust, tp).await;
-        let Ok(tp) = tp else {
-            return BatchOutcome::TweetypieTimeout;
-        };
-        let vf: HashMap<TweetId, &PostEvaluation> = rust
-            .iter()
-            .map(|outcome| (outcome.tweet_id, outcome))
-            .collect();
-        self.record(tweet_ids.iter().zip(&tp).map(|(&tweet_id, tp)| Compared {
-            lens: Lens::Standalone,
-            tweet_id,
-            viewer_id,
-            country_code: country_code.as_deref(),
-            tp,
-            vf: vf.get(&tweet_id).copied(),
-            pass: None,
-        }));
-        BatchOutcome::Compared
     }
 
     fn record<'a>(&self, comparisons: impl Iterator<Item = Compared<'a>>) {
@@ -362,9 +262,8 @@ impl TweetypieReference {
             *counts.entry(bucket).or_default() += 1;
         }
         drop(sampler);
-        let metrics = self.post_evaluator.metrics();
         for (bucket, count) in counts {
-            metrics.count(
+            self.metrics.count(
                 &TWEETYPIE_REFERENCE_COMPARE,
                 bucket.counter_values(&self.build_sha),
                 count,
@@ -373,7 +272,7 @@ impl TweetypieReference {
     }
 
     fn count(&self, outcome: BatchOutcome) {
-        self.post_evaluator.metrics().count(
+        self.metrics.count(
             &TWEETYPIE_REFERENCE_BATCHES,
             [SAFETY_LEVEL.into(), outcome.into(), &self.build_sha],
             1,
@@ -567,7 +466,9 @@ mod tests {
     use super::*;
     use crate::hydration::{Hydrators, Lookup};
     use crate::metrics::{Metrics, Recorded};
-    use crate::models::{Decided, DropReason, Withholding};
+    use crate::models::viewer::Client;
+    use crate::models::{Decided, DropReason, Verdict, Withholding};
+    use crate::params::ClientSwitches;
     use crate::rules::RuleId;
     use crate::rules::fixtures::{CLIENT_CLASSES, allow};
     use strum::VariantArray;

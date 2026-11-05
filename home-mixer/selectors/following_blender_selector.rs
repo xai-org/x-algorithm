@@ -20,7 +20,7 @@ impl FollowingBlenderSelector {
 impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
     fn select(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: Vec<FeedItem>,
     ) -> SelectResult<FeedItem> {
         let PartitionedFeedItems {
@@ -36,7 +36,9 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
         let blender = FollowingAdBlender {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
         };
-        let mut blended = blender.blend(posts, ads, &mut Vec::new());
+        let mut drops = Vec::new();
+        let mut blended = blender.blend(posts, ads, &mut drops);
+        query.ad_drops.extend(drops);
 
         insert_prompts(&mut blended, prompts);
         if input_post_count > FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS {

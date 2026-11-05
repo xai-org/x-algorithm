@@ -211,7 +211,6 @@ pub(super) fn rows() -> Vec<Row> {
                         "nsfw_card_image/blur/sensitive",
                     ),
                 ),
-                (TimelineHome, Role::Author, allow()),
                 (
                     TimelineHome,
                     Role::As("sensitive_opt_in", sensitive_opt_in_viewer()),

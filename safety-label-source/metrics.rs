@@ -12,6 +12,11 @@ const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
 const EXPIRED_LABELS: &str = "safety_labels_expired_labels";
+const CACHE_FILL_KEYS: &str = "safety_labels_cache_fill_keys";
+const SHADOW_KEYS: &str = "safety_labels_shadow_keys";
+const SHADOW_MANHATTAN_KEYS: &str = "safety_labels_shadow_manhattan_keys";
+const SHADOW_MH_CHECK_KEYS: &str = "safety_labels_shadow_mh_check_keys";
+const OUTAGE_KEYS: &str = "safety_labels_outage_keys";
 
 #[derive(Clone, Default)]
 pub(crate) struct LabelMetrics {
@@ -56,6 +61,8 @@ pub(crate) enum SourceOutcome {
 pub(crate) enum CacheTier {
     Local,
     Twemcache,
+    Dragonfly,
+    DragonflyShadow,
 }
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
@@ -128,6 +135,89 @@ pub(crate) enum WarmKeyResult {
 
 pub(crate) fn record_cache_warm_keys(metrics: &LabelMetrics, result: WarmKeyResult, count: usize) {
     metrics.incr(CACHE_WARM_KEYS, &[("result", result.into())], count);
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum FillKeyResult {
+    Enqueued,
+    Deduped,
+    DroppedQueueFull,
+    Written,
+    Failed,
+}
+
+pub(crate) fn record_cache_fill_keys(metrics: &LabelMetrics, result: FillKeyResult, count: usize) {
+    metrics.incr(CACHE_FILL_KEYS, &[("result", result.into())], count);
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ShadowResult {
+    Match,
+    Mismatch,
+    Failed,
+    Shed,
+}
+
+pub(crate) fn record_shadow_keys(metrics: &LabelMetrics, result: ShadowResult, count: usize) {
+    metrics.incr(SHADOW_KEYS, &[("result", result.into())], count);
+}
+
+pub(crate) fn record_shadow_manhattan_keys(metrics: &LabelMetrics, count: usize) {
+    metrics.incr(SHADOW_MANHATTAN_KEYS, &[], count);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum MhCheckClass {
+        AllEqual,
+        TwemcacheDiffers,
+        DragonflyDiffers,
+        AllDiffer,
+        ManhattanDiffers,
+    ManhattanFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum MhCheckSample {
+    Mismatch,
+    Match,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum MhCheckView {
+            Filtered,
+        Raw,
+}
+
+pub(crate) fn record_shadow_mh_check_keys(
+    metrics: &LabelMetrics,
+    class: MhCheckClass,
+    sample: MhCheckSample,
+    view: MhCheckView,
+    count: usize,
+) {
+    let labels = [
+        ("class", class.into()),
+        ("sample", sample.into()),
+        ("view", view.into()),
+    ];
+    metrics.incr(SHADOW_MH_CHECK_KEYS, &labels, count);
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum OutageResult {
+    Stale,
+    Manhattan,
+    Failed,
+}
+
+pub(crate) fn record_outage_keys(metrics: &LabelMetrics, result: OutageResult, count: usize) {
+    metrics.incr(OUTAGE_KEYS, &[("result", result.into())], count);
 }
 
 pub(crate) fn record_expired_labels(metrics: &LabelMetrics, count: usize) {

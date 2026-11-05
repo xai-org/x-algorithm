@@ -1,4 +1,5 @@
 pub mod args;
+pub mod carousel_model;
 pub mod config_sync;
 pub mod dpp;
 pub mod embedding_store;

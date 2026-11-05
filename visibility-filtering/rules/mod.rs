@@ -1,3 +1,4 @@
+mod action_kind;
 mod author_rules;
 #[cfg(test)]
 mod catalog;
@@ -19,6 +20,7 @@ mod tweet_rules;
 use crate::models::{Placement, PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
+pub(crate) use action_kind::ActionKind;
 use context::RuleContext;
 pub use defaults::Effect;
 pub use engine::RuleEngine;

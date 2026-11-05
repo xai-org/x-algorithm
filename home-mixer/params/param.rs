@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-03T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-11-04T16:00:31Z
 use xai_feature_switches::param;
 
 param!(
@@ -167,7 +167,7 @@ param!(
     PhoenixAggregationType,
     String,
     "rust_home_mixer_phoenix_aggregation_type",
-    "DENSE_WITH_LONG_DWELL"
+    "DENSE_WITH_LONG_DWELL_HOME_EXCURSION"
 );
 param!(
     PhoenixRetrievalAggregationType,
@@ -307,7 +307,7 @@ param!(
     EnableHomeExcursionScores,
     bool,
     "rust_home_mixer_enable_home_excursion_scores",
-    false
+    true
 );
 param!(
     EnablePageLogging,
@@ -399,7 +399,12 @@ param!(
 // navigating to a post (i.e., coordinating via groupchat) has no
 // ranking impact. And users cannot manufacture a post to show up in
 // their Timeline in any consistently reproducible way.
-param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.66);
+param!(
+    FavoriteWeight,
+    f64,
+    "rust_home_mixer_favorite_weight",
+    0.708
+);
 param!(ReplyWeight, f64, "rust_home_mixer_reply_weight", 5.0);
 param!(
     BidirectionalFollowReplyWeightBoost,
@@ -424,9 +429,9 @@ param!(
     VideoOpenWeight,
     f64,
     "rust_home_mixer_video_open_weight",
-    0.02
+    0.0
 );
-param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.3);
+param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.274);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
 param!(
     ProfileClickWeight,
@@ -435,7 +440,7 @@ param!(
     0.0
 );
 param!(VqvWeight, f64, "rust_home_mixer_vqv_weight", 0.0);
-param!(ShareWeight, f64, "rust_home_mixer_share_weight", 2.0);
+param!(ShareWeight, f64, "rust_home_mixer_share_weight", 2.118);
 param!(
     ShareViaDmWeight,
     f64,
@@ -490,20 +495,20 @@ param!(
     ContDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_dwell_time_weight",
-    0.006
+    0.0075
 );
 param!(
     ContClickDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_click_dwell_time_weight",
-    0.4
+    0.385
 );
 
 param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",
-    -52.272
+    -53.07
 );
 param!(
     BlockAuthorWeight,
@@ -930,6 +935,13 @@ param!(
     EnableAdsInjectionLogging,
     bool,
     "rust_home_mixer_enable_ads_injection_logging",
+    true
+);
+
+param!(
+    EnableAdsHistoryXdcCacheWrite,
+    bool,
+    "rust_home_mixer_enable_ads_history_xdc_cache_write",
     true
 );
 

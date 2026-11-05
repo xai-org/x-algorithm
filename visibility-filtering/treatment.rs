@@ -3,7 +3,7 @@ use crate::models::{
     Decided, Deletion, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
     MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
-    Withholding,
+    VerdictAction, Withholding,
 };
 use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::params::LimitedActionsPolicies;
@@ -596,6 +596,9 @@ fn limited_engagement_reason(reason: LimitedEngagementReason) -> action::Limited
                 action::CommunityTweetViewerRemoved::new(),
             )
         }
+        LimitedEngagementReason::DynamicProductAd => {
+            action::LimitedEngagementReason::DynamicProductAd(action::DynamicProductAd::new())
+        }
         LimitedEngagementReason::LocalTweet => {
             action::LimitedEngagementReason::LocalTweet(action::LocalTweet::new())
         }
@@ -636,19 +639,6 @@ pub(crate) fn proto_action(verdict: &Verdict) -> (vf_pb::Action, Option<vf_pb::F
     (vf_pb::Action { kind: Some(kind) }, filtered_reason)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum VerdictAction {
-    Allow,
-    Drop,
-    Tombstone,
-    Interstitial,
-    LimitedEngagement,
-    TweetInterstitial,
-    SoftIntervention,
-    Appealable,
-}
-
 #[cfg(test)]
 const BY_RULE_ACTIONS: [VerdictAction; 6] = [
     VerdictAction::Drop,
@@ -661,22 +651,8 @@ const BY_RULE_ACTIONS: [VerdictAction; 6] = [
 
 pub(crate) fn verdict_action(verdict: &Verdict) -> VerdictAction {
     match verdict {
-        Verdict::Withheld(Decided {
-            value: Withholding::Drop(_),
-            ..
-        }) => VerdictAction::Drop,
-        Verdict::Withheld(Decided {
-            value: Withholding::Tombstone(_),
-            ..
-        }) => VerdictAction::Tombstone,
-        Verdict::Fosnr(Decided {
-            value: Notice::SoftIntervention(_),
-            ..
-        }) => VerdictAction::SoftIntervention,
-        Verdict::Fosnr(Decided {
-            value: Notice::Appealable { .. },
-            ..
-        }) => VerdictAction::Appealable,
+        Verdict::Withheld(decided) => decided.value.kind().verdict_action(),
+        Verdict::Fosnr(decided) => decided.value.kind().verdict_action(),
         Verdict::Shown {
             label_interstitial: Some(_),
             ..
@@ -707,27 +683,9 @@ pub(crate) fn verdict_action(verdict: &Verdict) -> VerdictAction {
 pub(crate) fn decided_rows(
     verdict: &Verdict,
 ) -> impl Iterator<Item = (&'static str, VerdictAction)> {
-    let (interstitial, first, second) = match verdict {
-        Verdict::Withheld(Decided { by, .. }) | Verdict::Fosnr(Decided { by, .. }) => {
-            (None, Some((*by, verdict_action(verdict))), None)
-        }
-        Verdict::Shown {
-            label_interstitial,
-            media,
-            engagement,
-        } => (
-            label_interstitial
-                .as_ref()
-                .map(|interstitial| (interstitial.by, VerdictAction::Interstitial)),
-            media
-                .as_ref()
-                .map(|blur| (blur.by, VerdictAction::Interstitial)),
-            engagement
-                .as_ref()
-                .map(|limit| (limit.by, VerdictAction::LimitedEngagement)),
-        ),
-    };
-    interstitial.into_iter().chain(first).chain(second)
+    verdict
+        .decided()
+        .map(|(kind, by)| (by, kind.verdict_action()))
 }
 
 pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
@@ -1343,6 +1301,11 @@ mod tests {
                 "community_tweet_viewer_removed",
             ),
             (
+                R::DynamicProductAd,
+                T::DynamicProductAd(action::DynamicProductAd::new()),
+                "dynamic_product_ad",
+            ),
+            (
                 R::LocalTweet,
                 T::LocalTweet(action::LocalTweet::new()),
                 "local_tweet",
@@ -1713,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn each_level_82_rerender_sends_tweetypies_filtered_reason() {
+    fn each_quote_rerender_sends_tweetypies_filtered_reason() {
         use crate::rules::QuoteEntries;
         use strum::VariantArray;
         use ThriftFilteredReason as T;
@@ -1721,8 +1684,8 @@ mod tests {
             .iter()
             .flat_map(|&level| {
                 let rerenders = match level.spec().quote_entries() {
-                    QuoteEntries::Judged { rerenders } => rerenders,
-                    QuoteEntries::NotJudged => &[],
+                    QuoteEntries::JudgedWithQuotePass { rerenders } => rerenders,
+                    QuoteEntries::NotJudged | QuoteEntries::Judged => &[],
                 };
                 rerenders.iter().map(move |&(by, reason)| {
                     (level, by, rerendered_state(&Rerendered { by, reason }))
@@ -1748,12 +1711,25 @@ mod tests {
         .into_iter()
         .map(|(rule, reason)| {
             (
-                SafetyLevel::TimelineHomeHydration,
                 rule,
                 TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason)),
             )
         })
         .collect();
+        let expected: Vec<_> = SafetyLevel::VARIANTS
+            .iter()
+            .filter(|level| {
+                matches!(
+                    level.spec().quote_entries(),
+                    QuoteEntries::JudgedWithQuotePass { .. }
+                )
+            })
+            .flat_map(|&level| {
+                expected
+                    .iter()
+                    .map(move |(rule, state)| (level, *rule, state.clone()))
+            })
+            .collect();
         assert_eq!(sent, expected);
     }
 }

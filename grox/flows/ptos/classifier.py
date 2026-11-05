@@ -547,7 +547,13 @@ class SafetyPtosPolicyClassifier:
             user_msg = Message(role=Role.USER, content=[])
             if self._include_user_profile(violation.category):
                 user_msg.content.extend(UserRenderer.render(post.user))
-            user_msg.content.extend(PostRenderer.render(post, include_reply_to=True))
+            user_msg.content.extend(
+                PostRenderer.render(
+                    post,
+                    include_reply_to=True,
+                    include_media_tags=self._include_media_tags(violation.category),
+                )
+            )
         user_msg.content.append(
             f"\n\nAnalyze the post {post.id} for the specific safety policy violation category: {violation.category.value}"
         )
@@ -606,6 +612,10 @@ class SafetyPtosPolicyClassifier:
         ):
             return False
         return True
+
+    @staticmethod
+    def _include_media_tags(category: SafetyPolicyCategory) -> bool:
+        return category == SafetyPolicyCategory.Spam
 
     async def classify_policy_for_violation(
         self, post: Post, violation: SafetyPtosViolatedPolicy

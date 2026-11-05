@@ -1,7 +1,7 @@
 use super::{Role, Row, Subject};
 use crate::models::SafetyLabelType;
 use crate::rules::fixtures::{allow, blurred, candidate, dropped, sensitive_opt_in_viewer};
-use crate::rules::SafetyLevel::TimelineHome;
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomePromotedHydration};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::InterstitialReason;
 
@@ -43,7 +43,10 @@ pub(super) fn rows() -> Vec<Row> {
                 ]),
                 adult(),
             )],
-            at: vec![(TimelineHome, Role::NonFollower, allow())],
+            at: vec![
+                (TimelineHome, Role::NonFollower, allow()),
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
+            ],
         },
         Row {
             name: "reaction_to_adult_and_gore_post",
@@ -81,7 +84,10 @@ pub(super) fn rows() -> Vec<Row> {
                 Role::each([Role::NonFollower, Role::Follower, Role::Author, nsfw_view()]),
                 protected(),
             )],
-            at: vec![(TimelineHome, Role::NonFollower, allow())],
+            at: vec![
+                (TimelineHome, Role::NonFollower, allow()),
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
+            ],
         },
         Row {
             name: "reaction_to_gore_post",

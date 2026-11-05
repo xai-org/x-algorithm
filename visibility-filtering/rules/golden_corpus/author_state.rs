@@ -1,7 +1,9 @@
 use super::{Role, Row, Subject};
 use crate::models::{AuthorFeatures, PostCandidate, SafetyLabelType, Verdict};
 use crate::rules::fixtures::{allow, appealed, author_candidate, candidate, dropped};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    TimelineHome, TimelineHomeHydration, TimelineHomePromotedHydration,
+};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::AppealablePolicy;
 
@@ -39,7 +41,14 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (Role::Author, allow()),
             ],
-            at: vec![],
+            at: vec![
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
+                (
+                    TimelineHomePromotedHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    allow(),
+                ),
+            ],
         },
         Row {
             name: "suspended_author_nsfw_media",
@@ -89,7 +98,7 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (Role::Author, allow()),
             ],
-            at: vec![],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "suspended_and_deactivated_author",
@@ -127,7 +136,7 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (Role::Author, allow()),
             ],
-            at: vec![],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "offboarded_author",
@@ -142,7 +151,7 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (Role::Author, allow()),
             ],
-            at: vec![],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "protected_author",
@@ -154,7 +163,14 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (Role::each([Role::Follower, Role::Author]), allow()),
             ],
-            at: vec![],
+            at: vec![
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
+                (
+                    TimelineHomePromotedHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    allow(),
+                ),
+            ],
         },
         Row {
             name: "suspended_author_fosnr_label",

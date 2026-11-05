@@ -81,7 +81,10 @@ pub(crate) fn evaluate_tweets(
     context: Option<TwitterContextViewer>,
     level: SafetyLevel,
 ) -> Request<Vec<Entry>> {
-    let judges_quote_entries = matches!(level.spec().quote_entries(), QuoteEntries::Judged { .. });
+    let judges_quote_entries = match level.spec().quote_entries() {
+        QuoteEntries::NotJudged => false,
+        QuoteEntries::Judged | QuoteEntries::JudgedWithQuotePass { .. } => true,
+    };
     let rows = request
         .tweets
         .iter()

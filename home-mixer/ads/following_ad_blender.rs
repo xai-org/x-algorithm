@@ -1,9 +1,11 @@
-use super::AdsBlender;
+use super::drops::{adjacency_drop, dropped_ad, truncate_recording_drops};
 use super::util::{
-    MIN_POSTS_FOR_ADS, is_bsr_low_ad, posts_to_feed_items, should_drop_handle, should_drop_keyword,
+    handle_block, keyword_block, low_risk_block, posts_to_feed_items, Block, MIN_POSTS_FOR_ADS,
 };
+use super::AdsBlender;
 use crate::params::FOLLOWING_MAX_RESULT_SIZE;
-use xai_home_mixer_proto::{BrandSafetyVerdict, FeedItem, ScoredPost, feed_item};
+use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
+use xai_home_mixer_proto::{feed_item, BrandSafetyVerdict, FeedItem, ScoredPost};
 use xai_recsys_proto::AdIndexInfo;
 
 const DEFAULT_SPACING: usize = 3;
@@ -23,8 +25,19 @@ impl Default for FollowingAdBlender {
 }
 
 impl AdsBlender for FollowingAdBlender {
-    fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
-        blend_impl(scored_posts, ads, MIN_POSTS_FOR_ADS, self.result_size)
+    fn blend_inner_with_drops(
+        &self,
+        scored_posts: Vec<ScoredPost>,
+        ads: Vec<AdIndexInfo>,
+        drops: &mut Vec<DroppedAd>,
+    ) -> Vec<FeedItem> {
+        blend_with_drops(
+            scored_posts,
+            ads,
+            MIN_POSTS_FOR_ADS,
+            self.result_size,
+            drops,
+        )
     }
 }
 
@@ -89,34 +102,37 @@ fn is_medium_risk(post: &ScoredPost) -> bool {
     )
 }
 
-fn is_low_risk(post: &ScoredPost) -> bool {
-    post.brand_safety_verdict() == BrandSafetyVerdict::LowRisk
-}
-
 fn unit_medium_risk(unit: &[ScoredPost]) -> bool {
     unit.iter().any(is_medium_risk)
 }
 
-fn unit_low_risk(unit: &[ScoredPost]) -> bool {
-    !unit_medium_risk(unit) && unit.iter().any(is_low_risk)
+fn group_block(ad: &AdIndexInfo, above: &[ScoredPost], below: &[ScoredPost]) -> Option<Block> {
+    let posts = || above.iter().chain(below);
+    posts()
+        .find_map(|p| handle_block(ad, Some(p), None))
+        .or_else(|| posts().find_map(|p| keyword_block(ad, Some(p), None, &mut None)))
+        .or_else(|| posts().find_map(|p| low_risk_block(ad, Some(p), None)))
 }
 
-fn unit_drops_handle(ad: &AdIndexInfo, unit: &[ScoredPost]) -> bool {
-    unit.iter().any(|p| should_drop_handle(ad, Some(p), None))
-}
-
-fn unit_drops_keyword(ad: &AdIndexInfo, unit: &[ScoredPost]) -> bool {
-    unit.iter().any(|p| should_drop_keyword(ad, Some(p), None))
-}
-
+#[cfg(test)]
 pub(crate) fn blend_impl(
     scored_posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
     min_posts: usize,
     result_size: usize,
 ) -> Vec<FeedItem> {
+    blend_with_drops(scored_posts, ads, min_posts, result_size, &mut Vec::new())
+}
+
+pub(crate) fn blend_with_drops(
+    scored_posts: Vec<ScoredPost>,
+    ads: Vec<AdIndexInfo>,
+    min_posts: usize,
+    result_size: usize,
+    drops: &mut Vec<DroppedAd>,
+) -> Vec<FeedItem> {
     let spacing = compute_spacing(&ads);
-    blend_with_spacing(scored_posts, ads, min_posts, result_size, spacing)
+    blend_with_spacing(scored_posts, ads, min_posts, result_size, spacing, drops)
 }
 
 pub(crate) fn blend_with_spacing(
@@ -125,18 +141,25 @@ pub(crate) fn blend_with_spacing(
     min_posts: usize,
     result_size: usize,
     spacing: usize,
+    drops: &mut Vec<DroppedAd>,
 ) -> Vec<FeedItem> {
     let units = blend_units(&scored_posts);
     let n_units = units.len();
 
     if ads.is_empty() || n_units < min_posts || spacing < 1 {
+        drops.extend(
+            ads.iter()
+                .map(|ad| dropped_ad(ad, AdDropReason::TooFewPosts)),
+        );
         return posts_to_feed_items(scored_posts);
     }
 
     let first_position = compute_first_position(&ads, spacing);
-    let mut pool = ads;
+    let mut pool: Vec<(AdIndexInfo, Option<Block>)> =
+        ads.into_iter().map(|ad| (ad, None)).collect();
     let mut ad_after: Vec<Option<AdIndexInfo>> = (0..scored_posts.len()).map(|_| None).collect();
     let mut gap = spacing - first_position;
+    let mut medium_risk_openings = 0usize;
 
     for (unit_idx, unit) in units.iter().enumerate() {
         gap += 1;
@@ -144,24 +167,38 @@ pub(crate) fn blend_with_spacing(
             let above = &scored_posts[unit.start..unit.end];
             let next = &units[unit_idx + 1];
             let below = &scored_posts[next.start..next.end];
-            let group_safe = !unit_medium_risk(above) && !unit_medium_risk(below);
-            let group_low_risk = group_safe && (unit_low_risk(above) || unit_low_risk(below));
+            if unit_medium_risk(above) || unit_medium_risk(below) {
+                medium_risk_openings += 1;
+                continue;
+            }
 
-            if group_safe
-                && let Some(placed_idx) = pool.iter().position(|ad| {
-                    !(unit_drops_handle(ad, above)
-                        || unit_drops_handle(ad, below)
-                        || unit_drops_keyword(ad, above)
-                        || unit_drops_keyword(ad, below)
-                        || (group_low_risk && is_bsr_low_ad(ad)))
-                })
-            {
+            let mut placed_idx = None;
+            for (idx, (ad, last_block)) in pool.iter_mut().enumerate() {
+                match group_block(ad, above, below) {
+                    Some(block) => *last_block = Some(block),
+                    None => {
+                        placed_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(idx) = placed_idx {
                 let last = unit.end - 1;
-                ad_after[last] = Some(pool.remove(placed_idx));
+                ad_after[last] = Some(pool.remove(idx).0);
                 gap = 0;
             }
         }
     }
+
+    let no_room = if medium_risk_openings > 0 {
+        AdDropReason::NoEligibleNeighbours
+    } else {
+        AdDropReason::SpacingCap
+    };
+    drops.extend(pool.into_iter().map(|(ad, block)| match block {
+        Some(block) => adjacency_drop(&ad, block),
+        None => dropped_ad(&ad, no_room),
+    }));
 
     let mut items: Vec<FeedItem> = Vec::with_capacity(scored_posts.len() + ad_after.len());
     for (index, post) in scored_posts.into_iter().enumerate() {
@@ -177,10 +214,7 @@ pub(crate) fn blend_with_spacing(
         }
     }
 
-    items.truncate(result_size);
-    if matches!(items.last(), Some(item) if matches!(item.item, Some(feed_item::Item::Ad(_)))) {
-        items.pop();
-    }
+    truncate_recording_drops(&mut items, result_size, drops);
     for (i, item) in items.iter_mut().enumerate() {
         item.position = i as i32;
     }

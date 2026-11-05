@@ -26,7 +26,7 @@ use xai_home_mixer_proto::{FeedItem, ScoredPost};
 use xai_recsys_proto::AdIndexInfo;
 
 pub trait AdsBlender: Send + Sync {
-        fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
+    fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
         self.blend_inner_with_drops(scored_posts, ads, &mut Vec::new())
     }
 
@@ -39,7 +39,7 @@ pub trait AdsBlender: Send + Sync {
         self.blend_inner(scored_posts, ads)
     }
 
-        fn blend(
+    fn blend(
         &self,
         scored_posts: Vec<ScoredPost>,
         ads: Vec<AdIndexInfo>,

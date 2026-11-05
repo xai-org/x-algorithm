@@ -609,11 +609,7 @@ fn every_post_rule_reads_the_post() {
         .filter(|rule| {
             let mut read = Vec::new();
             rule.when.leaves(&mut read);
-            let notice = matches!(
-                rule.action.spec(),
-                ActionSpec::SoftIntervention(_) | ActionSpec::Appealable(_)
-            );
-            !notice && !read.iter().any(reads_the_post)
+            !rule.action.spec().kind().lands_in_fosnr() && !read.iter().any(reads_the_post)
         })
         .map(|rule| rule.name())
         .collect();
@@ -629,16 +625,16 @@ fn every_post_rule_reads_the_post() {
 }
 
 #[test]
+fn a_less_severe_action_kind_never_relies_on_an_earlier_defaults_bucket() {
+    let mut kinds = ActionKind::VARIANTS.to_vec();
+    kinds.sort_by_key(|kind| std::cmp::Reverse(kind.severity()));
+    for pair in kinds.windows(2) {
+        assert!(pair[0].bucket() <= pair[1].bucket(), "{pair:?}");
+    }
+}
+
+#[test]
 fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
-    let ends_the_fold = |action: &ActionSpec<UserEngine>| match action {
-        ActionSpec::Drop(_)
-        | ActionSpec::Tombstone(_)
-        | ActionSpec::SoftIntervention(_)
-        | ActionSpec::Appealable(_) => true,
-        ActionSpec::MediaRestriction(_)
-        | ActionSpec::LimitedEngagement(_)
-        | ActionSpec::LabelInterstitial(_) => false,
-    };
     let disjoint = |user: Audience, post: Audience| match (user, post) {
         (OnlyAuthor, NonAuthors | NonFollowers) | (NonAuthors | NonFollowers, OnlyAuthor) => true,
         (Everyone, _)
@@ -649,10 +645,13 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     let mut shadowing = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let LevelLists { user, post } = level.spec().rules().lists();
-        for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
-            let severity = user_rule.action.spec().severity();
+        for &user_rule in user
+            .iter()
+            .filter(|rule| rule.action.spec().kind().ends_the_fold())
+        {
+            let severity = user_rule.action.spec().kind().severity();
             for &post_rule in &post {
-                if post_rule.action.spec().severity() > severity
+                if post_rule.action.spec().kind().severity() > severity
                     && !disjoint(user_rule.audience, post_rule.audience)
                 {
                     shadowing.push(format!(

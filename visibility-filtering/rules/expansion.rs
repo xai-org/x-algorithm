@@ -2,7 +2,6 @@ use crate::hydration::inventory::Stake;
 use crate::hydration::{Relation, BEST_EFFORT_HYDRATION_TIMEOUT};
 use crate::rules::levels;
 use crate::rules::rule_spec::rule::Rule;
-use crate::rules::rule_spec::ActionSpec;
 use std::time::Duration;
 use strum::VariantArray;
 
@@ -84,10 +83,7 @@ impl Expansion {
 }
 
 const fn withholds(rule: &Rule) -> bool {
-    matches!(
-        rule.action.spec(),
-        ActionSpec::Drop(_) | ActionSpec::Tombstone(_)
-    )
+    rule.action.spec().kind().withholds()
 }
 
 #[cfg(test)]

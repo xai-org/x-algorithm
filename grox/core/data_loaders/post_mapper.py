@@ -177,6 +177,12 @@ class PostMapper:
             ]
             if post_metadata.mentionedUsersMetadata
             else None,
+            media_tag_mentioned_users=[
+                cls._from_strato_user_metadata_to_user(m)
+                for m in post_metadata.mediaTagMentionedUsersMetadata
+            ]
+            if post_metadata.mediaTagMentionedUsersMetadata
+            else None,
         )
 
     @classmethod

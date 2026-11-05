@@ -1,9 +1,10 @@
 use super::{Role, Row, Subject};
 use crate::models::{
-    RequestFacts, SafetyLabelType, TombstoneReason, ViewerFeatures, ViewerProfile,
+    LimitedEngagementReason, RequestFacts, SafetyLabelType, TombstoneReason, ViewerFeatures,
+    ViewerProfile,
 };
 use crate::rules::fixtures::{
-    allow, appealed, candidate, dropped, labeled, tombstoned, viewer_with_profile,
+    allow, appealed, candidate, dropped, labeled, limited, tombstoned, viewer_with_profile,
 };
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::{
@@ -27,6 +28,18 @@ fn soft_nsfw_viewer(name: &'static str, is_new_account: bool, switch_on: bool) -
 
 pub(super) fn rows() -> Vec<Row> {
     vec![
+        Row {
+            name: "dynamic_product_ad_label",
+            subject: Subject::Post(labeled(SafetyLabelType::DYNAMIC_PRODUCT_AD)),
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Author]),
+                limited(
+                    LimitedEngagementReason::DynamicProductAd,
+                    "dynamic_product_ad/limited_engagement",
+                ),
+            )],
+            at: vec![],
+        },
         Row {
             name: "soft_nsfw_label",
             subject: Subject::Post(labeled(SafetyLabelType::SOFT_NSFW)),

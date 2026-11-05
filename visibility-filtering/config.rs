@@ -10,6 +10,7 @@ pub const ENV_APP_ENV: &str = "APP_ENV";
 pub const ENV_FS_PATH: &str = "VF_FS_PATH";
 pub const ENV_GIZMODUCK_CLIENT_ID: &str = "VF_GIZMODUCK_CLIENT_ID";
 pub const ENV_TWEMCACHE_CLIENT_NAME: &str = "VF_TWEMCACHE_CLIENT_NAME";
+pub const ENV_LABEL_CACHE_EDS: &str = "VF_LABEL_CACHE_EDS";
 pub const ENV_QUOTE_PASS: &str = "VF_QUOTE_PASS";
 
 const DEFAULT_FS_PATH: &str = "/usr/local/config/features/visibility/main/rust_vf.yml";
@@ -27,6 +28,12 @@ pub(crate) fn gizmoduck_client_id() -> String {
 
 pub(crate) fn twemcache_client_name() -> String {
     resolve_twemcache_client_name(std::env::var(ENV_TWEMCACHE_CLIENT_NAME).ok().as_deref())
+}
+
+pub(crate) fn label_cache_eds() -> Option<String> {
+    std::env::var(ENV_LABEL_CACHE_EDS)
+        .ok()
+        .filter(|eds| !eds.trim().is_empty())
 }
 
 pub fn resolve_gizmoduck_client_id(configured: Option<&str>, app_env: Option<&str>) -> String {

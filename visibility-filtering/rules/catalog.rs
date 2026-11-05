@@ -25,8 +25,8 @@ fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = 
         let mut named: Vec<&'static NamedCond<E>> = Vec::new();
         rule.when.named(&mut named);
         CatalogRule {
-            severity: action.severity(),
-            kind_and_slot: action.kind_and_slot(),
+            severity: action.kind().severity(),
+            kind_and_slot: action.kind().catalog(),
             line: format!(
                 "`{}`: audience `{:?}`, when `{}`, `{}`",
                 rule_name(rule.id, &rule.action),
@@ -129,7 +129,7 @@ pub(super) fn catalog() -> String {
 fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E>]) {
     let mut band = None;
     for rule in rules {
-        let (kind, slot) = rule.action.kind_and_slot();
+        let (kind, slot) = rule.action.kind().catalog();
         if band != Some(kind) {
             band = Some(kind);
             match slot {

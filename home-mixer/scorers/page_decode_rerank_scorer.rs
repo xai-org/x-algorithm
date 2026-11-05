@@ -46,6 +46,8 @@ fn ranking_score_weights(query: &ScoredPostsQuery) -> RankingScoreWeights {
         report_weight: params.get(ReportWeight) as f32,
         not_dwelled_weight: params.get(NotDwelledWeight) as f32,
         min_video_duration_ms: params.get(MinVideoDurationMs) as f32,
+        share_via_dm_weight: 0.0,
+        share_via_copy_link_weight: 0.0,
     }
 }
 
@@ -287,5 +289,7 @@ mod tests {
         assert_eq!(weights.report_weight, -200.0);
         assert_eq!(weights.not_dwelled_weight, -1.5);
         assert_eq!(weights.min_video_duration_ms, 8000.0);
+        assert_eq!(weights.share_via_dm_weight, 0.0);
+        assert_eq!(weights.share_via_copy_link_weight, 0.0);
     }
 }

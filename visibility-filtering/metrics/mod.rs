@@ -10,9 +10,9 @@ use xai_stats_receiver::StatsReceiverExt;
 
 use crate::caller_identity;
 use crate::hydration::{Cause, Hydrators, Lookup, INBOUND_ALLOWANCE};
-use crate::models::{Evaluation, Verdict};
+use crate::models::{Evaluation, Verdict, VerdictAction};
 use crate::rules::SafetyLevel;
-use crate::treatment::{self, VerdictAction};
+use crate::treatment;
 
 pub(crate) mod families;
 

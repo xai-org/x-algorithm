@@ -26,8 +26,8 @@ mod tweet_state;
 
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    Decided, EdgeSet, Evaluation, Notice, NotificationKind, Placement, PostCandidate, TweetId,
-    UserCandidate, Verdict, ViewerFeatures, Withholding,
+    EdgeSet, Evaluation, NotificationKind, Placement, PostCandidate, TweetId, UserCandidate,
+    Verdict, ViewerFeatures,
 };
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{builder_call, logged_out_viewer, viewer, VIEWER_ID};
@@ -38,11 +38,13 @@ use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::{placed_test_context, RuleEngine, SafetyLevel};
 use crate::treatment::proto_action;
 use prost::Message;
+use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::iter::once;
 use strum::VariantArray;
 use SafetyLevel::{FilterAll, TimelineHomeHydration, TimelineHomeRecommendations};
 
+#[derive(Clone)]
 enum Role {
     NonFollower,
     Author,
@@ -64,6 +66,7 @@ pub(super) enum Subject {
     User(UserCandidate),
 }
 
+#[derive(Clone)]
 struct Row {
     name: &'static str,
     subject: Subject,
@@ -84,9 +87,23 @@ pub(super) struct CorpusCase {
 struct RowCase {
     row: &'static str,
     role: String,
-    from_at: bool,
+    provenance: Provenance,
     case: CorpusCase,
 }
+
+enum Provenance {
+    Expect,
+    At,
+    InheritedFrom(SafetyLevel),
+}
+
+struct PostLevel {
+    level: SafetyLevel,
+    wired: Vec<&'static str>,
+    wider: Vec<SafetyLevel>,
+}
+
+type View = (String, ViewerFeatures, Placement, Subject);
 
 const OUTER_TWEET_ID: TweetId = TweetId(2);
 
@@ -112,7 +129,7 @@ impl Role {
         Role::Each(roles.into())
     }
 
-    fn views(&self, subject: &Subject) -> Vec<(String, ViewerFeatures, Placement, Subject)> {
+    fn views(&self, subject: &Subject) -> Vec<View> {
         let standalone = |name: &str, viewer, subject| {
             vec![(name.to_owned(), viewer, Placement::Standalone, subject)]
         };
@@ -147,12 +164,7 @@ impl Role {
         }
     }
 
-    fn placed(
-        &self,
-        subject: &Subject,
-        prefix: &str,
-        placement: Placement,
-    ) -> Vec<(String, ViewerFeatures, Placement, Subject)> {
+    fn placed(&self, subject: &Subject, prefix: &str, placement: Placement) -> Vec<View> {
         self.views(subject)
             .into_iter()
             .map(|(role_name, viewer, _, subject)| {
@@ -168,21 +180,77 @@ fn preempted(level: SafetyLevel, rule: &str) -> bool {
         .any(|preempted| preempted.level == level && preempted.rule == rule)
 }
 
+fn decides(level: SafetyLevel, wired: &[&'static str], verdict: &Verdict) -> bool {
+    deciders(verdict)
+        .into_iter()
+        .all(|rule| wired.contains(&rule) && !preempted(level, rule))
+}
+
 fn reaches(level: SafetyLevel, wired: &[&'static str], verdict: &Verdict) -> bool {
-    deciders(verdict).into_iter().all(|rule| {
-        wired.contains(&rule) && !preempted(level, rule) && !WIRED_DIFFERENTLY.contains(&rule)
-    })
+    decides(level, wired, verdict)
+        && deciders(verdict)
+            .iter()
+            .all(|rule| !WIRED_DIFFERENTLY.contains(rule))
+}
+
+fn is_subsequence<T: PartialEq>(items: &[T], of: &[T]) -> bool {
+    let mut rest = of.iter();
+    items
+        .iter()
+        .all(|item| rest.any(|candidate| candidate == item))
+}
+
+fn inherited_where_unstated(
+    name: &str,
+    subject: &Subject,
+    at: &[(SafetyLevel, Role, Verdict)],
+    post_levels: &[PostLevel],
+) -> Vec<(SafetyLevel, View, Verdict, SafetyLevel)> {
+    let stated: Vec<(SafetyLevel, String)> = at
+        .iter()
+        .flat_map(|(level, role, _)| {
+            role.views(subject)
+                .into_iter()
+                .map(move |(role_name, ..)| (*level, role_name))
+        })
+        .collect();
+    let mut inherited: Vec<(SafetyLevel, View, Verdict, SafetyLevel)> = Vec::new();
+    for (wider, role, verdict) in at {
+        for narrower in post_levels.iter().filter(|narrower| {
+            narrower.wider.contains(wider) && decides(narrower.level, &narrower.wired, verdict)
+        }) {
+            for view in role.views(subject) {
+                if stated.contains(&(narrower.level, view.0.clone())) {
+                    continue;
+                }
+                match inherited.iter().find(|(level, other_view, ..)| {
+                    *level == narrower.level && other_view.0 == view.0
+                }) {
+                    None => inherited.push((narrower.level, view, verdict.clone(), *wider)),
+                    Some((_, _, other_verdict, other_wider)) => assert!(
+                        other_verdict == verdict,
+                        "{name}: {:?} inherits {other_verdict:?} for {} from {other_wider:?} and \
+                         {verdict:?} from {wider:?}; add an at entry at {:?}",
+                        narrower.level,
+                        view.0,
+                        narrower.level,
+                    ),
+                }
+            }
+        }
+    }
+    inherited
 }
 
 impl Row {
-    fn cases(self, post_levels: &[(SafetyLevel, Vec<&'static str>)]) -> Vec<RowCase> {
+    fn cases(self, post_levels: &[PostLevel]) -> Vec<RowCase> {
         let Row {
             name,
             subject,
             expect,
             at,
         } = self;
-        let row_case = |level, (role, viewer, placement, subject), expected, from_at| RowCase {
+        let row_case = |level, (role, viewer, placement, subject), expected, provenance| RowCase {
             row: name,
             case: CorpusCase {
                 name: format!("{name}/{level:?}/{role}"),
@@ -194,10 +262,10 @@ impl Row {
                 expected,
             },
             role,
-            from_at,
+            provenance,
         };
         let mut cases: Vec<RowCase> = at
-            .into_iter()
+            .iter()
             .flat_map(|(level, role, verdict)| {
                 assert_eq!(
                     matches!(level.spec().rules(), LevelRules::UserOnly(_)),
@@ -206,10 +274,23 @@ impl Row {
                 );
                 role.views(&subject)
                     .into_iter()
-                    .map(move |view| row_case(level, view, verdict.clone(), true))
-                    .collect::<Vec<_>>()
+                    .map(move |view| row_case(*level, view, verdict.clone(), Provenance::At))
             })
             .collect();
+        cases.extend(
+            inherited_where_unstated(name, &subject, &at, post_levels)
+                .into_iter()
+                .map(|(level, view, verdict, wider)| {
+                    row_case(level, view, verdict, Provenance::InheritedFrom(wider))
+                }),
+        );
+        let stated = |cases: &[RowCase], level, role: &str| {
+            cases.iter().any(|case| {
+                !matches!(case.provenance, Provenance::Expect)
+                    && case.case.level == level
+                    && case.role == role
+            })
+        };
         assert!(
             expect.is_empty() || matches!(subject, Subject::Post(_)),
             "{name}: a user row states each verdict at its level"
@@ -222,18 +303,20 @@ impl Row {
         for (role, verdict) in &expect {
             let mut holds_somewhere = false;
             for view in role.views(&subject) {
-                for (level, wired) in post_levels {
+                for PostLevel { level, wired, .. } in post_levels {
                     let holds = match (deciders(verdict).is_empty(), decided.is_empty()) {
                         (false, _) => reaches(*level, wired, verdict),
                         (true, false) => decided.iter().any(|other| reaches(*level, wired, other)),
                         (true, true) => *level != FilterAll,
                     };
-                    let replaced = cases.iter().any(|case| {
-                        case.from_at && case.case.level == *level && case.role == view.0
-                    });
-                    if holds && !replaced {
+                    if holds && !stated(&cases, *level, &view.0) {
                         holds_somewhere = true;
-                        cases.push(row_case(*level, view.clone(), verdict.clone(), false));
+                        cases.push(row_case(
+                            *level,
+                            view.clone(),
+                            verdict.clone(),
+                            Provenance::Expect,
+                        ));
                     }
                 }
             }
@@ -243,17 +326,78 @@ impl Row {
     }
 }
 
-fn row_cases() -> Vec<RowCase> {
+fn post_levels() -> Vec<PostLevel> {
     let rule_engine = RuleEngine::for_tests();
-    let post_levels: Vec<(SafetyLevel, Vec<&'static str>)> = SafetyLevel::VARIANTS
+    let lists: Vec<(SafetyLevel, LevelLists)> = SafetyLevel::VARIANTS
         .iter()
-        .filter(|level| matches!(level.spec().rules(), LevelRules::UserThenPost(_)))
-        .map(|&level| (level, rule_engine.wired_rule_names(level)))
+        .filter_map(|&level| match level.spec().rules() {
+            LevelRules::UserThenPost(rules) => Some((level, rules.lists())),
+            LevelRules::UserOnly(_) => None,
+        })
         .collect();
+    lists
+        .iter()
+        .map(|(level, rules)| PostLevel {
+            level: *level,
+            wired: rule_engine.wired_rule_names(*level),
+            wider: lists
+                .iter()
+                .filter(|(other, other_rules)| {
+                    other != level
+                        && is_subsequence(&rules.user, &other_rules.user)
+                        && is_subsequence(&rules.post, &other_rules.post)
+                })
+                .map(|(other, _)| *other)
+                .collect(),
+        })
+        .collect()
+}
+
+fn row_cases() -> Vec<RowCase> {
+    let post_levels = post_levels();
     rows()
         .into_iter()
         .flat_map(|row| row.cases(&post_levels))
         .collect()
+}
+
+#[test]
+fn no_at_entry_restates_what_its_row_derives_without_it() {
+    let post_levels = post_levels();
+    let cases = |row: Row| {
+        let mut cases: Vec<(String, Verdict)> = row
+            .cases(&post_levels)
+            .into_iter()
+            .map(|row_case| (row_case.case.name, row_case.case.expected))
+            .collect();
+        cases.sort_by(|(left, _), (right, _)| left.cmp(right));
+        cases
+    };
+    let mut redundant = Vec::new();
+    for row in rows() {
+        let with = cases(row.clone());
+        for index in 0..row.at.len() {
+            let mut without = row.clone();
+            let (level, role, _) = without.at.remove(index);
+            if cases(without) == with {
+                let roles: Vec<String> = role
+                    .views(&row.subject)
+                    .into_iter()
+                    .map(|(role_name, ..)| role_name)
+                    .collect();
+                redundant.push(format!("{}: ({level:?}, {})", row.name, roles.join(" ")));
+            }
+        }
+    }
+    redundant.sort();
+    redundant.dedup();
+    assert!(
+        redundant.is_empty(),
+        "{} at entries restate what their row's expect or a wider level's at entry derives; \
+         delete each:\n{}",
+        redundant.len(),
+        redundant.join("\n")
+    );
 }
 
 impl CorpusCase {
@@ -277,19 +421,7 @@ impl CorpusCase {
 }
 
 fn deciders(verdict: &Verdict) -> Vec<&'static str> {
-    match verdict {
-        Verdict::Withheld(Decided { by, .. }) | Verdict::Fosnr(Decided { by, .. }) => vec![*by],
-        Verdict::Shown {
-            label_interstitial,
-            media,
-            engagement,
-        } => label_interstitial
-            .iter()
-            .map(|interstitial| interstitial.by)
-            .chain(media.iter().map(|blur| blur.by))
-            .chain(engagement.iter().map(|limit| limit.by))
-            .collect(),
-    }
+    verdict.decided().map(|(_, by)| by).collect()
 }
 
 #[test]
@@ -327,13 +459,21 @@ fn golden_corpus_pins_policy_verdicts() {
         let level = case.level;
         let fix = match row_case {
             Some(RowCase {
-                row, role, from_at, ..
+                row,
+                role,
+                provenance,
+                ..
             }) => {
-                let entry = format!("({level:?}, <role {role}>, {got})");
-                if *from_at {
-                    format!("\n  row {row}'s at entry now gets {entry}")
-                } else {
-                    format!("\n  where {level:?} rightly differs, add to row {row}'s at: {entry}")
+                let at_entry = format!("({level:?}, <role {role}>, {got})");
+                let differs =
+                    format!("where {level:?} rightly differs, add to row {row}'s at: {at_entry}");
+                match provenance {
+                    Provenance::At => format!("\n  row {row}'s at entry now gets {at_entry}"),
+                    Provenance::InheritedFrom(wider) => format!(
+                        "\n  row {row}'s at entry at {wider:?}, which {level:?} inherits, gets {got}: \
+                         {differs}"
+                    ),
+                    Provenance::Expect => format!("\n  {differs}"),
                 }
             }
             None => String::new(),
@@ -443,41 +583,14 @@ fn outcome(evaluation: &Evaluation) -> (&'static str, Vec<&'static str>) {
         Evaluation::NotFound(_) | Evaluation::Deleted(_) => "NotFound",
         Evaluation::Failed(_) => "Failed",
     };
-    let kinds = match evaluation.verdict() {
-        Verdict::Withheld(Decided {
-            value: Withholding::Drop(_),
-            ..
-        }) => vec!["Drop"],
-        Verdict::Withheld(Decided {
-            value: Withholding::Tombstone(_),
-            ..
-        }) => vec!["Tombstone"],
-        Verdict::Fosnr(Decided {
-            value: Notice::Appealable { .. },
-            ..
-        }) => vec!["Appealable"],
-        Verdict::Fosnr(Decided {
-            value: Notice::SoftIntervention(_),
-            ..
-        }) => vec!["SoftIntervention"],
-        Verdict::Shown {
-            label_interstitial,
-            media,
-            engagement,
-        } => {
-            let kinds: Vec<&'static str> = label_interstitial
-                .iter()
-                .map(|_| "LabelInterstitial")
-                .chain(media.iter().map(|_| "MediaRestriction"))
-                .chain(engagement.iter().map(|_| "LimitedEngagement"))
-                .collect();
-            if kinds.is_empty() {
-                vec!["Allow"]
-            } else {
-                kinds
-            }
-        }
-    };
+    let mut kinds: Vec<&'static str> = evaluation
+        .verdict()
+        .decided()
+        .map(|(kind, _)| kind.into())
+        .collect();
+    if kinds.is_empty() {
+        kinds.push("Allow");
+    }
     (completeness, kinds)
 }
 
@@ -485,61 +598,70 @@ fn outcome(evaluation: &Evaluation) -> (&'static str, Vec<&'static str>) {
 fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
     let rule_engine = RuleEngine::for_tests();
     let cases = corpus();
-    let mut diverged = Vec::new();
-    let policies = SafetyLevel::VARIANTS.iter().flat_map(|&level| {
-        let spec = level.spec();
-        once((level, None, spec.rules().lists())).chain(
-            level
-                .post_kinds()
-                .map(move |(kind, rules)| (level, Some(kind), rules.lists())),
-        )
-    });
-    for (level, kind, rules) in policies {
-        let reference = one_fold(&rules);
-        let used = rules
-            .user
-            .iter()
-            .map(|rule| rule.requirements())
-            .chain(rules.post.iter().map(|rule| rule.requirements()))
-            .fold(Hydrators::empty(), Hydrators::union);
-        let failures: Vec<Hydrators> = once(Hydrators::empty())
-            .chain(used.iter().map(Hydrators::of))
-            .chain(once(used))
-            .collect();
-        for case in &cases {
-            let Subject::Post(fetched) = &case.subject else {
-                continue;
-            };
-            for &failed in &failures {
-                let candidate = PostCandidate {
-                    failed,
-                    ..fetched.clone()
+    let policies: Vec<_> = SafetyLevel::VARIANTS
+        .iter()
+        .flat_map(|&level| {
+            let spec = level.spec();
+            once((level, None, spec.rules().lists())).chain(
+                level
+                    .post_kinds()
+                    .map(move |(kind, rules)| (level, Some(kind), rules.lists())),
+            )
+        })
+        .collect();
+    let diverged: Vec<String> = policies
+        .par_iter()
+        .flat_map_iter(|&(level, kind, ref rules)| {
+            let mut diverged = Vec::new();
+            let reference = one_fold(rules);
+            let used = rules
+                .user
+                .iter()
+                .map(|rule| rule.requirements())
+                .chain(rules.post.iter().map(|rule| rule.requirements()))
+                .fold(Hydrators::empty(), Hydrators::union);
+            let failures: Vec<Hydrators> = once(Hydrators::empty())
+                .chain(used.iter().map(Hydrators::of))
+                .chain(once(used))
+                .collect();
+            for case in &cases {
+                let Subject::Post(fetched) = &case.subject else {
+                    continue;
                 };
-                let gate = match kind {
-                    None => rule_engine.evaluate(level, &case.viewer, &candidate, case.placement),
-                    Some(kind) => rule_engine.evaluate_post_kind(
-                        level,
-                        kind,
+                for &failed in &failures {
+                    let candidate = PostCandidate {
+                        failed,
+                        ..fetched.clone()
+                    };
+                    let gate = match kind {
+                        None => {
+                            rule_engine.evaluate(level, &case.viewer, &candidate, case.placement)
+                        }
+                        Some(kind) => rule_engine.evaluate_post_kind(
+                            level,
+                            kind,
+                            &case.viewer,
+                            &candidate,
+                            case.placement,
+                        ),
+                    };
+                    let fold = reference.evaluate(&placed_test_context(
                         &case.viewer,
                         &candidate,
                         case.placement,
-                    ),
-                };
-                let fold = reference.evaluate(&placed_test_context(
-                    &case.viewer,
-                    &candidate,
-                    case.placement,
-                ));
-                if outcome(&gate) != outcome(&fold) {
-                    diverged.push(format!(
-                        "{level:?} {kind:?} {} with {:?} failed:\n  gate {gate:?}\n  fold {fold:?}",
-                        case.name,
-                        failed.iter().collect::<Vec<Hydrator>>()
                     ));
+                    if outcome(&gate) != outcome(&fold) {
+                        diverged.push(format!(
+                            "{level:?} {kind:?} {} with {:?} failed:\n  gate {gate:?}\n  fold {fold:?}",
+                            case.name,
+                            failed.iter().collect::<Vec<Hydrator>>()
+                        ));
+                    }
                 }
             }
-        }
-    }
+            diverged
+        })
+        .collect();
     assert!(
         diverged.is_empty(),
         "{} evaluation(s) left the outcome of one severity-sorted fold:\n{}",

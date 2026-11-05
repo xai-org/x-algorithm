@@ -1,5 +1,5 @@
 use crate::hydration::Hydrators;
-use crate::models::{Notice, Verdict};
+use crate::models::Verdict;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -16,7 +16,7 @@ pub enum Effect {
     DuplicateEngagementReason,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Bucket {
     Withholding,
     Media,
@@ -25,19 +25,12 @@ pub(super) enum Bucket {
 
 impl Bucket {
     fn relied_on_by(self, verdict: &Verdict) -> bool {
-        let notice = match verdict {
-            Verdict::Withheld(_) => return matches!(self, Self::Withholding),
-            Verdict::Fosnr(notice) => &notice.value,
+        let terminal = match verdict {
+            Verdict::Withheld(decided) => decided.value.kind(),
+            Verdict::Fosnr(decided) => decided.value.kind(),
             Verdict::Shown { .. } => return true,
         };
-        match self {
-            Self::Withholding => true,
-            Self::Media => match notice {
-                Notice::SoftIntervention(_) => true,
-                Notice::Appealable { .. } => false,
-            },
-            Self::Engagement => false,
-        }
+        self <= terminal.bucket()
     }
 }
 

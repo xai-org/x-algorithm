@@ -13,6 +13,7 @@ pub use tweet::{
     ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, ReactionContext,
     TweetFeatures,
 };
+pub(crate) use verdict::VerdictAction;
 pub use verdict::{
     Decided, Deletion, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,

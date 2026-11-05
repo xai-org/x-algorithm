@@ -5,6 +5,7 @@ use crate::models::{
     PublicInterest, SafetyLabelMap, SafetyLabelType, TombstoneReason, ViewerProfile, Withholding,
 };
 use crate::params::CountryList;
+use crate::rules::action_kind::ActionKind;
 use crate::rules::RuleContext;
 use engine::{Engine, Fold, PostEngine};
 use features::{In, TweetSafetyLabels};
@@ -137,6 +138,7 @@ pub(crate) enum RuleId {
     LimitRepliesMyNetwork,
     LimitRepliesCo,
     CommunityTweetViewerRemoved,
+    DynamicProductAd,
     LocalTweet,
     ReadOnlyViewer,
 
@@ -484,18 +486,6 @@ pub(super) const fn legacy_nsfw_interstitial<E: Engine>() -> RuleAction<E> {
 
 #[cfg(test)]
 impl<E: Engine> ActionSpec<E> {
-    pub(super) const fn kind_and_slot(&self) -> (&'static str, &'static str) {
-        match self {
-            ActionSpec::Appealable(_) => ("appealable", "fosnr"),
-            ActionSpec::Drop(_) => ("drop", "withholding"),
-            ActionSpec::Tombstone(_) => ("tombstone", "withholding"),
-            ActionSpec::MediaRestriction(_) => ("media restriction", "media"),
-            ActionSpec::SoftIntervention(_) => ("soft intervention", "fosnr"),
-            ActionSpec::LimitedEngagement(_) => ("limited engagement", "engagement"),
-            ActionSpec::LabelInterstitial(_) => ("label interstitial", "label-interstitial"),
-        }
-    }
-
     pub(super) fn spelled(&self) -> String {
         match self {
             ActionSpec::Drop(reason) => format!("{reason:?}"),
@@ -599,15 +589,15 @@ impl<E: Fold> ActionSpec<E> {
 }
 
 impl<E: Engine> ActionSpec<E> {
-    pub(super) const fn severity(&self) -> u8 {
+    pub(super) const fn kind(&self) -> ActionKind {
         match self {
-            Self::Appealable(_) => 18,
-            Self::Drop(_) => 17,
-            Self::Tombstone(_) => 16,
-            Self::LabelInterstitial(_) => 11,
-            Self::MediaRestriction(_) => 10,
-            Self::SoftIntervention(_) => 8,
-            Self::LimitedEngagement(_) => 6,
+            Self::Appealable(_) => ActionKind::Appealable,
+            Self::Drop(_) => ActionKind::Drop,
+            Self::Tombstone(_) => ActionKind::Tombstone,
+            Self::LabelInterstitial(_) => ActionKind::LabelInterstitial,
+            Self::MediaRestriction(_) => ActionKind::MediaRestriction,
+            Self::SoftIntervention(_) => ActionKind::SoftIntervention,
+            Self::LimitedEngagement(_) => ActionKind::LimitedEngagement,
         }
     }
 }
@@ -976,5 +966,44 @@ mod tests {
             let check = Predicate::Request(ClientHas(switch));
             assert_eq!(check.truth(&context), Truth::True, "{switch:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_fosnr_label_an_agent_applied_reads_from_twemcache_as_not_proactive() {
+        use crate::models::{Evaluation, Placement};
+        use crate::rules::fixtures::{appealed, AUTHOR_ID};
+        use crate::rules::{RuleEngine, SafetyLevel};
+        use xai_safety_label_source::testing::FakeLabels;
+
+        let captured = std::fs::read(crate::pinned::crate_path(
+            "tests/fixtures/twemcache_agent_fosnr.mval",
+        ))
+        .unwrap();
+        let mut post = candidate().build();
+        let labels = FakeLabels::default()
+            .cached(post.post.tweet_id, captured)
+            .into_source()
+            .get(&[post.post.tweet_id])
+            .await
+            .remove(&post.post.tweet_id)
+            .and_then(Result::ok)
+            .expect("twemcache holds the post's labels");
+        post.post.safety_labels = SafetyLabelMap::from_proto_label_types(&labels);
+
+        assert_eq!(
+            RuleEngine::for_tests().evaluate(
+                SafetyLevel::TimelineHomeHydration,
+                &viewer(AUTHOR_ID),
+                &post,
+                Placement::Standalone,
+            ),
+            Evaluation::complete(appealed(
+                AppealablePolicy::VIOLENT_SPEECH,
+                3,
+                false,
+                false,
+                "fosnr_author/appealable",
+            ))
+        );
     }
 }

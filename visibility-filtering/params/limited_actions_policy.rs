@@ -131,8 +131,8 @@ mod tests {
     use LimitedEngagementReason::{
         BlockedViewer, CommunityTweetCommunityDeleted, CommunityTweetCommunityNotFound,
         CommunityTweetCommunitySuspended, CommunityTweetHidden, CommunityTweetMemberRemoved,
-        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, NonCompliant, ReadonlyViewer,
-        RootAuthorBlockedViewer, StaleTweet,
+        CommunityTweetViewerRemoved, ConversationControl, DynamicProductAd, LocalTweet,
+        NonCompliant, ReadonlyViewer, RootAuthorBlockedViewer, StaleTweet,
     };
 
     fn copy_naming_namespaces<'a>(
@@ -305,6 +305,20 @@ mod tests {
                 CommunityTweetViewerRemoved,
                 Some("ViewerIsRemovedFromCommunity"),
                 vec![T::Reply, T::PinToProfile],
+            ),
+            (
+                DynamicProductAd,
+                None,
+                vec![
+                    T::Reply,
+                    T::Retweet,
+                    T::QuoteTweet,
+                    T::ShareTweetVia,
+                    T::SendViaDm,
+                    T::CopyLink,
+                    T::AddToBookmarks,
+                    T::Like,
+                ],
             ),
             (LocalTweet, Some("LocalPost"), vec![T::Retweet, T::Reply]),
         ];

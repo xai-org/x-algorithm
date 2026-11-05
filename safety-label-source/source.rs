@@ -1,17 +1,18 @@
 use quanta::Clock;
 use quick_cache::sync::Cache;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
-use super::metrics::{self, BatchStage, CacheResult, CacheTier, LabelMetrics};
-use super::remote::{LookupError, LookupResults, RemoteLabels};
+use super::dragonfly::LabelCacheSwitches;
+use super::metrics::{self, BatchStage, CacheResult, CacheTier, LabelMetrics, OutageResult};
+use super::remote::{FailureKind, LookupError, LookupResults, RemoteLabels};
 
 const TTL: Duration = Duration::from_secs(10);
 
-fn tweet_timestamp_ms(tweet_id: u64) -> u64 {
+pub(crate) fn tweet_timestamp_ms(tweet_id: u64) -> u64 {
     const SNOWFLAKE_EPOCH_MS: u64 = 1288834974657;
     const SNOWFLAKE_TIMESTAMP_SHIFT: u32 = 22;
     (tweet_id >> SNOWFLAKE_TIMESTAMP_SHIFT) + SNOWFLAKE_EPOCH_MS
@@ -23,7 +24,7 @@ fn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {
         .is_none_or(|created_at| created_at > now)
 }
 
-fn system_unix_ms() -> i64 {
+pub(crate) fn system_unix_ms() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
@@ -38,7 +39,10 @@ fn label_is_live(expires_at_msec: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
-fn drop_expired_labels(map: &vf_pb::SafetyLabelMap, now_ms: i64) -> vf_pb::SafetyLabelMap {
+pub(crate) fn drop_expired_labels(
+    map: &vf_pb::SafetyLabelMap,
+    now_ms: i64,
+) -> vf_pb::SafetyLabelMap {
     vf_pb::SafetyLabelMap {
         labels: map
             .labels
@@ -72,7 +76,7 @@ impl SafetyLabelSource {
         Self::with_clock(remote, cache_capacity, Clock::new(), metrics)
     }
 
-    fn with_clock(
+    pub(crate) fn with_clock(
         remote: Arc<dyn RemoteLabels>,
         cache_capacity: Option<usize>,
         clock: Clock,
@@ -120,11 +124,14 @@ impl SafetyLabelSource {
         let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
             FxHashMap::with_capacity_and_hasher(total, Default::default());
 
-        let (local_misses, expired) = self.get_local(ids, &mut results);
-        let batch_size = local_misses.len();
+        let (local_misses, stale) = self.get_local(ids, &mut results);
+        let (batch_size, expired) = (local_misses.len(), stale.len());
 
-        let remote_results = self.remote.get(&local_misses).await;
-        self.backfill_local(remote_results, &mut results);
+        let remote_results = self.remote.get(&local_misses, &stale).await;
+        let unavailable = self.backfill_local(remote_results, &mut results);
+        if !unavailable.is_empty() {
+            self.serve_outage(unavailable, &mut results);
+        }
 
         self.emit_stats(total - batch_size, batch_size, expired);
 
@@ -147,16 +154,37 @@ impl SafetyLabelSource {
         results
     }
 
+        pub fn set_label_cache_switches(&self, switches: LabelCacheSwitches) {
+        self.remote.set_switches(switches);
+    }
+
+            fn serve_outage(
+        &self,
+        unavailable: Vec<u64>,
+        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+    ) {
+        let total = unavailable.len();
+        let mut stale = 0;
+        for tweet_id in unavailable {
+            if let Some(entry) = self.cache.as_ref().and_then(|cache| cache.peek(&tweet_id)) {
+                results.insert(tweet_id, Ok(entry.labels));
+                stale += 1;
+            }
+        }
+        metrics::record_outage_keys(&self.metrics, OutageResult::Stale, stale);
+        metrics::record_outage_keys(&self.metrics, OutageResult::Failed, total - stale);
+    }
+
     fn get_local(
         &self,
         ids: &[u64],
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-    ) -> (Vec<u64>, usize) {
+    ) -> (Vec<u64>, FxHashSet<u64>) {
         let Some(cache) = &self.cache else {
-            return (ids.to_vec(), 0);
+            return (ids.to_vec(), FxHashSet::default());
         };
         let mut misses = Vec::with_capacity(ids.len());
-        let mut expired = 0;
+        let mut expired = FxHashSet::default();
         for &tweet_id in ids {
             let now = self.clock.now();
             match cache.get(&tweet_id) {
@@ -164,7 +192,7 @@ impl SafetyLabelSource {
                     results.insert(tweet_id, Ok(entry.labels));
                 }
                 Some(_) => {
-                    expired += 1;
+                    expired.insert(tweet_id);
                     misses.push(tweet_id);
                 }
                 None => misses.push(tweet_id),
@@ -173,13 +201,19 @@ impl SafetyLabelSource {
         (misses, expired)
     }
 
-    fn backfill_local(
+        fn backfill_local(
         &self,
         remote_results: LookupResults,
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-    ) {
+    ) -> Vec<u64> {
         let wall_now = SystemTime::now();
+        let mut unavailable = Vec::new();
         for (id, result) in remote_results {
+            if let Err(failure) = &result
+                && failure.kind == FailureKind::LabelCacheUnavailable
+            {
+                unavailable.push(id);
+            }
             let result = result.map(Arc::new);
             if let Some(cache) = &self.cache
                 && let Ok(label_map) = &result
@@ -195,6 +229,7 @@ impl SafetyLabelSource {
             }
             results.insert(id, result);
         }
+        unavailable
     }
 
     fn emit_stats(&self, hits: usize, batch_size: usize, expired: usize) {
@@ -240,12 +275,14 @@ mod tests {
 
     #[async_trait]
     impl RemoteLabels for FakeRemote {
-        async fn get(&self, ids: &[u64]) -> LookupResults {
+        async fn get(&self, ids: &[u64], _stale: &FxHashSet<u64>) -> LookupResults {
             self.fetched_keys.fetch_add(ids.len(), Ordering::SeqCst);
             ids.iter()
                 .filter_map(|id| self.results.get(id).map(|result| (*id, result.clone())))
                 .collect()
         }
+
+        fn set_switches(&self, _switches: LabelCacheSwitches) {}
     }
 
     fn proto_label(expires_at_msec: Option<i64>) -> vf_pb::SafetyLabel {

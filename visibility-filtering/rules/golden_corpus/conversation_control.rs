@@ -188,6 +188,26 @@ pub(super) fn rows() -> Vec<Row> {
             )],
         },
         Row {
+            name: "dynamic_product_ad_by_invitation_conversation",
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::DYNAMIC_PRODUCT_AD)
+                    .with_conversation_control(controlled_root(ByInvitation))
+                    .build(),
+            ),
+            expect: vec![(
+                Role::NonFollower,
+                limited_for(
+                    &[
+                        LimitedEngagementReason::ConversationControl,
+                        LimitedEngagementReason::DynamicProductAd,
+                    ],
+                    "limit_replies_by_invitation/limited_engagement/conversation_control",
+                ),
+            )],
+            at: vec![],
+        },
+        Row {
             name: "by_invitation_reply",
             subject: Subject::Post(controlled_candidate(conversation_control(
                 ByInvitation,
