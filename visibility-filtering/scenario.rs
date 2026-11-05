@@ -5,7 +5,8 @@ use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unres
 use crate::metrics::{Endpoint, Metrics, RequestLevel, RequestMetrics, RetweetSources};
 use crate::models::{
     ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
-    RequestViewer, RetweetMerge, SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
+    RequestFacts, RequestViewer, RetweetMerge, SafetyLabelType, TweetFeatures, TweetId,
+    ViewerFeatures,
 };
 use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
@@ -195,8 +196,10 @@ impl<S: Sources + 'static> Scenario<S> {
 
     fn request(&self, raw: &[RawCandidate]) -> PostBatch {
         PostBatch {
-            viewer: RequestViewer::new(self.viewer_id, self.country_code.clone()),
-            client_capability: self.client_capability,
+            facts: RequestFacts::new(
+                RequestViewer::new(self.viewer_id, self.country_code.clone()),
+                self.client_capability,
+            ),
             safety_level: self.level,
             candidates: raw
                 .iter()

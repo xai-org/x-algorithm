@@ -21,7 +21,6 @@ use xai_x_rpc::xds_channel_factory::XdsChannelFactory;
 const CONFIG_PATH: &str = "/config/dark-traffic/dark_traffic.yaml";
 
 pub const MIRROR_NAMESPACE: &str = "visibility";
-pub const STAGING_APP_ENV: &str = "staging";
 pub const DEVEL_APP_ENV: &str = "devel";
 pub const MIRROR_PORT_ID: &str = "grpc";
 pub const MIRROR_WORKLOAD_PREFIX: &str = "xai-vf-service";
@@ -30,10 +29,7 @@ const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Li
 const LDS_MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 const LDS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CHANNEL_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub fn staging_tls_domain(dc: &str) -> String {
-    format!("visibility.visibility-filtering-service.staging.{dc}.s2s.twttr.net")
-}
+const MAX_DESTINATIONS: usize = 3;
 
 pub fn devel_tls_domain(dc: &str) -> String {
     format!("visibility.xai-vf-service.devel.{dc}.s2s.twttr.net")
@@ -44,25 +40,22 @@ pub type DarkLayer = Either<DarkTrafficLayer, tower::layer::util::Identity>;
 pub fn parse_mirror_listener(listener_name: &str) -> Option<EndpointInfo> {
     let dest = listener_name.rsplit('/').next().unwrap_or(listener_name);
     let dest = dest.split('?').next().unwrap_or(dest);
-    let (workload, app_env) = [STAGING_APP_ENV, DEVEL_APP_ENV]
-        .into_iter()
-        .find_map(|app_env| {
-            let suffix = format!(".{app_env}.{MIRROR_NAMESPACE}:{MIRROR_PORT_ID}");
-            dest.strip_suffix(&suffix)
-                .map(|workload| (workload, app_env))
-        })?;
+    let workload = dest.strip_suffix(&format!(
+        ".{DEVEL_APP_ENV}.{MIRROR_NAMESPACE}:{MIRROR_PORT_ID}"
+    ))?;
     if !workload.starts_with(MIRROR_WORKLOAD_PREFIX) || workload.contains('.') {
         return None;
     }
-    let name = if app_env == STAGING_APP_ENV {
-        workload.to_string()
-    } else {
-        format!("{workload}.{app_env}")
-    };
     Some(EndpointInfo {
-        name,
+        name: format!("{workload}.{DEVEL_APP_ENV}"),
         xds_dest: dest.to_string(),
     })
+}
+
+fn cap_destinations(mut endpoints: Vec<EndpointInfo>) -> (Vec<EndpointInfo>, Vec<EndpointInfo>) {
+    endpoints.sort_by(|a, b| a.name.cmp(&b.name));
+    let dropped = endpoints.split_off(endpoints.len().min(MAX_DESTINATIONS));
+    (endpoints, dropped)
 }
 
 struct XdsMirrorDiscovery {
@@ -129,15 +122,23 @@ impl XdsMirrorDiscovery {
             "none of {} LDS resources decoded as Listener",
             response.resources.len()
         );
-        let endpoints: Vec<EndpointInfo> = names
-            .iter()
-            .filter_map(|name| parse_mirror_listener(name))
-            .collect();
+        let (endpoints, dropped) = cap_destinations(
+            names
+                .iter()
+                .filter_map(|name| parse_mirror_listener(name))
+                .collect(),
+        );
 
+        if !dropped.is_empty() {
+            tracing::warn!(
+                dropped = %dropped.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "),
+                "dark_traffic: more than {MAX_DESTINATIONS} devel destinations; mirroring to the first by name"
+            );
+        }
         if endpoints.is_empty() {
             tracing::warn!(
                 listeners = names.len(),
-                "dark_traffic: no staging or devel listeners matched"
+                "dark_traffic: no devel listeners matched"
             );
         } else {
             info!(
@@ -150,20 +151,12 @@ impl XdsMirrorDiscovery {
     }
 }
 
-struct MirrorChannelFactory {
-    staging: XdsChannelFactory,
-    devel: XdsChannelFactory,
-}
+struct MirrorChannelFactory(XdsChannelFactory);
 
 #[async_trait::async_trait]
 impl ChannelFactory for MirrorChannelFactory {
     async fn create_channel(&self, ep: &EndpointInfo) -> anyhow::Result<Channel> {
-        let factory = if ep.xds_dest.contains(&format!(".{DEVEL_APP_ENV}.")) {
-            &self.devel
-        } else {
-            &self.staging
-        };
-        tokio::time::timeout(CHANNEL_CREATE_TIMEOUT, factory.create_channel(ep))
+        tokio::time::timeout(CHANNEL_CREATE_TIMEOUT, self.0.create_channel(ep))
             .await
             .with_context(|| format!("channel dial timed out for {}", ep.xds_dest))?
     }
@@ -200,16 +193,14 @@ pub fn resolve_layer() -> DarkLayer {
     let discovery = XdsMirrorDiscovery {
         server_uri: format!("http://frontend.kube-discovery.prod.svc.{dc}.kube.int-x.ai:8082"),
     };
-    let staging_domain = staging_tls_domain(&dc);
     let devel_domain = devel_tls_domain(&dc);
-    info!(staging_domain, devel_domain, "dark_traffic: enabled");
+    info!(devel_domain, "dark_traffic: enabled");
 
     #[expect(clippy::expect_used, reason = "startup fail-fast: TLS is required")]
     let tls = TlsMode::mtls_from_env().expect("S2S TLS config required");
-    let factory = MirrorChannelFactory {
-        staging: XdsChannelFactory::new(tls.clone().with_domain_override(&staging_domain)),
-        devel: XdsChannelFactory::new(tls.with_domain_override(&devel_domain)),
-    };
+    let factory = MirrorChannelFactory(XdsChannelFactory::new(
+        tls.with_domain_override(&devel_domain),
+    ));
 
     let channels = DynamicChannelManager::new(Arc::new(factory), Arc::new(discovery));
 
@@ -265,13 +256,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_vf_staging_and_devel_listeners() {
+    fn parse_accepts_only_vf_devel_listeners() {
         for (listener, workload, xds_dest) in [
-            (
-                "xai-vf-service.staging.visibility:grpc",
-                "xai-vf-service",
-                "xai-vf-service.staging.visibility:grpc",
-            ),
             (
                 "xai-vf-service.devel.visibility:grpc",
                 "xai-vf-service.devel",
@@ -287,16 +273,6 @@ mod tests {
                 "xai-vf-service-pr-123.devel",
                 "xai-vf-service-pr-123.devel.visibility:grpc",
             ),
-            (
-                "xai-vf-service-user1-foo.staging.visibility:grpc",
-                "xai-vf-service-user1-foo",
-                "xai-vf-service-user1-foo.staging.visibility:grpc",
-            ),
-            (
-                "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service.staging.visibility:grpc?key=val",
-                "xai-vf-service",
-                "xai-vf-service.staging.visibility:grpc",
-            ),
         ] {
             let ep = parse_mirror_listener(listener).expect(listener);
             assert_eq!(ep.name, workload);
@@ -307,20 +283,60 @@ mod tests {
     #[test]
     fn parse_rejects_out_of_scope_listeners() {
         for name in [
+            "xai-vf-service.staging.visibility:grpc",
+            "xai-vf-service-user1-foo.staging.visibility:grpc",
+            "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service.staging.visibility:grpc?key=val",
             "xai-vf-service.prod.visibility:grpc",
             "xai-vf-service.development.visibility:grpc",
             "xai-vf-service.staging-devel.visibility:grpc",
             "xai-vf-service.devel-staging.visibility:grpc",
             "xai-vf-service.devel.visibility:grpc-extra",
             "xai-vf-service.devel.visibility:grpc.other",
-            "other-svc.staging.visibility:grpc",
-            "xai-vf-service.staging.other:grpc",
-            "xai-vf-service.staging.visibility:metrics",
-            "evil.xai-vf-service.staging.visibility:grpc",
-            "xai-vf-service.staging.visibility",
+            "other-svc.devel.visibility:grpc",
+            "xai-vf-service.devel.other:grpc",
+            "xai-vf-service.devel.visibility:metrics",
+            "evil.xai-vf-service.devel.visibility:grpc",
+            "xai-vf-service.devel.visibility",
             "",
         ] {
             assert!(parse_mirror_listener(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn mirror_keeps_the_first_three_destinations_by_name() {
+        let devel = |workload: &str| {
+            parse_mirror_listener(&format!("{workload}.devel.visibility:grpc")).expect(workload)
+        };
+        let names = |endpoints: &[EndpointInfo]| {
+            endpoints.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+        };
+        let (kept, dropped) = cap_destinations(
+            [
+                "xai-vf-service-d",
+                "xai-vf-service",
+                "xai-vf-service-b",
+                "xai-vf-service-a",
+                "xai-vf-service-c",
+            ]
+            .map(devel)
+            .into(),
+        );
+        assert_eq!(
+            names(&kept),
+            [
+                "xai-vf-service-a.devel",
+                "xai-vf-service-b.devel",
+                "xai-vf-service-c.devel"
+            ]
+        );
+        assert_eq!(
+            names(&dropped),
+            ["xai-vf-service-d.devel", "xai-vf-service.devel"]
+        );
+
+        let (kept, dropped) = cap_destinations(vec![devel("xai-vf-service")]);
+        assert_eq!(names(&kept), ["xai-vf-service.devel"]);
+        assert!(dropped.is_empty());
     }
 }

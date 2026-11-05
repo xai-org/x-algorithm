@@ -17,6 +17,7 @@ use crate::source::SafetyLabelSource;
 #[derive(Default)]
 pub struct FakeLabels {
     labels: HashMap<u64, Vec<(SafetyLabelType, SafetyLabel)>>,
+    cached: HashMap<u64, Vec<u8>>,
     not_found: HashSet<u64>,
     failing: HashSet<u64>,
 }
@@ -28,6 +29,12 @@ impl FakeLabels {
             .entry(tweet_id)
             .or_default()
             .push((label_type, label));
+        self
+    }
+
+    #[must_use]
+    pub fn cached(mut self, tweet_id: u64, mval: Vec<u8>) -> Self {
+        self.cached.insert(tweet_id, mval);
         self
     }
 
@@ -62,11 +69,20 @@ impl CacheRead for FakeLabels {
             .iter()
             .filter_map(|&id| cache_key(id).ok())
             .collect();
+        let cached: HashMap<Key, &Vec<u8>> = self
+            .cached
+            .iter()
+            .filter_map(|(&id, mval)| Some((cache_key(id).ok()?, mval)))
+            .collect();
         let answer = |key: &Key| {
-            if !not_found.contains(key) {
+            let value = if not_found.contains(key) {
+                cached_value_not_found()
+            } else if let Some(mval) = cached.get(key) {
+                cached_value_found(mval)
+            } else {
                 return Ok(None);
-            }
-            cached_value_not_found()
+            };
+            value
                 .map(Some)
                 .map_err(|e| KVCacheError::Client(e.to_string()))
         };
@@ -106,6 +122,14 @@ fn raw_label(label_type: SafetyLabelType, label: &SafetyLabel) -> thrift::Result
     Ok(RawSafetyLabel {
         lkey: encode_lkey(label_type),
         mval: mval(label)?,
+    })
+}
+
+fn cached_value_found(mval: &[u8]) -> thrift::Result<Vec<u8>> {
+    xai_x_thrift::serialize_binary(&CachedValue {
+        value: Some(mval.to_vec()),
+        status: Some(CachedValueStatus::FOUND),
+        ..Default::default()
     })
 }
 

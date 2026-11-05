@@ -1,9 +1,11 @@
+use super::edges::edge_key;
 use super::key_origin::PairKey;
 use super::{RequestRow, Store};
 use crate::hydration::fetcher::{AnyFetcher, Fetcher};
-use crate::hydration::hydrator::UserPair;
+use crate::hydration::hydrator::{EdgeKey, UserPair};
 use crate::hydration::inventory::classify;
 use crate::hydration::relation::{quoting_author, Related};
+use crate::hydration::sources::source;
 use crate::hydration::{candidate_count_by_key, Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
 use crate::models::{AuthorId, EdgeSet, Quote, QuoteLink, TweetId};
 use rustc_hash::FxHashMap;
@@ -12,7 +14,6 @@ use xai_core_entities::entities::QuotedTweet;
 #[derive(Default)]
 pub(super) struct Quotes {
     entries: Vec<QuoteEntry>,
-    pub(super) quoted_tweets: Fetcher<QuotedTweet>,
 }
 
 impl Quotes {
@@ -20,10 +21,7 @@ impl Quotes {
         let mut entries = entries.to_vec();
         entries.sort_unstable();
         entries.dedup();
-        Self {
-            entries,
-            ..Self::default()
-        }
+        Self { entries }
     }
 
     pub(super) fn outer_of(&self, inner: TweetId) -> Option<TweetId> {
@@ -33,20 +31,24 @@ impl Quotes {
             .map(|quote| quote.outer)
     }
 
-    pub(super) fn quoted_author(&self, inner: TweetId) -> Result<AuthorId, Cause> {
+    pub(super) fn quoted_author(
+        &self,
+        quoted_tweets: &Fetcher<QuotedTweet>,
+        inner: TweetId,
+    ) -> Result<AuthorId, Cause> {
         let quotes = || {
             self.entries
                 .iter()
                 .filter(move |quote| quote.inner == inner)
         };
         let named = quotes().find_map(|quote| {
-            self.quoted_tweets
+            quoted_tweets
                 .get(quote.outer.0)
                 .filter(|quoted| quoted.tweet_id == inner.0 && quoted.user_id != 0)
         });
         match named {
             Some(quoted) => Ok(AuthorId(quoted.user_id)),
-            None if quotes().any(|quote| self.quoted_tweets.is_incomplete(quote.outer.0)) => {
+            None if quotes().any(|quote| quoted_tweets.is_incomplete(quote.outer.0)) => {
                 Err(Cause::Failed)
             }
             None => Err(Cause::NotFound),
@@ -80,7 +82,9 @@ impl Store {
     }
 
     fn quoting_author(&self, outer: TweetId) -> Option<AuthorId> {
-        self.pure_cores.request().get(outer.0).map(quoting_author)
+        self.request_fetcher::<source::TesPureCoreData>()
+            .get(outer.0)
+            .map(quoting_author)
     }
 
     pub(super) fn quote_pair(
@@ -118,11 +122,15 @@ impl Store {
     pub(super) fn claim_quote_pairs(&mut self, nodes: Hydrators) -> Vec<(u64, Vec<u64>)> {
         let mut claimed: Vec<(u64, Vec<u64>)> = Vec::new();
         for node in nodes.iter() {
-            let pairs = self.asked_pairs(node);
+            let edges = self
+                .asked_pairs(node)
+                .into_iter()
+                .filter_map(|pair| edge_key(node, pair))
+                .collect();
             let Some(fetcher) = self.edge_fetcher_mut(node) else {
                 continue;
             };
-            for pair in fetcher.claim(pairs) {
+            for pair in fetcher.claim(edges).into_iter().map(|edge| edge.pair) {
                 match claimed.last_mut() {
                     Some((source, destinations)) if *source == pair.source => {
                         destinations.push(pair.destination);
@@ -171,11 +179,12 @@ impl Store {
             .iter()
             .filter(|node| node.is_quote_pair_edge())
         {
-            let Some(fetcher) = self.edge_fetcher(node) else {
+            let (Some(fetcher), Some(edge)) = (self.edge_fetcher(node), node.edge()) else {
                 continue;
             };
             let holds = match self.pair_key(node, parent, outer) {
-                PairKey::Asked(asked) => {
+                PairKey::Asked(pair) => {
+                    let asked = EdgeKey { edge, pair };
                     if classify(self.stake(node), fetcher.answer(asked)).fails_node() {
                         failed = failed.with(node);
                     }

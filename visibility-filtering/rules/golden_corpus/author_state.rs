@@ -1,10 +1,8 @@
 use super::{Role, Row, Subject};
 use crate::models::{AuthorFeatures, PostCandidate, SafetyLabelType, Verdict};
 use crate::rules::fixtures::{allow, appealed, author_candidate, candidate, dropped};
-use crate::rules::SafetyLevel;
 use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
+    TimelineHome, TimelineHomeHydration, TimelineHomePromotedHydration,
 };
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::AppealablePolicy;
@@ -18,9 +16,8 @@ fn fosnr_post(set: fn(&mut AuthorFeatures)) -> PostCandidate {
         .build()
 }
 
-fn author_appeals() -> Vec<(SafetyLevel, Role, Verdict)> {
+fn author_appeals() -> Vec<(Role, Verdict)> {
     vec![(
-        TimelineHomeHydration,
         Role::Author,
         appealed(
             AppealablePolicy::HATEFUL_CONDUCT,
@@ -39,31 +36,17 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(author_candidate(|a| a.is_suspended = true)),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
                 ),
+                (Role::Author, allow()),
+            ],
+            at: vec![
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
                 (
-                    TimelineHome,
-                    Role::Follower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
-                ),
-                (TimelineHome, Role::Author, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::Follower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
-                ),
-                (TimelineHomeHydration, Role::Author, allow()),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+                    TimelineHomePromotedHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    allow(),
                 ),
             ],
         },
@@ -79,18 +62,11 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_media()
                     .build(),
             ),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
-                ),
-            ],
+            expect: vec![(
+                Role::NonFollower,
+                dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+            )],
+            at: vec![],
         },
         Row {
             name: "suspended_author_bounced_post",
@@ -104,57 +80,25 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::NonFollower,
                 dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
             )],
+            at: vec![],
         },
         Row {
             name: "deactivated_author",
             subject: Subject::Post(author_candidate(|a| a.is_deactivated = true)),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::AuthorIsDeactivated,
                         "deactivated_author/drop",
                     ),
                 ),
-                (
-                    TimelineHome,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorIsDeactivated,
-                        "deactivated_author/drop",
-                    ),
-                ),
-                (TimelineHome, Role::Author, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorIsDeactivated,
-                        "deactivated_author/drop",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorIsDeactivated,
-                        "deactivated_author/drop",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorIsDeactivated,
-                        "deactivated_author/drop",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "suspended_and_deactivated_author",
@@ -162,7 +106,8 @@ pub(super) fn rows() -> Vec<Row> {
                 a.is_suspended = true;
                 a.is_deactivated = true;
             })),
-            expect: vec![
+            expect: vec![],
+            at: vec![
                 (
                     TimelineHome,
                     Role::NonFollower,
@@ -183,132 +128,47 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(author_candidate(|a| a.is_erased = true)),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::AuthorAccountIsInactive,
                         "erased_author/drop/inactive",
                     ),
                 ),
-                (
-                    TimelineHome,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "erased_author/drop/inactive",
-                    ),
-                ),
-                (TimelineHome, Role::Author, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "erased_author/drop/inactive",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "erased_author/drop/inactive",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "erased_author/drop/inactive",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "offboarded_author",
             subject: Subject::Post(author_candidate(|a| a.is_offboarded = true)),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::AuthorAccountIsInactive,
                         "offboarded_author/drop/inactive",
                     ),
                 ),
-                (
-                    TimelineHome,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "offboarded_author/drop/inactive",
-                    ),
-                ),
-                (TimelineHome, Role::Author, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::Follower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "offboarded_author/drop/inactive",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "offboarded_author/drop/inactive",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::AuthorAccountIsInactive,
-                        "offboarded_author/drop/inactive",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![(TimelineHomePromotedHydration, Role::NonFollower, allow())],
         },
         Row {
             name: "protected_author",
             subject: Subject::Post(author_candidate(|a| a.is_protected = true)),
             expect: vec![
                 (
-                    TimelineHome,
-                    Role::NonFollower,
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
                     dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
                 ),
-                (TimelineHome, Role::Follower, allow()),
-                (TimelineHome, Role::Author, allow()),
+                (Role::each([Role::Follower, Role::Author]), allow()),
+            ],
+            at: vec![
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
                 (
-                    TimelineHome,
-                    Role::LoggedOut,
-                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
-                ),
-                (TimelineHomeHydration, Role::Follower, allow()),
-                (TimelineHomeHydration, Role::Author, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::LoggedOut,
-                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+                    TimelineHomePromotedHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    allow(),
                 ),
             ],
         },
@@ -316,26 +176,31 @@ pub(super) fn rows() -> Vec<Row> {
             name: "suspended_author_fosnr_label",
             subject: Subject::Post(fosnr_post(|a| a.is_suspended = true)),
             expect: author_appeals(),
+            at: vec![],
         },
         Row {
             name: "deactivated_author_fosnr_label",
             subject: Subject::Post(fosnr_post(|a| a.is_deactivated = true)),
             expect: author_appeals(),
+            at: vec![],
         },
         Row {
             name: "erased_author_fosnr_label",
             subject: Subject::Post(fosnr_post(|a| a.is_erased = true)),
             expect: author_appeals(),
+            at: vec![],
         },
         Row {
             name: "offboarded_author_fosnr_label",
             subject: Subject::Post(fosnr_post(|a| a.is_offboarded = true)),
             expect: author_appeals(),
+            at: vec![],
         },
         Row {
             name: "protected_author_fosnr_label",
             subject: Subject::Post(fosnr_post(|a| a.is_protected = true)),
             expect: author_appeals(),
+            at: vec![],
         },
     ]
 }

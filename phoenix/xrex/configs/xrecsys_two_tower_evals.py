@@ -4,13 +4,14 @@ from xrex.configs import config_registry
 from xrex.data.retrieval_dataset import RetrievalDataset
 from xrex.eval.eval_utils import EvalModule
 from xrex.eval.recsys_eval import RecsysTwoTowerEval
-from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig, blend_heads
 
 
-def _slot_weights(head_names: list[str], head: str) -> tuple[float, float] | None:
-    if "ld" not in head_names:
+def _slot_weights(head_names: list[str], head: str) -> tuple[float, ...] | None:
+    blended = blend_heads(head_names)
+    if not blended:
         return None
-    return (0.0, 1.0) if head == "ld" else (1.0, 0.0)
+    return (float(head not in blended), *(float(name == head) for name in blended))
 
 
 def build_evals(mparams, dataset, has_user_features_token) -> list[EvalModule]:
@@ -110,24 +111,24 @@ def build_evals(mparams, dataset, has_user_features_token) -> list[EvalModule]:
             )
         )
 
-    if "ld" in head_names:
-        ld_positive_actions = mparams.get(
-            "ld_positive_actions",
-            RecsysTwoTowerModelConfig.__dataclass_fields__["ld_positive_actions"].default_factory(),
-        )
-        ld_eval = RecsysTwoTowerEval(
+    for head in blend_heads(head_names):
+        positives = f"{head}_positive_actions"
+        head_eval = RecsysTwoTowerEval(
             max_steps=1,
-            positive_actions=ld_positive_actions,
+            positive_actions=mparams.get(
+                positives,
+                RecsysTwoTowerModelConfig.__dataclass_fields__[positives].default_factory(),
+            ),
             implicit_negative_actions=soft_negative_actions,
             explicit_negative_actions=hard_negative_actions,
             candidate_seq_len=mparams["candidate_seq_len"],
             target_dataset_type=target_dataset_type,
-            query_head_weights=_slot_weights(head_names, "ld"),
+            query_head_weights=_slot_weights(head_names, head),
         )
         evals.append(
             EvalModule(
-                eval_name="recsys_two_tower_ld_eval",
-                eval_conf=ld_eval,
+                eval_name=f"recsys_two_tower_{head}_eval",
+                eval_conf=head_eval,
                 eval_bs_per_device=eval_bs,
                 eval_seq_len=home_eval_seq_len,
                 eval_dataset=dataset,

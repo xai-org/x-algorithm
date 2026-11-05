@@ -1,7 +1,7 @@
 use super::{Role, Row, Subject};
 use crate::models::SafetyLabelType;
 use crate::rules::fixtures::{allow, blurred, candidate, dropped, sensitive_opt_in_viewer};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomePromotedHydration};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::InterstitialReason;
 
@@ -33,13 +33,19 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
                     .build(),
             ),
-            expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, adult()),
-                (TimelineHomeHydration, Role::Follower, adult()),
-                (TimelineHomeHydration, Role::LoggedOut, adult()),
-                (TimelineHomeHydration, Role::Author, adult()),
-                (TimelineHomeHydration, nsfw_view(), adult()),
+            expect: vec![(
+                Role::each([
+                    Role::NonFollower,
+                    Role::Follower,
+                    Role::LoggedOut,
+                    Role::Author,
+                    nsfw_view(),
+                ]),
+                adult(),
+            )],
+            at: vec![
                 (TimelineHome, Role::NonFollower, allow()),
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
             ],
         },
         Row {
@@ -52,7 +58,8 @@ pub(super) fn rows() -> Vec<Row> {
                     ])
                     .build(),
             ),
-            expect: vec![(TimelineHomeHydration, Role::NonFollower, adult())],
+            expect: vec![(Role::NonFollower, adult())],
+            at: vec![],
         },
         Row {
             name: "gore_post_reacting_to_adult_post",
@@ -62,7 +69,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
                     .build(),
             ),
-            expect: vec![(TimelineHomeHydration, Role::NonFollower, adult())],
+            expect: vec![(Role::NonFollower, adult())],
+            at: vec![],
         },
         Row {
             name: "reaction_to_protected_author_post",
@@ -72,12 +80,13 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_protected_reacted_to_author()
                     .build(),
             ),
-            expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, protected()),
-                (TimelineHomeHydration, Role::Follower, protected()),
-                (TimelineHomeHydration, Role::Author, protected()),
-                (TimelineHomeHydration, nsfw_view(), protected()),
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Follower, Role::Author, nsfw_view()]),
+                protected(),
+            )],
+            at: vec![
                 (TimelineHome, Role::NonFollower, allow()),
+                (TimelineHomePromotedHydration, Role::NonFollower, allow()),
             ],
         },
         Row {
@@ -89,11 +98,11 @@ pub(super) fn rows() -> Vec<Row> {
                     ])
                     .build(),
             ),
-            expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, gore()),
-                (TimelineHomeHydration, Role::Author, gore()),
-                (TimelineHomeHydration, nsfw_view(), gore()),
-            ],
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Author, nsfw_view()]),
+                gore(),
+            )],
+            at: vec![],
         },
     ]
 }

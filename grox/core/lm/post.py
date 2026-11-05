@@ -42,6 +42,7 @@ class PostRenderer:
         cards_note_override: str | None = None,
         include_follower_count: bool = False,
         include_bio: bool = False,
+        include_media_tags: bool = False,
     ) -> list[Content]:
         indent_str = ">" + (" " * indent) if indent > 0 else ""
         res = []
@@ -67,6 +68,11 @@ class PostRenderer:
             reply_handles = get_replies_handle_string(post)
             res.append(f"\n{indent_str}Replying to: {reply_handles}")
         res.append(f"\n{indent_str}Text: {formatted_text}")
+        tagged = [
+            f"@{u.handle}" for u in post.media_tag_mentioned_users or [] if u.handle
+        ]
+        if include_media_tags and tagged:
+            res.append(f"\n{indent_str}Media tagged accounts: {' '.join(tagged)}")
         urls = [url for url in post.urls or [] if url]
         if urls:
             res.append(f"\n{indent_str}The Post contains these URLs: {', '.join(urls)}")

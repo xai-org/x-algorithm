@@ -121,6 +121,7 @@ fn phoenix_scores_proto(s: &PhoenixScores) -> pb::PhoenixScores {
         quoted_vqv_score: s.quoted_vqv_score,
         post_unexplored_score: s.post_unexplored_score,
         post_video_score: s.post_video_score,
+        grok_analyze_score: s.grok_analyze_score,
         home_video_continuation_secs: s.home_video_continuation_secs,
         home_profile_visit_secs: s.home_profile_visit_secs,
     }

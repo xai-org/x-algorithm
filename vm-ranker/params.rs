@@ -106,6 +106,12 @@ param!(
     0.0
 );
 param!(
+    GrokAnalyzeWeight,
+    f64,
+    "rust_home_mixer_grok_analyze_weight",
+    0.0
+);
+param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",

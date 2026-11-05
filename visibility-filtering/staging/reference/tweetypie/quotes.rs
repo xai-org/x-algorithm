@@ -1,12 +1,12 @@
 use super::{
-    BatchOutcome, Compared, Lens, TWEETYPIE_TIMEOUT, TpResult, TweetypieReference, get_tweet_fields,
+    get_tweet_fields, BatchOutcome, Compared, Lens, TpResult, TweetypieReference, TWEETYPIE_TIMEOUT,
 };
 use crate::models::viewer::Client;
 use crate::models::{EvaluationKey, Placement, RequestViewer, TweetId};
 use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
-use crate::result_label::{Class, NONE, label};
-use crate::rules::{QuoteEntries, SafetyLevel};
+use crate::result_label::{label, Class, NONE};
+use crate::rules::SafetyLevel;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -33,7 +33,7 @@ impl Lens {
 }
 
 impl TweetypieReference {
-    pub(in crate::staging::reference) fn spawn_quote_comparison(
+    pub(in crate::staging::reference) fn spawn_entry_comparison(
         self: &Arc<Self>,
         viewer: &RequestViewer,
         safety_level: SafetyLevel,
@@ -43,7 +43,10 @@ impl TweetypieReference {
         let Some(viewer_id) = viewer.id() else {
             return;
         };
-        let Some(quotes) = quote_comparisons(safety_level, outcomes, quote_passes) else {
+        if !self.sample.selects(viewer_id, outcomes) {
+            return;
+        }
+        let Some(entries) = entry_comparisons(safety_level, outcomes, quote_passes) else {
             return;
         };
         let client = TwitterContextViewer {
@@ -56,32 +59,31 @@ impl TweetypieReference {
         let country_code = viewer.country_code().map(str::to_owned);
         self.detach(move |reference| async move {
             reference
-                .compare_quotes(viewer_id, country_code, client, quotes)
+                .compare_entries(viewer_id, country_code, client, entries)
                 .await
         });
     }
 
-    async fn compare_quotes(
+    async fn compare_entries(
         &self,
         viewer_id: u64,
         country_code: Option<String>,
         client: TwitterContextViewer,
-        quotes: QuoteComparisons,
+        entries: EntryComparisons,
     ) -> BatchOutcome {
         let Ok(tp) = timeout(
             TWEETYPIE_TIMEOUT,
-            get_tweet_fields(&self.tweetypie, &client, &quotes.outers),
+            get_tweet_fields(&self.tweetypie, &client, &entries.fetched),
         )
         .await
         else {
             return BatchOutcome::TweetypieTimeout;
         };
-        let by_outer: HashMap<TweetId, &TpResult> =
-            quotes.outers.iter().copied().zip(&tp).collect();
-        let answers: Vec<(&Served, TpResult)> = quotes
+        let by_id: HashMap<TweetId, &TpResult> = entries.fetched.iter().copied().zip(&tp).collect();
+        let answers: Vec<(&Served, TpResult)> = entries
             .served
             .iter()
-            .filter_map(|served| Some((served, served.lens.answer(by_outer.get(&served.outer)?))))
+            .filter_map(|served| Some((served, served.lens.answer(by_id.get(&served.fetched)?))))
             .collect();
         self.record(answers.iter().map(|(served, tp)| Compared {
             lens: served.lens,
@@ -98,80 +100,88 @@ impl TweetypieReference {
 
 struct Served {
     lens: Lens,
-    outer: TweetId,
+    fetched: TweetId,
     outcome: PostEvaluation,
     pass: Option<QuotePass>,
 }
 
-struct QuoteComparisons {
-    outers: Vec<TweetId>,
+struct EntryComparisons {
+    fetched: Vec<TweetId>,
     served: Vec<Served>,
 }
 
-fn quote_comparisons(
+fn entry_comparisons(
     safety_level: SafetyLevel,
     outcomes: &[PostEvaluation],
     quote_passes: &[QuotePass],
-) -> Option<QuoteComparisons> {
-    if !matches!(
-        safety_level.spec().quote_entries(),
-        QuoteEntries::Judged { .. }
-    ) {
-        return None;
+) -> Option<EntryComparisons> {
+    match safety_level {
+        SafetyLevel::TimelineHomeHydration => {}
+        SafetyLevel::FilterAll
+        | SafetyLevel::TimelineHome
+        | SafetyLevel::TimelineHomeRecommendations
+        | SafetyLevel::TimelineHomePromotedHydration
+        | SafetyLevel::ImmersiveExpandedRecommendations
+        | SafetyLevel::QuotedTweetRules
+        | SafetyLevel::NotificationsFollow
+        | SafetyLevel::NotificationsWriterV2 => return None,
     }
-    let mut outers = Vec::new();
-    for outcome in outcomes {
-        if let Placement::InnerQuoted { outer } = outcome.placement
-            && !outers.contains(&outer)
-        {
-            outers.push(outer);
-        }
-    }
-    if outers.is_empty() {
-        return None;
-    }
+    let outers: HashSet<TweetId> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome.placement {
+            Placement::InnerQuoted { outer } => Some(outer),
+            Placement::Standalone | Placement::RetweetSource => None,
+        })
+        .collect();
     let passes: HashMap<EvaluationKey, &QuotePass> =
         quote_passes.iter().map(|pass| (pass.key, pass)).collect();
     let mut seen = HashSet::new();
+    let mut fetched = Vec::new();
     let mut served = Vec::new();
     for outcome in outcomes {
-        let (lens, outer) = match outcome.placement {
+        let (lens, id) = match outcome.placement {
             Placement::InnerQuoted { outer } => (Lens::InnerQuoted, outer),
             Placement::Standalone if outers.contains(&outcome.tweet_id) => {
                 (Lens::Outer, outcome.tweet_id)
             }
-            Placement::Standalone | Placement::RetweetSource => continue,
+            Placement::Standalone => (Lens::Standalone, outcome.tweet_id),
+            Placement::RetweetSource => continue,
         };
         if !seen.insert(outcome.key()) {
             continue;
+        }
+        if !fetched.contains(&id) {
+            fetched.push(id);
         }
         let pass = passes.get(&outcome.key()).map(|&pass| pass.clone());
         if let Some(pass) = &pass {
             served.push(Served {
                 lens: Lens::QuotePass,
-                outer,
+                fetched: id,
                 outcome: outcome.clone(),
                 pass: Some(pass.clone()),
             });
         }
         served.push(Served {
             lens,
-            outer,
+            fetched: id,
             outcome: outcome.clone(),
             pass,
         });
     }
-    Some(QuoteComparisons { outers, served })
+    (!served.is_empty()).then_some(EntryComparisons { fetched, served })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{compared, counted, outcome, pair, shown};
-    use super::super::{tp_failed, tp_result};
+    use super::super::tests::{compared, counted, outcome, pair};
+    use super::super::{tp_failed, tp_result, SAFETY_LEVEL};
     use super::*;
+    use crate::hydration::{Hydrators, Lookup};
     use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};
     use crate::quote::{PassOutcome, Rerendered};
     use crate::result_label::Failure;
+    use crate::rules::fixtures::allow;
     use crate::rules::{RerenderReason, RuleId};
     use strum::VariantArray;
     use xai_strato::strato_thrift::StratoResult;
@@ -237,14 +247,14 @@ mod tests {
         };
         let vf = PostEvaluation {
             placement: Placement::InnerQuoted { outer: TweetId(7) },
-            ..outcome(shown())
+            ..outcome(allow())
         };
         let muted = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::ViewerMutesAuthor)),
             id: RuleId::QuotedViewerMutesAuthorNotFollowing,
             by: "quoted_viewer_mutes_author_not_following/drop",
         }));
-        let allowed = Evaluation::complete(shown());
+        let allowed = Evaluation::complete(allow());
         let pass = |author| QuotePass {
             key: vf.key(),
             outcome: PassOutcome::Passed,
@@ -273,13 +283,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_a_level_82_request_with_a_quote_entry_compares_each_entry_once_against_its_outer() {
-        let entry = |tweet_id, placement| PostEvaluation {
+    fn entry(tweet_id: u64, placement: Placement) -> PostEvaluation {
+        PostEvaluation {
             tweet_id: TweetId(tweet_id),
             placement,
-            ..outcome(shown())
-        };
+            ..outcome(allow())
+        }
+    }
+
+    #[test]
+    fn only_a_level_82_request_compares_each_entry_once_in_one_fetch() {
         let quoting = |outer| Placement::InnerQuoted {
             outer: TweetId(outer),
         };
@@ -288,60 +301,119 @@ mod tests {
             entry(1, quoting(10)),
             entry(3, Placement::Standalone),
             entry(1, quoting(10)),
+            entry(4, Placement::RetweetSource),
             entry(2, quoting(20)),
         ];
         let selected = |level, outcomes: &[PostEvaluation]| {
-            quote_comparisons(level, outcomes, &[]).map(|quotes| {
-                let served: Vec<_> = quotes
+            entry_comparisons(level, outcomes, &[]).map(|entries| {
+                let served: Vec<_> = entries
                     .served
                     .iter()
-                    .map(|served| (served.lens, served.outer.0, served.outcome.tweet_id.0))
+                    .map(|served| (served.lens, served.fetched.0, served.outcome.tweet_id.0))
                     .collect();
-                (quotes.outers, served)
+                (entries.fetched, served)
             })
         };
         assert_eq!(
-            selected(SafetyLevel::TimelineHomeHydration, &request),
+            selected(SAFETY_LEVEL, &request),
             Some((
-                vec![TweetId(10), TweetId(20)],
+                vec![TweetId(10), TweetId(3), TweetId(20)],
                 vec![
                     (Lens::Outer, 10, 10),
                     (Lens::InnerQuoted, 10, 1),
+                    (Lens::Standalone, 3, 3),
                     (Lens::InnerQuoted, 20, 2),
                 ]
             ))
         );
         for &level in SafetyLevel::VARIANTS {
-            if !matches!(level.spec().quote_entries(), QuoteEntries::Judged { .. }) {
+            if level != SAFETY_LEVEL {
                 assert!(selected(level, &request).is_none(), "{level:?}");
             }
         }
-        assert!(selected(SafetyLevel::TimelineHomeHydration, &request[..1]).is_none());
+        assert_eq!(
+            selected(SAFETY_LEVEL, &request[2..3]),
+            Some((vec![TweetId(3)], vec![(Lens::Standalone, 3, 3)]))
+        );
         let passes = [QuotePass {
             key: request[1].key(),
             outcome: PassOutcome::Passed,
             author: None,
         }];
-        let lenses: Vec<_> =
-            quote_comparisons(SafetyLevel::TimelineHomeHydration, &request, &passes)
-                .unwrap()
-                .served
-                .iter()
-                .map(|served| {
-                    (
-                        served.lens,
-                        served.outcome.tweet_id.0,
-                        served.pass.is_some(),
-                    )
-                })
-                .collect();
+        let lenses: Vec<_> = entry_comparisons(SAFETY_LEVEL, &request, &passes)
+            .unwrap()
+            .served
+            .iter()
+            .map(|served| {
+                (
+                    served.lens,
+                    served.outcome.tweet_id.0,
+                    served.pass.is_some(),
+                )
+            })
+            .collect();
         assert_eq!(
             lenses,
             [
                 (Lens::Outer, 10, false),
                 (Lens::QuotePass, 1, true),
                 (Lens::InnerQuoted, 1, true),
+                (Lens::Standalone, 3, false),
                 (Lens::InnerQuoted, 2, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_withheld_partial_or_failed_served_entry_is_compared() {
+        let suspended = Verdict::Withheld(Decided {
+            value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
+            by: "suspended_author/drop",
+        });
+        let request = [
+            PostEvaluation {
+                evaluation: Evaluation::complete(suspended),
+                ..entry(1, Placement::Standalone)
+            },
+            PostEvaluation {
+                evaluation: Evaluation::Partial {
+                    verdict: allow(),
+                    fail_open_defaults: Hydrators::empty(),
+                },
+                ..entry(2, Placement::Standalone)
+            },
+            PostEvaluation {
+                evaluation: Evaluation::Failed(Lookup::Author),
+                ..entry(3, Placement::Standalone)
+            },
+        ];
+        let entries = entry_comparisons(SafetyLevel::TimelineHomeHydration, &request, &[]).unwrap();
+        assert_eq!(entries.fetched, [TweetId(1), TweetId(2), TweetId(3)]);
+        let tp = TpResult {
+            label: pair("allow", NONE),
+            result: None,
+            strato_error: None,
+            quoted: None,
+        };
+        let vf: Vec<_> = entries
+            .served
+            .iter()
+            .map(|served| {
+                Compared {
+                    lens: served.lens,
+                    ..compared(&tp, Some(&served.outcome))
+                }
+                .bucket()
+                .vf
+            })
+            .collect();
+        assert_eq!(
+            vf,
+            [
+                pair("drop", "author_is_suspended"),
+                pair("failed", NONE),
+                pair("failed", NONE),
             ]
         );
     }
@@ -356,7 +428,7 @@ mod tests {
         };
         let inner = PostEvaluation {
             placement: Placement::InnerQuoted { outer: TweetId(7) },
-            ..outcome(shown())
+            ..outcome(allow())
         };
         let suspended = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),

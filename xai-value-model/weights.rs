@@ -25,6 +25,7 @@ pub struct ValueModelWeights {
     pub post_unexplored: f64,
     pub post_unexplored_include_out_of_network: bool,
     pub post_video: f64,
+    pub grok_analyze: f64,
     pub not_interested: f64,
     pub block_author: f64,
     pub mute_author: f64,
@@ -67,6 +68,7 @@ impl ValueModelWeights {
             + self.follow_author
             + self.post_unexplored
             + self.post_video
+            + self.grok_analyze
     }
 
     pub fn negative_sum(&self) -> f64 {
@@ -109,7 +111,7 @@ impl ValueModelWeights {
         self
     }
 
-    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 29] {
+    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 30] {
         [
             ("favorite", &mut self.favorite),
             ("reply", &mut self.reply),
@@ -135,6 +137,7 @@ impl ValueModelWeights {
             ("follow_author", &mut self.follow_author),
             ("post_unexplored", &mut self.post_unexplored),
             ("post_video", &mut self.post_video),
+            ("grok_analyze", &mut self.grok_analyze),
             ("not_interested", &mut self.not_interested),
             ("block_author", &mut self.block_author),
             ("mute_author", &mut self.mute_author),
@@ -166,6 +169,7 @@ impl ValueModelWeights {
                 ("post_unexplored", self.post_unexplored),
                 ("pdwell", self.post_unexplored),
                 ("post_video", self.post_video),
+                ("grok_analyze", self.grok_analyze),
                 ("not_interested", self.not_interested),
                 ("block_author", self.block_author),
                 ("mute_author", self.mute_author),

@@ -74,8 +74,7 @@ fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
         .copied()
         .collect();
     (!quotes.is_empty()).then(|| PostBatch {
-        viewer: request.viewer.clone(),
-        client_capability: request.client_capability,
+        facts: request.facts.clone(),
         safety_level: SafetyLevel::QuotedTweetRules,
         candidates: quotes,
         retweet_merge: RetweetMerge::Unmerged,
@@ -125,9 +124,12 @@ impl QuotePassRunner {
     ) -> (Vec<PostEvaluation>, PendingPass) {
         let pending = PendingPass {
             level: request.safety_level,
-            authors: match self.mode {
-                QuotePassMode::Off => None,
-                QuotePassMode::Shadow => quoted_authors(&request),
+            authors: match (self.mode, request.safety_level.spec().quote_entries()) {
+                (QuotePassMode::Shadow, QuoteEntries::JudgedWithQuotePass { .. }) => {
+                    quoted_authors(&request)
+                }
+                (QuotePassMode::Off, _)
+                | (QuotePassMode::Shadow, QuoteEntries::NotJudged | QuoteEntries::Judged) => None,
             },
             metrics: metrics.at_level(SafetyLevel::QuotedTweetRules),
         };
@@ -232,7 +234,7 @@ fn pass(
     match outer {
         None => return PassOutcome::OuterAbsent,
         Some(Evaluation::Complete {
-            verdict: Verdict::Shown { .. },
+            verdict: Verdict::Fosnr(_) | Verdict::Shown { .. },
             ..
         }) => {}
         Some(
@@ -275,7 +277,7 @@ fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
             ..
         } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),
         Evaluation::Complete {
-            verdict: Verdict::Shown { .. },
+            verdict: Verdict::Fosnr(_) | Verdict::Shown { .. },
             ..
         } => PassOutcome::Passed,
         Evaluation::Partial { .. }
@@ -286,7 +288,7 @@ fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
 }
 
 fn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {
-    let QuoteEntries::Judged { rerenders } = level.spec().quote_entries() else {
+    let QuoteEntries::JudgedWithQuotePass { rerenders } = level.spec().quote_entries() else {
         return None;
     };
     let &(_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;
@@ -322,7 +324,7 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeFrom, EdgeQuery, Graph};
     use crate::evaluate_tweets::EntryComparator;
     use crate::hydration::fallback_cache::FallbackCaches;
-    use crate::hydration::inventory::Source;
+    use crate::hydration::sources::Source;
     use crate::hydration::sources::{suspended, Fault, InMemorySources};
     use crate::hydration::tweet_fallback_cache;
     use crate::hydration::Relation;
@@ -364,6 +366,7 @@ mod tests {
     }
 
     struct Served {
+        level: ThriftLevel,
         wire: Wire,
         compared: UnboundedReceiver<Passes>,
         recording: Arc<Recording>,
@@ -385,6 +388,7 @@ mod tests {
                 metrics,
             );
             Self {
+                level: ThriftLevel::TIMELINE_HOME_HYDRATION,
                 wire,
                 compared,
                 recording,
@@ -398,7 +402,7 @@ mod tests {
         ) -> Vec<Outcome> {
             self.wire
                 .send(vf_pb::EvaluateTweetsRequest {
-                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
+                    safety_level: self.level.0,
                     viewer_id,
                     tweets,
                 })
@@ -760,6 +764,26 @@ mod tests {
             undecided.is_empty(),
             "quoted_tweet_rules rules no quote entry rerenders: {undecided:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_level_124_quote_entry_keeps_its_own_verdict_and_runs_no_pass() {
+        let world = Arc::new(world().user(QUOTED_AUTHOR, protected()));
+        let mut served = Served::new(
+            Arc::clone(&world),
+            FallbackCaches::default(),
+            QuotePassRunner::new(QuotePassMode::Shadow),
+        );
+        served.level = ThriftLevel::TIMELINE_HOME_PROMOTED_HYDRATION;
+        let outcomes = served.outcomes(Some(VIEWER), quote_with_outer()).await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::ResultStateThriftCompact(_))),
+            "{outcomes:?}"
+        );
+        assert_eq!(served.compared().await, Passes::Skipped);
+        assert!(world.starts(QUOTE_PAIRS).is_empty());
     }
 
     #[test]

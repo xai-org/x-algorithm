@@ -1,8 +1,11 @@
 use crate::models::query::ScoredPostsQuery;
+use crate::params::EnableAdsHistoryXdcCacheWrite;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::async_trait;
-use xai_ad_index_history::{build_history_record, UserAdHistoryCacheStore, UserAdHistoryStore};
+use xai_ad_index_history::{
+    build_history_record, UserAdHistoryCacheStore, UserAdHistoryStore, WriteScope,
+};
 use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_home_mixer_proto::feed_item::Item as FeedItemKind;
@@ -47,6 +50,11 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ServedAdHistoryCacheSideEffect {
         input: Arc<SideEffectInput<ScoredPostsQuery, FeedItem>>,
     ) -> Result<(), String> {
         let query = &input.query;
+        let scope = if query.params.get(EnableAdsHistoryXdcCacheWrite) {
+            WriteScope::LocalAndPeer
+        } else {
+            WriteScope::LocalOnly
+        };
         let ads = ads_in_feed(&input.selected_candidates);
         if ads.is_empty() {
             return Ok(());
@@ -54,11 +62,12 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ServedAdHistoryCacheSideEffect {
 
         let record = build_history_record(query.request_id as i64, ads)?;
         self.store
-            .put_user_value(
+            .put_user_value_scoped(
                 query.user_id as i64,
                 query.request_time_ms,
                 record,
                 AD_HISTORY_CACHE_TTL,
+                scope,
             )
             .await
             .map_err(|e| format!("ad history cache write failed: {}", e.message()))

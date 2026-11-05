@@ -15,7 +15,7 @@ pub mod tweet_source;
 
 use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, ClientCapability, Deletion, EdgeSet, Placement, PostCandidate, Quote, RawCandidate,
+    AuthorId, Deletion, EdgeSet, Placement, PostCandidate, Quote, RawCandidate, RequestFacts,
     RetweetMerge, TweetId, UserCandidate, UserEntity, ViewerFeatures,
 };
 pub(crate) use decode::author::AuthorNotFound;
@@ -35,7 +35,7 @@ use std::time::Duration;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);
-pub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(300);
+pub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);
 
 pub(crate) fn request_context(
@@ -53,9 +53,7 @@ pub(crate) fn request_context(
 }
 
 pub(crate) struct HydrationRequest<'a> {
-    viewer_id: Option<u64>,
-    country_code: Option<String>,
-    client_capability: ClientCapability,
+    facts: RequestFacts,
     raw_candidates: Vec<RawCandidate>,
     users: Vec<AuthorId>,
     quotes: Vec<QuoteEntry>,
@@ -72,18 +70,14 @@ pub(crate) struct QuoteEntry {
 
 impl<'a> HydrationRequest<'a> {
     pub(crate) fn new(
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        client_capability: ClientCapability,
+        facts: RequestFacts,
         raw_candidates: Vec<RawCandidate>,
         retweet_merge: RetweetMerge,
         fallback_caches: &'a FallbackCaches,
         metrics: &'a RequestMetrics,
     ) -> Self {
         Self {
-            viewer_id,
-            country_code,
-            client_capability,
+            facts,
             raw_candidates,
             users: Vec::new(),
             quotes: Vec::new(),
@@ -94,7 +88,7 @@ impl<'a> HydrationRequest<'a> {
     }
 
     pub(crate) fn for_users(
-        viewer_id: u64,
+        facts: RequestFacts,
         users: Vec<AuthorId>,
         fallback_caches: &'a FallbackCaches,
         metrics: &'a RequestMetrics,
@@ -102,9 +96,7 @@ impl<'a> HydrationRequest<'a> {
         Self {
             users,
             ..Self::new(
-                Some(viewer_id),
-                None,
-                ClientCapability::default(),
+                facts,
                 Vec::new(),
                 RetweetMerge::Unmerged,
                 fallback_caches,

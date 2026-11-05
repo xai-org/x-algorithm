@@ -1,6 +1,7 @@
 use crate::hydration::batch::{Hydrated, HydrationBatch};
-use crate::hydration::inventory::{Answer, Source};
+use crate::hydration::inventory::Answer;
 use crate::hydration::relation::Relation;
+use crate::hydration::sources::Source;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;

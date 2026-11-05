@@ -3,6 +3,7 @@ use super::{RequestRow, RowSubject, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::UserPair;
 use crate::hydration::relation::Related;
+use crate::hydration::sources::source;
 use crate::hydration::{Cause, Hydrator, Hydrators, RequestRows};
 use crate::models::{AuthorId, ClientSwitch, RetweetMerge, TweetId};
 use std::fmt;
@@ -144,7 +145,7 @@ impl KeyOrigin {
                 also_reads: NOTHING,
                 names: Names::Viewer,
                 needs_viewer: true,
-                keyed_by: KeyedBy::Request(|store| store.viewer_id),
+                keyed_by: KeyedBy::Request(|store| store.facts.viewer_id()),
             },
             K::PureCoreAuthor => Spec {
                 label: "author",
@@ -189,7 +190,7 @@ impl KeyOrigin {
                 needs_viewer: false,
                 keyed_by: KeyedBy::Row(|store, row| {
                     store
-                        .tweets
+                        .request_fetcher::<source::TesTweetForVisibility>()
                         .get(row.tweet_id()?.0)?
                         .exclusive_conversation_author_id
                 }),
@@ -202,7 +203,7 @@ impl KeyOrigin {
                 needs_viewer: false,
                 keyed_by: KeyedBy::Row(|store, row| {
                     store
-                        .tweets
+                        .request_fetcher::<source::TesTweetForVisibility>()
                         .get(row.tweet_id()?.0)?
                         .article_id
                         .map(NonZeroU64::get)
@@ -274,8 +275,7 @@ impl KeyOrigin {
                 needs_viewer: false,
                 keyed_by: KeyedBy::Related(|store, root| {
                     store
-                        .pure_cores
-                        .of(store.owner(H::ConversationRootPost))
+                        .fetcher_of::<source::TesPureCoreData>(store.owner(H::ConversationRootPost))
                         .get(root.tweet_id.0)
                         .map(|core| core.author_id.get())
                 }),
@@ -288,7 +288,8 @@ impl KeyOrigin {
                 needs_viewer: true,
                 keyed_by: KeyedBy::Row(|store, row| {
                     store
-                        .viewer_id
+                        .facts
+                        .viewer_id()
                         .filter(|_| store.control(row).is_some_and(lists_countries))
                 }),
             },
@@ -325,7 +326,7 @@ impl KeyOrigin {
                         .community_post(row)
                         .filter(|post| {
                             store
-                                .community_moderations
+                                .request_fetcher::<source::CommunityModeration>()
                                 .get(post.tweet_id)
                                 .is_some_and(|moderation| moderation.is_moderated())
                         })
@@ -340,12 +341,13 @@ impl KeyOrigin {
                 needs_viewer: true,
                 keyed_by: KeyedBy::Row(|store, row| {
                     store
-                        .tweets
+                        .request_fetcher::<source::TesTweetForVisibility>()
                         .get(row.tweet_id()?.0)?
                         .community_id
                         .filter(|_| {
                             store
-                                .client_capability
+                                .facts
+                                .client_capability()
                                 .has(ClientSwitch::CommunityViewerRemovedLimits)
                         })
                         .map(NonZeroU64::get)
@@ -358,7 +360,10 @@ impl KeyOrigin {
                 names: Names::Related,
                 needs_viewer: false,
                 keyed_by: KeyedBy::Row(|store, row| {
-                    store.tweets.get(row.tweet_id()?.0)?.trusted_friends_list_id
+                    store
+                        .request_fetcher::<source::TesTweetForVisibility>()
+                        .get(row.tweet_id()?.0)?
+                        .trusted_friends_list_id
                 }),
             },
             K::NarrowcastPlace => Spec {
@@ -368,7 +373,10 @@ impl KeyOrigin {
                 names: Names::Related,
                 needs_viewer: false,
                 keyed_by: KeyedBy::Row(|store, row| {
-                    store.tweets.get(row.tweet_id()?.0)?.narrowcast_place_id
+                    store
+                        .request_fetcher::<source::TesTweetForVisibility>()
+                        .get(row.tweet_id()?.0)?
+                        .narrowcast_place_id
                 }),
             },
             K::QuotedAuthorToQuotingAuthor => Spec {
@@ -394,7 +402,7 @@ impl KeyOrigin {
                 needs_viewer: false,
                 keyed_by: KeyedBy::Quote(|store, parent, outer| {
                     store.quote_pair(parent, outer, |quoted, quoting| {
-                        let authors = store.authors.request();
+                        let authors = store.request_fetcher::<source::GizmoduckAuthor>();
                         match authors
                             .get(quoted.get())
                             .filter(|_| !authors.is_incomplete(quoted.get()))
@@ -561,7 +569,7 @@ fn lists_countries(control: &ConversationControl) -> bool {
 impl Store {
     pub(super) fn key(&self, origin: KeyOrigin, row: &RequestRow) -> Option<u64> {
         let spec = origin.spec();
-        if spec.needs_viewer && self.viewer_id.is_none() {
+        if spec.needs_viewer && self.facts.viewer_id().is_none() {
             return None;
         }
         match spec.keyed_by {
@@ -585,7 +593,7 @@ impl Store {
 
     pub(super) fn related_key(&self, origin: KeyOrigin, related: Related) -> Option<u64> {
         let spec = origin.spec();
-        if spec.needs_viewer && self.viewer_id.is_none() {
+        if spec.needs_viewer && self.facts.viewer_id().is_none() {
             return None;
         }
         match spec.keyed_by {
@@ -596,7 +604,7 @@ impl Store {
 
     pub(super) fn node_keys(&self, node: Hydrator) -> Vec<u64> {
         let spec = self.origin(node).spec();
-        if spec.needs_viewer && self.viewer_id.is_none() {
+        if spec.needs_viewer && self.facts.viewer_id().is_none() {
             return Vec::new();
         }
         match spec.keyed_by {

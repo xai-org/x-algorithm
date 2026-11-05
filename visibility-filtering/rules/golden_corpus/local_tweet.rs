@@ -23,22 +23,21 @@ pub(super) fn rows() -> Vec<Row> {
             "local_tweet/limited_engagement",
         )
     };
-    let hydration = |role, verdict| (TimelineHomeHydration, role, verdict);
     vec![
         Row {
             name: "local_post_viewer_outside_place",
             subject: Subject::Post(local_post().with_edge(OutsideNarrowcastPlace).build()),
             expect: vec![
-                hydration(Role::NonFollower, local()),
-                hydration(Role::Author, allow()),
-                hydration(Role::LoggedOut, allow()),
-                (TimelineHome, Role::NonFollower, allow()),
+                (Role::NonFollower, local()),
+                (Role::each([Role::Author, Role::LoggedOut]), allow()),
             ],
+            at: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "local_post_viewer_in_place",
             subject: Subject::Post(local_post().build()),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "local_post_invited_viewer",
@@ -54,7 +53,8 @@ pub(super) fn rows() -> Vec<Row> {
                     })
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "local_reply_author_outside_place",
@@ -64,7 +64,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(conversation_control(Local, REPLY_ROOT_AUTHOR_ID))
                     .build(),
             ),
-            expect: vec![hydration(Role::Author, local())],
+            expect: vec![(Role::Author, local())],
+            at: vec![],
         },
         Row {
             name: "local_control_without_place",
@@ -74,7 +75,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(Local))
                     .build(),
             ),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "local_post_location_lookup_failed",
@@ -83,7 +85,8 @@ pub(super) fn rows() -> Vec<Row> {
                 candidate.failed = Hydrators::of(OutsideNarrowcastPlace);
                 candidate
             }),
-            expect: vec![hydration(Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "local_post_conversation_control_failed",
@@ -95,7 +98,8 @@ pub(super) fn rows() -> Vec<Row> {
                 candidate.failed = Hydrators::of(Hydrator::ConversationControl);
                 candidate
             }),
-            expect: vec![hydration(Role::Author, local())],
+            expect: vec![(Role::Author, local())],
+            at: vec![],
         },
         Row {
             name: "nsfw_local_post",
@@ -106,7 +110,9 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_edge(OutsideNarrowcastPlace)
                     .build(),
             ),
-            expect: vec![hydration(
+            expect: vec![],
+            at: vec![(
+                TimelineHomeHydration,
                 Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
                 blurred_and_limited(
                     blurred(
@@ -125,7 +131,7 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_conversation_control(controlled_root(ByInvitation))
                     .build(),
             ),
-            expect: vec![hydration(
+            expect: vec![(
                 Role::NonFollower,
                 limited_for(
                     &[
@@ -135,6 +141,7 @@ pub(super) fn rows() -> Vec<Row> {
                     "limit_replies_by_invitation/limited_engagement/conversation_control",
                 ),
             )],
+            at: vec![],
         },
     ]
 }

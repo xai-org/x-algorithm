@@ -19,6 +19,10 @@ use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
 pub const GRPC_PORT: u16 = 50051;
 
+pub fn tls_domain(dc: &str) -> String {
+    format!("visibility.visibility-filtering-service.staging.{dc}.s2s.twttr.net")
+}
+
 const CALL_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Deserialize)]
@@ -313,12 +317,28 @@ impl Case {
 }
 
 fn gate_label(state: &TweetFieldsResultState) -> Label {
-    let (class, reason) = state_label(state);
-    if offers_age_verification(state) {
-        (class, format!("{reason}/age_prompt"))
-    } else {
-        (class, reason)
+    let (class, mut reason) = state_label(state);
+    let mut append = |suffix: &str| {
+        reason = if reason == NONE {
+            suffix.to_string()
+        } else {
+            format!("{reason}/{suffix}")
+        };
+    };
+    if let TweetFieldsResultState::NotFound(not_found) = state {
+        for (bit, name) in [
+            (not_found.deleted, "deleted"),
+            (not_found.bounce_deleted, "bounce_deleted"),
+        ] {
+            if bit == Some(true) {
+                append(name);
+            }
+        }
     }
+    if offers_age_verification(state) {
+        reason = format!("{reason}/age_prompt");
+    }
+    (class, reason)
 }
 
 fn offers_age_verification(state: &TweetFieldsResultState) -> bool {
@@ -368,8 +388,8 @@ fn label_types(labels: &vf_pb::SafetyLabelMap) -> BTreeSet<String> {
 }
 
 impl CaseLine<'_> {
-    pub fn call_failed(&self) -> bool {
-        matches!(self.result, CaseResult::CallFailed { .. })
+    pub fn passed(&self) -> bool {
+        matches!(self.result, CaseResult::Pass { .. })
     }
 }
 
@@ -568,7 +588,6 @@ mod tests {
                 got: case.expect.clone()
             }
         );
-        assert!(!pass.call_failed());
         for (answer, got) in [
             (
                 filtered(FilteredReason::TweetIsBounced(true)),
@@ -627,6 +646,20 @@ mod tests {
     }
 
     #[test]
+    fn a_not_found_labels_its_reason_with_its_set_deletion_bits() {
+        use xai_x_thrift::tweet_service::TweetFieldsResultNotFound;
+        let label = |deleted, bounce_deleted| {
+            gate_label(&TweetFieldsResultState::NotFound(
+                TweetFieldsResultNotFound::new(deleted, bounce_deleted, None),
+            ))
+        };
+        let not_found = |reason: &str| ("not_found".to_string(), reason.to_string());
+        assert_eq!(label(false, false), not_found("none"));
+        assert_eq!(label(true, false), not_found("deleted"));
+        assert_eq!(label(true, true), not_found("deleted/bounce_deleted"));
+    }
+
+    #[test]
     fn judge_labels_a_filter_tweets_action_and_reason() {
         let case = case(None);
         let answer = |kind, reason: Option<vf_pb::filtered_reason::Reason>| {
@@ -668,7 +701,11 @@ mod tests {
             Answer::FilterTweets(Err(anyhow!("deadline exceeded"))),
             Answer::FilterTweets(Ok(vf_pb::VisibilityFilterResponse { results: vec![] })),
         ] {
-            assert!(case.judge(&answer).call_failed());
+            let result = case.judge(&answer).result;
+            assert!(
+                matches!(result, CaseResult::CallFailed { .. }),
+                "{result:?}"
+            );
         }
     }
 
@@ -747,7 +784,11 @@ mod tests {
             answer(vec![], vec![2]),
             Answer::GetSafetyLabels(Err(anyhow!("deadline exceeded"))),
         ] {
-            assert!(case.judge(&failed).call_failed());
+            let result = case.judge(&failed).result;
+            assert!(
+                matches!(result, CaseResult::CallFailed { .. }),
+                "{result:?}"
+            );
         }
     }
 }

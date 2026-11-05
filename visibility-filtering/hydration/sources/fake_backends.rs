@@ -1,21 +1,27 @@
 use super::*;
-use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, Graph};
+use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};
 use crate::clients::strato::answer::{found, no_row, Thrift};
 use crate::clients::{trusted_friends_client, user_devices_client, user_location_client};
-use crate::hydration::fetcher::FetcherId;
-use crate::hydration::inventory::Source;
+use crate::hydration::batch::Hydrated;
+use crate::hydration::community_source::CommunityPost;
+use crate::hydration::decode::viewer::DecodedViewer;
+use crate::hydration::fetcher::Owner;
+use crate::hydration::sources::Source;
+use crate::hydration::tweet_source::TweetState;
 use crate::models::NsfwFeature;
+use crate::models::{ArticleLifecycle, CommunityModeration, TweetFeatures};
 use std::fmt;
 use std::num::NonZeroU64;
 use thrift::protocol::TType;
 use tonic::{Request, Response, Status};
 use tower::util::BoxCloneSyncService;
 use tower::ServiceExt;
+use wingman_client::Exists;
 use xai_core_entities::entities::{
-    ApiCounts, CashtagAttachments, ConversationControlArm, EditControl, EscherbirdEntityAnnotation,
-    ExclusiveTweetControl, GizmoduckAccount, GizmoduckUserResult, MediaEntities, NoteTweet,
-    PCFLabel, PureCoreData, ReactionContext, Safety, TakedownReason, TrustedFriendsControl,
-    UrlEntities, UserResponseState,
+    ApiCounts, CashtagAttachments, ConversationControl, ConversationControlArm, EditControl,
+    EscherbirdEntityAnnotation, ExclusiveTweetControl, GizmoduckAccount, GizmoduckUser,
+    GizmoduckUserResult, MediaEntities, NoteTweet, PCFLabel, PureCoreData, QuotedTweet,
+    ReactionContext, Safety, TakedownReason, TrustedFriendsControl, UrlEntities, UserResponseState,
 };
 use xai_core_entities::gizmoduck_client::{
     GizmoduckClient, LookupContext, MockGizmoduckClient, UserFields, ViewerData,
@@ -25,6 +31,7 @@ use xai_safety_label_source::testing::FakeLabels;
 use xai_strato::strato_proto::rpc_server::{Rpc, RpcServer};
 use xai_strato::strato_proto::{result, Call3, Issue3, ResultList};
 use xai_strato::StratoGrpc;
+use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::entities::ApiMediaEntity;
 use xai_x_thrift::tweet_safety_label::{PerspectivalUser, SafetyLabel, SafetyLabelType};
 use xai_x_thrift::tweets::ApiPerspective;
@@ -683,49 +690,77 @@ fn shown<V: fmt::Debug>(
     shown.join(", ")
 }
 
-async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64>) -> String {
-    let owner = fetcher.owner;
+fn input(fetcher: FetcherId, keys: &[u64]) -> Input<'_> {
+    Input {
+        keys,
+        viewer_id: Some(VIEWER),
+        fields: &[],
+        queries: &[],
+        community_posts: &[],
+        fetcher,
+    }
+}
+
+async fn fetched_by<F: SourceFetch>(
+    sources: &(impl Fetches<F> + ?Sized),
+    input: Input<'_>,
+) -> F::Reply {
+    sources.fetch(&input).await.unwrap()
+}
+
+async fn fetch_shown(
+    sources: &dyn Sources,
+    fetcher: FetcherId,
+    unanswered: &mut Vec<u64>,
+) -> String {
     match fetcher.source {
         Source::TesPureCoreData => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.pure_cores(owner, &keys).await, &keys)
+            let cores = fetched_by::<source::TesPureCoreData>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &cores, &keys)
         }
         Source::TesTweetForVisibility => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.tweets(&keys).await, &keys)
+            let tweets =
+                fetched_by::<source::TesTweetForVisibility>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &tweets, &keys)
         }
         Source::TesConversationControl => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(
-                unanswered,
-                &sources.conversation_controls(&keys).await,
-                &keys,
-            )
+            let controls =
+                fetched_by::<source::TesConversationControl>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &controls, &keys)
         }
         Source::TesQuotedTweet => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.quoted_tweets(&keys).await, &keys)
+            let quoted = fetched_by::<source::TesQuotedTweet>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &quoted, &keys)
         }
         Source::TesTweetState => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.tweet_states(&keys).await, &keys)
+            let states = fetched_by::<source::TesTweetState>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &states, &keys)
         }
         Source::SafetyLabels => {
             let keys = [TWEET, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.safety_labels(owner, &keys).await,
-                &keys,
-            )
+            let labels = fetched_by::<source::SafetyLabels>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &labels, &keys)
         }
         Source::GizmoduckViewer => {
-            let asked = FIELDS
+            let inputs = FIELDS
                 .map(|fields| (VIEWER, fields))
                 .into_iter()
                 .chain([MISSING, FAILED].map(|viewer| (viewer, FIELDS[0])));
             let mut answers = vec![];
-            for (viewer_id, fields) in asked {
-                let viewer = sources.viewer(viewer_id, fields).await.map(|viewer| {
+            for (viewer_id, fields) in inputs {
+                let viewer_ids = [viewer_id];
+                let call_input = Input {
+                    viewer_id: Some(viewer_id),
+                    fields,
+                    ..input(fetcher, &viewer_ids)
+                };
+                let viewer = fetched_by::<source::GizmoduckViewer>(sources, call_input).await;
+                let viewer = viewer.map(|viewer| {
                     let DecodedViewer {
                         profile,
                         has_age_verified_18_label,
@@ -733,30 +768,34 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
                     } = viewer;
                     (profile, has_age_verified_18_label, state)
                 });
-                answers.push(shown(unanswered, &viewer, &[viewer_id]));
+                answers.push(shown(unanswered, &viewer, &viewer_ids));
             }
             answers.join(", ")
         }
         Source::GizmoduckAuthor | Source::GizmoduckActor => {
-            let asked: [&[u64]; 2] = [&[AUTHOR, MISSING, FAILED, ABSENT], &[SUSPENDED_AUTHOR]];
+            let users: [&[u64]; 2] = [&[AUTHOR, MISSING, FAILED, ABSENT], &[SUSPENDED_AUTHOR]];
             let mut answers = vec![];
-            for (users, fields) in asked.into_iter().zip(FIELDS) {
+            for (users, fields) in users.into_iter().zip(FIELDS) {
+                let call_input = || Input {
+                    fields,
+                    ..input(fetcher, users)
+                };
                 answers.push(if fetcher.source == Source::GizmoduckActor {
-                    shown(unanswered, &sources.actors(users, fields).await, users)
+                    let actors = fetched_by::<source::GizmoduckActor>(sources, call_input()).await;
+                    shown(unanswered, &actors, users)
                 } else {
-                    shown(
-                        unanswered,
-                        &sources.users(owner, users, fields).await,
-                        users,
-                    )
+                    let authors =
+                        fetched_by::<source::GizmoduckAuthor>(sources, call_input()).await;
+                    shown(unanswered, &authors, users)
                 });
             }
             answers.join(", ")
         }
         Source::ActorEmails => {
             let keys = [AUTHOR, MISSING];
-            let held = sources.confirmed_emails(&keys).await;
-            let failed = sources.confirmed_emails(&[FAILED]).await;
+            let held = fetched_by::<source::ActorEmails>(sources, input(fetcher, &keys)).await;
+            let failed =
+                fetched_by::<source::ActorEmails>(sources, input(fetcher, &[FAILED])).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &held, &keys),
@@ -765,8 +804,9 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
         }
         Source::ActorPhones => {
             let keys = [AUTHOR, MISSING];
-            let held = sources.verified_phones(&keys).await;
-            let failed = sources.verified_phones(&[FAILED]).await;
+            let held = fetched_by::<source::ActorPhones>(sources, input(fetcher, &keys)).await;
+            let failed =
+                fetched_by::<source::ActorPhones>(sources, input(fetcher, &[FAILED])).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &held, &keys),
@@ -790,7 +830,7 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
                 sourced(Graph::Mutes, FOLLOWER),
             ];
             let mut failed = vec![sourced(Graph::Blocks, FAILED)];
-            let viewer_id = match owner {
+            let viewer_id = match fetcher.owner {
                 Owner::Request => {
                     held.extend(
                         EDGES.map(|(graph, direction, _)| viewer(graph, direction, FOLLOWER)),
@@ -803,10 +843,12 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
             };
             let mut answers = vec![];
             for queries in [held, failed] {
-                let batches = sources
-                    .select_edges(owner, viewer_id, &queries)
-                    .await
-                    .unwrap();
+                let select = Input {
+                    viewer_id,
+                    queries: &queries,
+                    ..input(fetcher, &[])
+                };
+                let batches = fetched_by::<source::Flock>(sources, select).await;
                 for (query, batch) in queries.iter().zip(&batches) {
                     answers.push(shown(unanswered, batch, &query.destination_ids));
                 }
@@ -816,75 +858,74 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
         Source::ViewerCountry => {
             let mut answers = vec![];
             for viewer in [VIEWER, MISSING, FAILED] {
-                answers.push(shown(
-                    unanswered,
-                    &sources.viewer_country(viewer).await,
-                    &[viewer],
-                ));
+                let viewers = [viewer];
+                let call_input = Input {
+                    viewer_id: Some(viewer),
+                    ..input(fetcher, &viewers)
+                };
+                let country = fetched_by::<source::ViewerCountry>(sources, call_input).await;
+                answers.push(shown(unanswered, &country, &viewers));
             }
             answers.join(", ")
         }
         Source::Wingman => {
             let keys = [ROOT, MISSING, FAILED, ABSENT];
-            shown(
-                unanswered,
-                &sources.second_degree(VIEWER, &keys).await,
-                &keys,
-            )
+            let paths = fetched_by::<source::Wingman>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &paths, &keys)
         }
         Source::CommunityModeration => {
             let posts = [TWEET, MISSING, FAILED].map(|tweet_id| CommunityPost { tweet_id, ..POST });
-            let batch = sources.community_moderations(&posts).await;
+            let call_input = Input {
+                community_posts: &posts,
+                ..input(fetcher, &[])
+            };
+            let batch = fetched_by::<source::CommunityModeration>(sources, call_input).await;
             shown(unanswered, &batch, &posts.map(|post| post.tweet_id))
         }
         Source::CommunityModerator => {
             let keys = [COMMUNITY, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.community_moderators(VIEWER, &keys).await,
-                &keys,
-            )
+            let moderators =
+                fetched_by::<source::CommunityModerator>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &moderators, &keys)
         }
         Source::CommunityViewerRemoved => {
             let keys = [COMMUNITY, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.community_viewer_removals(VIEWER, &keys).await,
-                &keys,
-            )
+            let removals =
+                fetched_by::<source::CommunityViewerRemoved>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &removals, &keys)
         }
         Source::ArticleMediaEntities => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.article_media_entities(Some(VIEWER), &keys).await,
-                &keys,
-            )
+            let rows =
+                fetched_by::<source::ArticleMediaEntities>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &rows, &keys)
         }
         Source::ArticleCoverMedia => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.article_cover_media(Some(VIEWER), &keys).await,
-                &keys,
-            )
+            let rows =
+                fetched_by::<source::ArticleCoverMedia>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &rows, &keys)
         }
         Source::ArticleLifecycle => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(unanswered, &sources.article_lifecycles(&keys).await, &keys)
+            let lifecycles =
+                fetched_by::<source::ArticleLifecycle>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &lifecycles, &keys)
         }
         Source::TrustedFriends => {
             let keys = [CIRCLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.trusted_friends(VIEWER, &keys).await,
-                &keys,
-            )
+            let memberships =
+                fetched_by::<source::TrustedFriends>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &memberships, &keys)
         }
         Source::UserLocation => {
             let keys = [PLACE, MISSING];
-            let located = sources.outside_places(VIEWER, &keys).await;
-            let failed = sources.outside_places(FAILED, &[FAILED]).await;
+            let located = fetched_by::<source::UserLocation>(sources, input(fetcher, &keys)).await;
+            let failed = Input {
+                viewer_id: Some(FAILED),
+                ..input(fetcher, &[FAILED])
+            };
+            let failed = fetched_by::<source::UserLocation>(sources, failed).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &located, &keys),
@@ -900,9 +941,9 @@ async fn prod_sources_answer_what_their_backends_hold() {
     let mut wrong = vec![];
     for fetcher in FetcherId::all() {
         let mut unanswered = vec![];
-        let answer = ask(&prod, fetcher, &mut unanswered).await;
-        let expected = ask(&held, fetcher, &mut vec![]).await;
-        if answer != expected || answer == ask(&defaults, fetcher, &mut vec![]).await {
+        let answer = fetch_shown(&prod, fetcher, &mut unanswered).await;
+        let expected = fetch_shown(&held, fetcher, &mut vec![]).await;
+        if answer != expected || answer == fetch_shown(&defaults, fetcher, &mut vec![]).await {
             wrong.push(format!("{fetcher:?}\n  prod {answer}\n  held {expected}"));
         }
         unanswered.retain(|key| ![FAILED, ABSENT].contains(key));

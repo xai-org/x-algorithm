@@ -1,16 +1,13 @@
 use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{
-    ClientCapability, ClientSwitch, SafetyLabelType, ViewerFeatures, ViewerProfile,
+    ClientCapability, ClientSwitch, RequestFacts, SafetyLabelType, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
-    allow, appealed, blurred, candidate, controlled_root, dropped, labeled, noticed, on_client,
+    allow, appealed, blurred, candidate, controlled_root, dropped, fosnr, labeled, on_client,
     viewer, viewer_in_country, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
-};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations};
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
@@ -22,93 +19,66 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(labeled(SafetyLabelType::MALICIOUS_URL)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
                     Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "malicious_url/drop/undesirable",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Author, allow()),
-                (TimelineHome, Role::NonFollower, allow()),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "malicious_url/drop/undesirable",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "nsfw_high_recall_label",
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_HIGH_RECALL)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
                     Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::ContainNsfwMedia,
                         "nsfw_high_recall/drop/nsfw_media",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Author, allow()),
+                (Role::Author, allow()),
             ],
+            at: vec![],
         },
         Row {
             name: "do_not_amplify_label",
             subject: Subject::Post(labeled(SafetyLabelType::DO_NOT_AMPLIFY)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
                     Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "do_not_amplify/drop/undesirable",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Author, allow()),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "do_not_amplify/drop/undesirable",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![],
         },
         Row {
             name: "spam_high_recall_label",
             subject: Subject::Post(labeled(SafetyLabelType::SPAM_HIGH_RECALL)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
                     Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "spam_high_recall/drop/undesirable",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Author, allow()),
-                (TimelineHome, Role::NonFollower, allow()),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "spam_high_recall/drop/undesirable",
-                    ),
-                ),
+                (Role::Author, allow()),
             ],
+            at: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "brazil_election_legal_label",
             subject: Subject::Post(labeled(SafetyLabelType::BRAZIL_ELECTION_LEGAL)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
                     Role::As("in_br", viewer_in_country("br")),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
@@ -116,47 +86,32 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHomeRecommendations,
-                    Role::As("in_us", viewer_in_country("us")),
+                    Role::each([
+                        Role::As("in_us", viewer_in_country("us")),
+                        Role::As(
+                            "account_br_no_request_country",
+                            viewer_with_profile(ViewerProfile {
+                                account_country_code: Some("br".to_string()),
+                                ..ViewerProfile::default()
+                            }),
+                        ),
+                        Role::As(
+                            "author_in_br",
+                            ViewerFeatures {
+                                facts: RequestFacts::default().with_country("br"),
+                                ..viewer(AUTHOR_ID)
+                            },
+                        ),
+                        Role::NonFollower,
+                    ]),
                     allow(),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::As(
-                        "account_br_no_request_country",
-                        viewer_with_profile(ViewerProfile {
-                            account_country_code: Some("br".to_string()),
-                            ..ViewerProfile::default()
-                        }),
-                    ),
-                    allow(),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::As(
-                        "author_in_br",
-                        ViewerFeatures {
-                            country_code: Some("br".to_string()),
-                            ..viewer(AUTHOR_ID)
-                        },
-                    ),
-                    allow(),
-                ),
-                (TimelineHomeRecommendations, Role::NonFollower, allow()),
-                (
-                    TimelineHome,
-                    Role::As("in_br", viewer_in_country("br")),
-                    allow(),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::As("in_br", viewer_in_country("br")),
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "brazil_election_legal/drop/undesirable",
-                    ),
                 ),
             ],
+            at: vec![(
+                TimelineHome,
+                Role::As("in_br", viewer_in_country("br")),
+                allow(),
+            )],
         },
         Row {
             name: "brazil_election_legal_label_followed",
@@ -167,47 +122,19 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeRecommendations,
                 Role::As("follower_in_br", viewer_in_country("br")),
                 dropped(
                     FilteredReason::PossiblyUndesirable,
                     "brazil_election_legal/drop/undesirable",
                 ),
             )],
+            at: vec![],
         },
         Row {
             name: "fosnr_abuse_insults_label",
             subject: Subject::Post(labeled(SafetyLabelType::FOSNR_ABUSE_INSULTS)),
             expect: vec![
                 (
-                    TimelineHomeRecommendations,
-                    Role::each([Role::NonFollower, Role::Follower]),
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_abuse_insults/drop/undesirable",
-                    ),
-                ),
-                (TimelineHomeRecommendations, Role::Author, allow()),
-                (TimelineHome, Role::NonFollower, allow()),
-                (
-                    TimelineHomeHydration,
-                    Role::each([Role::NonFollower, Role::LoggedOut]),
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_abuse_insults_non_follower/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::Follower,
-                    noticed(
-                        true,
-                        false,
-                        "fosnr_abuse_insults_follower/soft_intervention/abuse",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
                     Role::Author,
                     appealed(
                         AppealablePolicy::ABUSE,
@@ -218,22 +145,51 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHomeHydration,
-                    Role::As("client_without_fosnr", client_without_fosnr(VIEWER_ID)),
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_abuse_insults_non_follower/drop/undesirable",
+                    ),
+                ),
+                (
+                    Role::Follower,
+                    fosnr(
+                        true,
+                        false,
+                        "fosnr_abuse_insults_follower/soft_intervention/abuse",
+                    ),
+                ),
+                (
+                    Role::each([
+                        Role::As("client_without_fosnr", client_without_fosnr(VIEWER_ID)),
+                        Role::As(
+                            "author_on_client_without_fosnr",
+                            client_without_fosnr(AUTHOR_ID),
+                        ),
+                    ]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_fallback/drop/undesirable",
                     ),
                 ),
+            ],
+            at: vec![
+                (TimelineHome, Role::NonFollower, allow()),
+                (TimelineHomeRecommendations, Role::Author, allow()),
                 (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "author_on_client_without_fosnr",
-                        client_without_fosnr(AUTHOR_ID),
-                    ),
+                    TimelineHomeRecommendations,
+                    Role::Follower,
                     dropped(
                         FilteredReason::PossiblyUndesirable,
-                        "fosnr_fallback/drop/undesirable",
+                        "fosnr_abuse_insults/drop/undesirable",
+                    ),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_abuse_insults/drop/undesirable",
                     ),
                 ),
             ],
@@ -248,16 +204,14 @@ pub(super) fn rows() -> Vec<Row> {
             ),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     Role::Follower,
-                    noticed(
+                    fosnr(
                         false,
                         true,
                         "fosnr_abuse_insults_follower/soft_intervention/abuse",
                     ),
                 ),
                 (
-                    TimelineHomeHydration,
                     Role::Author,
                     appealed(
                         AppealablePolicy::ABUSE,
@@ -268,6 +222,7 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
             ],
+            at: vec![],
         },
         Row {
             name: "fosnr_abuse_insults_on_nsfw_media",
@@ -279,7 +234,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .with_edge(Hydrator::Follows)
                     .build(),
             ),
-            expect: vec![(
+            expect: vec![],
+            at: vec![(
                 TimelineHomeHydration,
                 Role::As(
                     "web_follower_in_us",
@@ -302,23 +258,25 @@ pub(super) fn rows() -> Vec<Row> {
                     .build(),
             ),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::Follower,
-                noticed(
+                fosnr(
                     true,
                     false,
                     "fosnr_abuse_insults_follower/soft_intervention/abuse",
                 ),
             )],
+            at: vec![],
         },
     ]
 }
 
 fn client_without_fosnr(viewer_id: u64) -> ViewerFeatures {
     ViewerFeatures {
-        client_capability: ClientCapability::DEFAULT
-            .without(ClientSwitch::FosnrRules)
-            .with(ClientSwitch::FosnrFallbackDrops),
+        facts: RequestFacts::default().with_client(
+            ClientCapability::DEFAULT
+                .without(ClientSwitch::FosnrRules)
+                .with(ClientSwitch::FosnrFallbackDrops),
+        ),
         ..viewer(viewer_id)
     }
 }

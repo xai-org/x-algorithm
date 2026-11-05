@@ -11,8 +11,9 @@ use crate::rules::fixtures::{
     nsfw_high_precision_media, nsfw_viewer_dropped, viewer_in_country, viewer_with_age,
     CandidateBuilder, AUTHOR_ID, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::NotificationsWriterV2;
+use crate::rules::SafetyLevel;
 use std::num::NonZeroU64;
+use strum::VariantArray;
 use xai_core_entities::entities::TakedownReason;
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
@@ -392,36 +393,31 @@ fn post_cases() -> Vec<Case> {
     cases
 }
 
+fn post_case_verdict(kind: NotificationKind, with_level_79_drops: Verdict) -> Verdict {
+    match kind {
+        NotificationKind::Mention | NotificationKind::Reply => with_level_79_drops,
+        NotificationKind::MediaTagged => allow(),
+        NotificationKind::Follow | NotificationKind::FollowRequestAccepted => {
+            unreachable!("{kind:?} is no post kind")
+        }
+    }
+}
+
 pub(super) fn cases() -> Vec<CorpusCase> {
-    [
-        NotificationKind::Mention,
-        NotificationKind::Reply,
-        NotificationKind::MediaTagged,
-    ]
-    .into_iter()
-    .flat_map(|kind| {
-        let posts = post_cases().into_iter().map(move |case| {
-            let expected = match kind {
-                NotificationKind::MediaTagged => allow(),
-                NotificationKind::Mention | NotificationKind::Reply => case.mention_and_reply,
-                NotificationKind::Follow | NotificationKind::FollowRequestAccepted => {
-                    unreachable!("{kind:?} is no post kind")
-                }
-            };
-            CorpusCase {
-                name: format!(
-                    "{}/{NotificationsWriterV2:?}/{kind:?}/{}",
-                    case.name, case.role
-                ),
-                level: NotificationsWriterV2,
+    SafetyLevel::VARIANTS
+        .iter()
+        .flat_map(|&level| level.post_kinds().map(move |(kind, _)| (level, kind)))
+        .flat_map(|(level, kind)| {
+            let posts = post_cases().into_iter().map(move |case| CorpusCase {
+                name: format!("{}/{level:?}/{kind:?}/{}", case.name, case.role),
+                level,
                 kind: Some(kind),
                 viewer: case.recipient,
                 subject: Subject::Post(case.post),
                 placement: Placement::Standalone,
-                expected,
-            }
-        });
-        post_kind_cases(kind).into_iter().chain(posts)
-    })
-    .collect()
+                expected: post_case_verdict(kind, case.mention_and_reply),
+            });
+            post_kind_cases(level, kind).into_iter().chain(posts)
+        })
+        .collect()
 }

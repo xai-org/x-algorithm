@@ -1,15 +1,12 @@
 use super::{Role, Row, Subject};
 use crate::models::{
     AuthorFeatures, ClientCapability, ClientSwitch, LimitedEngagementReason, PostCandidate,
-    TweetFeatures, ViewerFeatures,
+    RequestFacts, TweetFeatures, ViewerFeatures,
 };
 use crate::rules::fixtures::{
     allow, candidate, dropped, limited, tweet_candidate, viewer, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
-};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use std::num::NonZeroU64;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -18,23 +15,11 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "nullcast",
             subject: Subject::Post(tweet_candidate(|t| t.is_nullcast = true)),
-            expect: vec![
-                (
-                    TimelineHome,
-                    Role::NonFollower,
-                    dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
-                ),
-                (
-                    TimelineHome,
-                    Role::Author,
-                    dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
-                ),
-            ],
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Author]),
+                dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
+            )],
+            at: vec![],
         },
         Row {
             name: "nullcast_retweet",
@@ -48,7 +33,8 @@ pub(super) fn rows() -> Vec<Row> {
                     .retweet_of(2)
                     .build()
             }),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "nullcast_community",
@@ -56,7 +42,8 @@ pub(super) fn rows() -> Vec<Row> {
                 t.is_nullcast = true;
                 t.community_id = NonZeroU64::new(500);
             })),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
         Row {
             name: "protected_author_community_post",
@@ -74,7 +61,6 @@ pub(super) fn rows() -> Vec<Row> {
             ),
             expect: vec![
                 (
-                    TimelineHomeHydration,
                     Role::Follower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
@@ -82,25 +68,33 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHomeHydration,
                     Role::NonFollower,
                     dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
                 ),
-                (TimelineHomeHydration, Role::Author, allow()),
+                (Role::Author, allow()),
             ],
+            at: vec![],
         },
         Row {
             name: "stale_edit",
             subject: Subject::Post(stale_candidate()),
             expect: vec![
                 (
-                    TimelineHome,
                     Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "stale_tweet/drop/unspecified",
                     ),
                 ),
+                (
+                    Role::Author,
+                    limited(
+                        LimitedEngagementReason::StaleTweet,
+                        "stale_tweet/limited_engagement",
+                    ),
+                ),
+            ],
+            at: vec![
                 (
                     TimelineHome,
                     Role::RetweetSource(Box::new(Role::NonFollower)),
@@ -108,46 +102,23 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (
                     TimelineHomeHydration,
-                    Role::NonFollower,
-                    limited(
-                        LimitedEngagementReason::StaleTweet,
-                        "stale_tweet/limited_engagement",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::Author,
-                    limited(
-                        LimitedEngagementReason::StaleTweet,
-                        "stale_tweet/limited_engagement",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
                     Role::As(
                         "client_without_stale_tweet_limits",
                         ViewerFeatures {
-                            client_capability: ClientCapability::DEFAULT
-                                .without(ClientSwitch::StaleTweetLimits),
+                            facts: RequestFacts::default().with_client(
+                                ClientCapability::DEFAULT.without(ClientSwitch::StaleTweetLimits),
+                            ),
                             ..viewer(VIEWER_ID)
                         },
                     ),
                     allow(),
                 ),
                 (
-                    TimelineHomeRecommendations,
+                    TimelineHomeHydration,
                     Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "stale_tweet/drop/unspecified",
-                    ),
-                ),
-                (
-                    ImmersiveExpandedRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "stale_tweet/drop/unspecified",
+                    limited(
+                        LimitedEngagementReason::StaleTweet,
+                        "stale_tweet/limited_engagement",
                     ),
                 ),
             ],
@@ -159,12 +130,14 @@ pub(super) fn rows() -> Vec<Row> {
                 retweet.post.source_tweet_id = Some(2);
                 retweet
             }),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![],
+            at: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "current_edit",
             subject: Subject::Post(tweet_candidate(|t| t.latest_edit_tweet_id = Some(1))),
-            expect: vec![(TimelineHome, Role::NonFollower, allow())],
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
         },
     ]
 }

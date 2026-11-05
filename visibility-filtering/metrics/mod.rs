@@ -10,9 +10,9 @@ use xai_stats_receiver::StatsReceiverExt;
 
 use crate::caller_identity;
 use crate::hydration::{Cause, Hydrators, Lookup, INBOUND_ALLOWANCE};
-use crate::models::{Evaluation, Verdict};
+use crate::models::{Evaluation, Verdict, VerdictAction};
 use crate::rules::SafetyLevel;
-use crate::treatment::{self, VerdictAction};
+use crate::treatment;
 
 pub(crate) mod families;
 
@@ -568,11 +568,8 @@ impl StatsReceiverExt for Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
-        Decided, DropReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-        MediaRestriction, Withholding,
-    };
-    use crate::rules::fixtures::allow;
+    use crate::models::{Decided, DropReason, LimitedEngagementReason, Withholding};
+    use crate::rules::fixtures::{allow, blurred, blurred_and_limited, limited};
     use crate::rules::RuleId;
     use xai_visibility_filtering::models::FilteredReason;
     use xai_visibility_filtering::tweet_safety_label::{
@@ -600,14 +597,6 @@ mod tests {
             id: RuleId::FilterAll,
             by: rule,
         })
-    }
-
-    fn limit_by(rule: &'static str) -> Decided<LimitedEngagement> {
-        Decided {
-            value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
-            id: RuleId::FilterAll,
-            by: rule,
-        }
     }
 
     #[test]
@@ -754,24 +743,14 @@ mod tests {
         let a = allow();
         let b = allow();
         let d = drop_by("nsfw_media");
-        let both = Verdict::Shown {
-            notice: None,
-            media: Some(Decided {
-                value: MediaRestriction::MediaInterstitial(MediaInterstitial {
-                    legacy: FilteredReason::ContainNsfwMedia,
-                    reason: InterstitialReason::Sensitive(true),
-                    prompt: None,
-                }),
-                id: RuleId::FilterAll,
-                by: "nsfw_media",
-            }),
-            engagement: Some(limit_by("conversation_control")),
-        };
-        let limit_only = Verdict::Shown {
-            notice: None,
-            media: None,
-            engagement: Some(limit_by("conversation_control")),
-        };
+        let limit_only = limited(
+            LimitedEngagementReason::ConversationControl,
+            "conversation_control",
+        );
+        let both = blurred_and_limited(
+            blurred(InterstitialReason::Sensitive(true), "nsfw_media"),
+            limit_only.clone(),
+        );
         let recorded = |family: &Family| {
             let (metrics, recording) = Metrics::recording();
             record_verdicts(

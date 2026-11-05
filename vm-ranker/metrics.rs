@@ -70,6 +70,27 @@ lazy_static! {
         &["outcome"]
     )
     .unwrap();
+    pub static ref CAROUSEL_MODELS_LOADED: IntGauge = register_int_gauge!(
+        "vm_ranker_carousel_models_loaded",
+        "Number of video carousel model files held in memory"
+    )
+    .unwrap();
+    pub static ref CAROUSEL_MODEL_RELOADS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_carousel_model_reloads_total",
+            "Video carousel model directory reads by outcome: ok, dir_error (kept all previous files) or file_error (kept that file's previous copy)"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref CAROUSEL_MODEL_REQUESTS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_carousel_model_requests_total",
+            "GetCarouselModel requests by outcome: ok, not_found or disabled (no --carousel-model-dir)"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
     pub static ref SCORE_REQUESTS: CounterVec = register_counter_vec!(
         Opts::new(
             "vm_ranker_requests_total",

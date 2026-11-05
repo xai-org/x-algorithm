@@ -91,6 +91,7 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         post_unexplored: params.get(PostUnexploredWeight),
         post_unexplored_include_out_of_network: params.get(PostUnexploredIncludeOutOfNetwork),
         post_video: params.get(PostVideoWeight),
+        grok_analyze: params.get(GrokAnalyzeWeight),
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),

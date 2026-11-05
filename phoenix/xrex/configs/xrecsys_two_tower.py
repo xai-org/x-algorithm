@@ -826,10 +826,18 @@ for config in configs:
                     "ld_soft_negative_actions"
                 ].default_factory(),
             ),
+            tweet_click_positive_actions=mparams.get(
+                "tweet_click_positive_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "tweet_click_positive_actions"
+                ].default_factory(),
+            ),
             head_dataset_mapping=mparams.get("head_dataset_mapping", None),
             head_names=head_names,
             w_fav=mparams.get("w_fav", 1.0),
             w_ld=mparams.get("w_ld", 0.0),
+            w_tweet_click=mparams.get("w_tweet_click", 0.0),
+            objective_head_weights=mparams.get("objective_head_weights", ""),
             user_tower_config=RecsysAggregatedModelConfig(
                 candidate_seq_len=mparams["candidate_seq_len"],
                 pad_token=PAD_TOKEN,

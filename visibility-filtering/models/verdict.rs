@@ -1,14 +1,28 @@
 use crate::hydration::{Hydrators, Lookup};
-use crate::rules::RuleId;
+use crate::rules::{ActionKind, RuleId};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 use xai_x_thrift::safety_result::SafetyResultReason;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum VerdictAction {
+    Allow,
+    Drop,
+    Tombstone,
+    Interstitial,
+    LimitedEngagement,
+    TweetInterstitial,
+    SoftIntervention,
+    Appealable,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
     Withheld(Decided<Withholding>),
+    Fosnr(Decided<Notice>),
     Shown {
-        notice: Option<Decided<Notice>>,
+        label_interstitial: Option<Decided<LabelInterstitial>>,
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     },
@@ -21,18 +35,13 @@ pub enum Notice {
         reason: FosnrReason,
         limited_actions: &'static [LimitedActionType],
     },
-    LabelInterstitial(LabelInterstitial),
 }
 
 impl Notice {
-    pub fn is_whole_verdict(&self) -> bool {
-        !matches!(self, Self::LabelInterstitial(_))
-    }
-
-    pub fn limited_engagement_reason(&self) -> Option<LimitedEngagementReason> {
+    pub(crate) const fn kind(&self) -> ActionKind {
         match self {
-            Self::SoftIntervention(_) | Self::Appealable { .. } => None,
-            Self::LabelInterstitial(interstitial) => Some(interstitial.limited_engagement_reason()),
+            Self::SoftIntervention(_) => ActionKind::SoftIntervention,
+            Self::Appealable { .. } => ActionKind::Appealable,
         }
     }
 }
@@ -116,6 +125,15 @@ pub struct Decided<T> {
 pub enum Withholding {
     Drop(DropReason),
     Tombstone(TombstoneReason),
+}
+
+impl Withholding {
+    pub(crate) const fn kind(&self) -> ActionKind {
+        match self {
+            Self::Drop(_) => ActionKind::Drop,
+            Self::Tombstone(_) => ActionKind::Tombstone,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +237,7 @@ pub enum LimitedEngagementReason {
     CommunityTweetCommunityDeleted,
     CommunityTweetCommunitySuspended,
     CommunityTweetViewerRemoved,
+    DynamicProductAd,
     LocalTweet,
 }
 
@@ -237,6 +256,7 @@ impl LimitedEngagementReason {
             Self::CommunityTweetCommunityDeleted => "community_tweet_community_deleted",
             Self::CommunityTweetCommunitySuspended => "community_tweet_community_suspended",
             Self::CommunityTweetViewerRemoved => "community_tweet_viewer_removed",
+            Self::DynamicProductAd => "dynamic_product_ad",
             Self::LocalTweet => "local_tweet",
         }
     }
@@ -263,20 +283,45 @@ impl Verdict {
     pub(crate) fn limited_engagement_reasons(
         &self,
     ) -> impl Iterator<Item = LimitedEngagementReason> + '_ {
-        let (notice, limit) = match self {
+        let (interstitial, limit) = match self {
             Self::Shown {
-                notice, engagement, ..
+                label_interstitial,
+                engagement,
+                ..
             } => (
-                notice
+                label_interstitial
                     .as_ref()
-                    .and_then(|notice| notice.value.limited_engagement_reason()),
+                    .map(|interstitial| interstitial.value.limited_engagement_reason()),
                 engagement.as_ref(),
             ),
-            Self::Withheld(_) => (None, None),
+            Self::Withheld(_) | Self::Fosnr(_) => (None, None),
         };
-        notice
+        interstitial
             .into_iter()
             .chain(limit.into_iter().flat_map(|limit| limit.value.reasons()))
+    }
+
+    pub(crate) fn decided(&self) -> impl Iterator<Item = (ActionKind, &'static str)> + '_ {
+        let (first, second, third) = match self {
+            Self::Withheld(decided) => (Some((decided.value.kind(), decided.by)), None, None),
+            Self::Fosnr(decided) => (Some((decided.value.kind(), decided.by)), None, None),
+            Self::Shown {
+                label_interstitial,
+                media,
+                engagement,
+            } => (
+                label_interstitial
+                    .as_ref()
+                    .map(|decided| (ActionKind::LabelInterstitial, decided.by)),
+                media
+                    .as_ref()
+                    .map(|decided| (ActionKind::MediaRestriction, decided.by)),
+                engagement
+                    .as_ref()
+                    .map(|decided| (ActionKind::LimitedEngagement, decided.by)),
+            ),
+        };
+        first.into_iter().chain(second).chain(third)
     }
 
     pub const fn not_found() -> Self {

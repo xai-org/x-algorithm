@@ -9,6 +9,7 @@ use xai_http_server::{CancellationToken, GrpcConfig, HttpServer};
 
 use xai_vm_ranker::{
     args::Args,
+    carousel_model::CarouselModelStore,
     config_sync::{ConfigSync, ConfigSyncOptions},
     dpp::DppConfig,
     embedding_store,
@@ -96,12 +97,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    let carousel_models = args.carousel_model_dir.clone().map(|dir| {
+        let store = CarouselModelStore::load(dir);
+        store.spawn_reloader(Duration::from_secs(args.carousel_model_reload_secs.max(1)));
+        store
+    });
     let ranker_service = VMRankerServiceImpl::new(
         args.max_concurrent_requests,
         dpp,
         user_debias,
         ranking_config,
-    );
+    )
+    .with_carousel_models(carousel_models);
     info!(
         "Initialized VMRankerService with max_concurrent_requests={}",
         args.max_concurrent_requests

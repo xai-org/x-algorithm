@@ -79,7 +79,7 @@ pub fn compute_weighted_score(
 pub fn weighted_terms(
     weights: &ValueModelWeights,
     candidate: &CandidateScoringInputs,
-) -> [(&'static str, f64); 29] {
+) -> [(&'static str, f64); 30] {
     let scores = &candidate.phoenix_scores;
 
     let vqv_weight = if candidate.vqv_eligible {
@@ -209,6 +209,10 @@ pub fn weighted_terms(
         (
             "post_video",
             apply(scores.post_video_score, weights.post_video),
+        ),
+        (
+            "grok_analyze",
+            apply(scores.grok_analyze_score, weights.grok_analyze),
         ),
     ]
 }

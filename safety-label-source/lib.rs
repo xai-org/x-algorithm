@@ -52,6 +52,7 @@
 
 mod connect;
 mod decode;
+mod dragonfly;
 mod metrics;
 mod mh_client;
 mod remote;
@@ -60,6 +61,7 @@ pub mod testing;
 mod warmer;
 
 pub use connect::{ConnectError, LabelClients, LabelSourceConfig, S2sPaths};
+pub use dragonfly::LabelCacheSwitches;
 pub use remote::{FailureKind, LookupError};
 pub use source::SafetyLabelSource;
 pub use warmer::WarmFetcher;

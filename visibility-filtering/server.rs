@@ -4,7 +4,7 @@ use crate::filter_notifications::FilterNotificationsEndpoint;
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::{GetSafetyLabelsCodec, GetSafetyLabelsEndpoint};
 use crate::hydration::sources::test_users_metadata;
-use crate::server_deps::{self, Comparators};
+use crate::server_deps;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -131,7 +131,7 @@ impl VFServer {
         crate::config::refuse_reference();
         server_deps::build(datacenter, metadata)
             .await
-            .into_server(Comparators::default())
+            .into_server(None)
     }
 }
 
@@ -204,11 +204,7 @@ mod tests {
         VFServer {
             evaluate_tweets: wire.into_endpoint(),
             filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(&post_evaluator)),
-            filter_tweets: FilterTweetsEndpoint::new(
-                post_evaluator,
-                ClientSwitches::for_tests(),
-                None,
-            ),
+            filter_tweets: FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests()),
             get_safety_labels: GetSafetyLabelsEndpoint::new(
                 Arc::new(FakeLabels::default().into_source()),
                 Metrics::none(),

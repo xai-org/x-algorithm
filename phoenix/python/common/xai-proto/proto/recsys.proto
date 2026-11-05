@@ -229,6 +229,8 @@ message RankingScoreWeights {
   float reportWeight = 11;
   float notDwelledWeight = 12;
   float minVideoDurationMs = 13;
+  float shareViaDmWeight = 14;
+  float shareViaCopyLinkWeight = 15;
 }
 
 message PageDecodeResult {
@@ -303,6 +305,10 @@ message RetrieveTopKCandidatesRequest {
   repeated uint64 excluded_post_ids = 16;
 
   map<string, float> value_model_weights = 17;
+
+  repeated uint64 include_author_ids = 18;
+
+  repeated uint64 exclude_author_ids = 19;
 }
 
 message ExcludedPostsBloomFilter {
@@ -692,8 +698,8 @@ enum ContinuousActionName {
   HOME_VIDEO_CONTINUATION_SECS = 3;
   BRIDGE_PROBABILITY = 4;
   ADS_WEB_CT_PURCHASE_VALUE = 5;
-  WEB_CONV_VALUE_USD = 6;
-  WEB_CONV_VALUE_RATIO = 7;
+  ADS_VIDEO_WATCH_TIME_SECS = 6;
+  ADS_VIDEO_LENGTH_SECS = 7;
 }
 
 enum ActionGroup {
@@ -1458,6 +1464,7 @@ message TweetInfo {
   SearchAuthorMatch searchAuthorMatch = 46;
   bool hasVideo = 47;
   bool hasImage = 48;
+  EngagementCounts authorEngagementCounts = 49;
 }
 
 message SearchLexicalMatch {

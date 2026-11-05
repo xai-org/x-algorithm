@@ -1,17 +1,25 @@
-use rustc_hash::FxHashMap;
+use arc_swap::ArcSwap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tonic::async_trait;
+use tracing::warn;
 use xai_cache::{CacheClient, KVCacheError, Key, Value};
 use xai_visibility_filtering_proto as vf_pb;
 
-use super::decode::{self, CachedLabels};
+use super::decode::{self, CachedLabels, RawSafetyLabel};
+use super::dragonfly::{
+    DragonflySource, EntryRead, Fill, FillJob, FillLabels, LabelCacheSwitches, ReadContext,
+};
 use super::metrics::{
-    self, BatchStage, CacheResult, CacheTier, LabelMetrics, ManhattanResult, SourceOutcome,
+    self, BatchStage, CacheResult, CacheTier, LabelMetrics, ManhattanResult, OutageResult,
+    SourceOutcome,
 };
 use super::mh_client::ManhattanLabelFetcher;
+use super::source::system_unix_ms;
 use super::warmer::CacheWarmer;
 
 const KEY_PREFIX: &str = "slm_";
@@ -20,6 +28,7 @@ const KEY_PREFIX: &str = "slm_";
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum LabelSource {
     Twemcache,
+    Dragonfly,
     Manhattan,
 }
 
@@ -40,6 +49,7 @@ pub(crate) enum FallbackReason {
 pub enum FailureKind {
     ManhattanFetch,
     ManhattanDecode,
+        LabelCacheUnavailable,
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,12 +78,21 @@ impl LookupError {
 
 pub(crate) type LookupResults = FxHashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;
 
-#[async_trait]
-pub(crate) trait RemoteLabels: Send + Sync {
-    async fn get(&self, ids: &[u64]) -> LookupResults;
+fn label_cache_unavailable() -> LookupError {
+    LookupError::new(
+        FailureKind::LabelCacheUnavailable,
+        "label cache read failed",
+    )
 }
 
-type CacheOpResult<T> = std::result::Result<T, KVCacheError>;
+#[async_trait]
+pub(crate) trait RemoteLabels: Send + Sync {
+                async fn get(&self, ids: &[u64], stale: &FxHashSet<u64>) -> LookupResults;
+
+    fn set_switches(&self, switches: LabelCacheSwitches);
+}
+
+pub(crate) type CacheOpResult<T> = std::result::Result<T, KVCacheError>;
 
 #[async_trait]
 pub(crate) trait CacheRead: Send + Sync + 'static {
@@ -90,10 +109,35 @@ impl CacheRead for CacheClient {
     }
 }
 
+#[async_trait]
+pub(crate) trait CacheWrite: CacheRead {
+    async fn set(&self, key: &Key, value: Value, ttl_secs: u32) -> CacheOpResult<()>;
+}
+
+#[async_trait]
+impl CacheWrite for CacheClient {
+    async fn set(&self, key: &Key, value: Value, ttl_secs: u32) -> CacheOpResult<()> {
+        CacheClient::set(self, key, value, ttl_secs).await
+    }
+}
+
+pub(crate) type NowMs = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum ReplayOutcome {
+    Found,
+    NotFound,
+    Failed,
+}
+
 pub(crate) struct RemoteSource {
     twemcache: TwemcacheSource,
     manhattan: ManhattanSource,
     warmer: Option<Arc<CacheWarmer>>,
+    dragonfly: Option<Arc<DragonflySource>>,
+    switches: ArcSwap<LabelCacheSwitches>,
+    now_ms: NowMs,
     metrics: LabelMetrics,
 }
 
@@ -113,6 +157,9 @@ impl RemoteSource {
                 metrics: metrics.clone(),
             },
             warmer: None,
+            dragonfly: None,
+            switches: ArcSwap::from_pointee(LabelCacheSwitches::default()),
+            now_ms: Arc::new(|| system_unix_ms().cast_unsigned()),
             metrics,
         }
     }
@@ -121,18 +168,69 @@ impl RemoteSource {
         self.warmer = Some(warmer);
         self
     }
+
+    pub(crate) fn with_dragonfly(mut self, cache: Arc<dyn CacheWrite>) -> Self {
+        self.dragonfly = Some(DragonflySource::spawn(
+            cache,
+            self.manhattan.clone(),
+            self.metrics.clone(),
+        ));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_dragonfly(
+        mut self,
+        dragonfly: Arc<DragonflySource>,
+        now_ms: NowMs,
+    ) -> Self {
+        self.dragonfly = Some(dragonfly);
+        self.now_ms = now_ms;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manhattan(&self) -> ManhattanSource {
+        self.manhattan.clone()
+    }
 }
 
 #[async_trait]
 impl RemoteLabels for RemoteSource {
-    async fn get(&self, ids: &[u64]) -> LookupResults {
-        let mut twemcache_results = self.twemcache.get(ids).await;
+    async fn get(&self, ids: &[u64], stale: &FxHashSet<u64>) -> LookupResults {
+        let context = ReadContext {
+            now_ms: (self.now_ms)(),
+            switches: **self.switches.load(),
+        };
+        let dragonfly = self
+            .dragonfly
+            .as_ref()
+            .filter(|_| context.switches.serve_buckets > 0);
+        let (served, unserved): (Vec<u64>, Cow<'_, [u64]>) = match dragonfly {
+            Some(_) => {
+                let (served, unserved) = ids.iter().partition(|&&id| context.switches.serves(id));
+                (served, Cow::Owned(unserved))
+            }
+            None => (Vec::new(), Cow::Borrowed(ids)),
+        };
+        let served_reads = async {
+            match dragonfly {
+                Some(dragonfly) if !served.is_empty() => {
+                    dragonfly
+                        .read(&served, &context, CacheTier::Dragonfly)
+                        .await
+                }
+                _ => Vec::new(),
+            }
+        };
+        let (mut twemcache_results, served_reads) =
+            tokio::join!(self.twemcache.get(&unserved), served_reads);
         let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         let mut fallback_ids = Vec::new();
         let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();
         let mut warm_ids = Vec::new();
 
-        for &tweet_id in ids {
+        for &tweet_id in unserved.iter() {
             if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {
                 continue;
             }
@@ -182,13 +280,118 @@ impl RemoteLabels for RemoteSource {
             warmer.warm(warm_ids);
         }
 
+        let mut fills = Vec::new();
+        let mut fill_ids = FxHashSet::default();
+        let mut outage_reads = 0;
+        for (tweet_id, read) in served_reads {
+            if results.contains_key(&tweet_id) || fill_ids.contains(&tweet_id) {
+                continue;
+            }
+            match read {
+                EntryRead::Hit { envelope, refresh } => {
+                    if let Some(fill) = refresh {
+                        fills.push(FillJob {
+                            tweet_id,
+                            fill,
+                            labels: FillLabels::Reread,
+                        });
+                    }
+                    results.insert(tweet_id, Ok(envelope.into_labels()));
+                }
+                EntryRead::Miss => {
+                    fill_ids.insert(tweet_id);
+                    fallback_ids.push(tweet_id);
+                }
+                EntryRead::Failed => {
+                    let admitted = !stale.contains(&tweet_id)
+                        && dragonfly.is_some_and(|dragonfly| dragonfly.admit_outage_read());
+                    if admitted {
+                        outage_reads += 1;
+                        fallback_ids.push(tweet_id);
+                    } else {
+                        results.insert(tweet_id, Err(label_cache_unavailable()));
+                    }
+                }
+            }
+        }
+        metrics::record_outage_keys(&self.metrics, OutageResult::Manhattan, outage_reads);
+
         metrics::record_batch_size(
             &self.metrics,
             BatchStage::ManhattanFallback,
             fallback_ids.len(),
         );
-        results.extend(self.manhattan.get(&fallback_ids).await);
+        for (tweet_id, result) in self.manhattan.scan(&fallback_ids).await {
+            let result = match result {
+                Ok(Scan { items, labels }) => {
+                    if fill_ids.contains(&tweet_id) {
+                        fills.push(FillJob {
+                            tweet_id,
+                            fill: Fill::new(context.now_ms),
+                            labels: FillLabels::Scanned(items),
+                        });
+                    }
+                    Ok(labels)
+                }
+                Err(e) => Err(e),
+            };
+            results.insert(tweet_id, result);
+        }
+        if let Some(dragonfly) = dragonfly {
+            dragonfly.fill(fills);
+        }
+
+        if let Some(dragonfly) = &self.dragonfly
+            && context.switches.shadow_buckets > context.switches.serve_buckets
+        {
+            let mut shadowed: Vec<u64> = unserved
+                .iter()
+                .copied()
+                .filter(|&id| context.switches.shadows(id))
+                .filter(|id| matches!(results.get(id), Some(Ok(_))))
+                .collect();
+            shadowed.sort_unstable();
+            shadowed.dedup();
+            if !shadowed.is_empty()
+                && let Some(permit) = dragonfly.shadow_permit(shadowed.len())
+            {
+                let answers = shadowed
+                    .into_iter()
+                    .filter_map(|id| match results.get(&id) {
+                        Some(Ok(labels)) => Some((id, labels.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                dragonfly.shadow(permit, answers, context);
+            }
+        }
+
+        if self.dragonfly.is_some() && context.switches.replay_bucket.is_some() {
+            log_replay(ids, &context, &results);
+        }
         results
+    }
+
+    fn set_switches(&self, switches: LabelCacheSwitches) {
+        self.switches.store(Arc::new(switches));
+    }
+}
+
+fn log_replay(ids: &[u64], context: &ReadContext, results: &LookupResults) {
+    let reads: Vec<(u64, &'static str)> = ids
+        .iter()
+        .filter(|&&id| context.switches.replays(id))
+        .map(|&id| {
+            let outcome = match results.get(&id) {
+                Some(Ok(labels)) if labels.labels.is_empty() => ReplayOutcome::NotFound,
+                Some(Ok(_)) => ReplayOutcome::Found,
+                Some(Err(_)) | None => ReplayOutcome::Failed,
+            };
+            (id, outcome.into())
+        })
+        .collect();
+    if !reads.is_empty() {
+        warn!(time_ms = context.now_ms, ?reads, "label cache replay reads");
     }
 }
 
@@ -205,7 +408,7 @@ struct TwemcacheSource {
     clippy::wildcard_enum_match_arm,
     reason = "KVCacheError belongs to the shared xai-cache client; only its timeout and backpressure errors get their own FallbackReason, and every other error counts as Other, including any the client adds"
 )]
-fn fallback_reason(e: &KVCacheError) -> FallbackReason {
+pub(crate) fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     match e {
         KVCacheError::Timeout(_) => FallbackReason::Timeout,
         KVCacheError::Backpressure => FallbackReason::Backpressure,
@@ -304,13 +507,19 @@ impl TwemcacheSource {
     }
 }
 
-struct ManhattanSource {
+#[derive(Clone)]
+pub(crate) struct ManhattanSource {
     fetcher: Arc<dyn ManhattanLabelFetcher>,
     metrics: LabelMetrics,
 }
 
+pub(crate) struct Scan {
+    pub(crate) items: Vec<RawSafetyLabel>,
+    pub(crate) labels: vf_pb::SafetyLabelMap,
+}
+
 impl ManhattanSource {
-    async fn get(&self, ids: &[u64]) -> LookupResults {
+    pub(crate) async fn scan(&self, ids: &[u64]) -> FxHashMap<u64, Result<Scan, LookupError>> {
         let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
@@ -323,12 +532,13 @@ impl ManhattanSource {
 
         let request_outcome = match self.fetcher.fetch_labels(&i64_ids).await {
             Ok(fetch_results) => {
-                for (i, &tweet_id) in ids.iter().enumerate() {
-                    match fetch_results.get(i) {
-                        Some(Ok(raw_items)) => match decode::raw_labels(raw_items) {
-                            Some(label_map) => {
+                let mut fetch_results = fetch_results.into_iter();
+                for &tweet_id in ids {
+                    match fetch_results.next() {
+                        Some(Ok(items)) => match decode::raw_labels(&items) {
+                            Some(labels) => {
                                 successes += 1;
-                                results.insert(tweet_id, Ok(label_map));
+                                results.insert(tweet_id, Ok(Scan { items, labels }));
                             }
                             None => {
                                 failures += 1;
@@ -481,7 +691,7 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42, 42]).await;
+        let results = source.get(&[42, 42], &FxHashSet::default()).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);
@@ -504,7 +714,7 @@ mod tests {
         )
         .with_warmer(Arc::new(warmer));
 
-        let results = source.get(&[1, 2, 3, 4, 5]).await;
+        let results = source.get(&[1, 2, 3, 4, 5], &FxHashSet::default()).await;
 
         assert_eq!(results.len(), 5);
         assert!(results.values().all(Result::is_ok));
@@ -533,7 +743,7 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42]).await;
+        let results = source.get(&[42], &FxHashSet::default()).await;
 
         assert!(matches!(
             results.get(&42),
@@ -556,7 +766,7 @@ mod tests {
         )
         .with_warmer(warmer);
 
-        let results = source.get(&[42]).await;
+        let results = source.get(&[42], &FxHashSet::default()).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);
@@ -600,8 +810,11 @@ mod tests {
             fetcher: Arc::new(fetcher),
             metrics: LabelMetrics::default(),
         }
-        .get(ids)
+        .scan(ids)
         .await
+        .into_iter()
+        .map(|(tweet_id, result)| (tweet_id, result.map(|scan| scan.labels)))
+        .collect()
     }
 
     #[tokio::test]

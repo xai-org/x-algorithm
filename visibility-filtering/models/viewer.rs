@@ -62,6 +62,80 @@ impl RequestViewer {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestFacts {
+    viewer: RequestViewer,
+    request_country: Option<String>,
+    client_capability: ClientCapability,
+    soft_nsfw_new_user_drop: bool,
+}
+
+impl RequestFacts {
+    pub(crate) fn new(viewer: RequestViewer, client_capability: ClientCapability) -> Self {
+        Self {
+            request_country: viewer.country_code().map(str::to_ascii_lowercase),
+            viewer,
+            client_capability,
+            soft_nsfw_new_user_drop: false,
+        }
+    }
+
+    pub(crate) fn logged_in(id: u64) -> Self {
+        Self::new(
+            RequestViewer::new(Some(id), None),
+            ClientCapability::DEFAULT,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn with_soft_nsfw_new_user_drop(self, soft_nsfw_new_user_drop: bool) -> Self {
+        Self {
+            soft_nsfw_new_user_drop,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_country(self, country_code: &str) -> Self {
+        let viewer = RequestViewer {
+            context: self.viewer.context,
+            ..RequestViewer::new(self.viewer.id, Some(country_code.to_owned()))
+        };
+        Self::new(viewer, self.client_capability)
+            .with_soft_nsfw_new_user_drop(self.soft_nsfw_new_user_drop)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_client(self, client_capability: ClientCapability) -> Self {
+        Self {
+            client_capability,
+            ..self
+        }
+    }
+
+    pub(crate) fn viewer(&self) -> &RequestViewer {
+        &self.viewer
+    }
+
+    pub(crate) fn viewer_id(&self) -> Option<u64> {
+        self.viewer.id()
+    }
+
+    pub(crate) fn request_country(&self) -> Option<&str> {
+        self.request_country.as_deref()
+    }
+
+    pub(crate) fn client_capability(&self) -> ClientCapability {
+        self.client_capability
+    }
+
+    pub(crate) fn soft_nsfw_new_user_drop(&self) -> bool {
+        self.soft_nsfw_new_user_drop
+    }
+}
+
 pub const ADULT_AGE_YEARS: i32 = 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -202,14 +276,12 @@ impl FromIterator<ClientSwitch> for ClientSwitchSet {
 pub struct ClientCapability {
     pub verify_blur_support: Option<VerifyBlurSupport>,
     pub switches_on: ClientSwitchSet,
-    pub soft_nsfw_new_user_drop: bool,
 }
 
 impl ClientCapability {
     pub const DEFAULT: Self = Self {
         verify_blur_support: Some(VerifyBlurSupport::Unsupported),
         switches_on: ClientSwitchSet::DEFAULT_ON,
-        soft_nsfw_new_user_drop: false,
     };
 
     pub const fn has(self, switch: ClientSwitch) -> bool {
@@ -314,22 +386,7 @@ impl Client {
 #[derive(Clone, Debug, Default)]
 pub struct ViewerFeatures {
     pub viewer: Viewer,
-    pub country_code: Option<String>,
-    pub client_capability: ClientCapability,
-}
-
-impl ViewerFeatures {
-    pub fn from_request(
-        viewer: Viewer,
-        country_code: Option<String>,
-        client_capability: ClientCapability,
-    ) -> Self {
-        Self {
-            viewer,
-            country_code: country_code.map(|c| c.to_ascii_lowercase()),
-            client_capability,
-        }
-    }
+    pub(crate) facts: RequestFacts,
 }
 
 #[cfg(test)]

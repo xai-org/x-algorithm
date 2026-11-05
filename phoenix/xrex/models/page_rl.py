@@ -68,6 +68,8 @@ class PageServeScoreConfig(Config):
     profile_click_weight: float = 0.5
     vqv_weight: float = 1.0
     share_weight: float = 4.0
+    share_via_dm_weight: float = 0.0
+    share_via_copy_link_weight: float = 0.0
     quote_weight: float = 5.0
     cont_dwell_time_weight: float = 0.1
     not_interested_weight: float = -500.0
@@ -91,6 +93,8 @@ RANKING_SCORE_WEIGHT_FIELDS: tuple[str, ...] = (
     "report_weight",
     "not_dwelled_weight",
     "min_video_duration_ms",
+    "share_via_dm_weight",
+    "share_via_copy_link_weight",
 )
 
 
@@ -330,6 +334,8 @@ def page_serve_weighted_score(
     profile_click = weight("profile_click_weight")
     vqv = weight("vqv_weight")
     share = weight("share_weight")
+    share_via_dm = weight("share_via_dm_weight")
+    share_via_copy_link = weight("share_via_copy_link_weight")
     quote = weight("quote_weight")
     cont_dwell_time = weight("cont_dwell_time_weight")
     not_interested = weight("not_interested_weight")
@@ -347,6 +353,8 @@ def page_serve_weighted_score(
         + profile_click * head(an.CLIENT_TWEET_CLICK_PROFILE)
         + vqv_w * head(an.CLIENT_TWEET_VIDEO_QUALITY_VIEW)
         + share * head(an.CLIENT_TWEET_SHARE)
+        + share_via_dm * head(an.CLIENT_TWEET_CLICK_SEND_VIA_DIRECT_MESSAGE)
+        + share_via_copy_link * head(an.CLIENT_TWEET_SHARE_VIA_COPY_LINK)
         + quote * head(an.SERVER_TWEET_QUOTE)
         + not_interested * head(an.CLIENT_TWEET_NOT_INTERESTED_IN)
         + report * head(an.CLIENT_TWEET_REPORT)
@@ -365,6 +373,8 @@ def page_serve_weighted_score(
         + profile_click
         + vqv
         + share
+        + share_via_dm
+        + share_via_copy_link
         + quote
         + jnp.maximum(not_dwelled, 0.0)
     )

@@ -88,7 +88,7 @@ from xrex.models.recsys_model import (
     RecsysAggregatedModel,
     RecsysAggregatedModelConfig,
 )
-from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel, scale_post_table_slots
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partition_grad_norms
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
@@ -99,6 +99,7 @@ from xrex.train.misc import (
     CheckpointConfig,
     PostEmbeddings,
     RecsysTrainingState,
+    replicated_global_array,
 )
 from xrex.train.trainer import (
     RecsysTwoTowerModelConfig,
@@ -528,6 +529,7 @@ class RecsysTrainer(Trainer):
     _post_table_ids_generation: int | None = field(default=None, init=False, repr=False)
     _post_table_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
     _eval_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
+    _eval_post_table: jax.Array | None = field(default=None, init=False, repr=False)
     dense_params_ema_decay: float = 0.0
     dense_params_ema_in_checkpoint: bool = False
     _dense_params_ema: typing.Any = field(default=None, init=False, repr=False)
@@ -2841,7 +2843,7 @@ class RecsysTrainer(Trainer):
                 top_k: int,
                 target_dataset_types,
                 eval_bs_per_device: int = 0,
-                query_head_weights: tuple[float, float] | None = None,
+                query_head_weights: tuple[float, ...] | None = None,
             ):
                 assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
                 model = self.model_config.make(
@@ -4028,13 +4030,15 @@ class RecsysTrainer(Trainer):
 
     def _load_retrieval_corpus_synchronously(
         self, target_datasets: list[RetrievalDataset], max_posts: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, float]:
         assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         _user_cfg = self.model_config.user_tower_config
         _use_post_sid = _user_cfg.use_post_sid
         _sid_num_levels = _user_cfg.sid_num_levels
+        use_objective_weights = bool(self.model_config.objective_head_weights)
+        objective_bits = None
         if jax.process_index() == 0:
-            post_ids, author_ids, dataset_types, post_sids_raw = RetrievalDataset.load_datasets(
+            corpus = RetrievalDataset.load_corpus(
                 target_datasets,
                 max_posts=max_posts,
                 read_post_sid=_use_post_sid,
@@ -4042,27 +4046,34 @@ class RecsysTrainer(Trainer):
                 cold_start_max_age_seconds=float(
                     getattr(self.model_config, "cold_start_max_age_seconds", 0.0) or 0.0
                 ),
+                read_objective_bits=use_objective_weights,
             )
+            post_ids, author_ids, dataset_types, post_sids_raw = corpus[:4]
+            objective_bits = corpus.objective_bits
         else:
             post_ids = np.zeros(max_posts, dtype=np.int64)
             author_ids = np.zeros(max_posts, dtype=np.int64)
             dataset_types = np.zeros(max_posts, dtype=np.int32)
             post_sids_raw = None
+            if use_objective_weights:
+                objective_bits = np.zeros(max_posts, dtype=np.int32)
         load_done = time.perf_counter()
         if post_sids_raw is None:
             post_sids_raw = np.full((max_posts, _sid_num_levels), -1, dtype=np.int32)
         post_ids_i32 = post_ids.view(np.int32)
         author_ids_i32 = author_ids.view(np.int32)
-        post_ids_i32, author_ids_i32, dataset_types, post_sids_raw = (
+        post_ids_i32, author_ids_i32, dataset_types, post_sids_raw, objective_bits = (
             multihost_utils.broadcast_one_to_all(
-                (post_ids_i32, author_ids_i32, dataset_types, post_sids_raw)
+                (post_ids_i32, author_ids_i32, dataset_types, post_sids_raw, objective_bits)
             )
         )
         post_ids = np.asarray(post_ids_i32, dtype=np.int32).view(np.int64)
         author_ids = np.asarray(author_ids_i32, dtype=np.int32).view(np.int64)
         dataset_types = np.asarray(dataset_types, dtype=np.int32)
         post_sids_raw = np.asarray(post_sids_raw, dtype=np.int32)
-        return post_ids, author_ids, dataset_types, post_sids_raw, load_done
+        if objective_bits is not None:
+            objective_bits = np.asarray(objective_bits, dtype=np.int32)
+        return post_ids, author_ids, dataset_types, post_sids_raw, objective_bits, load_done
 
     def maybe_build_retrieval_post_embeddings(self):
         if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
@@ -4078,6 +4089,7 @@ class RecsysTrainer(Trainer):
         _use_post_sid = _user_cfg.use_post_sid
         _sid_num_levels = _user_cfg.sid_num_levels
         max_posts = self.model_config.candidate_tower_config.max_posts
+        objective_bits: np.ndarray | None = None
         stager_config = self._retrieval_stager_config(target_datasets)
         staged = (
             self._acquire_staged_retrieval_corpus(stager_config)
@@ -4094,7 +4106,7 @@ class RecsysTrainer(Trainer):
             load_done = broadcast_done = time.perf_counter()
         else:
             corpus_label = "sync"
-            post_ids, author_ids, dataset_types, post_sids_raw, load_done = (
+            post_ids, author_ids, dataset_types, post_sids_raw, objective_bits, load_done = (
                 self._load_retrieval_corpus_synchronously(target_datasets, max_posts)
             )
             broadcast_done = time.perf_counter()
@@ -4214,13 +4226,27 @@ class RecsysTrainer(Trainer):
                 candidate_embeddings = jnp.where(mask_h, emb_h, candidate_embeddings)
                 del emb_h
 
-        ld_head = self.model_config.ld_head
-        if ld_head is not None:
-            emb_ld = _forward_chunked(ld_head)
+        for blend_head_name in self.model_config.blend_heads:
+            emb_blend = _forward_chunked(self.model_config.head_names.index(blend_head_name))
             candidate_embeddings = jax.device_put(
-                jnp.concatenate([candidate_embeddings, emb_ld], axis=-1), self.data_sharding
+                jnp.concatenate([candidate_embeddings, emb_blend], axis=-1), self.data_sharding
             )
-            del emb_ld
+            del emb_blend
+
+        self._eval_post_table = None
+        if objective_bits is not None:
+            slot_scales = self.model_config.objective_slot_scales(objective_bits[start_idx:end_idx])
+            self._eval_post_table = candidate_embeddings
+            candidate_embeddings = jax.jit(
+                scale_post_table_slots, out_shardings=self.data_sharding
+            )(
+                candidate_embeddings,
+                jax.make_array_from_process_local_data(self.data_sharding, slot_scales),
+            )
+            rank_logger.info(
+                "Scaled post-table slots by objective_head_weights=%s",
+                self.model_config.objective_head_weights,
+            )
 
         jax.block_until_ready(candidate_embeddings)
         forward_done = time.perf_counter()
@@ -4240,6 +4266,8 @@ class RecsysTrainer(Trainer):
             combined_dataset_types = multihost_utils.process_allgather(
                 dataset_types_shard, tiled=True
             ).reshape(-1, 1)
+        if isinstance(combined_dataset_types, np.ndarray):
+            combined_dataset_types = replicated_global_array(combined_dataset_types, self.mesh)
 
         original_embeddings = self.state.post_embeddings.embeddings
         mol_side_table = self.state.post_embeddings.mol_side_table
@@ -4415,7 +4443,11 @@ class RecsysTrainer(Trainer):
                 mesh=self.mesh,
                 rng=rng,
                 candidate_tower_forward_fn=eval_cand_fn,
-                all_post_embeddings=self.state.post_embeddings.embeddings.x,
+                all_post_embeddings=(
+                    self._eval_post_table
+                    if self._eval_post_table is not None
+                    else self.state.post_embeddings.embeddings.x
+                ),
                 all_post_ids=self.two_int32_to_int64(self.state.post_embeddings.post_ids),
                 dataset_types=self.state.post_embeddings.dataset_types,
                 eval_bs_per_device=eval_bs_per_device,

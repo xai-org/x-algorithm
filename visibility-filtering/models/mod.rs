@@ -13,19 +13,21 @@ pub use tweet::{
     ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, ReactionContext,
     TweetFeatures,
 };
+pub(crate) use verdict::VerdictAction;
 pub use verdict::{
     Decided, Deletion, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
     MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
     Withholding,
 };
-pub(crate) use viewer::RequestViewer;
 pub use viewer::{
     ClientCapability, ClientSwitch, ClientSwitchSet, NotificationFilters, VerifyBlurSupport,
     Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
 };
+pub(crate) use viewer::{RequestFacts, RequestViewer};
 
 use crate::hydration::{Hydrator, Hydrators};
+pub(crate) use xai_visibility_filtering::notifications::NotificationKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TweetId(pub u64);
@@ -95,27 +97,6 @@ pub enum RetweetMerge {
     Merged,
     #[default]
     Unmerged,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    strum::IntoStaticStr,
-    strum::VariantArray,
-)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum NotificationKind {
-    Follow,
-    FollowRequestAccepted,
-    Mention,
-    Reply,
-    MediaTagged,
 }
 
 #[derive(Clone, Copy, Debug)]

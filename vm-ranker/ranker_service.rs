@@ -6,9 +6,11 @@ use tonic::{Request, Response, Status};
 
 use xai_vm_ranker_proto::{
     vm_ranker_service_server::{VmRankerService, VmRankerServiceServer},
-    RankRequest, RankResponse, RankedCandidate,
+    GetCarouselModelRequest, GetCarouselModelResponse, RankRequest, RankResponse, RankedCandidate,
 };
 
+use crate::carousel_model::CarouselModelStore;
+use crate::metrics::CAROUSEL_MODEL_REQUESTS;
 use crate::metrics::{
     Timer, IN_FLIGHT_REQUESTS, REJECTED_REQUESTS, SCORE_CANDIDATES_IN, SCORE_DURATION,
     SCORE_ERRORS, SCORE_REQUESTS,
@@ -22,6 +24,7 @@ pub struct VMRankerServiceImpl {
     dpp: Option<DppContext>,
     user_debias: Option<Arc<UserDebiasStore>>,
     config: Option<Arc<RankingConfig>>,
+    carousel_models: Option<Arc<CarouselModelStore>>,
 }
 
 impl VMRankerServiceImpl {
@@ -44,7 +47,13 @@ impl VMRankerServiceImpl {
             dpp,
             user_debias,
             config,
+            carousel_models: None,
         }
+    }
+
+    pub fn with_carousel_models(mut self, store: Option<Arc<CarouselModelStore>>) -> Self {
+        self.carousel_models = store;
+        self
     }
 
     pub fn server(self) -> VmRankerServiceServer<Self> {
@@ -137,5 +146,28 @@ impl VmRankerService for VMRankerServiceImpl {
         }
 
         Ok(Response::new(RankResponse { candidates: result }))
+    }
+
+    async fn get_carousel_model(
+        &self,
+        request: Request<GetCarouselModelRequest>,
+    ) -> Result<Response<GetCarouselModelResponse>, Status> {
+        let Some(store) = self.carousel_models.as_ref() else {
+            CAROUSEL_MODEL_REQUESTS
+                .with_label_values(&["disabled"])
+                .inc();
+            return Err(Status::unavailable("no carousel model dir configured"));
+        };
+        let name = request.into_inner().name;
+        let Some(model_json) = store.get(&name) else {
+            CAROUSEL_MODEL_REQUESTS
+                .with_label_values(&["not_found"])
+                .inc();
+            return Err(Status::not_found(format!(
+                "carousel model {name} not found"
+            )));
+        };
+        CAROUSEL_MODEL_REQUESTS.with_label_values(&["ok"]).inc();
+        Ok(Response::new(GetCarouselModelResponse { model_json }))
     }
 }

@@ -1,10 +1,11 @@
 use crate::hydration::RequestRows;
 use crate::models::{
     AuthorId, ClientCapability, NotificationKind, PlacedCandidate, Placement, RawCandidate,
-    RequestViewer, RetweetMerge, TweetId,
+    RequestFacts, RequestViewer, RetweetMerge, TweetId,
 };
 use crate::params::ClientSwitches;
 use crate::post_evaluator::PostBatch;
+use crate::rules::notification_kind;
 use crate::rules::{LevelError, QuoteEntries, RuleEngine, SafetyLevel, WireLevel};
 use tonic::Status;
 use xai_twittercontext_proto::TwitterContextViewer;
@@ -21,7 +22,7 @@ pub(crate) enum Entry {
 }
 
 pub(crate) struct Notifications<S> {
-    pub(crate) recipient: u64,
+    pub(crate) facts: RequestFacts,
     pub(crate) rows: Vec<(NotificationKind, S)>,
 }
 
@@ -34,24 +35,6 @@ pub(crate) enum NotificationRequest {
 pub(crate) struct NotificationPost {
     pub(crate) post: TweetId,
     pub(crate) actor: AuthorId,
-}
-
-impl NotificationKind {
-    fn parse(kind: Option<&vf_pb::notification::Kind>) -> Result<(Self, Option<u64>), Status> {
-        use vf_pb::notification::Kind;
-        match kind {
-            Some(Kind::Follow(_)) => Ok((Self::Follow, None)),
-            Some(Kind::FollowRequestAccepted(_)) => Ok((Self::FollowRequestAccepted, None)),
-            Some(Kind::Mention(vf_pb::Mention { post_id })) => Ok((Self::Mention, Some(*post_id))),
-            Some(Kind::Reply(vf_pb::Reply { post_id })) => Ok((Self::Reply, Some(*post_id))),
-            Some(Kind::MediaTagged(vf_pb::MediaTagged { post_id })) => {
-                Ok((Self::MediaTagged, Some(*post_id)))
-            }
-            None => Err(Status::invalid_argument(
-                "a notification has no kind VF serves",
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,7 +81,10 @@ pub(crate) fn evaluate_tweets(
     context: Option<TwitterContextViewer>,
     level: SafetyLevel,
 ) -> Request<Vec<Entry>> {
-    let judges_quote_entries = matches!(level.spec().quote_entries(), QuoteEntries::Judged { .. });
+    let judges_quote_entries = match level.spec().quote_entries() {
+        QuoteEntries::NotJudged => false,
+        QuoteEntries::Judged | QuoteEntries::JudgedWithQuotePass { .. } => true,
+    };
     let rows = request
         .tweets
         .iter()
@@ -129,7 +115,8 @@ pub(crate) fn filter_notifications(
     request: &vf_pb::FilterNotificationsRequest,
     level: Result<SafetyLevel, Status>,
 ) -> Result<(SafetyLevel, NotificationRequest), Status> {
-    if request.recipient_id == 0 {
+    let facts = RequestFacts::logged_in(request.recipient_id);
+    if facts.viewer_id().is_none() {
         return Err(Status::invalid_argument(
             "FilterNotifications needs a recipient",
         ));
@@ -138,9 +125,15 @@ pub(crate) fn filter_notifications(
     let mut users = Vec::new();
     let mut posts = Vec::new();
     for notification in &request.notifications {
-        let (kind, post) = NotificationKind::parse(notification.kind.as_ref())?;
+        let (kind, post) = notification
+            .kind
+            .as_ref()
+            .map(NotificationKind::of_proto)
+            .ok_or_else(|| Status::invalid_argument("a notification has no kind VF serves"))?;
         let actor = AuthorId(notification.actor_id);
-        let rows = level.notification_rows(kind);
+        let rows = level
+            .judges(kind)
+            .then(|| notification_kind::judged(kind).rows());
         match post {
             None if rows == Some(RequestRows::Users) => users.push((kind, actor)),
             Some(0) => {
@@ -167,21 +160,14 @@ pub(crate) fn filter_notifications(
             }
         }
     }
-    let recipient = request.recipient_id;
     let request = match (users.is_empty(), posts.is_empty()) {
         (false, false) => {
             return Err(Status::invalid_argument(
                 "a request mixes user and post notifications",
             ));
         }
-        (true, false) => NotificationRequest::Posts(Notifications {
-            recipient,
-            rows: posts,
-        }),
-        (_, true) => NotificationRequest::Users(Notifications {
-            recipient,
-            rows: users,
-        }),
+        (true, false) => NotificationRequest::Posts(Notifications { facts, rows: posts }),
+        (_, true) => NotificationRequest::Users(Notifications { facts, rows: users }),
     };
     Ok((level, request))
 }
@@ -210,14 +196,11 @@ pub(crate) fn filter_tweets_batch(
     safety_level: SafetyLevel,
     candidates: Vec<PlacedCandidate>,
 ) -> PostBatch {
-    let client_capability = ClientCapability {
-        soft_nsfw_new_user_drop: rule_engine.reads_soft_nsfw_new_user_drop(safety_level)
-            && client_switches.soft_nsfw_new_user_drop(viewer.id(), viewer.country_code()),
-        ..ClientCapability::default()
-    };
+    let soft_nsfw_new_user_drop = rule_engine.reads_soft_nsfw_new_user_drop(safety_level)
+        && client_switches.soft_nsfw_new_user_drop(viewer.id(), viewer.country_code());
     PostBatch {
-        viewer,
-        client_capability,
+        facts: RequestFacts::new(viewer, ClientCapability::DEFAULT)
+            .with_soft_nsfw_new_user_drop(soft_nsfw_new_user_drop),
         safety_level,
         candidates,
         retweet_merge: RetweetMerge::Unmerged,
@@ -233,8 +216,7 @@ pub(crate) fn evaluate_tweets_batch(
     let client_capability =
         client_switches.resolve(viewer.context(), viewer.id(), viewer.country_code());
     PostBatch {
-        viewer,
-        client_capability,
+        facts: RequestFacts::new(viewer, client_capability),
         safety_level,
         candidates,
         retweet_merge: RetweetMerge::Merged,

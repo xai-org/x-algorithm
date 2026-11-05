@@ -11,8 +11,8 @@ use super::*;
 use crate::hydration::inventory::Tier;
 use crate::hydration::Hydrator;
 use crate::models::{
-    ClientCapability, ClientSwitch, PostCandidate, SafetyLabelMap, SafetyLabelType, UserCandidate,
-    VerifyBlurSupport, ViewerFeatures,
+    ClientCapability, ClientSwitch, PostCandidate, RequestFacts, SafetyLabelMap, SafetyLabelType,
+    UserCandidate, VerifyBlurSupport, ViewerFeatures,
 };
 use crate::params::CountryLists;
 use crate::rules::expansion::Expansion;
@@ -39,7 +39,7 @@ fn truths() -> Vec<Truth> {
 fn wired<E: Engine>(list: fn(LevelLists) -> Vec<&'static Rule<E>>) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for rule in level.spec().rule_lists().flat_map(list) {
+        for rule in level.rule_lists().flat_map(list) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -478,31 +478,31 @@ fn the_conversation_root_exemption_is_whole() {
 }
 
 #[test]
-fn every_client_capability_is_live() {
+fn every_client_capability_and_rule_switch_is_live() {
     let base = ClientCapability::default();
+    let with_client = |client| RequestFacts::default().with_client(client);
     let blur_supports = once(None)
         .chain(VerifyBlurSupport::VARIANTS.iter().copied().map(Some))
         .filter(|&support| support != base.verify_blur_support)
-        .map(|support| ClientCapability {
-            verify_blur_support: support,
-            ..base
+        .map(|support| {
+            with_client(ClientCapability {
+                verify_blur_support: support,
+                ..base
+            })
         })
         .collect();
     let toggle = |switch| {
-        if base.has(switch) {
+        with_client(if base.has(switch) {
             base.without(switch)
         } else {
             base.with(switch)
-        }
+        })
     };
-    let toggled: Vec<(&str, Vec<ClientCapability>)> = [
+    let toggled: Vec<(&str, Vec<RequestFacts>)> = [
         ("verify_blur_support", blur_supports),
         (
             "soft_nsfw_new_user_drop",
-            vec![ClientCapability {
-                soft_nsfw_new_user_drop: !base.soft_nsfw_new_user_drop,
-                ..base
-            }],
+            vec![RequestFacts::default().with_soft_nsfw_new_user_drop(true)],
         ),
     ]
     .into_iter()
@@ -514,22 +514,23 @@ fn every_client_capability_is_live() {
     .collect();
     let leaves = wired_leaves();
     let fetched = candidate().build();
-    let holds = |client_capability: ClientCapability, leaf: Predicate| {
+    let holds = |facts: &RequestFacts, leaf: Predicate| {
         let features = ViewerFeatures {
-            client_capability,
+            facts: facts.clone(),
             ..viewer(VIEWER_ID)
         };
         leaf.holds(&test_context(&features, &fetched))
     };
-    for (field, capabilities) in toggled {
-        let live = capabilities.iter().any(|&capability| {
+    let default = RequestFacts::default();
+    for (field, variants) in toggled {
+        let live = variants.iter().any(|facts| {
             leaves
                 .iter()
-                .any(|&leaf| holds(capability, leaf) != holds(base, leaf))
+                .any(|&leaf| holds(facts, leaf) != holds(&default, leaf))
         });
         assert!(
             live,
-            "no wired leaf reads the client's {field}: wire a rule that reads it, or delete it"
+            "no wired leaf reads the request's {field}: wire a rule that reads it, or delete it"
         );
     }
 }
@@ -608,11 +609,7 @@ fn every_post_rule_reads_the_post() {
         .filter(|rule| {
             let mut read = Vec::new();
             rule.when.leaves(&mut read);
-            let notice = matches!(
-                rule.action.spec(),
-                ActionSpec::SoftIntervention(_) | ActionSpec::Appealable(_)
-            );
-            !notice && !read.iter().any(reads_the_post)
+            !rule.action.spec().kind().lands_in_fosnr() && !read.iter().any(reads_the_post)
         })
         .map(|rule| rule.name())
         .collect();
@@ -628,16 +625,16 @@ fn every_post_rule_reads_the_post() {
 }
 
 #[test]
+fn a_less_severe_action_kind_never_relies_on_an_earlier_defaults_bucket() {
+    let mut kinds = ActionKind::VARIANTS.to_vec();
+    kinds.sort_by_key(|kind| std::cmp::Reverse(kind.severity()));
+    for pair in kinds.windows(2) {
+        assert!(pair[0].bucket() <= pair[1].bucket(), "{pair:?}");
+    }
+}
+
+#[test]
 fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
-    let ends_the_fold = |action: &ActionSpec<UserEngine>| match action {
-        ActionSpec::Drop(_)
-        | ActionSpec::Tombstone(_)
-        | ActionSpec::SoftIntervention(_)
-        | ActionSpec::Appealable(_) => true,
-        ActionSpec::MediaRestriction(_)
-        | ActionSpec::LimitedEngagement(_)
-        | ActionSpec::LabelInterstitial(_) => false,
-    };
     let disjoint = |user: Audience, post: Audience| match (user, post) {
         (OnlyAuthor, NonAuthors | NonFollowers) | (NonAuthors | NonFollowers, OnlyAuthor) => true,
         (Everyone, _)
@@ -648,10 +645,13 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     let mut shadowing = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let LevelLists { user, post } = level.spec().rules().lists();
-        for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
-            let severity = user_rule.action.spec().severity();
+        for &user_rule in user
+            .iter()
+            .filter(|rule| rule.action.spec().kind().ends_the_fold())
+        {
+            let severity = user_rule.action.spec().kind().severity();
             for &post_rule in &post {
-                if post_rule.action.spec().severity() > severity
+                if post_rule.action.spec().kind().severity() > severity
                     && !disjoint(user_rule.audience, post_rule.audience)
                 {
                     shadowing.push(format!(
@@ -671,16 +671,17 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     );
 }
 
+pub(in crate::rules) const WIRED_DIFFERENTLY: [&str; 6] = [
+    "nsfw_high_precision/blur/nudity",
+    "nsfw_high_precision/blur/sensitive",
+    "gore_and_violence_high_precision/blur",
+    "nsfw_card_image/blur/sensitive",
+    "nsfw_admin/blur/sensitive",
+    "nsfw_user/blur/sensitive_user",
+];
+
 #[test]
 fn each_rule_name_wires_the_same_rules_at_every_level() {
-    const WIRED_DIFFERENTLY: [&str; 6] = [
-        "nsfw_high_precision/blur/nudity",
-        "nsfw_high_precision/blur/sensitive",
-        "gore_and_violence_high_precision/blur",
-        "nsfw_card_image/blur/sensitive",
-        "nsfw_admin/blur/sensitive",
-        "nsfw_user/blur/sensitive_user",
-    ];
     let mut first: Vec<(String, SafetyLevel, Vec<String>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let rules = level.spec().rules().lists();

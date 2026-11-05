@@ -27,25 +27,19 @@ pub(super) fn rows() -> Vec<Row> {
     vec![Row {
         name: "nsfw_high_precision_media_in_a_local_regulations_country",
         subject: Subject::Post(nsfw_high_precision_media()),
-        expect: vec![
-            (
-                TimelineHomeHydration,
+        expect: vec![(
+            Role::each([
                 web_in_in(),
-                high_precision_tombstone(),
-            ),
-            (
-                TimelineHomeHydration,
                 Role::As(
                     "sensitive_opt_in_web_in_in",
                     on_client("web", "in", sensitive_opt_in_viewer()),
                 ),
-                high_precision_tombstone(),
-            ),
-            (
-                TimelineHomeHydration,
                 Role::As("no_client_context_in_in", viewer_in_country("in")),
-                high_precision_tombstone(),
-            ),
+            ]),
+            high_precision_tombstone(),
+        )],
+        at: vec![
+            (TimelineHome, web_in_in(), plain_high_precision()),
             (
                 TimelineHomeHydration,
                 Role::As("author_web_in_in", on_client("web", "in", author_viewer())),
@@ -56,7 +50,6 @@ pub(super) fn rows() -> Vec<Row> {
                 Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
                 plain_high_precision(),
             ),
-            (TimelineHome, web_in_in(), plain_high_precision()),
         ],
     }]
 }

@@ -13,14 +13,9 @@ impl XService for StagingServer {
 
     async fn build(ctx: ServiceContext<Option<MetadataMap>>) -> Self {
         let deps = server_deps::build(&ctx.datacenter, ctx.config.as_ref()).await;
-        let comparators = reference::build(
-            deps.init_deadline,
-            &deps.post_evaluator,
-            &deps.client_switches,
-            ctx.config.as_ref(),
-        )
-        .await;
-        Self(Arc::new(deps.into_server(comparators)))
+        let comparator =
+            reference::build(deps.init_deadline, &deps.metrics, ctx.config.as_ref()).await;
+        Self(Arc::new(deps.into_server(comparator)))
     }
 
     fn register(self: Arc<Self>, routes: &mut tonic::service::RoutesBuilder) {

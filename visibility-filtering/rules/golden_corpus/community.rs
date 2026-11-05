@@ -7,7 +7,6 @@ use crate::models::{
 use crate::rules::fixtures::{
     allow, author_viewer, candidate, dropped, limited, on_client, viewer, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::TimelineHomeHydration;
 use std::num::NonZeroU64;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -67,12 +66,14 @@ fn viewer_removed_limit() -> Verdict {
 
 fn ios_before_viewer_removed_limits() -> Role {
     let ios = on_client("ios_current", "us", viewer(VIEWER_ID));
+    let client = ios
+        .facts
+        .client_capability()
+        .without(ClientSwitch::CommunityViewerRemovedLimits);
     Role::As(
         "ios_10_15",
         ViewerFeatures {
-            client_capability: ios
-                .client_capability
-                .without(ClientSwitch::CommunityViewerRemovedLimits),
+            facts: ios.facts.with_client(client),
             ..ios
         },
     )
@@ -83,36 +84,29 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "hidden_community_post",
             subject: Subject::Post(community_post(HIDDEN, Some(false))),
-            expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, hidden_drop()),
-                (TimelineHomeHydration, Role::Follower, hidden_drop()),
-                (TimelineHomeHydration, Role::LoggedOut, hidden_drop()),
-            ],
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Follower, Role::LoggedOut]),
+                hidden_drop(),
+            )],
+            at: vec![],
         },
         Row {
             name: "hidden_community_post_moderator_lookup_failed",
             subject: Subject::Post(community_post(HIDDEN, None)),
             expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, allow()),
-                (TimelineHomeHydration, Role::LoggedOut, hidden_drop()),
+                (Role::NonFollower, allow()),
+                (Role::LoggedOut, hidden_drop()),
             ],
+            at: vec![],
         },
         Row {
             name: "author_removed_community_post",
             subject: Subject::Post(community_post(AUTHOR_REMOVED, Some(false))),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
-                    author_removed_drop(),
-                ),
-                (TimelineHomeHydration, Role::Follower, author_removed_drop()),
-                (
-                    TimelineHomeHydration,
-                    Role::LoggedOut,
-                    author_removed_drop(),
-                ),
-            ],
+            expect: vec![(
+                Role::each([Role::NonFollower, Role::Follower, Role::LoggedOut]),
+                author_removed_drop(),
+            )],
+            at: vec![],
         },
         Row {
             name: "hidden_author_removed_community_post",
@@ -123,81 +117,67 @@ pub(super) fn rows() -> Vec<Row> {
                 },
                 Some(false),
             )),
-            expect: vec![(TimelineHomeHydration, Role::NonFollower, hidden_drop())],
+            expect: vec![(Role::NonFollower, hidden_drop())],
+            at: vec![],
         },
         Row {
             name: "unmoderated_community_post",
             subject: Subject::Post(community_post(CommunityModeration::default(), None)),
-            expect: vec![
-                (TimelineHomeHydration, Role::NonFollower, allow()),
-                (TimelineHomeHydration, Role::LoggedOut, allow()),
-            ],
+            expect: vec![(Role::each([Role::NonFollower, Role::LoggedOut]), allow())],
+            at: vec![],
         },
         Row {
             name: "community_post_viewer_removed",
             subject: Subject::Post(viewer_removed_post(true)),
             expect: vec![
                 (
-                    TimelineHomeHydration,
-                    Role::As("web", on_client("web", "us", viewer(VIEWER_ID))),
+                    Role::each([
+                        Role::As("web", on_client("web", "us", viewer(VIEWER_ID))),
+                        Role::As(
+                            "ios_current",
+                            on_client("ios_current", "us", viewer(VIEWER_ID)),
+                        ),
+                        Role::As(
+                            "android_current",
+                            on_client("android_current", "us", viewer(VIEWER_ID)),
+                        ),
+                    ]),
                     viewer_removed_limit(),
                 ),
                 (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "ios_current",
-                        on_client("ios_current", "us", viewer(VIEWER_ID)),
-                    ),
-                    viewer_removed_limit(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::As(
-                        "android_current",
-                        on_client("android_current", "us", viewer(VIEWER_ID)),
-                    ),
-                    viewer_removed_limit(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    ios_before_viewer_removed_limits(),
-                    allow(),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::As("mac_app", on_client("mac_app", "us", viewer(VIEWER_ID))),
+                    Role::each([
+                        ios_before_viewer_removed_limits(),
+                        Role::As("mac_app", on_client("mac_app", "us", viewer(VIEWER_ID))),
+                    ]),
                     allow(),
                 ),
             ],
+            at: vec![],
         },
         Row {
             name: "community_post_author_removed_from_its_community",
             subject: Subject::Post(viewer_removed_post(true)),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::As("author_on_web", on_client("web", "us", author_viewer())),
                 viewer_removed_limit(),
             )],
+            at: vec![],
         },
         Row {
             name: "community_post_viewer_not_removed",
             subject: Subject::Post(viewer_removed_post(false)),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
+            expect: vec![(
+                Role::each([
                     Role::As("web", on_client("web", "us", viewer(VIEWER_ID))),
-                    allow(),
-                ),
-                (
-                    TimelineHomeHydration,
                     Role::As(
                         "ios_current",
                         on_client("ios_current", "us", viewer(VIEWER_ID)),
                     ),
-                    allow(),
-                ),
-                (TimelineHomeHydration, Role::LoggedOut, allow()),
-            ],
+                    Role::LoggedOut,
+                ]),
+                allow(),
+            )],
+            at: vec![],
         },
         Row {
             name: "community_post_viewer_removal_lookup_failed",
@@ -207,10 +187,10 @@ pub(super) fn rows() -> Vec<Row> {
                 candidate
             }),
             expect: vec![(
-                TimelineHomeHydration,
                 Role::As("web", on_client("web", "us", viewer(VIEWER_ID))),
                 allow(),
             )],
+            at: vec![],
         },
     ]
 }

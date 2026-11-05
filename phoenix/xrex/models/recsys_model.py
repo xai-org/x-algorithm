@@ -372,6 +372,7 @@ class ContinuousActionLossConfig(Config):
     product_surfaces: tuple[int, ...] = ()
 
     exclude_product_surfaces: tuple[int, ...] = ()
+    condition_action_index: int | None = None
 
     def __post_init__(self):
         if self.metric_name is None:
@@ -4612,10 +4613,16 @@ class RecsysAggregatedModel(hk.Module):
                         and loss_config.action_index < candidate_continuous_actions.shape[-1]
                     ):
                         head_valid_mask = continuous_base_mask
-                        head_surface_mask = None
+                        head_mask = None
                         if loss_config.product_surfaces or loss_config.exclude_product_surfaces:
-                            head_surface_mask = _get_surface_mask(loss_config, product_surface)
-                            head_valid_mask = head_valid_mask * head_surface_mask.astype(
+                            head_mask = _get_surface_mask(loss_config, product_surface)
+                        if loss_config.condition_action_index is not None:
+                            condition_mask = targets[:, :, loss_config.condition_action_index] > 0
+                            head_mask = (
+                                condition_mask if head_mask is None else head_mask & condition_mask
+                            )
+                        if head_mask is not None:
+                            head_valid_mask = head_valid_mask * head_mask.astype(
                                 head_valid_mask.dtype
                             )
                         if loss_config.action_index == recsys_pb2.ContinuousActionName.DWELL_TIME:
@@ -4626,7 +4633,7 @@ class RecsysAggregatedModel(hk.Module):
                             head_valid_mask = head_valid_mask * in_range.astype(
                                 head_valid_mask.dtype
                             )
-                        continuous_heads[index] = (head_valid_mask, head_surface_mask)
+                        continuous_heads[index] = (head_valid_mask, head_mask)
                         valid_mask = head_valid_mask
                         if loss_config.loss_type == "cread":
                             valid_mask = valid_mask.astype(jnp.bool_)
@@ -4946,6 +4953,7 @@ class RecsysAggregatedModel(hk.Module):
             negative_feedback_action_indices = jnp.array(
                 [
                     action_type_map["ServerTweetReport"],
+                    action_type_map["ClientTweetReport"],
                     action_type_map["ClientTweetNotInterestedIn"],
                     action_type_map["ClientTweetSeeFewer"],
                     action_type_map["ClientTweetUnfollowAuthor"],

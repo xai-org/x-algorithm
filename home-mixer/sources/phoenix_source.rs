@@ -10,7 +10,6 @@ use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
     retrieval_value_model_weights,
 };
-use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
@@ -24,7 +23,6 @@ use xai_recsys_proto::RetrievalDatasetType;
 use xai_stats_receiver::global_stats_receiver;
 
 const ZERO_FAV_RETRIEVED_METRIC: &str = "ScoredStats.PhoenixRetrievalZeroFavTweets.Retrieved";
-const SOCIALGRAPH_RETRIEVED_METRIC: &str = "PhoenixSource.SocialgraphRetrieved";
 
 pub struct PhoenixSource {
     pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
@@ -145,39 +143,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let candidates =
             candidates_from_retrieval_response(response, served_type_for_dataset, cluster);
         record_zero_fav_retrieved(&candidates);
-        record_socialgraph_retrieved(query, &candidates);
         Ok(candidates)
-    }
-}
-
-fn record_socialgraph_retrieved(query: &ScoredPostsQuery, candidates: &[PostCandidate]) {
-    let Some(receiver) = global_stats_receiver() else {
-        return;
-    };
-    let muted: FxHashSet<i64> = query.user_features.muted_user_ids.iter().copied().collect();
-    let blocked: FxHashSet<i64> = query
-        .user_features
-        .blocked_user_ids
-        .iter()
-        .copied()
-        .collect();
-    let (mut muted_count, mut blocked_count) = (0u64, 0u64);
-    for c in candidates {
-        let author_id = c.author_id as i64;
-        muted_count += muted.contains(&author_id) as u64;
-        blocked_count += blocked.contains(&author_id) as u64;
-    }
-    let m = SOCIALGRAPH_RETRIEVED_METRIC;
-    receiver.incr(m, &[("type", "requests")], 1);
-    receiver.incr(m, &[("type", "retrieved")], candidates.len() as u64);
-    if muted_count > 0 {
-        receiver.incr(m, &[("type", "muted")], muted_count);
-    }
-    if blocked_count > 0 {
-        receiver.incr(m, &[("type", "blocked")], blocked_count);
-    }
-    if muted_count + blocked_count > 0 {
-        receiver.incr(m, &[("type", "requests_with_hit")], 1);
     }
 }
 

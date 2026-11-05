@@ -6,7 +6,6 @@ from pathlib import Path
 
 from xrex import settings
 from xrex.configs import config_registry
-from xrex.data.grpc_recsys import PhoenixGrpcDataset
 from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.rust_kafka_recsys import RustKafkaDataset
 from xrex.data.rust_parquet_recsys import RustParquetDataset
@@ -26,7 +25,6 @@ _KAFKA_CLUSTER = settings.KAFKA_CLUSTER
 _OTEL_ENDPOINT = settings.OTEL_ENDPOINT
 _RUST_BOOTSTRAP = settings.KAFKA_RUST_BOOTSTRAP
 _DISPATCHER_HOST_TEMPLATE = settings.KAFKA_DISPATCHER_HOST_TEMPLATE
-_GRPC_DATALOADER_ADDRESS = settings.GRPC_DATALOADER_ADDRESS
 
 
 def kafka_kwargs(cluster: str = _KAFKA_CLUSTER) -> dict:
@@ -268,40 +266,12 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
     )
 
 
-def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
-    del config_name
-    if mparams.get("enable_stale_post", False):
-        raise ValueError(
-            "enable_stale_post is unsupported on grpc_recsys, which does not transport per-post feature arrays (int64/bool/categorical/float)"
-        )
-    return PhoenixGrpcDataset(
-        hash_table=hash_table,
-        history_seq_len=mparams["history_seq_len"],
-        candidate_seq_len=mparams["candidate_seq_len"],
-        server_address=_GRPC_DATALOADER_ADDRESS,
-        input_vocab_size=mparams["input_vocab_size"],
-        pad_token=PAD_TOKEN,
-        output_vocab_size=mparams["output_vocab_size"],
-        num_continuous_actions=mparams["num_continuous_actions"],
-        num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-        num_data_loaders=8,
-        num_kafka_partitions=1024,
-        multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
-        use_post_sid=use_post_sid,
-        sid_num_levels=sid_num_levels,
-        ads_head_masking=mparams.get("ads_head_masking", False),
-        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
-        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
-    )
-
-
 RANKING_DATASET_FACTORIES = {
     "aggregated_kafka": _ranking_aggregated_kafka,
     "rust_kafka": _ranking_rust_kafka,
     "kafka_dispatcher": _ranking_kafka_dispatcher,
     "offline_kafka_dump": _ranking_offline_kafka_dump,
     "rust_parquet": _ranking_rust_parquet,
-    "grpc_recsys": _ranking_grpc_recsys,
 }
 
 RANKING_EXTRA_DATASET_TYPES = [
@@ -309,7 +279,6 @@ RANKING_EXTRA_DATASET_TYPES = [
     "rust_parquet",
     "rust_kafka",
     "kafka_dispatcher",
-    "grpc_recsys",
 ]
 
 

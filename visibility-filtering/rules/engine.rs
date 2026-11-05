@@ -1,16 +1,19 @@
 use crate::hydration::{Hydration, HydrationPlan, Hydrators, RequestRows};
 use crate::models::{
-    AuthorId, Decided, Evaluation, LimitedEngagement, MediaRestriction, Notice, NotificationKind,
-    Placement, PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
+    AuthorId, Decided, Evaluation, LabelInterstitial, LimitedEngagement, MediaRestriction,
+    NotificationKind, Placement, PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
 };
 use crate::params::CountryLists;
+use crate::rules::action_kind::{ActionKind, Filled};
 use crate::rules::defaults::{Bucket, Defaults, Effect};
 use crate::rules::levels::PostRules;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
 use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
 use crate::rules::rule_spec::rule::{self, Rule};
-use crate::rules::rule_spec::{rule_name, ActionSpec, Contribution, RuleAction, RuleId, Truth};
+#[cfg(test)]
+use crate::rules::rule_spec::ActionSpec;
+use crate::rules::rule_spec::{rule_name, Contribution, RuleAction, RuleId, Truth};
 use crate::rules::{Predicate, RequestLeaf, RuleContext, SafetyLevel};
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -32,7 +35,7 @@ impl<E: Fold> Policy<E> {
         if let Err(error) = rule::validate(rules.iter().map(|(_, rule)| rule)) {
             panic!("invalid rules: {error:?}");
         }
-        rules.sort_by_key(|(_, rule)| Reverse(rule.action.spec().severity()));
+        rules.sort_by_key(|(_, rule)| Reverse(rule.action.spec().kind().severity()));
         let mut runs: Vec<&'static str> = Vec::new();
         let mut run: Vec<&Rule<E>> = Vec::new();
         for (name, rule) in &rules {
@@ -109,7 +112,8 @@ fn fold_from<E: Fold, O: Observer<E>>(
         }
         let action = rule.action.spec();
         let completed = (truth.resolves_true()
-            && (O::TOTAL || (after.is_none() && decision.suppressed(action).is_none())))
+            && (O::TOTAL
+                || (after.is_none() && action.kind().kept_by(decision.filled()).is_none())))
         .then(|| action.interpret(&EvaluateInputs(context)));
         let diagnostic = if O::TOTAL {
             completed
@@ -126,7 +130,7 @@ fn fold_from<E: Fold, O: Observer<E>>(
         } else {
             let contribution = completed.and_then(|completed| completed.value);
             let (selected, effect, admitted) =
-                decision.step(rule.id, by, action, truth, contribution);
+                decision.step(rule.id, by, action.kind(), truth, contribution);
             if let Some(verdict) = selected {
                 terminal = Some((occurrence, verdict));
             }
@@ -174,72 +178,41 @@ fn finish<E: Engine, O: Observer<E>>(
 
 #[derive(Default)]
 struct Decision {
-    notice: Option<Decided<Notice>>,
+    label_interstitial: Option<Decided<LabelInterstitial>>,
     media: Option<Decided<MediaRestriction>>,
     engagement: Option<Decided<LimitedEngagement>>,
     defaults: Defaults,
 }
 
 impl Decision {
-    fn suppressed<E: Engine>(&self, action: &ActionSpec<E>) -> Option<Effect> {
-        if self.notice.is_some()
-            && matches!(
-                action,
-                ActionSpec::SoftIntervention(_) | ActionSpec::LabelInterstitial(_)
-            )
-        {
-            return Some(Effect::KeptEarlierNotice);
-        }
-        self.media.as_ref()?;
-        match action {
-            ActionSpec::MediaRestriction(_) => Some(Effect::KeptEarlierMedia),
-            ActionSpec::SoftIntervention(_) => Some(Effect::KeptEarlierMediaInsteadOfNotice),
-            ActionSpec::Appealable(_)
-            | ActionSpec::Drop(_)
-            | ActionSpec::Tombstone(_)
-            | ActionSpec::LimitedEngagement(_)
-            | ActionSpec::LabelInterstitial(_) => None,
+    fn filled(&self) -> Filled {
+        Filled {
+            label_interstitial: self.label_interstitial.is_some(),
+            media: self.media.is_some(),
+            engagement: self.engagement.is_some(),
         }
     }
 
     #[inline]
-    fn step<E: Engine>(
+    fn step(
         &mut self,
         id: RuleId,
         by: &'static str,
-        action: &ActionSpec<E>,
+        kind: ActionKind,
         truth: Truth,
         contribution: Option<Contribution>,
     ) -> (Option<Verdict>, Effect, (Bucket, Hydrators)) {
-        let unknown_reads = match truth {
-            Truth::Unknown { failed, .. } => failed,
-            Truth::True | Truth::False => Hydrators::empty(),
+        let filled = self.filled();
+        let reads = match truth {
+            Truth::Unknown { failed, .. } if kind.admits_defaults(filled) => failed,
+            Truth::Unknown { .. } | Truth::True | Truth::False => Hydrators::empty(),
         };
-        let (bucket, reads) = match action {
-            ActionSpec::Appealable(_) | ActionSpec::Drop(_) | ActionSpec::Tombstone(_) => {
-                (Bucket::Withholding, unknown_reads)
-            }
-            ActionSpec::MediaRestriction(_)
-            | ActionSpec::SoftIntervention(_)
-            | ActionSpec::LabelInterstitial(_)
-                if self.suppressed(action).is_none() =>
-            {
-                (Bucket::Media, unknown_reads)
-            }
-            ActionSpec::LimitedEngagement(_) if self.engagement.is_none() => {
-                (Bucket::Engagement, unknown_reads)
-            }
-            ActionSpec::MediaRestriction(_)
-            | ActionSpec::SoftIntervention(_)
-            | ActionSpec::LabelInterstitial(_) => (Bucket::Media, Hydrators::empty()),
-            ActionSpec::LimitedEngagement(_) => (Bucket::Engagement, Hydrators::empty()),
-        };
-        self.defaults.admit(bucket, reads);
-        let admitted = (bucket, reads);
+        let admitted = (kind.bucket(), reads);
+        self.defaults.admit(kind.bucket(), reads);
         if !truth.resolves_true() {
             return (None, Effect::DidNotApply, admitted);
         }
-        if let Some(effect) = self.suppressed(action) {
+        if let Some(effect) = kind.kept_by(filled) {
             return (None, effect, admitted);
         }
         let (terminal, effect) = match contribution {
@@ -248,6 +221,14 @@ impl Decision {
                 Some(Verdict::Withheld(Decided { value, id, by })),
                 Effect::Decided,
             ),
+            Some(Contribution::Notice(value)) => (
+                Some(Verdict::Fosnr(Decided { value, id, by })),
+                Effect::Decided,
+            ),
+            Some(Contribution::LabelInterstitial(value)) => {
+                self.label_interstitial = Some(Decided { value, id, by });
+                (None, Effect::FilledLabelInterstitial)
+            }
             Some(Contribution::Media(value)) => {
                 self.media = Some(Decided { value, id, by });
                 (None, Effect::FilledMedia)
@@ -272,33 +253,13 @@ impl Decision {
                 };
                 (None, effect)
             }
-            Some(Contribution::Notice(notice)) if !notice.is_whole_verdict() => {
-                self.notice = Some(Decided {
-                    value: notice,
-                    id,
-                    by,
-                });
-                (None, Effect::FilledNotice)
-            }
-            Some(Contribution::Notice(notice)) => (
-                Some(Verdict::Shown {
-                    notice: Some(Decided {
-                        value: notice,
-                        id,
-                        by,
-                    }),
-                    media: None,
-                    engagement: None,
-                }),
-                Effect::Decided,
-            ),
         };
         (terminal, effect, admitted)
     }
 
     fn finish(self) -> Verdict {
         Verdict::Shown {
-            notice: self.notice,
+            label_interstitial: self.label_interstitial,
             media: self.media,
             engagement: self.engagement,
         }
@@ -406,12 +367,11 @@ impl Level {
 impl PostKinds {
     fn new(
         level: SafetyLevel,
-        kinds: &[(NotificationKind, PostRules)],
+        kinds: impl Iterator<Item = (NotificationKind, PostRules)>,
         names: &mut Vec<(RuleId, RuleAction, &'static str)>,
     ) -> Self {
         let policies: Vec<(NotificationKind, PostPolicy)> = kinds
-            .iter()
-            .map(|&(kind, rules)| {
+            .map(|(kind, rules)| {
                 let rules = rules.lists();
                 let user = named(names, &rules.user);
                 (kind, PostPolicy::new(user, named(names, &rules.post)))
@@ -623,8 +583,9 @@ impl RuleEngine {
                     plans_from_its_rows(&entry.plan),
                     "{level:?} plans keys its request rows cannot give"
                 );
-                if !spec.post_kinds().is_empty() {
-                    let post_kinds = PostKinds::new(level, spec.post_kinds(), &mut names);
+                let mut kinds = level.post_kinds().peekable();
+                if kinds.peek().is_some() {
+                    let post_kinds = PostKinds::new(level, kinds, &mut names);
                     assert!(
                         plans_from_its_rows(&post_kinds.plan),
                         "{level:?} plans keys its actor post rows cannot give"
@@ -909,7 +870,7 @@ mod tests {
     use crate::models::Withholding;
     use crate::models::{
         AuthorFeatures, ClientCapability, ClientSwitch, DropReason, NsfwViewerDropReason,
-        SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
+        RequestFacts, SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
         candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
@@ -925,7 +886,7 @@ mod tests {
             .with_media()
             .build();
         let viewer = ViewerFeatures {
-            country_code: Some("us".into()),
+            facts: RequestFacts::default().with_country("us"),
             ..viewer_with_profile(ViewerProfile {
                 viewer_age: ViewerAge::NotStated,
                 ..ViewerProfile::default()
@@ -1024,14 +985,15 @@ country_specific_nsfw_content_gating:
         );
         let rule_engine = RuleEngine::with_country_lists(country_lists);
         let viewer = ViewerFeatures {
-            country_code: Some("us".into()),
-            client_capability: ClientCapability {
-                verify_blur_support: Some(VerifyBlurSupport::IosNeedsUpdate),
-                ..ClientCapability::DEFAULT
-                    .with(ClientSwitch::ModernBlur)
-                    .with(ClientSwitch::CommunityViewerRemovedLimits)
-                    .with(ClientSwitch::GoreBlurIgnoresSettings)
-            },
+            facts: RequestFacts::default()
+                .with_country("us")
+                .with_client(ClientCapability {
+                    verify_blur_support: Some(VerifyBlurSupport::IosNeedsUpdate),
+                    ..ClientCapability::DEFAULT
+                        .with(ClientSwitch::ModernBlur)
+                        .with(ClientSwitch::CommunityViewerRemovedLimits)
+                        .with(ClientSwitch::GoreBlurIgnoresSettings)
+                }),
             ..viewer(VIEWER_ID)
         };
         let nsfw_admin = AuthorFeatures {
@@ -1048,7 +1010,7 @@ country_specific_nsfw_content_gating:
             .into_verdict()
         {
             Verdict::Withheld(Decided { by, .. }) => Some(by),
-            Verdict::Shown { .. } => None,
+            Verdict::Fosnr(_) | Verdict::Shown { .. } => None,
         };
         let labeled = |label| candidate().with_label(label);
         assert_eq!(
@@ -1516,12 +1478,7 @@ country_specific_nsfw_content_gating:
                 trace.evaluation
             );
             let Evaluation::Complete {
-                verdict:
-                    Verdict::Shown {
-                        notice: Some(Decided { by: "notice", .. }),
-                        media: None,
-                        engagement: None,
-                    },
+                verdict: Verdict::Fosnr(Decided { by: "notice", .. }),
                 fail_open_defaults,
             } = trace.evaluation
             else {
@@ -1589,12 +1546,13 @@ country_specific_nsfw_content_gating:
         use super::super::*;
         use crate::clients::socialgraph_client::{EdgeQuery, Graph};
         use crate::hydration::fallback_cache::FallbackCaches;
-        use crate::hydration::inventory::Source;
+        use crate::hydration::sources::Source;
         use crate::hydration::sources::{suspended, InMemorySources};
         use crate::hydration::{HydrationRequest, Hydrator};
         use crate::metrics::{Endpoint, Metrics, RequestLevel};
         use crate::models::{
-            ClientCapability, RawCandidate, RetweetMerge, SafetyLabelType, TweetId,
+            ClientCapability, RawCandidate, RequestFacts, RequestViewer, RetweetMerge,
+            SafetyLabelType, TweetId,
         };
         use crate::models::{LimitedEngagementReason, Notice};
         use crate::rules::fixtures::{allow, candidate, dropped, viewer, VIEWER_ID};
@@ -1612,6 +1570,7 @@ country_specific_nsfw_content_gating:
         use crate::rules::test_context;
         use crate::rules::tweet_rules;
         use crate::scenario::{raw, Scenario};
+        use rayon::prelude::*;
         use std::iter::once;
         use xai_core_entities::entities::{GizmoduckUser, Label, Labels};
         use xai_visibility_filtering::models::FilteredReason;
@@ -1647,10 +1606,16 @@ country_specific_nsfw_content_gating:
         #[test]
         fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {
             let rule_engine = RuleEngine::for_tests();
-            let mut seen = (0, 0);
-            for (own_level, viewer, fetched) in post_cases() {
-                for &level in SafetyLevel::VARIANTS {
-                    let failed_alone = if level == own_level {
+            let cases = post_cases();
+            let runs: Vec<_> = SafetyLevel::VARIANTS
+                .iter()
+                .flat_map(|&level| cases.iter().map(move |case| (level, case)))
+                .collect();
+            let seen = runs
+                .par_iter()
+                .map(|&(level, (own_level, viewer, fetched))| {
+                    let mut seen = (0, 0);
+                    let failed_alone = if level == *own_level {
                         rule_engine.policy(level).hydrators
                     } else {
                         Hydrators::empty()
@@ -1662,8 +1627,8 @@ country_specific_nsfw_content_gating:
                         let mut candidate = fetched.clone();
                         candidate.failed = candidate.failed.union(failed);
                         let served =
-                            rule_engine.evaluate(level, &viewer, &candidate, Placement::Standalone);
-                        let observed = rule_engine.trace(level, &viewer, &candidate);
+                            rule_engine.evaluate(level, viewer, &candidate, Placement::Standalone);
+                        let observed = rule_engine.trace(level, viewer, &candidate);
                         assert_eq!(
                             observed.evaluation, served,
                             "{level:?} {viewer:?} {candidate:?}"
@@ -1686,8 +1651,12 @@ country_specific_nsfw_content_gating:
                             | Evaluation::Failed(_) => {}
                         }
                     }
-                }
-            }
+                    seen
+                })
+                .reduce(
+                    || (0, 0),
+                    |total, seen| (total.0 + seen.0, total.1 + seen.1),
+                );
             assert!(seen.0 > 0 && seen.1 > 0, "{seen:?}");
         }
 
@@ -1768,14 +1737,7 @@ country_specific_nsfw_content_gating:
             assert_eq!(named.skip, Some(Skip::TrueDisjunct(all.node)));
             assert_eq!(mutes.skip, Some(Skip::TrueDisjunct(all.node)));
             assert_eq!(mutes.truth, Truth::False);
-            assert_eq!(
-                trace.evaluation,
-                Evaluation::complete(Verdict::Shown {
-                    notice: None,
-                    media: None,
-                    engagement: None
-                })
-            );
+            assert_eq!(trace.evaluation, Evaluation::complete(allow()));
 
             let unfollowed = candidate().build();
             let trace = observe(&unfollowed);
@@ -2071,9 +2033,10 @@ country_specific_nsfw_content_gating:
             let metrics =
                 Metrics::none().request(Endpoint::FilterTweets, RequestLevel::Named(plan.level()));
             let request = HydrationRequest::new(
-                Some(50),
-                Some("us".into()),
-                ClientCapability::default(),
+                RequestFacts::new(
+                    RequestViewer::new(Some(50), Some("us".into())),
+                    ClientCapability::DEFAULT,
+                ),
                 raw,
                 RetweetMerge::Unmerged,
                 &caches,
@@ -2179,7 +2142,7 @@ country_specific_nsfw_content_gating:
             .hydrate(
                 &sources,
                 HydrationRequest::for_users(
-                    50,
+                    RequestFacts::logged_in(50),
                     vec![AuthorId(10), AuthorId(20)],
                     &caches,
                     &Metrics::none()
@@ -2232,7 +2195,7 @@ country_specific_nsfw_content_gating:
                 [
                     Effect::FilledMedia,
                     Effect::KeptEarlierMedia,
-                    Effect::KeptEarlierMediaInsteadOfNotice,
+                    Effect::KeptEarlierMediaInsteadOfFosnr,
                     Effect::FilledEngagement,
                     Effect::AddedEngagementReason,
                     Effect::DuplicateEngagementReason,
@@ -2251,7 +2214,7 @@ country_specific_nsfw_content_gating:
                 panic!("a suppressed notice is completed: {:?}", trace.rows[2]);
             };
             let Verdict::Shown {
-                notice: None,
+                label_interstitial: None,
                 media: Some(media),
                 engagement: Some(engagement),
             } = served.into_verdict()

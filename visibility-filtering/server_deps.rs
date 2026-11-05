@@ -9,7 +9,7 @@ use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::filter_notifications::FilterNotificationsEndpoint;
-use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
+use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
 use crate::hydration::community_source::CommunitySource;
 use crate::hydration::fallback_cache::FallbackCaches;
@@ -18,8 +18,7 @@ use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
 use crate::metrics::{Endpoint, Metrics, RequestLevel};
 use crate::models::{
-    ClientCapability, Evaluation, PlacedCandidate, RawCandidate, RequestViewer, RetweetMerge,
-    TweetId,
+    Evaluation, PlacedCandidate, RawCandidate, RequestFacts, RetweetMerge, TweetId,
 };
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
@@ -114,7 +113,7 @@ pub(crate) struct ServerDeps {
     pub(crate) post_evaluator: Arc<PostEvaluator>,
     pub(crate) client_switches: ClientSwitches,
     safety_label_source: Arc<SafetyLabelSource>,
-    metrics: Metrics,
+    pub(crate) metrics: Metrics,
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +129,13 @@ impl CacheWarming {
     ) -> Option<Arc<dyn WarmFetcher>> {
         match self {
             Self::AsConfigured => build(),
+            Self::Off => None,
+        }
+    }
+
+    fn label_cache_eds(self) -> Option<String> {
+        match self {
+            Self::AsConfigured => crate::config::label_cache_eds(),
             Self::Off => None,
         }
     }
@@ -183,11 +189,15 @@ pub(crate) async fn serving(
     ));
     let country_lists = Arc::new(CountryLists::starting_at_default());
     country_lists.refresh(&feature_switches.load());
+    safety_label_source.set_label_cache_switches(crate::params::label_cache_switches(
+        &feature_switches.load(),
+    ));
     let client_switches = ClientSwitches::new(Arc::clone(&feature_switches), limited_actions_copy);
     crate::params::spawn_refresh(
         switch_files,
         feature_switches,
         Arc::clone(&country_lists),
+        Arc::clone(&safety_label_source),
         copy_drift,
         metrics.clone(),
     );
@@ -242,29 +252,19 @@ fn deterministic_aperture() -> bool {
     std::env::var(crate::config::ENV_APP_ENV).as_deref() == Ok("prod")
 }
 
-#[derive(Default)]
-pub(crate) struct Comparators {
-    pub(crate) filter_tweets: Option<Box<dyn Comparator>>,
-    pub(crate) evaluate_tweets: Option<Box<dyn EntryComparator>>,
-}
-
 impl ServerDeps {
-    pub(crate) fn into_server(self, comparators: Comparators) -> VFServer {
+    pub(crate) fn into_server(self, comparator: Option<Box<dyn EntryComparator>>) -> VFServer {
         VFServer {
             evaluate_tweets: EvaluateTweetsEndpoint::new(
                 Arc::clone(&self.post_evaluator),
                 self.client_switches.clone(),
-                comparators.evaluate_tweets,
+                comparator,
                 QuotePassRunner::new(crate::config::quote_pass()),
             ),
             filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(
                 &self.post_evaluator,
             )),
-            filter_tweets: FilterTweetsEndpoint::new(
-                self.post_evaluator,
-                self.client_switches,
-                comparators.filter_tweets,
-            ),
+            filter_tweets: FilterTweetsEndpoint::new(self.post_evaluator, self.client_switches),
             get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source, self.metrics),
         }
     }
@@ -366,6 +366,7 @@ pub(crate) async fn prod_sources(
             },
             deterministic_aperture,
             twemcache_client_name: crate::config::twemcache_client_name(),
+            label_cache_eds: cache_warming.label_cache_eds(),
             cache_capacity: crate::config::safety_label_cache_capacity(),
             stats,
             init_deadline,
@@ -517,8 +518,7 @@ const WARM_FILTER_TWEETS_SLEEP: Duration = Duration::from_millis(500);
 
 fn warm_filter_tweets_request() -> PostBatch {
     PostBatch {
-        viewer: RequestViewer::default(),
-        client_capability: ClientCapability::default(),
+        facts: RequestFacts::default(),
         safety_level: SafetyLevel::TimelineHomeRecommendations,
         candidates: vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),

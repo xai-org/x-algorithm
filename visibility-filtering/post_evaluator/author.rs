@@ -4,7 +4,7 @@ use crate::hydration::{
     Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, Unresolved,
 };
 use crate::metrics::RequestMetrics;
-use crate::models::{AuthorId, Evaluation, EvaluationKey};
+use crate::models::{AuthorId, Evaluation, EvaluationKey, RequestFacts};
 use crate::rules::{LevelSpec, SafetyLevel};
 use std::collections::HashMap;
 use tracing::warn;
@@ -120,7 +120,7 @@ impl PostEvaluator {
     pub(crate) async fn evaluate_users(
         &self,
         level: SafetyLevel,
-        viewer_id: u64,
+        facts: RequestFacts,
         users: Vec<AuthorId>,
         metrics: &RequestMetrics,
     ) -> HashMap<AuthorId, Option<Evaluation>> {
@@ -139,12 +139,7 @@ impl PostEvaluator {
             .plan(level)
             .hydrate(
                 &*self.sources,
-                HydrationRequest::for_users(
-                    viewer_id,
-                    users.clone(),
-                    &self.fallback_caches,
-                    metrics,
-                ),
+                HydrationRequest::for_users(facts, users.clone(), &self.fallback_caches, metrics),
             )
             .await;
         let viewer_failed = !hydration
@@ -173,13 +168,11 @@ impl PostEvaluator {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeFrom, EdgeQuery, Graph};
-    use crate::hydration::inventory::Source;
     use crate::hydration::sources::InMemorySources;
+    use crate::hydration::sources::Source;
     use crate::hydration::Hydrator;
     use crate::metrics::{Endpoint, Metrics, RequestLevel};
-    use crate::models::{
-        ClientCapability, PlacedCandidate, Placement, RequestViewer, RetweetMerge, TweetId,
-    };
+    use crate::models::{PlacedCandidate, Placement, RequestFacts, RetweetMerge, TweetId};
     use crate::rules::fixtures::{allow, dropped};
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::raw;
@@ -229,8 +222,7 @@ mod tests {
         let authors = post_evaluator
             .evaluate_authors(
                 PostBatch {
-                    viewer: RequestViewer::default(),
-                    client_capability: ClientCapability::default(),
+                    facts: RequestFacts::default(),
                     safety_level: SafetyLevel::QuotedTweetRules,
                     candidates: [1, 2, 3, 4].map(quoted).into(),
                     retweet_merge: RetweetMerge::Unmerged,
@@ -307,8 +299,7 @@ mod tests {
             },
         };
         let batch = || PostBatch {
-            viewer: RequestViewer::new(Some(50), None),
-            client_capability: ClientCapability::default(),
+            facts: RequestFacts::logged_in(50),
             safety_level: SafetyLevel::QuotedTweetRules,
             candidates: vec![quoted(1, 8), quoted(2, 9)],
             retweet_merge: RetweetMerge::Unmerged,

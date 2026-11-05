@@ -58,7 +58,7 @@ impl Leaf for RequestLeaf {
                 m.run_with(switch, |(), facts| facts.client_capability().has(switch))
             }
             Self::RequestHasSoftNsfwNewUserDrop => {
-                m.run(|(), facts| facts.client_capability().soft_nsfw_new_user_drop)
+                m.run(|(), facts| facts.soft_nsfw_new_user_drop())
             }
         }
     }

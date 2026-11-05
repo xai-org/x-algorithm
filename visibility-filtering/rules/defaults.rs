@@ -1,5 +1,5 @@
 use crate::hydration::Hydrators;
-use crate::models::{Notice, Verdict};
+use crate::models::Verdict;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -8,15 +8,15 @@ pub enum Effect {
     AfterTerminal,
     FilledMedia,
     KeptEarlierMedia,
-    KeptEarlierMediaInsteadOfNotice,
-    FilledNotice,
-    KeptEarlierNotice,
+    KeptEarlierMediaInsteadOfFosnr,
+    FilledLabelInterstitial,
+    KeptEarlierLabelInterstitial,
     FilledEngagement,
     AddedEngagementReason,
     DuplicateEngagementReason,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Bucket {
     Withholding,
     Media,
@@ -25,15 +25,12 @@ pub(super) enum Bucket {
 
 impl Bucket {
     fn relied_on_by(self, verdict: &Verdict) -> bool {
-        let notice = match verdict {
-            Verdict::Withheld(_) => return matches!(self, Self::Withholding),
-            Verdict::Shown { notice, .. } => notice.as_ref().map(|notice| &notice.value),
+        let terminal = match verdict {
+            Verdict::Withheld(decided) => decided.value.kind(),
+            Verdict::Fosnr(decided) => decided.value.kind(),
+            Verdict::Shown { .. } => return true,
         };
-        match self {
-            Self::Withholding => true,
-            Self::Media => !matches!(notice, Some(Notice::Appealable { .. })),
-            Self::Engagement => !notice.is_some_and(Notice::is_whole_verdict),
-        }
+        self <= terminal.bucket()
     }
 }
 

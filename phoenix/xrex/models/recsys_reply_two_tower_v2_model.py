@@ -8,6 +8,7 @@ import math
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from xai_configlib import configclass
@@ -77,6 +78,25 @@ def _log_rate(num: jax.Array, den: jax.Array) -> jax.Array:
     num = jnp.maximum(jnp.asarray(num).astype(jnp.float32), 0.0)
     den = jnp.maximum(jnp.asarray(den).astype(jnp.float32), 0.0)
     return (jnp.log(num + 1.0) - jnp.log(den + _RATE_PRIOR)) / _LOG_SCALE
+
+
+@jax.custom_vjp
+def _small_table_take(table: jax.Array, ids: jax.Array) -> jax.Array:
+    return table[ids]
+
+
+def _small_table_take_fwd(table: jax.Array, ids: jax.Array):
+    return table[ids], (table, ids)
+
+
+def _small_table_take_bwd(res, g: jax.Array):
+    table, ids = res
+    one_hot = jax.nn.one_hot(ids.reshape(-1), table.shape[0], dtype=g.dtype)
+    grad = jnp.dot(one_hot.T, g.reshape(-1, table.shape[-1]), preferred_element_type=jnp.float32)
+    return grad.astype(table.dtype), np.zeros(ids.shape, dtype=jax.dtypes.float0)
+
+
+_small_table_take.defvjp(_small_table_take_fwd, _small_table_take_bwd)
 
 
 def log_bucket(x: jax.Array, num_buckets: int, per_octave: int) -> jax.Array:
@@ -250,6 +270,9 @@ class RecsysReplyTwoTowerV2Config(RecsysAggregatedModelConfig):
     num_interests: int = 4
     num_attn_heads: int = 4
     num_history_layers: int = 1
+    history_encoder_width: int = 2048
+    history_encoder_layers: int = 0
+    history_encoder_heads: int = 16
     head_tower_rank: int = 32
     bilinear_rank: int = 16
     head_bias_init: float = -3.0
@@ -365,9 +388,10 @@ class RecsysReplyTwoTowerV2Model(hk.Module):
     ) -> jax.Array:
         out = None
         for name, vocab, ids in lookups:
-            e = self._table(name, vocab, dim, zeros=zeros)[
-                jnp.clip(jnp.asarray(ids).astype(jnp.int32), 0, vocab - 1)
-            ]
+            e = _small_table_take(
+                self._table(name, vocab, dim, zeros=zeros),
+                jnp.clip(jnp.asarray(ids).astype(jnp.int32), 0, vocab - 1),
+            )
             out = e if out is None else out + e
         assert out is not None
         return out.astype(self._dtype)
@@ -483,21 +507,37 @@ class RecsysReplyTwoTowerV2Model(hk.Module):
             (eqf * neg).sum(-1),
         )
 
-    def _history_layer(self, i: int, x: jax.Array, valid: jax.Array) -> jax.Array:
-        cfg = self.config
+    def _history_layer(
+        self,
+        name: str,
+        x: jax.Array,
+        valid: jax.Array,
+        heads: int,
+        mlp_mult: int = 2,
+        zero_out: bool = False,
+    ) -> jax.Array:
         B, S, D = x.shape
-        H = cfg.num_attn_heads
-        dh = D // H
-        h = self._norm(f"hist{i}_attn_norm", x)
-        qkv = self._dense(f"hist{i}_qkv", h, 3 * D).reshape(B, S, 3, H, dh)
+        dh = D // heads
+        h = self._norm(f"{name}_attn_norm", x)
+        qkv = self._dense(f"{name}_qkv", h, 3 * D).reshape(B, S, 3, heads, dh)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         logits = jnp.einsum("bqhd,bkhd->bhqk", q, k).astype(jnp.float32) / math.sqrt(dh)
         logits = jnp.where(valid[:, None, None, :], logits, -1e9)
         w = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
         a = jnp.einsum("bhqk,bkhd->bqhd", w, v).reshape(B, S, D)
-        x = x + self._dense(f"hist{i}_attn_out", a, D)
-        h = self._norm(f"hist{i}_mlp_norm", x)
-        return x + self._mlp(f"hist{i}_mlp", h, 2 * D, D)
+        x = x + self._dense(f"{name}_attn_out", a, D, zeros=zero_out)
+        h = self._norm(f"{name}_mlp_norm", x)
+        h = jax.nn.silu(self._dense(f"{name}_mlp_in", h, mlp_mult * D, bias=True))
+        return x + self._dense(f"{name}_mlp_out", h, D, bias=True, zeros=zero_out)
+
+    def _history_encoder(self, x: jax.Array, valid: jax.Array) -> jax.Array:
+        cfg = self.config
+        h = self._dense("histx_in", x, cfg.history_encoder_width)
+        for i in range(cfg.history_encoder_layers):
+            h = self._history_layer(
+                f"histx{i}", h, valid, cfg.history_encoder_heads, mlp_mult=4, zero_out=True
+            )
+        return self._dense("histx_out", self._norm("histx_norm", h), x.shape[-1], zeros=True)
 
     def _interest_pool(
         self,
@@ -664,7 +704,9 @@ class RecsysReplyTwoTowerV2Model(hk.Module):
         )
         tokens = self._norm("hist_token_norm", tokens)
         for i in range(cfg.num_history_layers):
-            tokens = self._history_layer(i, tokens, hist["valid"])
+            tokens = self._history_layer(f"hist{i}", tokens, hist["valid"], cfg.num_attn_heads)
+        if cfg.history_encoder_layers:
+            tokens = tokens + self._history_encoder(tokens, hist["valid"])
 
         ctx = self._norm("interest_ctx_norm", f + self._norm("user_id_norm", user_vec))
         interests = self._interest_pool(tokens, hist, recency, ctx)
@@ -765,7 +807,7 @@ class RecsysReplyTwoTowerV2Model(hk.Module):
             ]
         )
         for name, vocab, ids in placement_feature_buckets(i64):
-            e = self._table(name, vocab, None, zeros=True)[ids]
+            e = _small_table_take(self._table(name, vocab, None, zeros=True), ids)
             bag = bag + jnp.where((ids > 0)[..., None], e, 0).astype(self._dtype)
         x = jnp.concatenate(
             [
