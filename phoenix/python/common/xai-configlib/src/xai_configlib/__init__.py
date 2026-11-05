@@ -161,8 +161,9 @@ def from_dict(
     max_back_compat: bool = False,
     ignore_unregistered_cls: bool = False,
 ):
-    if isinstance(ensure_class, type):
-        ensure_class = ensure_class.__name__
+    required_type = ensure_class if isinstance(ensure_class, type) else None
+    if required_type is not None:
+        ensure_class = _config_class_key(required_type)
     if isinstance(value, tuple):
         return tuple(
             from_dict(
@@ -181,7 +182,10 @@ def from_dict(
         if "__class" in value or ensure_class:
             cls_name = value.get("__class", ensure_class)
             if ensure_class:
-                assert cls_name == ensure_class, (
+                matches_requirement = cls_name == ensure_class
+                if required_type is not None:
+                    matches_requirement = CONFIG_REGISTRY.get(cls_name) is required_type
+                assert matches_requirement, (
                     f'Inconsistent config class requirement: "{cls_name}" != "{ensure_class}"'
                 )
 
