@@ -198,28 +198,33 @@ async fn process_tweet_events_v2(
 
                 message_buffer.extend(messages);
 
-                if message_buffer.len() >= batch_size {
-                    batch_count += 1;
-                    let messages = std::mem::take(&mut message_buffer);
-                    let post_store_clone = Arc::clone(&post_store);
+                // catchup_sender is Some only on the single iteration where catch-up
+                // is detected, so flush and signal even if a full batch has not
+                // accumulated; otherwise the signal is lost and startup blocks forever.
+                if message_buffer.len() >= batch_size || catchup_sender.is_some() {
+                    if !message_buffer.is_empty() {
+                        batch_count += 1;
+                        let messages = std::mem::take(&mut message_buffer);
+                        let post_store_clone = Arc::clone(&post_store);
 
-                    let permit = if init_data_downloaded {
-                        Some(semaphore.clone().acquire_owned().await.unwrap())
-                    } else {
-                        None
-                    };
-
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        match deserialize_batch(messages) {
-                            Err(e) => warn!("Error processing batch {}: {:#}", batch_count, e),
-                            Ok((light_posts, delete_posts)) => {
-                                post_store_clone.insert_posts(light_posts);
-                                post_store_clone.mark_as_deleted(delete_posts);
-                            }
+                        let permit = if init_data_downloaded {
+                            Some(semaphore.clone().acquire_owned().await.unwrap())
+                        } else {
+                            None
                         };
-                    })
-                    .await;
+
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            match deserialize_batch(messages) {
+                                Err(e) => warn!("Error processing batch {}: {:#}", batch_count, e),
+                                Ok((light_posts, delete_posts)) => {
+                                    post_store_clone.insert_posts(light_posts);
+                                    post_store_clone.mark_as_deleted(delete_posts);
+                                }
+                            };
+                        })
+                        .await;
+                    }
 
                     if let Some((sender, lag)) = catchup_sender {
                         info!("Completed kafka init for a single thread");
