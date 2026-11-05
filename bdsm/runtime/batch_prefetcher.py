@@ -585,12 +585,14 @@ def prefetcher_loop(
             from manhattan_arrow_adapter import arrow_bytes_to_batch
 
             single_batches = []
+            successful_rows = []
             for u, raw in user_rows:
                 try:
                     b, _ = arrow_bytes_to_batch(
                         [(u, raw)], seq_len=seq_len, n_action_types=n_action_types
                     )
                     single_batches.append(b)
+                    successful_rows.append((u, raw))
                 except Exception:
                     pass
             if not single_batches:
@@ -599,7 +601,8 @@ def prefetcher_loop(
 
             merged = _merge_single_user_batches(single_batches, seq_len)
             B = len(single_batches)
-            uid_list = uid_list[:B]
+            user_rows = successful_rows
+            uid_list = [u for u, _raw in user_rows]
 
         import numpy as _np
 
