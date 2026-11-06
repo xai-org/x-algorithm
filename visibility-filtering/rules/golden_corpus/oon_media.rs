@@ -98,16 +98,7 @@ pub(super) fn rows() -> Vec<Row> {
             })),
             expect: vec![
                 (
-                    Role::each([
-                        Role::As("in_de", viewer_in_country("de")),
-                        Role::As(
-                            "author_in_de",
-                            ViewerFeatures {
-                                facts: RequestFacts::default().with_country("de"),
-                                ..author_viewer()
-                            },
-                        ),
-                    ]),
+                    Role::As("in_de", viewer_in_country("de")),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "geo_restricted_media/drop/unspecified",
@@ -117,6 +108,13 @@ pub(super) fn rows() -> Vec<Row> {
                     Role::each([
                         Role::As("in_us", viewer_in_country("us")),
                         Role::NonFollower,
+                        Role::As(
+                            "author_in_de",
+                            ViewerFeatures {
+                                facts: RequestFacts::default().with_country("de"),
+                                ..author_viewer()
+                            },
+                        ),
                     ]),
                     allow(),
                 ),
@@ -140,6 +138,7 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (Role::As("in_us", viewer_in_country("us")), allow()),
+                (Role::Author, allow()),
             ],
             at: vec![],
         },
@@ -148,7 +147,10 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(tweet_candidate(|t| {
                 t.media.geo_allow_list = vec!["US".to_string()]
             })),
-            expect: vec![(Role::As("in_us", viewer_in_country("us")), allow())],
+            expect: vec![
+                (Role::As("in_us", viewer_in_country("us")), allow()),
+                (Role::Author, allow()),
+            ],
             at: vec![],
         },
         Row {
@@ -170,13 +172,16 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(tweet_candidate(|t| {
                 t.media.geo_deny_list = vec!["xx".to_string()]
             })),
-            expect: vec![(
-                Role::NonFollower,
-                dropped(
-                    FilteredReason::UnspecifiedReason,
-                    "geo_restricted_media/drop/unspecified",
+            expect: vec![
+                (
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "geo_restricted_media/drop/unspecified",
+                    ),
                 ),
-            )],
+                (Role::Author, allow()),
+            ],
             at: vec![],
         },
         Row {

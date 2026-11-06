@@ -1,5 +1,9 @@
-use crate::discovery::{build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery};
+use crate::discovery::{
+    build_vf_channel, env_override, visibility_tls_domain, VfChannel, VfChannelError,
+    VfChannelParams, VfDiscovery, XdsTarget,
+};
 use crate::metrics::{ClientRpc, RequestMetrics};
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tonic::codec::CompressionEncoding;
@@ -7,6 +11,7 @@ use tonic::{async_trait, Status};
 use tracing::warn;
 use xai_safety_label_store::types::SafetyLabelMap;
 use xai_visibility_filtering_proto as vf_pb;
+use xai_visibility_filtering_proto::safety_label_store_service_client::SafetyLabelStoreServiceClient;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
 use xai_x_thrift::tweet_safety_label::{
@@ -38,18 +43,63 @@ pub trait TweetSafetyLabelClient: Send + Sync {
 }
 
 pub struct ProdTweetSafetyLabelClient {
-    client: VfServiceClient,
+    client: ServiceClient,
     max_batch_size: usize,
     timeout: Duration,
 }
 
-#[derive(Clone)]
-enum VfServiceClient {
-    Wily(VisibilityFilteringServiceClient<tonic::transport::Channel>),
-    Xds(VisibilityFilteringServiceClient<LoadBalancedChannel>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafetyLabelsBackend {
+    Vf,
+    Store,
 }
 
-impl VfServiceClient {
+#[derive(Clone)]
+enum SafetyLabelsRpc<T> {
+    Vf(VisibilityFilteringServiceClient<T>),
+    Store(SafetyLabelStoreServiceClient<T>),
+}
+
+impl<T> SafetyLabelsRpc<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    fn new(backend: SafetyLabelsBackend, channel: T) -> Self {
+        match backend {
+            SafetyLabelsBackend::Vf => Self::Vf(
+                VisibilityFilteringServiceClient::new(channel)
+                    .send_compressed(CompressionEncoding::Zstd)
+                    .accept_compressed(CompressionEncoding::Zstd),
+            ),
+            SafetyLabelsBackend::Store => Self::Store(
+                SafetyLabelStoreServiceClient::new(channel)
+                    .send_compressed(CompressionEncoding::Zstd)
+                    .accept_compressed(CompressionEncoding::Zstd),
+            ),
+        }
+    }
+
+    async fn get_safety_labels(
+        &mut self,
+        request: tonic::Request<vf_pb::GetSafetyLabelsRequest>,
+    ) -> Result<tonic::Response<vf_pb::GetSafetyLabelsResponse>, Status> {
+        match self {
+            Self::Vf(c) => c.get_safety_labels(request).await,
+            Self::Store(c) => c.get_safety_labels(request).await,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ServiceClient {
+    Wily(SafetyLabelsRpc<tonic::transport::Channel>),
+    Xds(SafetyLabelsRpc<LoadBalancedChannel>),
+}
+
+impl ServiceClient {
     async fn get_safety_labels(
         &mut self,
         request: tonic::Request<vf_pb::GetSafetyLabelsRequest>,
@@ -61,50 +111,88 @@ impl VfServiceClient {
     }
 }
 
+const VF_SAFETY_LABELS_BACKEND_ENV: &str = "VF_SAFETY_LABELS_BACKEND";
 const VF_SAFETY_LABELS_DISCOVERY_ENV: &str = "VF_SAFETY_LABELS_DISCOVERY";
 const VF_SAFETY_LABELS_APERTURE_SIZE: usize = 16;
+const STORE_XDS_LISTENER_ENV: &str = "SAFETY_LABEL_STORE_CLIENT_XDS_LISTENER";
+const STORE_TLS_NAME_ENV: &str = "SAFETY_LABEL_STORE_CLIENT_TLS_NAME";
+const DEFAULT_STORE_XDS_LISTENER: &str = "xai-safety-label-store.prod.visibility:grpc";
 
-fn vf_channel_params(dc: &str) -> VfChannelParams<'_> {
-    VfChannelParams {
-        name: "vf-safety-labels",
+fn channel_params(
+    dc: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(SafetyLabelsBackend, VfChannelParams<'_>), VfChannelError> {
+    let backend = match env(VF_SAFETY_LABELS_BACKEND_ENV)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "vf") => SafetyLabelsBackend::Vf,
+        Some("store") => SafetyLabelsBackend::Store,
+        Some(other) => {
+            return Err(VfChannelError::Config(anyhow!(
+                "unknown {VF_SAFETY_LABELS_BACKEND_ENV} value {other:?}; expected vf or store"
+            )));
+        }
+    };
+    let discovery = VfDiscovery::parse(
+        VF_SAFETY_LABELS_DISCOVERY_ENV,
+        env(VF_SAFETY_LABELS_DISCOVERY_ENV).as_deref(),
+        match backend {
+            SafetyLabelsBackend::Vf => VfDiscovery::Wily,
+            SafetyLabelsBackend::Store => VfDiscovery::Xds,
+        },
+    );
+    let (name, xds) = match backend {
+        SafetyLabelsBackend::Vf => ("vf-safety-labels", XdsTarget::vf(dc)),
+        SafetyLabelsBackend::Store => {
+            if discovery == VfDiscovery::Wily {
+                return Err(VfChannelError::Config(anyhow!(
+                    "{VF_SAFETY_LABELS_BACKEND_ENV}=store is reached only over xDS; \
+                     unset {VF_SAFETY_LABELS_DISCOVERY_ENV} or set it to xds"
+                )));
+            }
+            let store = XdsTarget {
+                listener: env_override(
+                    env(STORE_XDS_LISTENER_ENV).as_deref(),
+                    DEFAULT_STORE_XDS_LISTENER.to_string(),
+                ),
+                tls_domain: env_override(
+                    env(STORE_TLS_NAME_ENV).as_deref(),
+                    visibility_tls_domain("xai-safety-label-store", dc),
+                ),
+            };
+            ("safety-label-store", store)
+        }
+    };
+    let params = VfChannelParams {
+        name,
         dc,
-        discovery: VfDiscovery::from_env(VF_SAFETY_LABELS_DISCOVERY_ENV, VfDiscovery::Wily),
+        discovery,
+        xds,
         aperture_size: VF_SAFETY_LABELS_APERTURE_SIZE,
-        deterministic_aperture: std::env::var("APP_ENV").as_deref() == Ok("prod"),
+        deterministic_aperture: env("APP_ENV").as_deref() == Some("prod"),
         xds_lb_policy: LbPolicy::least_request(),
-    }
+    };
+    Ok((backend, params))
 }
 
 fn channel_error_to_status(e: VfChannelError) -> Status {
     match e {
         VfChannelError::Config(e) => Status::internal(format!("{e:#}")),
-        VfChannelError::Connect(e) => {
-            Status::unavailable(format!("failed to connect to vf-service: {e:#}"))
-        }
+        VfChannelError::Connect(e) => Status::unavailable(format!("failed to connect: {e:#}")),
     }
-}
-
-fn make_client<T>(channel: T) -> VisibilityFilteringServiceClient<T>
-where
-    T: tonic::client::GrpcService<tonic::body::Body>,
-    T::Error: Into<tonic::codegen::StdError>,
-    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
-    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
-{
-    VisibilityFilteringServiceClient::new(channel)
-        .send_compressed(CompressionEncoding::Zstd)
-        .accept_compressed(CompressionEncoding::Zstd)
 }
 
 impl ProdTweetSafetyLabelClient {
     pub async fn new(dc: &str) -> Result<Self, Status> {
-        let params = vf_channel_params(dc);
+        let (backend, params) =
+            channel_params(dc, |name| std::env::var(name).ok()).map_err(channel_error_to_status)?;
         let client = match build_vf_channel(&params)
             .await
             .map_err(channel_error_to_status)?
         {
-            VfChannel::Wily(ch) => VfServiceClient::Wily(make_client(ch)),
-            VfChannel::Xds(ch) => VfServiceClient::Xds(make_client(ch)),
+            VfChannel::Wily(ch) => ServiceClient::Wily(SafetyLabelsRpc::new(backend, ch)),
+            VfChannel::Xds(ch) => ServiceClient::Xds(SafetyLabelsRpc::new(backend, ch)),
         };
 
         Ok(Self {
@@ -277,8 +365,12 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::service::Routes;
     use tonic::transport::Server;
     use tonic::{Request, Response};
+    use xai_visibility_filtering_proto::safety_label_store_service_server::{
+        SafetyLabelStoreService, SafetyLabelStoreServiceServer,
+    };
     use xai_visibility_filtering_proto::visibility_filtering_service_server::{
         VisibilityFilteringService, VisibilityFilteringServiceServer,
     };
@@ -337,15 +429,36 @@ mod tests {
         }
     }
 
-    async fn start_test_server(
-        service: TestVisibilityFilteringService,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    #[derive(Clone, Default)]
+    struct TestSafetyLabelStore {
+        requests: Arc<Mutex<Vec<Vec<u64>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl SafetyLabelStoreService for TestSafetyLabelStore {
+        async fn get_safety_labels(
+            &self,
+            request: Request<vf_pb::GetSafetyLabelsRequest>,
+        ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
+            let tweet_ids = request.into_inner().tweet_ids;
+            self.requests.lock().await.push(tweet_ids.clone());
+            Ok(Response::new(vf_pb::GetSafetyLabelsResponse {
+                results: tweet_ids
+                    .into_iter()
+                    .map(|id| (id, vf_pb::SafetyLabelMap::default()))
+                    .collect(),
+                failed_ids: Vec::new(),
+            }))
+        }
+    }
+
+    async fn serve(routes: Routes) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
         let handle = tokio::spawn(async move {
             Server::builder()
-                .add_service(VisibilityFilteringServiceServer::new(service))
+                .add_routes(routes)
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -353,7 +466,21 @@ mod tests {
         (addr, handle)
     }
 
-    async fn test_client(addr: SocketAddr) -> ProdTweetSafetyLabelClient {
+    async fn start_test_server(
+        service: TestVisibilityFilteringService,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        serve(Routes::new(
+            VisibilityFilteringServiceServer::new(service)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Zstd),
+        ))
+        .await
+    }
+
+    async fn test_client_for(
+        backend: SafetyLabelsBackend,
+        addr: SocketAddr,
+    ) -> ProdTweetSafetyLabelClient {
         let endpoint = format!("http://{addr}");
         let channel = tonic::transport::Endpoint::from_shared(endpoint)
             .unwrap()
@@ -361,10 +488,126 @@ mod tests {
             .await
             .unwrap();
         ProdTweetSafetyLabelClient {
-            client: VfServiceClient::Wily(VisibilityFilteringServiceClient::new(channel)),
+            client: ServiceClient::Wily(SafetyLabelsRpc::new(backend, channel)),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         }
+    }
+
+    async fn test_client(addr: SocketAddr) -> ProdTweetSafetyLabelClient {
+        test_client_for(SafetyLabelsBackend::Vf, addr).await
+    }
+
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn channel_params_pick_the_backend_discovery_and_target_from_env() {
+        let vf_target = XdsTarget {
+            listener: "xai-vf-service.prod.visibility:grpc".to_string(),
+            tls_domain: "visibility.visibility-filtering-service.prod.atla.s2s.twttr.net"
+                .to_string(),
+        };
+        for vars in [&[][..], &[("VF_SAFETY_LABELS_BACKEND", " VF ")][..]] {
+            let (backend, params) = channel_params("atla", env_of(vars)).unwrap();
+            assert_eq!(backend, SafetyLabelsBackend::Vf);
+            assert_eq!(params.name, "vf-safety-labels");
+            assert_eq!(params.discovery, VfDiscovery::Wily);
+            assert_eq!(params.xds, vf_target);
+        }
+        let (_, params) =
+            channel_params("atla", env_of(&[("VF_SAFETY_LABELS_DISCOVERY", "xds")])).unwrap();
+        assert_eq!(params.discovery, VfDiscovery::Xds);
+
+        for vars in [
+            &[("VF_SAFETY_LABELS_BACKEND", "store")][..],
+            &[
+                ("VF_SAFETY_LABELS_BACKEND", "store"),
+                ("VF_SAFETY_LABELS_DISCOVERY", "xds"),
+                (
+                    "VF_CLIENT_XDS_LISTENER",
+                    "xai-vf-service.staging.visibility:grpc",
+                ),
+            ][..],
+        ] {
+            let (backend, params) = channel_params("pdxa", env_of(vars)).unwrap();
+            assert_eq!(backend, SafetyLabelsBackend::Store);
+            assert_eq!(params.name, "safety-label-store");
+            assert_eq!(params.discovery, VfDiscovery::Xds);
+            assert_eq!(
+                params.xds,
+                XdsTarget {
+                    listener: "xai-safety-label-store.prod.visibility:grpc".to_string(),
+                    tls_domain: "visibility.xai-safety-label-store.prod.pdxa.s2s.twttr.net"
+                        .to_string(),
+                }
+            );
+        }
+        let store_overrides = XdsTarget {
+            listener: "xai-safety-label-store.staging.visibility:grpc".to_string(),
+            tls_domain: "visibility.xai-safety-label-store.staging.atla.s2s.twttr.net".to_string(),
+        };
+        let (_, params) = channel_params(
+            "atla",
+            env_of(&[
+                ("VF_SAFETY_LABELS_BACKEND", "store"),
+                (
+                    "SAFETY_LABEL_STORE_CLIENT_XDS_LISTENER",
+                    store_overrides.listener.as_str(),
+                ),
+                (
+                    "SAFETY_LABEL_STORE_CLIENT_TLS_NAME",
+                    store_overrides.tls_domain.as_str(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(params.xds, store_overrides);
+
+        let Err(VfChannelError::Config(e)) =
+            channel_params("atla", env_of(&[("VF_SAFETY_LABELS_BACKEND", "stroe")]))
+        else {
+            panic!("an unknown backend is a config error");
+        };
+        let message = format!("{e:#}");
+        assert!(message.contains("VF_SAFETY_LABELS_BACKEND"), "{message}");
+        assert!(message.contains("stroe"), "{message}");
+
+        let Err(VfChannelError::Config(e)) = channel_params(
+            "atla",
+            env_of(&[
+                ("VF_SAFETY_LABELS_BACKEND", "store"),
+                ("VF_SAFETY_LABELS_DISCOVERY", "wily"),
+            ]),
+        ) else {
+            panic!("the store is reached only over xDS");
+        };
+        assert!(format!("{e:#}").contains("xDS"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn store_backend_calls_safety_label_store_service() {
+        let store = TestSafetyLabelStore::default();
+        let requests = store.requests.clone();
+        let (addr, handle) = serve(Routes::new(
+            SafetyLabelStoreServiceServer::new(store)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Zstd),
+        ))
+        .await;
+        let client = test_client_for(SafetyLabelsBackend::Store, addr).await;
+
+        let result = client.get_safety_labels(vec![1, 2]).await.unwrap();
+
+        assert_eq!(*requests.lock().await, vec![vec![1, 2]]);
+        assert_eq!(result.labels.len(), 2);
+        assert!(result.failures.is_empty());
+        handle.abort();
     }
 
     #[test]

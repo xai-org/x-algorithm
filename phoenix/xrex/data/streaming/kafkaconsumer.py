@@ -178,6 +178,7 @@ _consumer_poll_latency = None
 _consumer_uptime_gauge = None
 _consumer_dropped_records = None
 _consumer_deserialize_errors = None
+_consumer_width_mismatch_drops = None
 _consumer_end_offsets_polled_count = None
 _consumer_drop_mode_active = None
 _consumer_partition_lag = None
@@ -195,7 +196,7 @@ def _init_consumer_metrics(
     lag_tracker: "PartitionLagTracker | None" = None, metric_attrs: dict[str, str] | None = None
 ) -> bool:
     global _consumer_messages_per_poll, _consumer_poll_latency, _consumer_uptime_gauge
-    global _consumer_dropped_records, _consumer_deserialize_errors
+    global _consumer_dropped_records, _consumer_deserialize_errors, _consumer_width_mismatch_drops
     global _consumer_drop_mode_active, _consumer_partition_lag
     global _consumer_partition_consumed_offset, _consumer_partition_end_offset
     global _consumer_metrics_initialized, _consumer_end_offsets_polled_count
@@ -232,6 +233,12 @@ def _init_consumer_metrics(
         _consumer_deserialize_errors = meter.create_counter(
             name="recsys_kafka_consumer_deserialize_errors_total",
             description="Total number of Kafka messages that failed Arrow IPC deserialization",
+            unit="1",
+        )
+
+        _consumer_width_mismatch_drops = meter.create_counter(
+            name="recsys_kafka_consumer_width_mismatch_dropped_total",
+            description="Kafka messages dropped because a nested list width differs from the model's",
             unit="1",
         )
 
@@ -475,6 +482,55 @@ def deserialize_arrow_ipc(data: bytes) -> pa.RecordBatch:
         raise err
 
 
+_expected_inner_list_widths: dict[str, int] = {}
+_MAX_WIDTH_MISMATCH_LOGS = 20
+_width_mismatch_logs = 0
+
+
+def set_expected_inner_list_widths(widths: typing.Mapping[str, int]) -> None:
+    global _expected_inner_list_widths
+    _expected_inner_list_widths = dict(widths)
+
+
+def inner_list_width_mismatch(
+    rb: pa.RecordBatch, expected: typing.Mapping[str, int]
+) -> tuple[str, int, int] | None:
+    for name, want in expected.items():
+        index = rb.schema.get_field_index(name)
+        if index < 0:
+            continue
+        field_type = rb.schema.field(index).type
+        if not (
+            pa.types.is_list(field_type)
+            or pa.types.is_large_list(field_type)
+            or pa.types.is_fixed_size_list(field_type)
+        ):
+            continue
+        element = field_type.value_type
+        if pa.types.is_fixed_size_list(element) and element.list_size != want:
+            return name, want, element.list_size
+    return None
+
+
+def _drop_width_mismatched(rb: pa.RecordBatch, partition: int, offset: int) -> bool:
+    global _width_mismatch_logs
+    if not _expected_inner_list_widths:
+        return False
+    mismatch = inner_list_width_mismatch(rb, _expected_inner_list_widths)
+    if mismatch is None:
+        return False
+    if _consumer_width_mismatch_drops is not None:
+        _consumer_width_mismatch_drops.add(1, {"partition": str(partition)})
+    if _width_mismatch_logs < _MAX_WIDTH_MISMATCH_LOGS:
+        _width_mismatch_logs += 1
+        column, want, got = mismatch
+        rank_logger.warning(
+            f"[width-guard {_width_mismatch_logs}/{_MAX_WIDTH_MISMATCH_LOGS}] dropping "
+            f"partition={partition} offset={offset}: {column} element width {got}, model expects {want}"
+        )
+    return True
+
+
 def _decode_chunk(
     msgs: list[ConsumerRecord],
     negative_downsample_rate: int,
@@ -509,6 +565,9 @@ def _decode_training_message(
         )
         if _consumer_deserialize_errors is not None:
             _consumer_deserialize_errors.add(1, {"partition": str(partition)})
+        return None
+
+    if _drop_width_mismatched(user_action_sequence, partition, offset):
         return None
 
     if negative_downsample_rate > 1:

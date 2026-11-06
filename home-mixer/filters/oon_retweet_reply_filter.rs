@@ -14,7 +14,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for OONRetweetReplyFilter {
     ) -> FilterResult<PostCandidate> {
         let allow_phoenix_oon_replies = query.params.get(EnablePhoenixOonReplies);
         let root_only = query.params.get(PhoenixOonRepliesRootOnly);
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        FilterResult::partition(candidates, |c| {
             let is_reply = c.in_reply_to_tweet_id.is_some();
             let is_retweet = c.retweeted_tweet_id.is_some();
             let replies_to_root =
@@ -23,11 +23,9 @@ impl Filter<ScoredPostsQuery, PostCandidate> for OONRetweetReplyFilter {
                 && !(allow_phoenix_oon_replies
                     && is_phoenix_home_retrieval(c)
                     && (!root_only || replies_to_root));
-            (c.in_network == Some(false) && (is_retweet || oon_reply_dropped))
-                || (is_reply && c.ancestors.is_empty())
-        });
-
-        FilterResult { kept, removed }
+            !((c.in_network == Some(false) && (is_retweet || oon_reply_dropped))
+                || (is_reply && c.ancestors.is_empty()))
+        })
     }
 }
 

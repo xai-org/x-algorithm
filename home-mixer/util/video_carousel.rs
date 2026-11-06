@@ -3,10 +3,13 @@ use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
     VideoCarouselImmersiveVqvWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
-    VideoCarouselVideoOpenWeight, VideoCarouselWeightedScoreWeight,
+    VideoCarouselVideoContinuationWeight, VideoCarouselVideoOpenWeight,
+    VideoCarouselWeightedScoreWeight,
 };
+use crate::util::video_carousel_ctr_model::CtrModel;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const MAX_VERTICAL_ASPECT_RATIO: f32 = 1.0;
 
@@ -17,6 +20,10 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
         && !query.is_bottom_request
 }
 
+pub(crate) fn was_seen(seen: &HashSet<u64>, candidate: &PostCandidate) -> bool {
+    seen.contains(&candidate.tweet_id) || seen.contains(&candidate.get_original_tweet_id())
+}
+
 pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)
@@ -24,12 +31,14 @@ pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
         && !query.is_bottom_request
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CarouselScoring {
     video_open_weight: f64,
     immersive_vqv_weight: f64,
     open_times_immersive_dwell_weight: f64,
     weighted_score_weight: f64,
+    video_continuation_weight: f64,
+    ctr_model: Option<Arc<CtrModel>>,
 }
 
 impl CarouselScoring {
@@ -41,16 +50,27 @@ impl CarouselScoring {
                 .params
                 .get(VideoCarouselOpenTimesImmersiveDwellWeight),
             weighted_score_weight: query.params.get(VideoCarouselWeightedScoreWeight),
+            video_continuation_weight: query.params.get(VideoCarouselVideoContinuationWeight),
+            ctr_model: query.video_carousel_ctr_model.get().cloned(),
         }
     }
 
     pub(crate) fn score(&self, candidate: &PostCandidate) -> f64 {
+        if let Some(model) = &self.ctr_model {
+            return model.score(
+                video_open_score(candidate),
+                candidate.video_embedding.as_deref(),
+            );
+        }
         self.video_open_weight * video_open_score(candidate)
             + self.immersive_vqv_weight * immersive_vqv_score(candidate)
             + self.open_times_immersive_dwell_weight
                 * video_open_score(candidate)
                 * immersive_dwell_time(candidate)
             + self.weighted_score_weight * candidate.weighted_score.unwrap_or(0.0)
+            + self.video_continuation_weight
+                * video_open_score(candidate)
+                * video_continuation_secs(candidate)
     }
 
     pub(crate) fn needs_immersive_scores(&self) -> bool {
@@ -170,10 +190,11 @@ pub(crate) fn take_videos_by_carousel_score(
     candidates: &mut Vec<PostCandidate>,
     count: usize,
     scoring: &CarouselScoring,
+    seen: &HashSet<u64>,
 ) -> Vec<PostCandidate> {
     let (mut videos, rest): (Vec<_>, Vec<_>) = std::mem::take(candidates)
         .into_iter()
-        .partition(is_carousel_video);
+        .partition(|candidate| is_carousel_video(candidate) && !was_seen(seen, candidate));
     videos.sort_by(|a, b| scoring.rank(a, b));
     let overflow = videos.split_off(count.min(videos.len()));
     *candidates = rest;
@@ -216,6 +237,13 @@ fn immersive_dwell_time(candidate: &PostCandidate) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn video_continuation_secs(candidate: &PostCandidate) -> f64 {
+    candidate
+        .phoenix_scores
+        .home_video_continuation_secs
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +254,8 @@ mod tests {
             immersive_vqv_weight,
             open_times_immersive_dwell_weight: 0.0,
             weighted_score_weight: 0.0,
+            video_continuation_weight: 0.0,
+            ctr_model: None,
         }
     }
     use crate::models::candidate::PhoenixScores;
@@ -400,6 +430,36 @@ mod tests {
                 None
             )),
             vec![4, 2, 1, 3]
+        );
+    }
+
+    fn with_continuation(mut candidate: PostCandidate, seconds: f64) -> PostCandidate {
+        candidate.phoenix_scores.home_video_continuation_secs = Some(seconds);
+        candidate
+    }
+
+    #[test]
+    fn ranks_by_open_times_continuation_with_missing_continuation_as_zero() {
+        let candidates = vec![
+            with_continuation(vertical(1, 10, &[], 0.9), 2.0),
+            with_continuation(vertical(2, 20, &[], 0.1), 10.0),
+            with_continuation(vertical(3, 30, &[], 0.5), 3.0),
+            vertical(4, 40, &[], 0.8),
+        ];
+
+        assert_eq!(
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                &CarouselScoring {
+                    video_continuation_weight: 1.0,
+                    ..scoring(0.0, 0.0)
+                },
+                false,
+                0,
+                None
+            )),
+            vec![1, 3, 2, 4]
         );
     }
 

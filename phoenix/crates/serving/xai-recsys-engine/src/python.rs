@@ -3195,6 +3195,7 @@ macro_rules! server_impl {
                         tls_cert_path = None,
                         tls_key_path = None,
                         tls_client_ca_path = None,
+                        dscp = None,
                     ))]
             fn new(
                         grpc_port: u16,
@@ -3264,6 +3265,7 @@ macro_rules! server_impl {
                         tls_cert_path: Option<String>,
                         tls_key_path: Option<String>,
                         tls_client_ca_path: Option<String>,
+                        dscp: Option<u8>,
                     ) -> PyResult<Self> {
                         xai_recsys_server::init_env_logger();
                         let queue_max_staleness = if queue_max_staleness_ms == 0 {
@@ -3441,6 +3443,9 @@ macro_rules! server_impl {
                                 .with_readyz_endpoint();
                             if let Some(tls) = tls_config {
                                 grpc_config = grpc_config.with_tls_config(tls);
+                            }
+                            if let Some(dscp) = dscp {
+                                grpc_config = grpc_config.with_dscp(dscp);
                             }
                             HttpServer::builder(
                                 metrics_port,

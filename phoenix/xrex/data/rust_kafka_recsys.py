@@ -202,6 +202,10 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                 negative_downsample_positive_action_indices=(
                     self.negative_downsample_positive_action_indices
                 ),
+                expected_inner_list_widths=",".join(
+                    f"{column}={width}"
+                    for column, width in self.expected_inner_list_widths().items()
+                ),
                 enable_drop_on_high_qps=self.enable_drop_on_high_qps,
                 drop_catchup_window_secs=self.drop_catchup_window_secs,
                 drop_min_staleness_secs=self.drop_min_staleness_secs,

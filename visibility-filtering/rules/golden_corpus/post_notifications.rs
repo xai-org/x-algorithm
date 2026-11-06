@@ -349,6 +349,30 @@ fn post_cases() -> Vec<Case> {
             labeled(SafetyLabelType::SMYTE_SPAM_TWEET),
             unspecified("smyte_spam_tweet/drop/unspecified"),
         ),
+        Case {
+            mention_and_reply: unspecified("risky_high_viz_reply_oon/drop/unspecified"),
+            ..shown(
+                "risky_high_viz_reply_label",
+                "non_follower",
+                default_recipient(),
+                labeled(SafetyLabelType::RISKY_HIGH_VIZ_REPLY),
+            )
+        },
+        shown(
+            "risky_high_viz_reply_label",
+            "follower",
+            default_recipient(),
+            candidate()
+                .with_label(SafetyLabelType::RISKY_HIGH_VIZ_REPLY)
+                .with_edge(Hydrator::Follows)
+                .build(),
+        ),
+        shown(
+            "risky_high_viz_reply_label",
+            "self",
+            recipient(AUTHOR_ID, ViewerProfile::default()),
+            labeled(SafetyLabelType::RISKY_HIGH_VIZ_REPLY),
+        ),
     ];
     for (label, by) in [
         (
@@ -397,7 +421,10 @@ fn post_case_verdict(kind: NotificationKind, with_level_79_drops: Verdict) -> Ve
     match kind {
         NotificationKind::Mention | NotificationKind::Reply => with_level_79_drops,
         NotificationKind::MediaTagged => allow(),
-        NotificationKind::Follow | NotificationKind::FollowRequestAccepted => {
+        NotificationKind::Follow
+        | NotificationKind::FollowRequestAccepted
+        | NotificationKind::Like
+        | NotificationKind::Repost => {
             unreachable!("{kind:?} is no post kind")
         }
     }

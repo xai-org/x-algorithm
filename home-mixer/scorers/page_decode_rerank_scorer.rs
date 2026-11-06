@@ -27,6 +27,10 @@ pub(crate) fn page_decode_params(query: &ScoredPostsQuery) -> PageDecodeParams {
         ranking_score_weights: Some(ranking_score_weights(query)),
         diversity_weight: None,
         reward_head: Some(query.params.get(PageDecodeRewardHead)),
+        eta: None,
+        nu_author: None,
+        nu_sid: None,
+        prior_tau: None,
     }
 }
 

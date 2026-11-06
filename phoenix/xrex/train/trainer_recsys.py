@@ -3644,6 +3644,7 @@ class RecsysTrainer(Trainer):
                     tls_cert_path=cc.copy_port_tls_cert or None,
                     tls_key_path=cc.copy_port_tls_key or None,
                     tls_client_ca_path=cc.copy_port_tls_client_ca or None,
+                    dscp=cc.copy_port_dscp,
                 )
             multihost_utils.sync_global_devices("recsys-copy-port-bind")
 

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import os
 import re
 from collections.abc import Callable, Sequence
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from xrex.data.recsys import sidecar
 
 COLUMN = "userIdListFeatures"
 HASHES_KEY = "user_id_list_hashes"
@@ -19,8 +20,6 @@ MASK_KEY = "user_id_list_mask"
 CANONICAL_TYPE: pa.DataType = pa.list_(
     pa.struct([pa.field("name", pa.string()), pa.field("ids", pa.list_(pa.int64()))])
 )
-
-_PARTITION_SEG_RE = re.compile(r"(partition=\d+/)")
 
 
 class IdListFamily(enum.Enum):
@@ -288,13 +287,7 @@ def total_k(specs: Sequence[IdListFeatureSpec]) -> int:
 
 
 def sidecar_path_for(batch_file_path: str, sidecar_root: str) -> str:
-    m = _PARTITION_SEG_RE.search(batch_file_path)
-    if m is None:
-        raise ValueError(f"not a partition batch file path: {batch_file_path}")
-    rel = batch_file_path[m.start() :]
-    if not rel.endswith(".parquet"):
-        raise ValueError(f"not a parquet path: {batch_file_path}")
-    return os.path.join(sidecar_root, rel[: -len(".parquet")] + ".list_features.parquet")
+    return sidecar.sidecar_path_for(batch_file_path, sidecar_root, ".list_features.parquet")
 
 
 def load_sidecar_column(sidecar_path: str, expected_rows: int | None = None) -> pa.Array:
@@ -320,11 +313,7 @@ def null_column(num_rows: int) -> pa.Array:
 
 
 def set_column(batch: pa.RecordBatch, col: pa.Array) -> pa.RecordBatch:
-    if len(col) != batch.num_rows:
-        raise ValueError(f"{COLUMN}: {len(col)} rows != batch rows {batch.num_rows}")
-    if COLUMN in batch.schema.names:
-        batch = batch.drop_columns([COLUMN])
-    return batch.append_column(pa.field(COLUMN, col.type, nullable=True), col)
+    return sidecar.set_column(batch, COLUMN, col)
 
 
 def empty_arrays(

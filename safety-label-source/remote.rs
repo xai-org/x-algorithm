@@ -112,12 +112,17 @@ impl CacheRead for CacheClient {
 #[async_trait]
 pub(crate) trait CacheWrite: CacheRead {
     async fn set(&self, key: &Key, value: Value, ttl_secs: u32) -> CacheOpResult<()>;
+    async fn delete(&self, key: &Key) -> CacheOpResult<()>;
 }
 
 #[async_trait]
 impl CacheWrite for CacheClient {
     async fn set(&self, key: &Key, value: Value, ttl_secs: u32) -> CacheOpResult<()> {
         CacheClient::set(self, key, value, ttl_secs).await
+    }
+
+    async fn delete(&self, key: &Key) -> CacheOpResult<()> {
+        CacheClient::delete(self, key).await
     }
 }
 

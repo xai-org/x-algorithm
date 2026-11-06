@@ -11,6 +11,21 @@ pub struct FilterResult<C> {
     pub removed: Vec<C>,
 }
 
+impl<C> FilterResult<C> {
+    pub fn partition(mut candidates: Vec<C>, mut keep: impl FnMut(&C) -> bool) -> Self {
+        let removed = candidates
+            .extract_if(.., |candidate| !keep(candidate))
+            .collect();
+        if candidates.is_empty() {
+            candidates = Vec::new();
+        }
+        Self {
+            kept: candidates,
+            removed,
+        }
+    }
+}
+
 pub trait Filter<Q, C>: Any + Send + Sync
 where
     Q: PipelineQuery,
@@ -66,5 +81,49 @@ where
                 result.removed.len() as u64,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_preserves_input_order_and_calls_the_predicate_once_per_item() {
+        let input: Vec<_> = (0..17).map(|id| (id, format!("payload-{id}"))).collect();
+        let expected_kept: Vec<_> = input
+            .iter()
+            .filter(|(id, _)| id % 2 == 0)
+            .cloned()
+            .collect();
+        let expected_removed: Vec<_> = input
+            .iter()
+            .filter(|(id, _)| id % 2 != 0)
+            .cloned()
+            .collect();
+        let mut visited = Vec::new();
+        let result = FilterResult::partition(input, |(id, _)| {
+            visited.push(*id);
+            id % 2 == 0
+        });
+        assert_eq!(visited, (0..17).collect::<Vec<_>>());
+        assert_eq!(result.kept, expected_kept);
+        assert_eq!(result.removed, expected_removed);
+    }
+
+    #[test]
+    fn partition_accepts_nonclone_candidates_and_releases_empty_kept_buffers() {
+        struct NonClone(String);
+        let input = vec![
+            NonClone("kept".to_string()),
+            NonClone("removed".to_string()),
+        ];
+        let result = FilterResult::partition(input, |candidate| candidate.0 == "kept");
+        assert_eq!(result.kept[0].0, "kept");
+        assert_eq!(result.removed[0].0, "removed");
+        let result = FilterResult::partition(result.kept, |_| false);
+        assert!(result.kept.is_empty());
+        assert_eq!(result.kept.capacity(), 0);
+        assert_eq!(result.removed[0].0, "kept");
     }
 }

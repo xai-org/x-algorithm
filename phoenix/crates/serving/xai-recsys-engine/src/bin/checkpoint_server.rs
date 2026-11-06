@@ -12,7 +12,9 @@ use tokio::signal;
 use {
     axum::{Router, routing::get},
     prometheus::TextEncoder,
-    tonic::transport::Server,
+    std::net::SocketAddr,
+    tokio::net::{TcpListener, TcpSocket},
+    tonic::transport::{Server, server::TcpIncoming},
     xai_recsys_engine::{
         checkpoint_proxy::CheckpointProxy,
         copy::{CopyService, Sender},
@@ -61,6 +63,9 @@ struct Args {
     tls_key: Option<String>,
     #[clap(long, requires = "tls_cert")]
     tls_client_ca: Option<String>,
+
+    #[clap(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=63))]
+    dscp: u8,
 }
 
 #[cfg(target_os = "linux")]
@@ -68,6 +73,15 @@ fn derive_server_index() -> Option<usize> {
     let hostname = std::env::var("HOSTNAME").ok()?;
     let idx = hostname.rfind('-')?;
     hostname[idx + 1..].parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn bind_grpc_listener(addr: SocketAddr, dscp: u8) -> std::io::Result<TcpListener> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.set_tos_v4(u32::from(dscp) << 2)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 #[cfg(target_os = "linux")]
@@ -101,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     info!(
-        "checkpoint-server starting: copy_url={}, index={}/{}, port={}, metrics_port={}, poll={}s, max_entries={}, request_timeout={}s",
+        "checkpoint-server starting: copy_url={}, index={}/{}, port={}, metrics_port={}, poll={}s, max_entries={}, request_timeout={}s, dscp={}",
         args.copy_url,
         server_index,
         args.num_servers,
@@ -110,6 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         args.poll_interval,
         args.max_entries,
         args.request_timeout,
+        args.dscp,
     );
 
     let proxy = CheckpointProxy::new(
@@ -124,6 +139,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let grpc_addr = format!("0.0.0.0:{}", args.port).parse()?;
+    let grpc_listener = bind_grpc_listener(grpc_addr, args.dscp)?;
     info!("CopyService listening on {}", grpc_addr);
 
     let mut server = Server::builder();
@@ -137,7 +153,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let server_handle = tokio::spawn(async move {
         server
             .add_service(CopyService::new(Sender::new(args.max_entries)))
-            .serve(grpc_addr)
+            .serve_with_incoming(TcpIncoming::from(grpc_listener).with_nodelay(Some(true)))
             .await
     });
 

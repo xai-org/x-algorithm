@@ -275,6 +275,7 @@ impl fmt::Display for HydrationPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rows = match self.rows {
             RequestRows::ActorPosts => " actor post rows",
+            RequestRows::Posts if self.level.spec().rows() != RequestRows::Posts => " post rows",
             RequestRows::Posts | RequestRows::Users => "",
         };
         writeln!(
@@ -343,14 +344,21 @@ mod tests {
     use crate::rules::{RuleEngine, SafetyLevel};
     use strum::VariantArray;
 
+    fn level_plans(
+        engine: &RuleEngine,
+        level: SafetyLevel,
+    ) -> impl Iterator<Item = &HydrationPlan> {
+        std::iter::once(engine.plan(level))
+            .chain(engine.post_kinds_plan(level))
+            .chain(engine.recipient_posts_plan(level))
+    }
+
     #[test]
     fn each_level_plans_these_calls() {
         let engine = RuleEngine::for_tests();
         let plans: String = SafetyLevel::VARIANTS
             .iter()
-            .flat_map(|&level| {
-                std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level))
-            })
+            .flat_map(|&level| level_plans(&engine, level))
             .map(ToString::to_string)
             .collect();
         crate::pinned::assert_pinned("tests/fixtures/plans.txt", &plans);
@@ -382,7 +390,7 @@ mod tests {
         let engine = RuleEngine::for_tests();
         let mut shared = Vec::new();
         for &level in SafetyLevel::VARIANTS {
-            for plan in std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level)) {
+            for plan in level_plans(&engine, level) {
                 let labels: Vec<(&str, &str)> = plan.groups().map(Group::label).collect();
                 for (position, &label) in labels.iter().enumerate() {
                     if labels[..position].contains(&label) {
@@ -402,7 +410,7 @@ mod tests {
     fn groups_of_one_fetcher_claim_each_others_keys_only_through_an_edge() {
         let engine = RuleEngine::for_tests();
         for &level in SafetyLevel::VARIANTS {
-            for plan in std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level)) {
+            for plan in level_plans(&engine, level) {
                 let groups: Vec<_> = plan.groups().collect();
                 for (position, group) in groups.iter().enumerate() {
                     for other in groups.iter().skip(position + 1) {

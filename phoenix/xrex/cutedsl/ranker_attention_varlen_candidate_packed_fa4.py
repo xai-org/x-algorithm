@@ -50,15 +50,17 @@ def ranker_attention_varlen_candidate_packed_fa4(
 
     def forward(q, k, v, cand_cu, key_starts, key_counts, bs_args):
         out, lse, softmax_stats = varlen_forward(kernels, q, k, v, bs_args)
-        cand_o, cand_lse = cand_forward(*candidate_inputs(q, k, v, cand_cu, key_starts, key_counts))
-        return out.at[0, region_start:].set(cand_o), lse, softmax_stats, cand_lse
+        cand_o, cand_stats = cand_forward(
+            *candidate_inputs(q, k, v, cand_cu, key_starts, key_counts)
+        )
+        return out.at[0, region_start:].set(cand_o), lse, softmax_stats, cand_stats
 
     @jax.custom_vjp
     def attention(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
         return forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)[0]
 
     def attention_fwd(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
-        out, lse, softmax_stats, cand_lse = forward(
+        out, lse, softmax_stats, cand_stats = forward(
             q, k, v, cand_cu, key_starts, key_counts, bs_args
         )
         out_bits = jax.lax.bitcast_convert_type(jax.lax.optimization_barrier(out), jnp.uint16)
@@ -66,7 +68,7 @@ def ranker_attention_varlen_candidate_packed_fa4(
         out = jax.lax.bitcast_convert_type(out_bits, out.dtype)
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
         softmax_stats = tuple(checkpoint_name(t, "cutedsl_attn_outputs") for t in softmax_stats)
-        cand_lse = checkpoint_name(cand_lse, "cutedsl_attn_outputs")
+        cand_stats = checkpoint_name(cand_stats, "cutedsl_attn_outputs")
         return out, (
             q,
             k,
@@ -77,17 +79,17 @@ def ranker_attention_varlen_candidate_packed_fa4(
             out,
             lse,
             softmax_stats,
-            cand_lse,
+            cand_stats,
             bs_args,
         )
 
     def attention_bwd(res, g):
-        q, k, v, cand_cu, key_starts, key_counts, out, lse, softmax_stats, cand_lse, bs_args = res
+        q, k, v, cand_cu, key_starts, key_counts, out, lse, softmax_stats, cand_stats, bs_args = res
         dq, dk, dv = varlen_backward(kernels, q, k, v, out, lse, softmax_stats, bs_args, g)
         dq_cand, dk_keys, dv_keys, dk_self, dv_self = cand_backward(
             *candidate_inputs(q, k, v, cand_cu, key_starts, key_counts),
             out[0, region_start:],
-            cand_lse,
+            cand_stats,
             g[0, region_start:],
         )
         dq = dq.at[0, region_start:].set(dq_cand)

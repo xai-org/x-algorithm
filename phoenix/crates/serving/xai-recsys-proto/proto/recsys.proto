@@ -213,6 +213,11 @@ message PageDecodeParams {
   optional float diversityWeight = 5;
 
   optional uint32 rewardHead = 6;
+
+  optional float eta = 7;
+  optional float nuAuthor = 8;
+  optional float nuSid = 9;
+  optional float priorTau = 10;
 }
 
 message RankingScoreWeights {
@@ -1956,6 +1961,7 @@ enum UserActionAggregationType {
   IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
   DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
   DENSE_WITH_LONG_DWELL_DEDUP_ATTRIBUTION = 33;
+  DENSE_WITH_RECENT_IMPRESSIONS = 34;
 }
 
 message UserActionAggregationResponse {

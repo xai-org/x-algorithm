@@ -17,5 +17,6 @@ pub mod under_the_hood;
 pub mod url;
 pub mod urt;
 pub mod video_carousel;
+pub mod video_carousel_ctr_model;
 pub mod viewer_history;
 pub mod xds;

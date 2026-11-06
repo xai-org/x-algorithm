@@ -21,15 +21,13 @@ impl Filter<ScoredPostsQuery, PostCandidate> for PreviouslySeenPostsFilter {
 
         let seen_ids: HashSet<u64> = query.seen_ids.iter().copied().collect();
 
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
-            related_post_ids_iter(c).any(|post_id| {
+        FilterResult::partition(candidates, |c| {
+            !related_post_ids_iter(c).any(|post_id| {
                 seen_ids.contains(&post_id)
                     || bloom_filters
                         .iter()
                         .any(|filter| filter.may_contain(post_id))
             })
-        });
-
-        FilterResult { kept, removed }
+        })
     }
 }

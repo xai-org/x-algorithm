@@ -1,4 +1,6 @@
-use crate::discovery::{build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery};
+use crate::discovery::{
+    build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery, XdsTarget,
+};
 use crate::evaluated::EvaluationResult;
 use crate::metrics::{ClientRpc, RequestMetrics};
 use crate::models::{Action, DropReason, FilteredReason, SafetyResult};
@@ -287,6 +289,7 @@ pub(crate) fn xds_channel_params<'a>(name: &'a str, dc: &'a str) -> VfChannelPar
         name,
         dc,
         discovery: VfDiscovery::Xds,
+        xds: XdsTarget::vf(dc),
         aperture_size: XAI_VF_APERTURE_SIZE,
         deterministic_aperture: std::env::var("APP_ENV").as_deref() == Ok("prod"),
         xds_lb_policy: LbPolicy::least_request(),

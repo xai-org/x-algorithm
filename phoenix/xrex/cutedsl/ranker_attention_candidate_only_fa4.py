@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -8,13 +10,14 @@ _CANDIDATE_ATTENTION_CACHE: dict = {}
 
 
 def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
-    from xrex.cutedsl.ranker_attention_fa4 import cutedsl_arch
+    from xrex.cutedsl.ranker_attention_fa4 import attention_delta, cutedsl_arch
     from xrex.cutedsl.ranker_attention_varlen_fa4 import zeros_after
 
     total_q, num_q_heads, head_dim = q_shape
     total_k, num_kv_heads, _ = k_shape
     arch = cutedsl_arch()
     sm_scale = float(sm_scale)
+    scale_log2 = sm_scale * math.log2(math.e)
     cache_key = (arch, total_q, total_k, num_seqs, num_q_heads, num_kv_heads, head_dim, sm_scale)
     if cache_key in _CANDIDATE_ATTENTION_CACHE:
         return _CANDIDATE_ATTENTION_CACHE[cache_key]
@@ -25,7 +28,6 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     from cutlass.jax import cutlass_call
 
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-    from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 
     if arch not in (90, 100):
         raise NotImplementedError(
@@ -89,35 +91,35 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         mSeqUsedK,
         mO,
         mLSE,
+        mRowMax,
+        mInvSum,
         softmax_scale: cutlass.Float32,
     ):
-        fa_fwd(mQ, mK, mV, mO, mLSE, softmax_scale, mCuQ, mCuK, None, mSeqUsedK, stream=stream)
+        fa_fwd(
+            mQ,
+            mK,
+            mV,
+            mO,
+            mLSE,
+            softmax_scale,
+            mCuQ,
+            mCuK,
+            None,
+            mSeqUsedK,
+            mSoftmaxStats=(mRowMax, mInvSum),
+            stream=stream,
+        )
 
     fwd_call = cutlass_call(
         launch_fwd,
         output_shape_dtype=[
             jax.ShapeDtypeStruct((total_q, num_q_heads, head_dim), jnp.bfloat16),
             jax.ShapeDtypeStruct((num_q_heads, total_q), jnp.float32),
+            jax.ShapeDtypeStruct((num_q_heads, total_q), jnp.float32),
+            jax.ShapeDtypeStruct((num_q_heads, total_q), jnp.float32),
         ],
         use_static_tensors=False,
         softmax_scale=cutlass.Float32(sm_scale),
-    )
-
-    fa_pre = FlashAttentionBackwardPreprocess(
-        cutlass.BFloat16, head_dim, head_dim, tile_m=bwd_tile_m
-    )
-
-    @cute.jit
-    def launch_pre(stream: cuda_driver.CUstream, mO, mdO, mLSE, mCuQ, mdPsum, mLSElog2):
-        fa_pre(mO, mdO, mdPsum, mLSE, mLSElog2, None, mCuQ, None, None, stream)
-
-    pre_call = cutlass_call(
-        launch_pre,
-        output_shape_dtype=[
-            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),
-            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),
-        ],
-        use_static_tensors=False,
     )
 
     if arch == 90:
@@ -175,11 +177,12 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         mK,
         mV,
         mdO,
-        mLSElog2,
+        mRowMax,
         mdPsum,
         mCuQ,
         mCuK,
         mSeqUsedK,
+        mInvSum,
         mdQaccum,
         mdK,
         mdV,
@@ -190,7 +193,7 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
             mK,
             mV,
             mdO,
-            mLSElog2,
+            mRowMax,
             mdPsum,
             mdQaccum,
             mdK,
@@ -200,13 +203,14 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
             mCuK,
             None,
             mSeqUsedK,
+            mSoftmaxStats=(mRowMax, mInvSum),
             stream=stream,
         )
 
     bwd_call = cutlass_call(
         launch_bwd,
         output_shape_dtype=bwd_accumulators,
-        input_output_aliases={9: 0, 10: 1, 11: 2},
+        input_output_aliases={10: 0, 11: 1, 12: 2},
         use_static_tensors=False,
         softmax_scale=cutlass.Float32(sm_scale),
     )
@@ -264,39 +268,62 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     def self_scores(q, k_self, query_valid):
         k_rep = jnp.repeat(k_self, qpk, axis=1)
         s = jnp.einsum("thd,thd->th", q.astype(jnp.float32), k_rep.astype(jnp.float32))
-        return jnp.where(query_valid[:, None], s * sm_scale, -jnp.inf)
+        return jnp.where(query_valid[:, None], s, -jnp.inf)
 
     def forward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k):
         query_valid = jnp.arange(total_q) < cu_q[-1]
-        o_hist, lse_hist = fwd_call(q, k_keys, v_keys, cu_q, cu_k, used_k)
-        lse_hist = jnp.where(query_valid[:, None], lse_hist.T, -jnp.inf)
+        o_hist, _, hist_max, hist_inv_sum = fwd_call(q, k_keys, v_keys, cu_q, cu_k, used_k)
+        has_history = query_valid[:, None] & (hist_inv_sum.T > 0)
+        hist_max = jnp.where(has_history, hist_max.T, -jnp.inf)
         s = self_scores(q, k_self, query_valid)
-        lse = jnp.logaddexp(lse_hist, s)
-        lse_safe = jnp.where(query_valid[:, None], lse, 0.0)
-        w_hist = jnp.where(query_valid[:, None], jnp.exp(lse_hist - lse_safe), 0.0)
-        w_self = jnp.where(query_valid[:, None], jnp.exp(s - lse_safe), 0.0)
+        row_max = jnp.where(query_valid[:, None], jnp.maximum(hist_max, s), 0.0)
+        hist_sum = jnp.exp2((hist_max - row_max) * scale_log2) / jnp.where(
+            has_history, hist_inv_sum.T, 1.0
+        )
+        self_sum = jnp.exp2((s - row_max) * scale_log2)
+        inv_sum = jnp.where(
+            query_valid[:, None],
+            1.0 / jnp.where(query_valid[:, None], hist_sum + self_sum, 1.0),
+            0.0,
+        )
+        w_hist, w_self = hist_sum * inv_sum, self_sum * inv_sum
         v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)
         o_hist = jnp.where(query_valid[:, None, None], o_hist.astype(jnp.float32), 0.0)
         o = (w_hist[..., None] * o_hist + w_self[..., None] * v_rep).astype(jnp.bfloat16)
-        return o, lse_safe
+        return o, jnp.stack((jnp.where(query_valid[:, None], row_max, jnp.inf), inv_sum))
 
-    def backward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k, o, lse, do):
+    def backward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k, o, stats, do):
         query_valid = jnp.arange(total_q) < cu_q[-1]
         do = jnp.where(query_valid[:, None, None], do, 0).astype(jnp.bfloat16)
         bwd_cu_rows = cu_q if q_heads_per_bwd_head == 1 else cu_q * q_heads_per_bwd_head
         bwd_do = fold_q_heads(do)
-        dpsum, lse_log2 = pre_call(fold_q_heads(o), bwd_do, fold_q_heads(lse).T, bwd_cu_rows)
+        padded_starts = (
+            (bwd_cu_rows[:-1] + jnp.arange(num_seqs) * bwd_tile_m) // bwd_tile_m * bwd_tile_m
+        )
+        rows = jnp.arange(bwd_rows_padded)
+        seq = jnp.searchsorted(padded_starts, rows, side="right") - 1
+        src = rows - padded_starts[seq] + bwd_cu_rows[seq]
+        src = jnp.where(src < bwd_cu_rows[seq + 1], src, bwd_rows)
+
+        def pad_stat(x, fill):
+            return jnp.take(fold_q_heads(x), src, axis=0, mode="fill", fill_value=fill).T
+
+        row_max, inv_sum = stats
+        padded_max, padded_inv_sum = pad_stat(row_max, jnp.inf), pad_stat(inv_sum, 0.0)
+        delta = attention_delta(o[None], do[None], (total_q + 31) // 32 * 32)[0, :, :total_q].T
+        dpsum = pad_stat(delta, 0.0)
         dq_accum_init, dk_init, dv_init = zeros_after(do, *bwd_accumulators)
         dq_accum, dk_keys, dv_keys = bwd_call(
             fold_q_heads(q),
             k_keys,
             v_keys,
             bwd_do,
-            lse_log2,
+            padded_max,
             dpsum,
             bwd_cu_rows,
             cu_k,
             used_k,
+            padded_inv_sum,
             dq_accum_init,
             dk_init,
             dv_init,
@@ -313,7 +340,9 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         dv_keys = jnp.where(key_valid[:, None, None], dv_keys, 0)
 
         s = self_scores(q, k_self, query_valid)
-        p_self = jnp.where(query_valid[:, None], jnp.exp(s - lse), 0.0)
+        p_self = jnp.where(
+            query_valid[:, None], jnp.exp2((s - row_max) * scale_log2) * inv_sum, 0.0
+        )
         do32 = do.astype(jnp.float32)
         delta = jnp.sum(do32 * o.astype(jnp.float32), axis=-1)
         v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)
@@ -359,10 +388,10 @@ def ranker_attention_varlen_candidate_only_fa4(
         return forward(*args)[0]
 
     def attention_fwd(*args):
-        o, lse = forward(*args)
+        o, stats = forward(*args)
         o = checkpoint_name(o, "cutedsl_attn_outputs")
-        lse = checkpoint_name(lse, "cutedsl_attn_outputs")
-        return o, (*args, o, lse)
+        stats = checkpoint_name(stats, "cutedsl_attn_outputs")
+        return o, (*args, o, stats)
 
     def attention_bwd(res, do):
         return backward(*res, do) + (None, None, None)

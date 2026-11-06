@@ -10,7 +10,6 @@ impl Filter<ScoredPostsQuery, PostCandidate> for CoreDataHydrationFilter {
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let (kept, removed) = candidates.into_iter().partition(|c| c.author_id != 0);
-        FilterResult { kept, removed }
+        FilterResult::partition(candidates, |c| c.author_id != 0)
     }
 }

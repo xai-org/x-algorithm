@@ -43,6 +43,7 @@ from xrex.data.parquet_recsys import (
     load_global_ids_from_parquet_file,
 )
 from xrex.data.recsys import id_list_features, reply_features
+from xrex.data.recsys.ad_side_ids import AD_SIDE_FIELD_COLUMNS
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
@@ -73,6 +74,7 @@ from xrex.data.streaming.kafkaconsumer import (
     PartitionLagTracker,
     consume_messages,
     discover_partition_count,
+    set_expected_inner_list_widths,
     validate_offset_map,
     validate_seek_options,
 )
@@ -1106,6 +1108,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     negative_downsample_positive_action_indices: str = (
         DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES
     )
+    drop_width_mismatched_messages: bool = True
     per_partition_poll: bool = True
     consumer_mode: ConsumerMode = ConsumerMode.PER_PARTITION
 
@@ -1204,6 +1207,9 @@ class PhoenixKafkaDataset(PhoenixDataset):
             optional_columns = [*optional_columns, id_list_features.COLUMN]
         if self.read_ads_engagement_counts:
             optional_columns = [*optional_columns, *ADS_COUNT_COLUMNS, *USER_ADS_COUNT_COLUMNS]
+        if self.read_ad_side_ids:
+            ad_columns = [c for f in self.ad_side_field_names for c in AD_SIDE_FIELD_COLUMNS[f]]
+            optional_columns = list(dict.fromkeys([*optional_columns, *ad_columns]))
         embedding_col_name: str | None = None
         if self.multimodal_embedding_type is not None:
             embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
@@ -1279,6 +1285,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
             history_url_embedding_fn=history_url_lookup,
             read_ads_engagement_counts=self.read_ads_engagement_counts,
             alloc=self._alloc,
+            read_ad_side_ids=self.read_ad_side_ids,
+            ad_side_fields=self.ad_side_field_names,
         )
 
         cardinality = inspect_prepared_batch(
@@ -1687,6 +1695,14 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.error(f"Error in periodic reload task: {e}")
                 await asyncio.sleep(self.global_ids_reload_interval_seconds / 2)
 
+    def expected_inner_list_widths(self) -> dict[str, int]:
+        if not self.drop_width_mismatched_messages:
+            return {}
+        return {
+            "actionNameMultiHotSeqSeq": self.output_vocab_size,
+            "continuousActionValuesSeqSeq": self.num_continuous_actions,
+        }
+
     def _async_kafka_consumer_arrow(
         self,
         example_queue: queue.Queue[KafkaQueueItem],
@@ -1697,6 +1713,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
         stop_event: threading.Event | None = None,
         reset_event: threading.Event | None = None,
     ) -> None:
+        set_expected_inner_list_widths(self.expected_inner_list_widths())
         try:
             self._run_kafka_consumer_arrow(
                 example_queue,

@@ -1,4 +1,4 @@
-use crate::hydration::{Hydration, HydrationPlan, Hydrators, RequestRows};
+use crate::hydration::{Hydration, HydrationPlan, Hydrator, Hydrators, RequestRows};
 use crate::models::{
     AuthorId, Decided, Evaluation, LabelInterstitial, LimitedEngagement, MediaRestriction,
     NotificationKind, Placement, PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
@@ -342,6 +342,7 @@ struct Level {
     plan: HydrationPlan,
     reads_soft_nsfw_new_user_drop: bool,
     post_kinds: Option<PostKinds>,
+    recipient_posts: Option<HydrationPlan>,
 }
 
 struct PostKinds {
@@ -360,6 +361,13 @@ impl Level {
             policy,
             plan,
             post_kinds: None,
+            recipient_posts: level.judges_recipient_posts().then(|| {
+                HydrationPlan::with_rows(
+                    level,
+                    RequestRows::Posts,
+                    Hydrators::of(Hydrator::PureCore),
+                )
+            }),
         }
     }
 }
@@ -762,6 +770,10 @@ impl RuleEngine {
 
     pub(crate) fn post_kinds_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
         Some(&self.level(level).post_kinds.as_ref()?.plan)
+    }
+
+    pub(crate) fn recipient_posts_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
+        self.level(level).recipient_posts.as_ref()
     }
 
     pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {

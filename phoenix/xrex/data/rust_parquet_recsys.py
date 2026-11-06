@@ -383,6 +383,12 @@ class RustParquetDataset(PhoenixDataset):
                 "sidecar join is implemented in InterleavingRecordBatchProvider only. "
                 "Use PhoenixDataset, or unset id_list_sidecar_root to read the native column."
             )
+        if self.ad_fields_sidecar_root is not None:
+            raise NotImplementedError(
+                "ad_fields_sidecar_root is not supported by RustParquetDataset: the ad-field "
+                "sidecar join is implemented in InterleavingRecordBatchProvider only. "
+                "Use PhoenixDataset, or unset ad_fields_sidecar_root to read the native columns."
+            )
 
         queue: Queue = Queue(maxsize=prefetch_factor)
         stop_event = Event()
@@ -426,6 +432,8 @@ class RustParquetDataset(PhoenixDataset):
                 id_list_specs=dataset.id_list_specs or None,
                 history_url_embedding_dim=dataset.history_url_embedding_dim,
                 alloc=dataset._alloc,
+                read_ad_side_ids=dataset.read_ad_side_ids,
+                ad_side_fields=dataset.ad_side_field_names,
             )
 
             if record_batch.num_rows < batch_size:
