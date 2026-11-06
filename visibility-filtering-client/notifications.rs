@@ -33,15 +33,20 @@ pub enum NotificationKind {
     Mention,
     Reply,
     MediaTagged,
+    Like,
+    Repost,
 }
 
 impl NotificationKind {
     pub const fn level(self) -> SafetyLevel {
         match self {
             Self::Follow => SafetyLevel::NOTIFICATIONS_FOLLOW,
-            Self::FollowRequestAccepted | Self::Mention | Self::Reply | Self::MediaTagged => {
-                SafetyLevel::NOTIFICATIONS_WRITER_V2
-            }
+            Self::FollowRequestAccepted
+            | Self::Mention
+            | Self::Reply
+            | Self::MediaTagged
+            | Self::Like
+            | Self::Repost => SafetyLevel::NOTIFICATIONS_WRITER_V2,
         }
     }
 
@@ -55,14 +60,28 @@ impl NotificationKind {
             Kind::MediaTagged(vf_pb::MediaTagged { post_id }) => {
                 (Self::MediaTagged, Some(*post_id))
             }
+            Kind::Like(vf_pb::Like { post_id }) => (Self::Like, Some(*post_id)),
+            Kind::Repost(vf_pb::Repost { source_post_id }) => (Self::Repost, Some(*source_post_id)),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notification {
-    Follow { actor_id: u64 },
-    FollowRequestAccepted { actor_id: u64 },
+    Follow {
+        actor_id: u64,
+    },
+    FollowRequestAccepted {
+        actor_id: u64,
+    },
+    Like {
+        actor_id: u64,
+        post_id: NonZeroU64,
+    },
+    Repost {
+        actor_id: u64,
+        source_post_id: NonZeroU64,
+    },
 }
 
 impl Notification {
@@ -77,6 +96,21 @@ impl Notification {
                 kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
                     vf_pb::FollowRequestAccepted {},
                 )),
+            },
+            Self::Like { actor_id, post_id } => vf_pb::Notification {
+                actor_id,
+                kind: Some(vf_pb::notification::Kind::Like(vf_pb::Like {
+                    post_id: post_id.get(),
+                })),
+            },
+            Self::Repost {
+                actor_id,
+                source_post_id,
+            } => vf_pb::Notification {
+                actor_id,
+                kind: Some(vf_pb::notification::Kind::Repost(vf_pb::Repost {
+                    source_post_id: source_post_id.get(),
+                })),
             },
         }
     }
@@ -388,16 +422,37 @@ mod tests {
     }
 
     #[test]
-    fn follow_request_accepted_encodes_its_own_message() {
-        assert_eq!(
-            Notification::FollowRequestAccepted { actor_id: 10 }.into_proto(),
-            vf_pb::Notification {
-                actor_id: 10,
-                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
-                    vf_pb::FollowRequestAccepted {}
-                )),
-            }
-        );
+    fn each_user_notification_encodes_its_own_message() {
+        use vf_pb::notification::Kind;
+        for (notification, kind) in [
+            (
+                Notification::FollowRequestAccepted { actor_id: 10 },
+                Kind::FollowRequestAccepted(vf_pb::FollowRequestAccepted {}),
+            ),
+            (
+                Notification::Like {
+                    actor_id: 10,
+                    post_id: NonZeroU64::new(20).unwrap(),
+                },
+                Kind::Like(vf_pb::Like { post_id: 20 }),
+            ),
+            (
+                Notification::Repost {
+                    actor_id: 10,
+                    source_post_id: NonZeroU64::new(20).unwrap(),
+                },
+                Kind::Repost(vf_pb::Repost { source_post_id: 20 }),
+            ),
+        ] {
+            assert_eq!(
+                notification.into_proto(),
+                vf_pb::Notification {
+                    actor_id: 10,
+                    kind: Some(kind),
+                },
+                "{notification:?}"
+            );
+        }
     }
 
     #[tokio::test]

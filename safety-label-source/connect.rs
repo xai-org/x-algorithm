@@ -1,20 +1,23 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tonic::async_trait;
 use tracing::{error, info, warn};
 use xai_cache::discovery::{WilyDiscovery, XdsDiscovery};
 use xai_cache::{
     CacheClient, ClientBuilder, ClientConfig, HashAlgorithm, KVCacheError, Key, Protocol, RingHash,
-    TlsConfig,
+    TlsConfig, Value,
 };
 use xai_manhattan::s2s::S2sConfig;
 use xai_stats_receiver::StatsReceiverExt;
 
+use crate::dragonfly::LabelCacheInvalidator;
 use crate::metrics::LabelMetrics;
 use crate::mh_client::{ManhattanLabelFetcher, MhLabelClient};
-use crate::remote::RemoteSource;
+use crate::remote::{CacheOpResult, CacheRead, RemoteSource};
 use crate::source::SafetyLabelSource;
 use crate::warmer::{CacheWarmer, WarmFetcher};
 
@@ -26,7 +29,7 @@ pub struct LabelSourceConfig {
     pub datacenter: String,
     pub s2s: S2sPaths,
     pub deterministic_aperture: bool,
-    pub twemcache_client_name: String,
+    pub twemcache_client_name: Option<String>,
     pub label_cache_eds: Option<String>,
     pub cache_capacity: Option<usize>,
     pub stats: Option<Arc<dyn StatsReceiverExt>>,
@@ -46,7 +49,7 @@ pub struct ConnectError(Vec<String>);
 
 pub struct LabelClients {
     manhattan: Arc<MhLabelClient>,
-    twemcache: Arc<CacheClient>,
+    twemcache: Option<Arc<CacheClient>>,
     dragonfly: Option<Arc<CacheClient>>,
     cache_capacity: Option<usize>,
     metrics: LabelMetrics,
@@ -78,8 +81,11 @@ impl LabelClients {
             Ok::<_, String>(manhattan)
         };
         let twemcache = async {
+            let Some(client_name) = &twemcache_client_name else {
+                return Ok(None);
+            };
             let twemcache = retry("twemcache", init_deadline, || {
-                twemcache_client(&datacenter, twemcache_client_name.clone(), s2s.clone())
+                twemcache_client(&datacenter, client_name.clone(), s2s.clone())
             })
             .await?;
             let start = Instant::now();
@@ -90,7 +96,7 @@ impl LabelClients {
                 "Cache client connected to {CACHE_PATH}"
             );
             warm_cache(&twemcache).await;
-            Ok::<_, String>(twemcache)
+            Ok::<_, String>(Some(Arc::new(twemcache)))
         };
         let dragonfly = async {
             let Some(eds) = &label_cache_eds else {
@@ -106,7 +112,7 @@ impl LabelClients {
         match tokio::join!(manhattan, twemcache, dragonfly) {
             (Ok(manhattan), Ok(twemcache), Ok(dragonfly)) => Ok(Self {
                 manhattan: Arc::new(manhattan),
-                twemcache: Arc::new(twemcache),
+                twemcache,
                 dragonfly,
                 cache_capacity,
                 metrics: LabelMetrics::new(stats),
@@ -120,6 +126,11 @@ impl LabelClients {
         }
     }
 
+    pub fn label_cache_invalidator(&self) -> Option<LabelCacheInvalidator> {
+        let cache: Arc<CacheClient> = Arc::clone(self.dragonfly.as_ref()?);
+        Some(LabelCacheInvalidator::new(cache))
+    }
+
     pub fn into_source(self, warm_fetcher: Option<Arc<dyn WarmFetcher>>) -> SafetyLabelSource {
         let Self {
             manhattan,
@@ -128,6 +139,10 @@ impl LabelClients {
             cache_capacity,
             metrics,
         } = self;
+        let twemcache: Arc<dyn CacheRead> = match twemcache {
+            Some(twemcache) => twemcache,
+            None => Arc::new(NoTwemcache),
+        };
         let mut remote = RemoteSource::new(twemcache, manhattan, metrics.clone());
         if let Some(fetcher) = warm_fetcher {
             info!("L2 cache warmer enabled");
@@ -137,6 +152,15 @@ impl LabelClients {
             remote = remote.with_dragonfly(dragonfly);
         }
         SafetyLabelSource::new(Arc::new(remote), cache_capacity, metrics)
+    }
+}
+
+struct NoTwemcache;
+
+#[async_trait]
+impl CacheRead for NoTwemcache {
+    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, CacheOpResult<Option<Value>>> {
+        keys.iter().map(|key| (key.clone(), Ok(None))).collect()
     }
 }
 

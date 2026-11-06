@@ -111,6 +111,7 @@ pub(crate) enum RuleId {
     AbusiveUqf,
     UntrustedUrlUqf,
     DownrankSpamReplyUqf,
+    RiskyHighVizReplyOon,
 
     NsfwHighRecallUserLabel,
     NsfwHighPrecisionUserLabel,

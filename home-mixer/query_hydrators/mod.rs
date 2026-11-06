@@ -20,3 +20,5 @@ pub mod subscribed_user_ids_query_hydrator;
 pub mod user_demographics_query_hydrator;
 pub mod user_inferred_gender_query_hydrator;
 pub mod user_installed_apps_query_hydrator;
+pub mod video_carousel_ctr_model_query_hydrator;
+pub mod video_carousel_seen_query_hydrator;

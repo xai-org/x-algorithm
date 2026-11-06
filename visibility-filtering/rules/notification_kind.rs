@@ -1,4 +1,3 @@
-use crate::hydration::RequestRows;
 use crate::models::NotificationKind;
 use crate::rules::levels;
 use crate::rules::levels::PostRules;
@@ -6,21 +5,14 @@ use crate::rules::levels::PostRules;
 #[derive(Clone, Copy)]
 pub(crate) enum Judged {
     Actor,
+    ActorOnRecipientPost,
     ActorPost(PostRules),
-}
-
-impl Judged {
-    pub(crate) const fn rows(self) -> RequestRows {
-        match self {
-            Self::Actor => RequestRows::Users,
-            Self::ActorPost(_) => RequestRows::ActorPosts,
-        }
-    }
 }
 
 pub(crate) const fn judged(kind: NotificationKind) -> Judged {
     match kind {
         NotificationKind::Follow | NotificationKind::FollowRequestAccepted => Judged::Actor,
+        NotificationKind::Like | NotificationKind::Repost => Judged::ActorOnRecipientPost,
         NotificationKind::Mention => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MENTION),
         NotificationKind::Reply => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_REPLY),
         NotificationKind::MediaTagged => {

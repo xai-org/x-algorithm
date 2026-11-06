@@ -31,6 +31,9 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
             kept.iter()
                 .skip(RESULT_SIZE)
                 .chain(&removed)
+                .filter(|candidate| {
+                    !video_carousel::was_seen(&query.seen_carousel_video_ids, candidate)
+                })
                 .filter(|candidate| match candidate.brand_safety_verdict {
                     Some(BrandSafetyVerdict::HighRisk) => !drop_high_risk,
                     Some(BrandSafetyVerdict::MediumRisk) => !drop_medium_risk,
@@ -47,5 +50,55 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
                 .then(|| query.params.get(VideoCarouselEmbeddingDedupeThreshold)),
         ));
         FilterResult { kept, removed }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::candidate::PhoenixScores;
+    use std::collections::HashSet;
+    use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
+
+    #[test]
+    fn carousel_skips_videos_seen_in_a_carousel() {
+        let mut results = FeatureSwitches::new(vec![])
+            .unwrap()
+            .match_recipient(&RecipientBuilder::new().build());
+        results.override_fs("rust_home_mixer_enable_video_carousel".to_string(), "true");
+        let params: Params = results.into();
+        let query = ScoredPostsQuery {
+            params,
+            video_carousel_eligible: true,
+            seen_carousel_video_ids: HashSet::from([101, 103]),
+            ..Default::default()
+        };
+        let main_feed = (1..=RESULT_SIZE as u64).map(|tweet_id| PostCandidate {
+            tweet_id,
+            ..Default::default()
+        });
+        let videos = (101..=106).map(|tweet_id| PostCandidate {
+            tweet_id,
+            author_id: tweet_id,
+            has_video: Some(true),
+            video_aspect_ratio: Some(0.5),
+            brand_safety_verdict: Some(BrandSafetyVerdict::Safe),
+            phoenix_scores: PhoenixScores {
+                video_open_score: Some(1.0 / tweet_id as f64),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        VideoCarouselFilter.filter(&query, main_feed.chain(videos).collect());
+
+        let carousel_ids: HashSet<u64> = query
+            .video_carousel
+            .get()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate.tweet_id)
+            .collect();
+        assert_eq!(carousel_ids, HashSet::from([102, 104, 105, 106]));
     }
 }

@@ -491,7 +491,6 @@ class FlashAttentionBackwardSm100:
         ]
 
         if const_expr(mSoftmaxStats is not None):
-            assert mCuSeqlensQ is None and mCuSeqlensK is None
             mSoftmaxStats = tuple(
                 layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in mSoftmaxStats
             )
@@ -2868,8 +2867,12 @@ class FlashAttentionBackwardSm100:
                         row = m_block * self.tile_m + tScS_t2r[lane_idx, stage, 0, 0][1]
                         row_max_lane, inv_sum_lane = Float32.inf, Float32(0.0)
                         if row < seqlen.seqlen_q:
-                            row_max_lane = mSoftmaxStats[0][row, head_idx, batch_idx]
-                            inv_sum_lane = mSoftmaxStats[1][row, head_idx, batch_idx]
+                            row_max_lane = seqlen.offset_batch_Q(
+                                mSoftmaxStats[0], batch_idx, dim=2, padded=True
+                            )[row, head_idx]
+                            inv_sum_lane = seqlen.offset_batch_Q(
+                                mSoftmaxStats[1], batch_idx, dim=2, padded=True
+                            )[row, head_idx]
                     else:
                         tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                         if const_expr(not self.shuffle_LSE):

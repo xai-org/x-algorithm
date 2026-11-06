@@ -534,11 +534,20 @@ MODEL_CFGS = {
             **_home_direct_packed_base(),
             **_H100_OVERRIDES,
             "seqpack_candidate_packing": True,
-            "seqpack_candidate_count": [32, 128],
+            "seqpack_candidate_count": [128],
+            "seqpack_distribution": replace(
+                _home_direct_packed_base()["seqpack_distribution"], mean_len=414
+            ),
             "num_candidate_only_layers": 2,
             "candidate_only_attn_impl": "cutedsl_ranker_candidate_only_attn",
             "fp8_gemms": Fp8Gemms.ALL,
             "metrics_ndcg_shared_sorts": True,
+            "metric_mask_keys": [
+                "non_negative_home",
+                "non_negative_no_history",
+                "negative",
+                "non_negative_ranked_following",
+            ],
             "view_loss_weight": 0.5,
             "home_video_continuation_loss_weight": 0.013,
             "home_profile_visit_secs_loss_weight": 0.0035,

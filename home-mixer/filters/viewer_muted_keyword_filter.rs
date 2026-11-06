@@ -39,19 +39,10 @@ impl Filter<ScoredPostsQuery, PostCandidate> for ViewerMutedKeywordFilter {
             let user_mutes = UserMutes::new(token_sequences);
             let matcher = MatchTweetGroup::new(user_mutes);
 
-            let mut kept = Vec::new();
-            let mut removed = Vec::new();
-
-            for candidate in candidates {
+            FilterResult::partition(candidates, |candidate| {
                 let tweet_text_token_sequence = tokenizer.tokenize(&candidate.tweet_text);
-                if matcher.matches(&tweet_text_token_sequence) {
-                    removed.push(candidate);
-                } else {
-                    kept.push(candidate);
-                }
-            }
-
-            FilterResult { kept, removed }
+                !matcher.matches(&tweet_text_token_sequence)
+            })
         })
     }
 }

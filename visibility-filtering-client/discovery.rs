@@ -75,26 +75,34 @@ impl std::fmt::Display for VfChannelError {
 
 impl std::error::Error for VfChannelError {}
 
-fn vf_xds_listener(override_value: Option<&str>) -> String {
-    match override_value.map(str::trim) {
+pub(crate) fn env_override(value: Option<&str>, default: String) -> String {
+    match value.map(str::trim) {
         Some(v) if !v.is_empty() => v.to_string(),
-        _ => DEFAULT_VF_XDS_LISTENER.to_string(),
+        _ => default,
     }
+}
+
+fn vf_xds_listener(override_value: Option<&str>) -> String {
+    env_override(override_value, DEFAULT_VF_XDS_LISTENER.to_string())
 }
 
 fn vf_xds_listener_from_env() -> String {
     vf_xds_listener(std::env::var(VF_XDS_LISTENER_ENV).ok().as_deref())
 }
 
-fn vf_tls_domain(dc: &str) -> String {
-    format!("visibility.visibility-filtering-service.prod.{dc}.s2s.twttr.net")
+pub(crate) fn visibility_tls_domain(service: &str, dc: &str) -> String {
+    format!("visibility.{service}.prod.{dc}.s2s.twttr.net")
 }
 
-fn vf_tls(dc: &str) -> Result<TlsMode, VfChannelError> {
+fn vf_tls_domain(dc: &str) -> String {
+    visibility_tls_domain("visibility-filtering-service", dc)
+}
+
+fn s2s_tls(tls_domain: &str) -> Result<TlsMode, VfChannelError> {
     Ok(TlsMode::mtls_from_env()
         .context("failed to load mTLS certs (S2S cert env vars required)")
         .map_err(VfChannelError::Config)?
-        .with_domain_override(vf_tls_domain(dc)))
+        .with_domain_override(tls_domain.to_string()))
 }
 
 fn incr_build_metric(name: &str, transport: &str, result: &str) {
@@ -111,10 +119,26 @@ fn incr_build_metric(name: &str, transport: &str, result: &str) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XdsTarget {
+    pub listener: String,
+    pub tls_domain: String,
+}
+
+impl XdsTarget {
+    pub(crate) fn vf(dc: &str) -> Self {
+        Self {
+            listener: vf_xds_listener_from_env(),
+            tls_domain: vf_tls_domain(dc),
+        }
+    }
+}
+
 pub(crate) struct VfChannelParams<'a> {
     pub name: &'a str,
     pub dc: &'a str,
     pub discovery: VfDiscovery,
+    pub xds: XdsTarget,
     pub aperture_size: usize,
     pub deterministic_aperture: bool,
     pub xds_lb_policy: LbPolicy,
@@ -138,19 +162,16 @@ pub(crate) async fn build_vf_xds_channel(
     params: &VfChannelParams<'_>,
 ) -> Result<LoadBalancedChannel, VfChannelError> {
     let name = params.name;
-    let listener = vf_xds_listener_from_env();
-    let result = match tokio::time::timeout(
-        VF_XDS_BUILD_TIMEOUT,
-        build_xds_channel(params, &listener),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
-            "timed out after {}s",
-            VF_XDS_BUILD_TIMEOUT.as_secs()
-        ))),
-    };
+    let listener = &params.xds.listener;
+    let result =
+        match tokio::time::timeout(VF_XDS_BUILD_TIMEOUT, build_xds_channel(params, listener)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
+                "timed out after {}s",
+                VF_XDS_BUILD_TIMEOUT.as_secs()
+            ))),
+        };
     match result {
         Ok(channel) => {
             incr_build_metric(name, "xds", "built");
@@ -210,7 +231,7 @@ async fn build_wily_channel(params: &VfChannelParams<'_>) -> Result<Channel, VfC
     let source = PollingEndpointSource::new(lookup, VF_DNS_POLL_INTERVAL);
 
     let mut builder = ChannelBuilder::new(name)
-        .tls(vf_tls(dc)?)
+        .tls(s2s_tls(&vf_tls_domain(dc))?)
         .endpoint_source(source)
         .aperture(params.aperture_size);
     if params.deterministic_aperture {
@@ -238,7 +259,7 @@ async fn build_xds_channel(
     );
 
     let mut builder = ChannelBuilder::new(name)
-        .tls(vf_tls(params.dc)?)
+        .tls(s2s_tls(&params.xds.tls_domain)?)
         .xds(StartFrom::Lds(listener.to_string()))
         .await
         .map_err(|e| match e {

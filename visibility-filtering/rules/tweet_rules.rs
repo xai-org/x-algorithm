@@ -890,7 +890,7 @@ pub(super) const DMCA_MEDIA_DROP_UNSPECIFIED: Rule = Rule {
 
 pub(super) const GEO_RESTRICTED_MEDIA_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::GeoRestrictedMedia,
-    audience: Everyone,
+    audience: NonAuthors,
     when: all![TweetMediaGeoRestrictedInRequestCountry],
     action: drop_post(DropAs::UnspecifiedReason),
 };
@@ -1016,6 +1016,13 @@ pub(super) const DOWNRANK_SPAM_REPLY_UQF_DROP_UNSPECIFIED: Rule = Rule {
         TweetHasLabel(SafetyLabelType::DOWNRANK_SPAM_REPLY),
         ViewerHasUqfEnabled
     ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const RISKY_HIGH_VIZ_REPLY_OON_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::RiskyHighVizReplyOon,
+    audience: NonFollowers,
+    when: all![TweetHasLabel(SafetyLabelType::RISKY_HIGH_VIZ_REPLY)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 

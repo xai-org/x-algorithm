@@ -1,7 +1,9 @@
 use crate::clients::post_v8_search_embedding_client::PostV8SearchEmbeddingClient;
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{EnableVideoCarouselEmbeddingDedupe, VideoCarouselEmbeddingVersion};
+use crate::params::{
+    EnableVideoCarouselCtrModel, EnableVideoCarouselEmbeddingDedupe, VideoCarouselEmbeddingVersion,
+};
 use crate::util::video_carousel;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -20,7 +22,9 @@ impl VideoEmbeddingHydrator {
 #[async_trait]
 impl Hydrator<ScoredPostsQuery, PostCandidate> for VideoEmbeddingHydrator {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        video_carousel::is_enabled(query) && query.params.get(EnableVideoCarouselEmbeddingDedupe)
+        video_carousel::is_enabled(query)
+            && (query.params.get(EnableVideoCarouselEmbeddingDedupe)
+                || query.params.get(EnableVideoCarouselCtrModel))
     }
 
     async fn hydrate(

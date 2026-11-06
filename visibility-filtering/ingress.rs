@@ -1,11 +1,10 @@
-use crate::hydration::RequestRows;
 use crate::models::{
     AuthorId, ClientCapability, NotificationKind, PlacedCandidate, Placement, RawCandidate,
     RequestFacts, RequestViewer, RetweetMerge, TweetId,
 };
 use crate::params::ClientSwitches;
 use crate::post_evaluator::PostBatch;
-use crate::rules::notification_kind;
+use crate::rules::notification_kind::{self, Judged};
 use crate::rules::{LevelError, QuoteEntries, RuleEngine, SafetyLevel, WireLevel};
 use tonic::Status;
 use xai_twittercontext_proto::TwitterContextViewer;
@@ -27,8 +26,14 @@ pub(crate) struct Notifications<S> {
 }
 
 pub(crate) enum NotificationRequest {
-    Users(Notifications<AuthorId>),
+    Users(Notifications<NotificationUser>),
     Posts(Notifications<NotificationPost>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NotificationUser {
+    pub(crate) actor: AuthorId,
+    pub(crate) recipient_post: Option<TweetId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,29 +136,40 @@ pub(crate) fn filter_notifications(
             .map(NotificationKind::of_proto)
             .ok_or_else(|| Status::invalid_argument("a notification has no kind VF serves"))?;
         let actor = AuthorId(notification.actor_id);
-        let rows = level
-            .judges(kind)
-            .then(|| notification_kind::judged(kind).rows());
-        match post {
-            None if rows == Some(RequestRows::Users) => users.push((kind, actor)),
-            Some(0) => {
-                return Err(Status::invalid_argument(
-                    "a post notification names no post",
-                ));
+        let judged = level.judges(kind).then(|| notification_kind::judged(kind));
+        match (judged, post) {
+            (Some(Judged::Actor), None) => users.push((
+                kind,
+                NotificationUser {
+                    actor,
+                    recipient_post: None,
+                },
+            )),
+            (_, Some(0)) => {
+                return Err(Status::invalid_argument("a notification names no post"));
             }
-            Some(_) if actor.0 == 0 => {
+            (Some(Judged::ActorOnRecipientPost), Some(post)) => users.push((
+                kind,
+                NotificationUser {
+                    actor,
+                    recipient_post: Some(TweetId(post)),
+                },
+            )),
+            (_, Some(_)) if actor.0 == 0 => {
                 return Err(Status::invalid_argument(
                     "a post notification names no actor",
                 ));
             }
-            Some(post) if rows == Some(RequestRows::ActorPosts) => posts.push((
+            (Some(Judged::ActorPost(_)), Some(post)) => posts.push((
                 kind,
                 NotificationPost {
                     post: TweetId(post),
                     actor,
                 },
             )),
-            None | Some(_) => {
+            (None, _)
+            | (Some(Judged::Actor), Some(_))
+            | (Some(Judged::ActorOnRecipientPost | Judged::ActorPost(_)), None) => {
                 return Err(Status::invalid_argument(
                     "the safety level does not serve this notification kind",
                 ));

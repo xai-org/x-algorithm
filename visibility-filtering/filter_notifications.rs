@@ -1,4 +1,6 @@
-use crate::ingress::{self, NotificationPost, NotificationRequest, Notifications};
+use crate::ingress::{
+    self, NotificationPost, NotificationRequest, NotificationUser, Notifications,
+};
 use crate::metrics::{self, Endpoint, RequestLevel, RequestMetrics};
 use crate::models::{AuthorId, Evaluation, NotificationKind, TweetId};
 use crate::post_evaluator::PostEvaluator;
@@ -36,13 +38,18 @@ impl FilterNotificationsEndpoint {
                     ingress::filter_notifications(request.get_ref(), level)?;
                 let response = match notifications {
                     NotificationRequest::Users(users) => {
-                        let by_actor = context
-                            .scope(self.users(level, &users, &request_metrics))
+                        let (by_actor, by_post) = context
+                            .scope(async {
+                                tokio::join!(
+                                    self.users(level, &users, &request_metrics),
+                                    self.recipient_posts(level, &users, &request_metrics),
+                                )
+                            })
                             .await;
                         respond(
                             &request_metrics,
-                            users.rows.iter().map(|&(kind, actor)| {
-                                (kind, by_actor.get(&actor).and_then(Option::as_ref))
+                            users.rows.iter().map(|&(kind, user)| {
+                                (kind, user_evaluation(user, &by_actor, &by_post))
                             }),
                         )
                     }
@@ -73,11 +80,14 @@ impl FilterNotificationsEndpoint {
     async fn users(
         &self,
         level: SafetyLevel,
-        notifications: &Notifications<AuthorId>,
+        notifications: &Notifications<NotificationUser>,
         metrics: &RequestMetrics,
     ) -> HashMap<AuthorId, Option<Evaluation>> {
-        let mut actors: Vec<AuthorId> =
-            notifications.rows.iter().map(|&(_, actor)| actor).collect();
+        let mut actors: Vec<AuthorId> = notifications
+            .rows
+            .iter()
+            .map(|&(_, user)| user.actor)
+            .collect();
         actors.sort_unstable_by_key(|actor| actor.0);
         actors.dedup();
         if actors.is_empty() {
@@ -85,6 +95,27 @@ impl FilterNotificationsEndpoint {
         }
         self.post_evaluator
             .evaluate_users(level, notifications.facts.clone(), actors, metrics)
+            .await
+    }
+
+    async fn recipient_posts(
+        &self,
+        level: SafetyLevel,
+        notifications: &Notifications<NotificationUser>,
+        metrics: &RequestMetrics,
+    ) -> HashMap<TweetId, Result<(), Evaluation>> {
+        let mut posts: Vec<TweetId> = notifications
+            .rows
+            .iter()
+            .filter_map(|&(_, user)| user.recipient_post)
+            .collect();
+        posts.sort_unstable_by_key(|post| post.0);
+        posts.dedup();
+        if posts.is_empty() {
+            return HashMap::new();
+        }
+        self.post_evaluator
+            .resolve_recipient_posts(level, notifications.facts.clone(), posts, metrics)
             .await
     }
 
@@ -104,6 +135,18 @@ impl FilterNotificationsEndpoint {
         self.post_evaluator
             .evaluate_post_notifications(level, notifications.facts.clone(), &posts, metrics)
             .await
+    }
+}
+
+fn user_evaluation<'a>(
+    user: NotificationUser,
+    by_actor: &'a HashMap<AuthorId, Option<Evaluation>>,
+    by_post: &'a HashMap<TweetId, Result<(), Evaluation>>,
+) -> Option<&'a Evaluation> {
+    match user.recipient_post.map(|post| by_post.get(&post)) {
+        None | Some(Some(Ok(()))) => by_actor.get(&user.actor).and_then(Option::as_ref),
+        Some(Some(Err(evaluation))) => Some(evaluation),
+        Some(None) => None,
     }
 }
 
@@ -148,7 +191,7 @@ mod tests {
         EVALUATED_CANDIDATES, NOTIFICATION_RESULTS, REQUESTS, REQUESTS_BY_CALLER,
         UNRESOLVED_TWEETS, VERDICTS, VERDICTS_BY_RULE,
     };
-    use crate::metrics::Metrics;
+    use crate::metrics::{Metrics, Recording};
     use crate::rules::RuleEngine;
     use vf_pb::NotificationDropReason as DropReason;
     use xai_core_entities::entities::{
@@ -168,6 +211,7 @@ mod tests {
     const OTHER_POST: u64 = 101;
     const SUSPENDED_POST: u64 = 102;
     const MISSING_POST: u64 = 999;
+    const RECIPIENT_POST: u64 = 104;
 
     #[derive(Debug, PartialEq, Eq)]
     enum Seen {
@@ -189,6 +233,22 @@ mod tests {
             kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
                 vf_pb::FollowRequestAccepted {},
             )),
+        }
+    }
+
+    fn like(actor_id: u64, post_id: u64) -> vf_pb::Notification {
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(vf_pb::notification::Kind::Like(vf_pb::Like { post_id })),
+        }
+    }
+
+    fn repost(actor_id: u64, source_post_id: u64) -> vf_pb::Notification {
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(vf_pb::notification::Kind::Repost(vf_pb::Repost {
+                source_post_id,
+            })),
         }
     }
 
@@ -266,6 +326,7 @@ mod tests {
             .user(ACTOR, actor_with_image(ACTOR))
             .user(OTHER_ACTOR, actor_with_image(OTHER_ACTOR))
             .user(SUSPENDED_ACTOR, suspended())
+            .tweet(RECIPIENT_POST, RECIPIENT)
     }
 
     async fn filter(
@@ -351,6 +412,13 @@ mod tests {
                 vec![follow(ACTOR), accepted(OTHER_ACTOR)],
             ),
             (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![follow(ACTOR)]),
+            (FOLLOW, RECIPIENT, vec![like(ACTOR, RECIPIENT_POST)]),
+            (
+                FOLLOW,
+                RECIPIENT,
+                vec![follow(ACTOR), repost(OTHER_ACTOR, RECIPIENT_POST)],
+            ),
+            (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![like(ACTOR, 0)]),
             (9_999, RECIPIENT, vec![follow(ACTOR)]),
             (FOLLOW, RECIPIENT, vec![mention(ACTOR, POST)]),
             (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![mention(ACTOR, 0)]),
@@ -369,6 +437,16 @@ mod tests {
                 FOLLOW_REQUEST_ACCEPTED,
                 RECIPIENT,
                 vec![accepted(OTHER_ACTOR), media_tagged(ACTOR, POST)],
+            ),
+            (
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![like(OTHER_ACTOR, RECIPIENT_POST), mention(ACTOR, POST)],
+            ),
+            (
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![reply(ACTOR, POST), repost(OTHER_ACTOR, RECIPIENT_POST)],
             ),
         ] {
             let (seen, sources) = filter(world(), level, recipient_id, notifications).await;
@@ -588,6 +666,167 @@ mod tests {
         )
         .await;
         assert_eq!(followed, Ok(vec![Seen::Allowed]));
+    }
+
+    #[tokio::test]
+    async fn a_like_and_a_repost_get_an_accepted_follow_request_s_verdict_on_each_actor() {
+        const PROTECTED_ACTOR: u64 = 5;
+        const MUTED_ACTOR: u64 = 6;
+        const READ_ONLY_ACTOR: u64 = 7;
+        const FAILED_ACTOR: u64 = 8;
+        let mut protected = actor_with_image(PROTECTED_ACTOR);
+        if let Some(user) = protected.user.as_mut() {
+            user.safety.is_protected = true;
+        }
+        let world = || {
+            world()
+                .edge(Graph::Blocks, RECIPIENT, OTHER_ACTOR)
+                .user(PROTECTED_ACTOR, protected.clone())
+                .user(MUTED_ACTOR, actor_with_image(MUTED_ACTOR))
+                .edge(Graph::Mutes, RECIPIENT, MUTED_ACTOR)
+                .user(
+                    READ_ONLY_ACTOR,
+                    labeled(READ_ONLY_ACTOR, LabelValue::READ_ONLY),
+                )
+                .user(FAILED_ACTOR, actor_with_image(FAILED_ACTOR))
+                .fail_key(Source::GizmoduckActor, FAILED_ACTOR)
+        };
+        let actors = [
+            ACTOR,
+            SUSPENDED_ACTOR,
+            OTHER_ACTOR,
+            MISSING_ACTOR,
+            PROTECTED_ACTOR,
+            MUTED_ACTOR,
+            READ_ONLY_ACTOR,
+            FAILED_ACTOR,
+        ];
+        for (name, kind) in [
+            ("accepted", accepted as fn(u64) -> vf_pb::Notification),
+            ("like", |actor| like(actor, RECIPIENT_POST)),
+            ("repost", |actor| repost(actor, RECIPIENT_POST)),
+        ] {
+            let (seen, _) = filter(
+                world(),
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                actors.map(kind).into(),
+            )
+            .await;
+            assert_eq!(
+                seen,
+                Ok(vec![
+                    Seen::Allowed,
+                    Seen::Dropped(DropReason::ActorSuspended),
+                    Seen::Dropped(DropReason::RecipientBlocksActor),
+                    Seen::Dropped(DropReason::ActorNotFound),
+                    Seen::Dropped(DropReason::ActorProtected),
+                    Seen::Dropped(DropReason::RecipientMutesActor),
+                    Seen::Dropped(DropReason::Unspecified),
+                    Seen::Failed,
+                ]),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_s() {
+        const FAILED_POST: u64 = 105;
+        let sources = world()
+            .tweet(POST, ACTOR)
+            .tweet(FAILED_POST, RECIPIENT)
+            .fail_key(Source::TesPureCoreData, FAILED_POST);
+        let (seen, sources) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                like(ACTOR, RECIPIENT_POST),
+                repost(ACTOR, MISSING_POST),
+                like(OTHER_ACTOR, POST),
+                repost(SUSPENDED_ACTOR, MISSING_POST),
+                like(ACTOR, FAILED_POST),
+                like(SUSPENDED_ACTOR, FAILED_POST),
+                accepted(ACTOR),
+                repost(OTHER_ACTOR, RECIPIENT_POST),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            Ok(vec![
+                Seen::Allowed,
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Failed,
+                Seen::Failed,
+                Seen::Allowed,
+                Seen::Allowed,
+            ])
+        );
+        assert_eq!(
+            sources.keys(Source::TesPureCoreData),
+            [vec![POST, RECIPIENT_POST, FAILED_POST, MISSING_POST]]
+        );
+        for unasked in [
+            Source::TesTweetForVisibility,
+            Source::SafetyLabels,
+            Source::GizmoduckAuthor,
+        ] {
+            assert!(!sources.calls().contains(&unasked), "{unasked:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_user_notification_counts_under_its_kind() {
+        let (metrics, recording) = Metrics::recording();
+        let (seen, _) = filter_with(
+            metrics,
+            world(),
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                like(ACTOR, RECIPIENT_POST),
+                repost(SUSPENDED_ACTOR, RECIPIENT_POST),
+                accepted(ACTOR),
+                like(MISSING_ACTOR, RECIPIENT_POST),
+            ],
+        )
+        .await;
+        assert!(seen.is_ok());
+        assert_eq!(
+            notification_results(&recording),
+            [
+                result_row("follow_request_accepted", "allowed", "none"),
+                result_row("like", "allowed", "none"),
+                result_row("like", "dropped", "actor_not_found"),
+                result_row("repost", "dropped", "actor_suspended"),
+            ]
+        );
+    }
+
+    fn notification_results(recording: &Recording) -> Vec<(String, String, String, f64)> {
+        let mut recorded: Vec<_> = recording
+            .take(&NOTIFICATION_RESULTS.family)
+            .into_iter()
+            .map(|sample| {
+                let label = |name| sample.label(name).unwrap().to_owned();
+                (
+                    label("notification_type"),
+                    label("outcome"),
+                    label("reason"),
+                    sample.value,
+                )
+            })
+            .collect();
+        recorded.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        recorded
+    }
+
+    fn result_row(kind: &str, outcome: &str, reason: &str) -> (String, String, String, f64) {
+        (kind.to_owned(), outcome.to_owned(), reason.to_owned(), 1.0)
     }
 
     #[tokio::test]
@@ -969,30 +1208,13 @@ mod tests {
         )
         .await;
         assert!(seen.is_ok());
-        let mut recorded: Vec<(String, String, String, f64)> = recording
-            .take(&NOTIFICATION_RESULTS.family)
-            .into_iter()
-            .map(|sample| {
-                let label = |name| sample.label(name).unwrap().to_owned();
-                (
-                    label("notification_type"),
-                    label("outcome"),
-                    label("reason"),
-                    sample.value,
-                )
-            })
-            .collect();
-        recorded.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let row = |kind: &str, outcome: &str, reason: &str| {
-            (kind.to_owned(), outcome.to_owned(), reason.to_owned(), 1.0)
-        };
         assert_eq!(
-            recorded,
+            notification_results(&recording),
             [
-                row("media_tagged", "dropped", "post_not_found"),
-                row("mention", "allowed", "none"),
-                row("mention", "dropped", "actor_suspended"),
-                row("reply", "dropped", "post_not_found"),
+                result_row("media_tagged", "dropped", "post_not_found"),
+                result_row("mention", "allowed", "none"),
+                result_row("mention", "dropped", "actor_suspended"),
+                result_row("reply", "dropped", "post_not_found"),
             ]
         );
         let mut by_rule: Vec<(String, String, f64)> = recording

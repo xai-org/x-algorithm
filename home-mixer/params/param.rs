@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-04T16:00:31Z
+// mirrored from config feature-switch defaults; last sync 2026-11-05T16:00:35Z
 use xai_feature_switches::param;
 
 param!(
@@ -94,7 +94,9 @@ param!(
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
     vec![
         "Experiment18Fou:0.3".to_string(),
-        "Experiment19Fou:0.3".to_string()
+        "Experiment19Fou:0.3".to_string(),
+        "Experiment22Fou:0.3".to_string(),
+        "Experiment23Fou:0.3".to_string()
     ]
 );
 param!(
@@ -1255,6 +1257,18 @@ param!(
     0.72
 );
 param!(
+    EnableVideoCarouselCtrModel,
+    bool,
+    "rust_home_mixer_enable_video_carousel_ctr_model",
+    false
+);
+param!(
+    VideoCarouselCtrModelName,
+    String,
+    "rust_home_mixer_video_carousel_ctr_model_name",
+    ""
+);
+param!(
     VideoCarouselEmbeddingVersion,
     String,
     "rust_home_mixer_video_carousel_embedding_version",
@@ -1270,6 +1284,12 @@ param!(
     EnableVideoCarouselMediumRiskFilter,
     bool,
     "rust_home_mixer_enable_video_carousel_medium_risk_filter",
+    false
+);
+param!(
+    EnableVideoCarouselSeenFilter,
+    bool,
+    "rust_home_mixer_enable_video_carousel_seen_filter",
     false
 );
 param!(
@@ -1300,6 +1320,12 @@ param!(
     VideoCarouselWeightedScoreWeight,
     f64,
     "rust_home_mixer_video_carousel_weighted_score_weight",
+    0.0
+);
+param!(
+    VideoCarouselVideoContinuationWeight,
+    f64,
+    "rust_home_mixer_video_carousel_video_continuation_weight",
     0.0
 );
 param!(

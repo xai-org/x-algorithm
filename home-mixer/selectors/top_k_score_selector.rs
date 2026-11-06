@@ -20,6 +20,7 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
                 &mut non_selected,
                 query.params.get(VideoCarouselExtraCandidates),
                 &CarouselScoring::from_query(query),
+                &query.seen_carousel_video_ids,
             ));
         }
         SelectResult {
@@ -41,6 +42,7 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
 mod tests {
     use super::*;
     use crate::models::candidate::PhoenixScores;
+    use std::collections::HashSet;
     use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
 
     fn carousel_query(video_open_weight: &str, immersive_vqv_weight: &str) -> ScoredPostsQuery {
@@ -155,5 +157,18 @@ mod tests {
 
         let (_, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
         assert_eq!(tweet_ids(extras), vec![101, 106, 103]);
+    }
+
+    #[test]
+    fn carousel_extras_skip_videos_seen_in_a_carousel() {
+        let query = ScoredPostsQuery {
+            seen_carousel_video_ids: HashSet::from([101, 103]),
+            ..carousel_query("1.0", "0.0")
+        };
+
+        let result = TopKScoreSelector.select(&query, candidates());
+
+        let (_, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
+        assert_eq!(tweet_ids(extras), vec![106]);
     }
 }

@@ -113,6 +113,8 @@ use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserId
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
+use crate::query_hydrators::video_carousel_ctr_model_query_hydrator::VideoCarouselCtrModelQueryHydrator;
+use crate::query_hydrators::video_carousel_seen_query_hydrator::VideoCarouselSeenQueryHydrator;
 use crate::scorers::immersive_video_scorer::ImmersiveVideoScorer;
 use crate::scorers::page_decode_rerank_scorer::PageDecodeRerankScorer;
 use crate::scorers::page_rl_exploration_scorer::PageRlExplorationScorer;
@@ -212,7 +214,7 @@ use xai_candidate_pipeline::side_effect::SideEffect;
 use xai_candidate_pipeline::source::Source;
 use xai_feature_switches::FeatureSwitches;
 use xai_geo_ip::GeoIpLocationClient;
-use xai_redis_client::{XdsRedisClient, XdsRedisConfig};
+use xai_redis_client::{NoopRedisClient, XdsRedisClient, XdsRedisConfig};
 use xai_visibility_filtering::tweet_safety_label::{
     MockTweetSafetyLabelClient, TweetSafetyLabelClient,
 };
@@ -278,6 +280,7 @@ impl PhoenixCandidatePipeline {
         popular_posts: Arc<PopularPostsCache>,
         author_brand_safety_client: Arc<dyn AuthorBrandSafetyClient>,
         post_v8_search_embedding_client: Arc<dyn PostV8SearchEmbeddingClient>,
+        video_carousel_seen_redis_client: Arc<dyn RedisClient + Send + Sync>,
     ) -> PhoenixCandidatePipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ScoringSequenceQueryHydrator::new(
@@ -319,6 +322,9 @@ impl PhoenixCandidatePipeline {
             Box::new(UserInstalledAppsQueryHydrator::new(
                 user_installed_apps_client,
             )),
+            Box::new(VideoCarouselCtrModelQueryHydrator::new(
+                vm_ranker_client.clone(),
+            )),
             Box::new(RecentSearchQueriesQueryHydrator::new(
                 recent_search_queries_client,
             )),
@@ -332,6 +338,9 @@ impl PhoenixCandidatePipeline {
                 client: impression_bloom_filter_client,
             }),
             Box::new(IpQueryHydrator { client: ip_client }),
+            Box::new(VideoCarouselSeenQueryHydrator {
+                redis_client: video_carousel_seen_redis_client,
+            }),
             Box::new(UserInferredGenderQueryHydrator::new(
                 user_inferred_gender_store_client,
                 user_inferred_gender_grpc_client,
@@ -912,6 +921,26 @@ impl PhoenixCandidatePipeline {
                     Arc::new(NoopPostV8SearchEmbeddingClient)
                 }
             };
+        let video_carousel_seen_redis_client: Arc<dyn RedisClient + Send + Sync> =
+            match XdsRedisClient::new_with_response_timeout(
+                XdsRedisConfig {
+                    eds_resource_name: format!(
+                        "xdstp://discovery-{datacenter}/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.video-carousel-seen-cache.prod.cache:redis"
+                    ),
+                },
+                Duration::from_millis(30),
+            )
+            .await
+            {
+                Ok(client) => Arc::new(client),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "video carousel seen cache unavailable; carousel seen filter is a no-op"
+                    );
+                    Arc::new(NoopRedisClient)
+                }
+            };
 
         PhoenixCandidatePipeline::build_with_clients(
             user_action_aggregation_client,
@@ -959,6 +988,7 @@ impl PhoenixCandidatePipeline {
             popular_posts,
             author_brand_safety_client,
             post_v8_search_embedding_client,
+            video_carousel_seen_redis_client,
         )
         .await
     }
@@ -1073,6 +1103,7 @@ impl PhoenixCandidatePipeline {
             ))),
             Arc::new(MockAuthorBrandSafetyClient::default()) as Arc<dyn AuthorBrandSafetyClient>,
             Arc::new(NoopPostV8SearchEmbeddingClient) as Arc<dyn PostV8SearchEmbeddingClient>,
+            Arc::new(MockRedisClient::default()),
         )
         .await
     }

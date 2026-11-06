@@ -199,8 +199,18 @@ impl SafetyLevel {
             .filter(move |&kind| self.judges(kind))
             .filter_map(|kind| match notification_kind::judged(kind) {
                 Judged::ActorPost(rules) => Some((kind, rules)),
-                Judged::Actor => None,
+                Judged::Actor | Judged::ActorOnRecipientPost => None,
             })
+    }
+
+    pub(super) fn judges_recipient_posts(self) -> bool {
+        NotificationKind::VARIANTS.iter().any(|&kind| {
+            self.judges(kind)
+                && matches!(
+                    notification_kind::judged(kind),
+                    Judged::ActorOnRecipientPost
+                )
+        })
     }
 
     #[cfg(test)]

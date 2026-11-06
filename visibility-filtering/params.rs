@@ -125,39 +125,6 @@ impl CountryLists {
     }
 }
 
-pub(crate) fn label_cache_switches(feature_switches: &FeatureSwitches) -> LabelCacheSwitches {
-    let results = feature_switches.match_recipient(&RecipientBuilder::new().build());
-    let value = |key| {
-        results
-            .get_i64_no_impression(key)
-            .and_then(|value| u64::try_from(value).ok())
-    };
-    let default = LabelCacheSwitches::default();
-    LabelCacheSwitches {
-        shadow_buckets: value("rust_vf_safety_label_cache_shadow_buckets")
-            .unwrap_or(default.shadow_buckets),
-        serve_buckets: value("rust_vf_safety_label_cache_serve_buckets")
-            .unwrap_or(default.serve_buckets),
-        found_ttl: value("rust_vf_safety_label_cache_found_ttl_secs")
-            .map_or(default.found_ttl, Duration::from_secs),
-        not_found_ttl: value("rust_vf_safety_label_cache_not_found_ttl_secs")
-            .map_or(default.not_found_ttl, Duration::from_secs),
-        refresh_cutoff_ms: value("rust_vf_safety_label_cache_refresh_cutoff_ms")
-            .unwrap_or(default.refresh_cutoff_ms),
-        replay_bucket: value("rust_vf_safety_label_cache_replay_bucket"),
-        shadow_mh_check_keys_per_sec: value(
-            "rust_vf_safety_label_cache_shadow_mh_check_keys_per_sec",
-        )
-        .map_or(default.shadow_mh_check_keys_per_sec, |keys| {
-            u32::try_from(keys).unwrap_or(u32::MAX)
-        }),
-        shadow_fill_keys_per_sec: value("rust_vf_safety_label_cache_shadow_fill_keys_per_sec")
-            .map_or(default.shadow_fill_keys_per_sec, |keys| {
-                u32::try_from(keys).unwrap_or(u32::MAX)
-            }),
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct Experiments {
     store: Option<Arc<ReloadableAbDeciderStore>>,
@@ -341,8 +308,9 @@ pub(crate) fn spawn_refresh(
                 feature_switches.store(Arc::new(engine));
             }
             country_lists.refresh(&feature_switches.load());
-            safety_label_source
-                .set_label_cache_switches(label_cache_switches(&feature_switches.load()));
+            safety_label_source.set_label_cache_switches(
+                LabelCacheSwitches::from_feature_switches(&feature_switches.load()),
+            );
             copy_drift.run(&metrics);
         }
     });
@@ -420,40 +388,6 @@ country_specific_nsfw_content_gating:
         assert!(lists.contains(CountryList::NsfwGating, "de"));
         assert!(!lists.contains(CountryList::NsfwGating, "xx"));
         assert!(lists.contains(CountryList::LocalRegulations, "in"));
-    }
-
-    #[test]
-    fn label_cache_switches_read_rust_vf_and_keep_defaults_for_missing_or_negative_values() {
-        assert_eq!(
-            label_cache_switches(&engine("rust_vf:\n  parameters: {}\n")),
-            LabelCacheSwitches::default()
-        );
-        assert_eq!(
-            label_cache_switches(&engine(
-                r#"
-rust_vf:
-  parameters:
-    rust_vf_safety_label_cache_shadow_buckets: {type: integer, default: 100}
-    rust_vf_safety_label_cache_serve_buckets: {type: integer, default: 10}
-    rust_vf_safety_label_cache_found_ttl_secs: {type: integer, default: 3600}
-    rust_vf_safety_label_cache_not_found_ttl_secs: {type: integer, default: -5}
-    rust_vf_safety_label_cache_refresh_cutoff_ms: {type: long, default: 1700000000000}
-    rust_vf_safety_label_cache_replay_bucket: {type: integer, default: 7}
-    rust_vf_safety_label_cache_shadow_mh_check_keys_per_sec: {type: integer, default: 50}
-    rust_vf_safety_label_cache_shadow_fill_keys_per_sec: {type: integer, default: 200}
-"#
-            )),
-            LabelCacheSwitches {
-                shadow_buckets: 100,
-                serve_buckets: 10,
-                found_ttl: Duration::from_secs(3600),
-                refresh_cutoff_ms: 1_700_000_000_000,
-                replay_bucket: Some(7),
-                shadow_mh_check_keys_per_sec: 50,
-                shadow_fill_keys_per_sec: 200,
-                ..LabelCacheSwitches::default()
-            }
-        );
     }
 
     #[test]

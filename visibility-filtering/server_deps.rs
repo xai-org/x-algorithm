@@ -189,9 +189,11 @@ pub(crate) async fn serving(
     ));
     let country_lists = Arc::new(CountryLists::starting_at_default());
     country_lists.refresh(&feature_switches.load());
-    safety_label_source.set_label_cache_switches(crate::params::label_cache_switches(
-        &feature_switches.load(),
-    ));
+    safety_label_source.set_label_cache_switches(
+        xai_safety_label_source::LabelCacheSwitches::from_feature_switches(
+            &feature_switches.load(),
+        ),
+    );
     let client_switches = ClientSwitches::new(Arc::clone(&feature_switches), limited_actions_copy);
     crate::params::spawn_refresh(
         switch_files,
@@ -365,7 +367,7 @@ pub(crate) async fn prod_sources(
                 ca_chain: S2S_CHAIN_PATH.clone(),
             },
             deterministic_aperture,
-            twemcache_client_name: crate::config::twemcache_client_name(),
+            twemcache_client_name: Some(crate::config::twemcache_client_name()),
             label_cache_eds: cache_warming.label_cache_eds(),
             cache_capacity: crate::config::safety_label_cache_capacity(),
             stats,

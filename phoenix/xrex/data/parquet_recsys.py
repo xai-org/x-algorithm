@@ -43,8 +43,9 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
+from xrex.data.recsys import ad_fields_sidecar, reply_features, sidecar
+from xrex.data.recsys import ad_side_ids as ad_side
 from xrex.data.recsys import id_list_features as id_lists
-from xrex.data.recsys import reply_features
 from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
@@ -154,22 +155,14 @@ def load_global_ids_from_parquet_file(
 
 class _IdListSourceCounter:
     def __init__(self, every: int = 1000):
-        self._every: int = every
-        self._counts: dict[str, int] = {"sidecar": 0, "native": 0, "none": 0}
-        self._seen: set[str] = set()
+        self._counter = sidecar.SourceCounter(id_lists.COLUMN, "id-list features", every)
 
     def note(self, fname: str, source: str) -> None:
-        self._counts[source] += 1
-        total = sum(self._counts.values())
-        if source not in self._seen:
-            self._seen.add(source)
-            rank_logger.info(f"id-list features: first file with source={source}: {fname}")
-        if total % self._every == 0:
-            rank_logger.info(f"id-list features: sources after {total} files: {self._counts}")
+        self._counter.note(fname, {id_lists.COLUMN: source})
 
     @property
     def counts(self) -> dict[str, int]:
-        return dict(self._counts)
+        return self._counter.counts[id_lists.COLUMN]
 
 
 class LazyRecordBatchIterator:
@@ -184,6 +177,8 @@ class LazyRecordBatchIterator:
         id_list_prefer_sidecar: bool = True,
         id_list_sidecar_strict: bool = False,
         id_list_sources: _IdListSourceCounter | None = None,
+        ad_fields_sidecar_root: str | None = None,
+        ad_fields_sources: ad_fields_sidecar.SourceCounter | None = None,
     ):
         self.pf: pq.ParquetFile = pf
         self.iter: Iterator[pa.RecordBatch] | None = None
@@ -200,6 +195,9 @@ class LazyRecordBatchIterator:
         self._id_list_sources: _IdListSourceCounter | None = id_list_sources
         self._id_list_sidecar: pa.Array | None = None
         self._id_list_source: str | None = None
+        self.ad_fields_sidecar_root: str | None = ad_fields_sidecar_root
+        self._ad_fields_sources: ad_fields_sidecar.SourceCounter | None = ad_fields_sources
+        self._ad_fields: ad_fields_sidecar.FileJoin | None = None
         self._row_pos: int = 0
 
     def seek(self):
@@ -238,6 +236,13 @@ class LazyRecordBatchIterator:
             if self._id_list_sources is not None:
                 self._id_list_sources.note(self.fname, self._id_list_source)
 
+        if self.ad_fields_sidecar_root is not None:
+            self._ad_fields = ad_fields_sidecar.FileJoin(
+                self.fname, self.ad_fields_sidecar_root, arrow_schema.names, self.num_rows
+            )
+            if self._ad_fields_sources is not None:
+                self._ad_fields_sources.note(self.fname, self._ad_fields.sources)
+
         cnt = 0
         while cnt < self.rows_to_skip:
             skipped = next(self.iter)
@@ -270,6 +275,8 @@ class LazyRecordBatchIterator:
             )
         elif self._id_list_source == "none":
             batch = id_lists.set_column(batch, id_lists.null_column(batch.num_rows))
+        if self._ad_fields is not None:
+            batch = self._ad_fields.apply(batch, self._row_pos)
         self._row_pos += batch.num_rows
         return batch
 
@@ -815,6 +822,7 @@ class InterleavingRecordBatchProvider:
         id_list_sidecar_root: str | None = None,
         id_list_prefer_sidecar: bool = True,
         id_list_sidecar_strict: bool = False,
+        ad_fields_sidecar_root: str | None = None,
         end_batch_id: int | None = None,
     ):
         self._conversion_delay_columns = conversion_delay_columns
@@ -823,6 +831,10 @@ class InterleavingRecordBatchProvider:
         self._id_list_prefer_sidecar = id_list_prefer_sidecar
         self._id_list_sidecar_strict = id_list_sidecar_strict
         self._id_list_sources = _IdListSourceCounter() if id_list_sidecar_root is not None else None
+        self._ad_fields_sidecar_root = ad_fields_sidecar_root
+        self._ad_fields_sources = (
+            ad_fields_sidecar.SourceCounter() if ad_fields_sidecar_root is not None else None
+        )
         if metadata_path is None and index_path is None:
             raise ValueError("Either metadata_path or index_path must be provided")
 
@@ -1181,6 +1193,8 @@ class InterleavingRecordBatchProvider:
                     id_list_prefer_sidecar=self._id_list_prefer_sidecar,
                     id_list_sidecar_strict=self._id_list_sidecar_strict,
                     id_list_sources=self._id_list_sources,
+                    ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                    ad_fields_sources=self._ad_fields_sources,
                 )
                 if self._shards_per_partition > 1:
                     holder = RowSplitRecordBatchIterator(
@@ -1326,6 +1340,8 @@ class InterleavingRecordBatchProvider:
                 id_list_prefer_sidecar=self._id_list_prefer_sidecar,
                 id_list_sidecar_strict=self._id_list_sidecar_strict,
                 id_list_sources=self._id_list_sources,
+                ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                ad_fields_sources=self._ad_fields_sources,
             )
         except Exception as e:
             if "No such file or directory" in str(e):
@@ -1686,6 +1702,8 @@ class InterleavingRecordBatchProvider:
                             id_list_prefer_sidecar=self._id_list_prefer_sidecar,
                             id_list_sidecar_strict=self._id_list_sidecar_strict,
                             id_list_sources=self._id_list_sources,
+                            ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                            ad_fields_sources=self._ad_fields_sources,
                         )
                         batch = holder.read()
                         return holder, batch
@@ -1802,6 +1820,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 padded[key] = pad_array(value_labels)
         if (ads_counts := post_seq.get("ads_count_buckets")) is not None:
             padded["ads_count_buckets"] = pad_array(ads_counts)
+        if (ad_side := post_seq.get("ad_side_ids")) is not None:
+            padded["ad_side_ids"] = pad_array(ad_side)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
             padded["conversion_delay_ms"] = np.pad(
                 delays,
@@ -1942,6 +1962,9 @@ class PhoenixDataset(Dataset):
     ads_late_window_heads: bool = False
     page_records: bool = False
     read_ads_engagement_counts: bool = False
+    read_ad_side_ids: bool = False
+    ad_side_fields: str = "campaign,line_item,creative"
+    ad_fields_sidecar_root: str | None = None
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -1961,6 +1984,10 @@ class PhoenixDataset(Dataset):
     @property
     def id_list_specs(self) -> tuple[id_lists.IdListFeatureSpec, ...]:
         return id_lists.parse_specs(self.id_list_features)
+
+    @property
+    def ad_side_field_names(self) -> tuple[str, ...]:
+        return ad_side.parse_ad_side_fields(self.ad_side_fields)
 
     @property
     def multimodal_embedding_dim(self) -> int:
@@ -2335,6 +2362,18 @@ class PhoenixDataset(Dataset):
                     raise FileNotFoundError(
                         f"id_list_sidecar_root does not exist: {self.id_list_sidecar_root!r}"
                     )
+                if self.ad_fields_sidecar_root is not None:
+                    if not self.read_ad_side_ids:
+                        raise ValueError("ad_fields_sidecar_root needs read_ad_side_ids=True")
+                    if not os.path.isdir(self.ad_fields_sidecar_root):
+                        raise FileNotFoundError(
+                            f"ad_fields_sidecar_root does not exist: "
+                            f"{self.ad_fields_sidecar_root!r}"
+                        )
+                    rank_logger.info(
+                        f"ad-side ids {self.ad_side_field_names}: ad-field sidecar root "
+                        f"{self.ad_fields_sidecar_root!r}"
+                    )
                 id_list_fill_logged = False
 
                 min_timestamp_ms: int | None = None
@@ -2369,6 +2408,7 @@ class PhoenixDataset(Dataset):
                         id_list_sidecar_root=self.id_list_sidecar_root,
                         id_list_prefer_sidecar=self.id_list_prefer_sidecar,
                         id_list_sidecar_strict=self.id_list_sidecar_strict,
+                        ad_fields_sidecar_root=self.ad_fields_sidecar_root,
                         shuffle_window_time_slices=shuffle_window,
                         shuffle_in_memory_buffer_rows=shuffle_buffer,
                         shuffle_seed=self.shuffle_seed,
@@ -2406,6 +2446,7 @@ class PhoenixDataset(Dataset):
                         id_list_sidecar_root=self.id_list_sidecar_root,
                         id_list_prefer_sidecar=self.id_list_prefer_sidecar,
                         id_list_sidecar_strict=self.id_list_sidecar_strict,
+                        ad_fields_sidecar_root=self.ad_fields_sidecar_root,
                     )
                 self._rb_provider = rb_provider
                 data_iter = self._rb_provider.get_record_batches()
@@ -2481,6 +2522,8 @@ class PhoenixDataset(Dataset):
                         read_ads_engagement_counts=self.read_ads_engagement_counts,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
+                        read_ad_side_ids=self.read_ad_side_ids,
+                        ad_side_fields=self.ad_side_field_names,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2769,6 +2812,10 @@ class PhoenixDataset(Dataset):
         if self.read_ads_engagement_counts:
             batch["candidate_seq"]["ads_count_buckets"] = np.zeros(
                 (batch_size, candidate_seq_len, NUM_ADS_COUNT_FEATURES), dtype=np.uint8
+            )
+        if self.read_ad_side_ids:
+            batch["candidate_seq"]["ad_side_ids"] = np.zeros(
+                (batch_size, candidate_seq_len, len(self.ad_side_field_names)), dtype=np.int32
             )
         if specs := self.id_list_specs:
             ids, batch["user_id_list_mask"] = id_lists.empty_arrays(batch_size, specs)

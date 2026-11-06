@@ -5,7 +5,7 @@ use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::in_network_reply::{serialize_in_network_replies, InNetworkReplies};
 use crate::models::user_features::UserFeatures;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_candidate_pipeline::candidate_pipeline::PipelineQuery;
@@ -129,6 +129,7 @@ pub struct ScoredPostsQuery {
     pub who_to_follow_eligible: bool,
     pub feed_survey_eligible: bool,
     pub video_carousel_eligible: bool,
+    pub seen_carousel_video_ids: HashSet<u64>,
     #[serde(serialize_with = "serialize_debug")]
     pub non_polling_timestamps: Option<NonPollingTimestamps>,
     pub impressed_post_ids: Vec<u64>,
@@ -140,6 +141,9 @@ pub struct ScoredPostsQuery {
     pub ad_drops: Arc<AdDrops>,
     #[serde(serialize_with = "serialize_debug")]
     pub video_carousel: Arc<OnceLock<Vec<PostCandidate>>>,
+    #[serde(skip)]
+    pub video_carousel_ctr_model:
+        Arc<OnceLock<Arc<crate::util::video_carousel_ctr_model::CtrModel>>>,
     #[serde(skip)]
     pub served_post_score_infos: Arc<OnceLock<HashMap<u64, xai_recsys_proto::ScoreInfo>>>,
 }
@@ -251,6 +255,7 @@ impl ScoredPostsQuery {
             who_to_follow_eligible: false,
             feed_survey_eligible: false,
             video_carousel_eligible: false,
+            seen_carousel_video_ids: HashSet::new(),
             non_polling_timestamps: None,
             impressed_post_ids: Vec::new(),
             push_to_home_post_id,
@@ -258,6 +263,7 @@ impl ScoredPostsQuery {
             following_pagination_meta: Arc::new(OnceLock::new()),
             ad_drops: Arc::default(),
             video_carousel: Arc::new(OnceLock::new()),
+            video_carousel_ctr_model: Arc::new(OnceLock::new()),
             served_post_score_infos: Arc::new(OnceLock::new()),
         }
     }

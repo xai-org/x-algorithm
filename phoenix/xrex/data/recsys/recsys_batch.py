@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy import typing as npt
 
+from xrex.data.recsys import ad_side_ids as ad_side
 from xrex.data.recsys import history_id_lists, id_list_features, reply_features
 from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
 from xrex.data.recsys.ads_late_window import (
@@ -359,6 +360,7 @@ class PostSeq(TypedDict):
     post_creation_ts_sec: npt.NDArray[np.int32]
     post_sids: npt.NDArray[np.uint16] | None
     ads_count_buckets: NotRequired[npt.NDArray[np.uint8]]
+    ad_side_ids: NotRequired[npt.NDArray[np.int32]]
     rl_served_slot: NotRequired[npt.NDArray[np.int32]]
     rl_weighted_score: NotRequired[npt.NDArray[np.float32]]
     rl_final_score: NotRequired[npt.NDArray[np.float32]]
@@ -744,6 +746,29 @@ def ads_count_bucket(counts: npt.ArrayLike) -> npt.NDArray[np.uint8]:
     return out
 
 
+def read_ad_side_seq(
+    record_batch: pa.RecordBatch,
+    batch_size: int,
+    alloc: ArrayAllocator,
+    fields: tuple[str, ...],
+    *,
+    line_item_objective: np.ndarray,
+    impression_timestamps_ms: np.ndarray,
+) -> np.ndarray:
+    names = set(record_batch.schema.names)
+    needed = [c for f in fields for c in ad_side.AD_SIDE_FIELD_COLUMNS[f]]
+    cols = {"lineItemObjectiveSeq": line_item_objective}
+    zeros = np.broadcast_to(np.int64(0), impression_timestamps_ms.shape)
+    for column in needed:
+        if column not in cols:
+            cols[column] = (
+                _col(record_batch, column, batch_size, np.int64, alloc=alloc)
+                if column in names
+                else zeros
+            )
+    return ad_side.ad_side_ids(fields, cols, impressed_time_ms=impression_timestamps_ms)
+
+
 def read_ads_count_buckets(
     record_batch: pa.RecordBatch, batch_size: int, num_slots: int
 ) -> npt.NDArray[np.uint8]:
@@ -800,12 +825,18 @@ def from_record_batch(
     *,
     alloc: ArrayAllocator,
     aux_value_events: tuple[str, ...] = (),
+    read_ad_side_ids: bool = False,
+    ad_side_fields: tuple[str, ...] = ad_side.AD_SIDE_DEFAULT_FIELDS,
 ) -> RecsysFeaturesBatch:
     if read_ads_engagement_counts and (
         num_negatives_per_example or num_global_negatives_per_example
     ):
         raise ValueError(
             "read_ads_engagement_counts aligns count slots with candidates; negatives are unsupported"
+        )
+    if read_ad_side_ids and (num_negatives_per_example or num_global_negatives_per_example):
+        raise ValueError(
+            "read_ad_side_ids fills real candidate slots only; negatives are unsupported"
         )
     start = time.time()
     batch_size = record_batch.num_rows
@@ -889,6 +920,18 @@ def from_record_batch(
 
     value_labels = _read_value_labels(
         record_batch, (batch_size, actions.shape[1]), aux_value_events
+    )
+    ad_side_seq = (
+        read_ad_side_seq(
+            record_batch,
+            batch_size,
+            alloc,
+            tuple(ad_side_fields),
+            line_item_objective=line_item_objective,
+            impression_timestamps_ms=impression_timestamps_ms,
+        )
+        if read_ad_side_ids
+        else None
     )
     conversion_delays = _read_conversion_delays(record_batch, (batch_size, actions.shape[1]))
     lexical_strings = {
@@ -1190,6 +1233,11 @@ def from_record_batch(
     candidate_conversion_delays = alloc.full(
         (*cand_shape_2d, len(CONVERSION_DELAY_COLUMNS)), CONVERSION_DELAY_NONE, dtype=np.int32
     )
+    candidate_ad_side = (
+        alloc.zeros((*cand_shape_2d, ad_side_seq.shape[-1]), dtype=np.int32)
+        if ad_side_seq is not None
+        else None
+    )
     candidate_lexical_strings = {
         column: np.zeros(cand_shape_2d, dtype=object) for column in lexical_strings
     }
@@ -1378,6 +1426,8 @@ def from_record_batch(
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
             for key, values in value_labels.items():
                 candidate_value_labels[key][*cslice] = values[*dslice]
+            if candidate_ad_side is not None:
+                candidate_ad_side[*cslice] = ad_side_seq[*dslice]
             candidate_conversion_delays[*cslice] = conversion_delays[*dslice, :]
             for column, values in lexical_strings.items():
                 candidate_lexical_strings[column][*cslice] = values[*dslice]
@@ -1474,6 +1524,8 @@ def from_record_batch(
             candidate_continuous_actions[not_found] = 0
             for values in candidate_value_labels.values():
                 values[not_found] = 0
+            if candidate_ad_side is not None:
+                candidate_ad_side[not_found] = 0
             candidate_conversion_delays[not_found] = CONVERSION_DELAY_NONE
             candidate_promoted_ids[not_found] = 0
             candidate_line_item_objective[not_found] = 0
@@ -1681,6 +1733,8 @@ def from_record_batch(
         candidate_seq_with_negatives["ads_count_buckets"] = read_ads_count_buckets(
             record_batch, batch_size, max_candidate_post_action_pairs
         )
+    if candidate_ad_side is not None:
+        candidate_seq_with_negatives["ad_side_ids"] = candidate_ad_side
     batch = RecsysFeaturesBatch(
         user_hashes=hash_table.get_user_hash(user_ids),
         user_ip_hashes=hash_table.get_ip_hash(user_ip_ids),

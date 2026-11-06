@@ -10,6 +10,7 @@ use rustc_hash::FxHashSet;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::warn;
 use xai_cache::{KVCacheError, Key};
+use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
 use xai_safety_label_store::types::safety_label_metas;
 use xai_visibility_filtering_proto as vf_pb;
 
@@ -64,6 +65,46 @@ impl Default for LabelCacheSwitches {
 }
 
 impl LabelCacheSwitches {
+        pub fn serving_every_post() -> Self {
+        Self {
+            serve_buckets: RAMP_BUCKETS,
+            ..Self::default()
+        }
+    }
+
+        pub fn from_feature_switches(feature_switches: &FeatureSwitches) -> Self {
+        let results = feature_switches.match_recipient(&RecipientBuilder::new().build());
+        let value = |key| {
+            results
+                .get_i64_no_impression(key)
+                .and_then(|value| u64::try_from(value).ok())
+        };
+        let default = Self::default();
+        Self {
+            shadow_buckets: value("rust_vf_safety_label_cache_shadow_buckets")
+                .unwrap_or(default.shadow_buckets),
+            serve_buckets: value("rust_vf_safety_label_cache_serve_buckets")
+                .unwrap_or(default.serve_buckets),
+            found_ttl: value("rust_vf_safety_label_cache_found_ttl_secs")
+                .map_or(default.found_ttl, Duration::from_secs),
+            not_found_ttl: value("rust_vf_safety_label_cache_not_found_ttl_secs")
+                .map_or(default.not_found_ttl, Duration::from_secs),
+            refresh_cutoff_ms: value("rust_vf_safety_label_cache_refresh_cutoff_ms")
+                .unwrap_or(default.refresh_cutoff_ms),
+            replay_bucket: value("rust_vf_safety_label_cache_replay_bucket"),
+            shadow_mh_check_keys_per_sec: value(
+                "rust_vf_safety_label_cache_shadow_mh_check_keys_per_sec",
+            )
+            .map_or(default.shadow_mh_check_keys_per_sec, |keys| {
+                u32::try_from(keys).unwrap_or(u32::MAX)
+            }),
+            shadow_fill_keys_per_sec: value("rust_vf_safety_label_cache_shadow_fill_keys_per_sec")
+                .map_or(default.shadow_fill_keys_per_sec, |keys| {
+                    u32::try_from(keys).unwrap_or(u32::MAX)
+                }),
+        }
+    }
+
     pub(crate) fn serves(&self, tweet_id: u64) -> bool {
         ramp_bucket(tweet_id) < self.serve_buckets
     }
@@ -367,6 +408,21 @@ fn differing_fields(a: &vf_pb::SafetyLabel, b: &vf_pb::SafetyLabel) -> Vec<&'sta
 
 fn cache_key(tweet_id: u64) -> Result<Key, KVCacheError> {
     Key::new(format!("{KEY_PREFIX}{tweet_id}").into_bytes())
+}
+
+#[derive(Clone)]
+pub struct LabelCacheInvalidator {
+    cache: Arc<dyn CacheWrite>,
+}
+
+impl LabelCacheInvalidator {
+    pub(crate) fn new(cache: Arc<dyn CacheWrite>) -> Self {
+        Self { cache }
+    }
+
+    pub async fn invalidate(&self, tweet_id: u64) -> Result<(), KVCacheError> {
+        self.cache.delete(&cache_key(tweet_id)?).await
+    }
 }
 
 pub(crate) enum EntryRead {
@@ -933,7 +989,6 @@ mod tests {
     use xai_cache::Value;
     use xai_manhattan::ManhattanError;
     use xai_safety_label_store::types::encode_lkey;
-    use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
     use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
 
     use crate::decode::tests::{cached_value_found_mval, minimal_mval, mval_with_score, raw_label};
@@ -942,6 +997,7 @@ mod tests {
         self, CacheOpResult, FailureKind, LookupError, NowMs, RemoteLabels, RemoteSource,
     };
     use crate::source::SafetyLabelSource;
+    use crate::testing::{RecordedStats, settle};
 
     const BASE_MS: u64 = 1_700_000_000_000;
     const DAY_SECS: u32 = 86_400;
@@ -1013,6 +1069,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(key.clone(), (value, ttl_secs));
+            Ok(())
+        }
+
+        async fn delete(&self, key: &Key) -> CacheOpResult<()> {
+            self.entries.lock().unwrap().remove(key);
             Ok(())
         }
     }
@@ -1095,31 +1156,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RecordedStats(Mutex<HashMap<String, u64>>);
-
-    impl RecordedStats {
-        fn count(&self, name: &str, scopes: &[(&str, &str)]) -> u64 {
-            let key = format!("{name}{scopes:?}");
-            self.0.lock().unwrap().get(&key).copied().unwrap_or(0)
-        }
-    }
-
-    impl StatsReceiverExt for RecordedStats {
-        fn incr(&self, name: &str, scopes: &[(&str, &str)], value: u64) {
-            *self
-                .0
-                .lock()
-                .unwrap()
-                .entry(format!("{name}{scopes:?}"))
-                .or_default() += value;
-        }
-        fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-    }
-
     fn paused_clock() -> NowMs {
         let start = tokio::time::Instant::now();
         Arc::new(move || BASE_MS + start.elapsed().as_millis() as u64)
@@ -1194,13 +1230,6 @@ mod tests {
         build(switches, None, None).world
     }
 
-    fn serving_all() -> LabelCacheSwitches {
-        LabelCacheSwitches {
-            serve_buckets: RAMP_BUCKETS,
-            ..LabelCacheSwitches::default()
-        }
-    }
-
     fn spam(score: f64) -> vf_pb::SafetyLabelMap {
         vf_pb::SafetyLabelMap {
             labels: HashMap::from([(
@@ -1230,10 +1259,6 @@ mod tests {
 
     fn labels(answers: &Answers, id: u64) -> vf_pb::SafetyLabelMap {
         (**answers[&id].as_ref().unwrap()).clone()
-    }
-
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     fn fill(filled_at_ms: u64, step: u8) -> Fill {
@@ -1735,6 +1760,43 @@ mod tests {
     }
 
     #[test]
+    fn switches_read_rust_vf_and_keep_defaults_for_missing_or_negative_values() {
+        let read = |yaml| {
+            LabelCacheSwitches::from_feature_switches(&FeatureSwitches::load_string(yaml).unwrap())
+        };
+        assert_eq!(
+            read("rust_vf:\n  parameters: {}\n"),
+            LabelCacheSwitches::default()
+        );
+        assert_eq!(
+            read(
+                r#"
+rust_vf:
+  parameters:
+    rust_vf_safety_label_cache_shadow_buckets: {type: integer, default: 100}
+    rust_vf_safety_label_cache_serve_buckets: {type: integer, default: 10}
+    rust_vf_safety_label_cache_found_ttl_secs: {type: integer, default: 3600}
+    rust_vf_safety_label_cache_not_found_ttl_secs: {type: integer, default: -5}
+    rust_vf_safety_label_cache_refresh_cutoff_ms: {type: long, default: 1700000000000}
+    rust_vf_safety_label_cache_replay_bucket: {type: integer, default: 7}
+    rust_vf_safety_label_cache_shadow_mh_check_keys_per_sec: {type: integer, default: 50}
+    rust_vf_safety_label_cache_shadow_fill_keys_per_sec: {type: integer, default: 200}
+"#
+            ),
+            LabelCacheSwitches {
+                shadow_buckets: 100,
+                serve_buckets: 10,
+                found_ttl: Duration::from_secs(3600),
+                refresh_cutoff_ms: 1_700_000_000_000,
+                replay_bucket: Some(7),
+                shadow_mh_check_keys_per_sec: 50,
+                shadow_fill_keys_per_sec: 200,
+                ..LabelCacheSwitches::default()
+            }
+        );
+    }
+
+    #[test]
     fn a_ramp_bucket_is_xxhash64_of_the_ids_little_endian_bytes_mod_10000() {
         assert_eq!(
             [0, 1, 42, 99_999_999_999_999].map(ramp_bucket),
@@ -1761,7 +1823,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_served_miss_reads_manhattan_and_fills_the_entry_for_a_day() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         w.manhattan.set_spam(1, 0.5);
 
         let first = w.source.get(&[1, 2]).await;
@@ -1804,7 +1866,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_entry_in_an_unknown_version_reads_as_a_miss_and_is_overwritten() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         let mut newer = stored(&Envelope {
             fill: fill(BASE_MS, 2),
             status: Status::Found(spam(0.1)),
@@ -1826,7 +1888,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn entries_expire_at_read_from_their_fill_time_under_the_ttl_switches() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         let ten_minutes_ago = BASE_MS - 600_000;
         w.dragonfly
             .put(1, Status::Found(spam(0.5)), fill(ten_minutes_ago, 2));
@@ -1845,7 +1907,7 @@ mod tests {
 
         w.source.set_label_cache_switches(LabelCacheSwitches {
             found_ttl: Duration::from_secs(300),
-            ..serving_all()
+            ..LabelCacheSwitches::serving_every_post()
         });
         let answers = w.source.get(&[1]).await;
         assert_eq!(labels(&answers, 1), spam(0.9));
@@ -1856,7 +1918,7 @@ mod tests {
         let w = world(LabelCacheSwitches {
             found_ttl: Duration::ZERO,
             not_found_ttl: Duration::ZERO,
-            ..serving_all()
+            ..LabelCacheSwitches::serving_every_post()
         });
         w.dragonfly
             .put(1, Status::Found(spam(0.5)), fill(BASE_MS - 59_999, 2));
@@ -1876,7 +1938,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_filled_entry_is_reread_at_30s_and_90s_then_never() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         let start = tokio::time::Instant::now();
         let at = |secs| tokio::time::sleep_until(start + Duration::from_secs(secs));
         w.manhattan.set_spam(1, 0.5);
@@ -1921,7 +1983,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fills_and_rereads_drop_the_label_types_twemcache_does_not_decode() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         let abusive = i32::from(SafetyLabelType::ABUSIVE);
         w.manhattan.set_spam(1, 0.5);
         w.manhattan.add_label(1, SafetyLabelType::ABUSIVE);
@@ -1982,7 +2044,7 @@ mod tests {
     async fn an_entry_filled_before_the_refresh_cutoff_is_served_then_refilled() {
         let w = world(LabelCacheSwitches {
             refresh_cutoff_ms: BASE_MS - 1_000,
-            ..serving_all()
+            ..LabelCacheSwitches::serving_every_post()
         });
         w.dragonfly
             .put(1, Status::Found(spam(0.5)), fill(BASE_MS - 1_001, 2));
@@ -2030,7 +2092,7 @@ mod tests {
             world: w,
             label_cache,
             fill_rx,
-        } = build(serving_all(), None, Some(1));
+        } = build(LabelCacheSwitches::serving_every_post(), None, Some(1));
         let mut fill_rx = fill_rx.unwrap();
         w.manhattan.set_spam(1, 0.5);
         w.manhattan.set_spam(2, 0.6);
@@ -2118,7 +2180,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_fill_stores_manhattans_items_as_scanned_and_reads_back_twemcache_types_only() {
-        let w = world(serving_all());
+        let w = world(LabelCacheSwitches::serving_every_post());
         w.manhattan.set_spam(1, 0.5);
         w.manhattan.add_label(1, SafetyLabelType::ABUSIVE);
 
@@ -2422,7 +2484,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn when_the_label_cache_fails_stale_hot_keys_then_budgeted_manhattan_then_failed_ids() {
         let (clock, mock) = quanta::Clock::mock();
-        let w = build(serving_all(), Some(clock), None).world;
+        let w = build(LabelCacheSwitches::serving_every_post(), Some(clock), None).world;
         w.manhattan.set_spam(1, 0.5);
         w.source.get(&[1]).await;
         mock.increment(Duration::from_secs(10));
@@ -2451,7 +2513,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_outage_reads_manhattan_in_the_batchs_one_call_and_keeps_stale_hot_keys() {
         let (clock, mock) = quanta::Clock::mock();
-        let w = build(serving_all(), Some(clock), None).world;
+        let w = build(LabelCacheSwitches::serving_every_post(), Some(clock), None).world;
         for id in 1..=3 {
             w.manhattan.set_spam(id, 0.5);
         }
@@ -2478,6 +2540,27 @@ mod tests {
         assert_eq!(
             (outage("stale"), outage("manhattan"), outage("failed")),
             (1, 1, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidated_entry_reads_as_a_miss_and_refills_from_manhattan() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        w.dragonfly
+            .put(1, Status::Found(spam(0.5)), fill(BASE_MS, 2));
+        w.manhattan.set_spam(1, 0.9);
+        let invalidator = LabelCacheInvalidator::new(Arc::<FakeDragonfly>::clone(&w.dragonfly));
+
+        invalidator.invalidate(1).await.unwrap();
+        assert_eq!(w.dragonfly.entry(1), None);
+        let answers = w.source.get(&[1]).await;
+        settle().await;
+
+        assert_eq!(labels(&answers, 1), spam(0.9));
+        assert_eq!(w.manhattan.calls(), vec![vec![1]]);
+        assert_eq!(
+            w.dragonfly.entry(1).unwrap().0.status,
+            Status::Found(spam(0.9))
         );
     }
 }

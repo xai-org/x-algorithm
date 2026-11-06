@@ -21,10 +21,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for AuthorSocialgraphFilter {
         let viewer_muted_user_ids: FxHashSet<i64> =
             query.user_features.muted_user_ids.iter().copied().collect();
 
-        let mut kept: Vec<PostCandidate> = Vec::with_capacity(candidates.len());
-        let mut removed: Vec<PostCandidate> = Vec::new();
-
-        for candidate in candidates {
+        FilterResult::partition(candidates, |candidate| {
             let author_id = candidate.author_id as i64;
             let muted = viewer_muted_user_ids.contains(&author_id);
             let blocked = viewer_blocked_user_ids.contains(&author_id);
@@ -42,20 +39,13 @@ impl Filter<ScoredPostsQuery, PostCandidate> for AuthorSocialgraphFilter {
                 .map(|uid| viewer_blocked_user_ids.contains(&(uid as i64)))
                 .unwrap_or(false);
 
-            if muted
+            !(muted
                 || blocked
                 || author_blocks_viewer
                 || quoted_author_blocks_viewer
                 || viewer_blocks_quoted_author
-                || viewer_blocks_retweeted_user
-            {
-                removed.push(candidate);
-            } else {
-                kept.push(candidate);
-            }
-        }
-
-        FilterResult { kept, removed }
+                || viewer_blocks_retweeted_user)
+        })
     }
 }
 

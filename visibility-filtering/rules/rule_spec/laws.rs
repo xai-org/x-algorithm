@@ -261,6 +261,11 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
     ),
+    (
+        "risky_high_viz_reply_oon/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
 ];
 
 #[test]

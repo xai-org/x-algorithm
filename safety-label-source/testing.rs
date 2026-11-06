@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tonic::async_trait;
 use xai_cache::{KVCacheError, Key, Value};
 use xai_manhattan::ManhattanError;
 use xai_safety_label_store::types::encode_lkey;
+use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
 use xai_x_thrift::servo_repo::{CachedValue, CachedValueStatus};
 use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
 
@@ -109,6 +111,38 @@ impl ManhattanLabelFetcher for FakeLabels {
             .map(|&id| fetch(id.cast_unsigned()))
             .collect())
     }
+}
+
+#[derive(Default)]
+pub struct RecordedStats(Mutex<HashMap<String, u64>>);
+
+impl RecordedStats {
+    pub fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        let counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        counts
+            .get(&format!("{name}{labels:?}"))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl StatsReceiverExt for RecordedStats {
+    fn incr(&self, name: &str, labels: &[(&str, &str)], value: u64) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(format!("{name}{labels:?}"))
+            .or_default() += value;
+    }
+    fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
+    fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+}
+
+pub async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 pub(crate) fn mval(label: &SafetyLabel) -> thrift::Result<Vec<u8>> {
