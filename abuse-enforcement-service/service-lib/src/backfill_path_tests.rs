@@ -1148,6 +1148,16 @@ async fn lifting_a_skip_a_running_backfill_reads_needs_the_confirm() {
             cfg.config["action_control"]["aliases"] = serde_json::json!({ BB1.0: holder });
         }
         let b = bed(cfg, vec![]).await;
+        if renamed {
+            let new_name =
+                action_control::lkey_for(action_control::ControlEntity::User, BB1.0, None, None);
+            b.control_store
+                .rows
+                .lock()
+                .unwrap()
+                .remove(&(action_control::MH_PKEY.to_owned(), new_name));
+            b.ctx.action_control.refresh().await.unwrap();
+        }
         put_running(
             &b.backfill_store,
             RUN,
@@ -1174,7 +1184,7 @@ async fn lifting_a_skip_a_running_backfill_reads_needs_the_confirm() {
             mode: ControlMode::Rules,
             actions: vec![],
             reason: "lift the follower skip".into(),
-            expected_version: None,
+            expected_version: (!renamed).then_some(1),
             confirm: confirm.map(Into::into),
             updated_by: None,
             confidence: None,

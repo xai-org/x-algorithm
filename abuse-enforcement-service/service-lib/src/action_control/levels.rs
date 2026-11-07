@@ -399,6 +399,7 @@ pub(super) fn resolve_run(
         by_row: on_rows,
         factory: m.factory,
         unlisted: false,
+        unknown: false,
         author_skips: snap.author_skips(entity, &names, m.factory),
     }
 }
@@ -792,6 +793,8 @@ impl ActionControl {
         let factory = seen
             .iter()
             .any(|s| s.factory && s.head == req.head && s.entity_type == entity);
+        let unknown = !factory && !snap.names_head(entity, &names);
+        first_save_of_unknown_head(&req, unknown)?;
         let moving = req.mode == ControlMode::Rows;
         let leaving = !moving && req.confidence.is_none();
         let on_rows = scope_before
@@ -952,7 +955,7 @@ impl ActionControl {
             };
             let skips = author_skips_after(&req, scope_before.as_ref());
             let mut rec = ActionControlRecord {
-                admit_unlisted_labels: admits_unlisted_after(&req, scope_before.as_ref()),
+                admit_unlisted_labels: admits_unlisted_after(&req, scope_before.as_ref(), unknown),
                 follower_threshold: skips.follower_threshold,
                 skip_high_credibility: skips.skip_high_credibility,
                 ..record(
@@ -1012,8 +1015,9 @@ impl ActionControl {
         };
         let mut harsher: Vec<String> = Vec::new();
         for (row, after) in compare {
-            let mut priors =
-                vec![snap.row_decider(entity, &names, classifier, row, &recording, factory)];
+            let mut priors = vec![snap
+                .row_decider(entity, &names, classifier, row, &recording, factory)
+                .or_else(|| unknown.then(|| recording.clone()))];
             if set_aside {
                 priors.push(None);
             }
@@ -1032,7 +1036,7 @@ impl ActionControl {
         }
         if let Some(why) = scope_write
             .as_ref()
-            .and_then(|after| admits_unlisted_harsher(scope_before.as_ref(), after))
+            .and_then(|after| admits_unlisted_harsher(scope_before.as_ref(), after, unknown))
         {
             harsher.push(why.to_owned());
         }

@@ -1152,6 +1152,10 @@ impl CandidatePipeline<ScoredPostsQuery, PostCandidate> for PhoenixCandidatePipe
 }
 
 #[cfg(test)]
+#[path = "performance_tests.rs"]
+mod performance_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::candidate_pipeline::phoenix_candidate_pipeline::PhoenixCandidatePipeline;
     use crate::models::query::ScoredPostsQuery;

@@ -324,7 +324,21 @@ async fn a_grox_impersonation_scam_message_is_suspended_by_its_rule() {
     };
     let score = grox(Account::Clean);
     assert!(!is_factory_message(&score));
-    let b = bed(vec![], false).await;
+    let unset = bed(vec![], false).await;
+    let t = unset.run_fresh(&score).await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.outcomes[0].dry_run);
+    let b = bed(
+        vec![record(
+            "ImpersonationScam",
+            None,
+            None,
+            ControlMode::Rules,
+            vec![],
+        )],
+        false,
+    )
+    .await;
     let t = b.run_fresh(&score).await;
     assert_eq!(t.status, "success", "{:?}", info(&t));
     assert_eq!(ais_names(&t), vec!["suspendUser"]);
@@ -353,8 +367,12 @@ async fn a_user_record_on_a_shared_head_never_touches_its_post_decisions() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let head = "SharedSpamBot";
     let model = "shared_spam_v1";
-    let none = bed(vec![], false).await;
-    let user_live = bed(vec![live(head, None, vec![SUSPEND])], false).await;
+    let post_rules = ActionControlRecord {
+        entity_type: ControlEntity::Post,
+        ..record(head, None, None, ControlMode::Rules, vec![])
+    };
+    let none = bed(vec![post_rules.clone()], false).await;
+    let user_live = bed(vec![post_rules, live(head, None, vec![SUSPEND])], false).await;
     let mut acted = 0;
     for label in crate::replay_tests::rule_labels(BAKED_POST_RULES) {
         let post = message(EntityType::Post, head, model, &[&label], Account::Clean);
@@ -372,7 +390,11 @@ async fn a_user_record_on_a_shared_head_never_touches_its_post_decisions() {
                 o.info.get("action_control_mode").map(String::as_str),
                 Some("rules")
             );
-            assert!(!o.info.contains_key("action_control_lkey"), "{label}");
+            assert_eq!(
+                o.info.get("action_control_lkey").map(String::as_str),
+                Some("post/h/SharedSpamBot"),
+                "{label}"
+            );
         }
         acted += usize::from(!now.ais.is_empty());
     }
@@ -1460,7 +1482,6 @@ async fn an_unlisted_head_without_a_deciding_record_is_dropped() {
     let rows_without_opt_in =
         |e| of_entity(e, record(REPLY_HEAD, None, None, ControlMode::Rows, vec![]));
     for records in [
-        vec![],
         vec![
             of_entity(ControlEntity::User, rules()),
             of_entity(ControlEntity::Post, rules()),
@@ -1484,9 +1505,100 @@ async fn an_unlisted_head_without_a_deciding_record_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_head_no_record_names_logs_only_on_both_levels() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![], false).await;
+    let listed = listing(&b, "abuse.embeddings.user_decisions", &[REPLY_LABEL], &[]);
+    for (processor, entity) in [
+        (post_topic(&b), EntityType::Post),
+        (user_topic(&b), EntityType::User),
+        (listed, EntityType::User),
+    ] {
+        let t = b.run_admitted(&processor, &reply_bot(entity)).await;
+        assert_logged_before_any_fetch(&t);
+        assert_eq!(t.outcomes[0].head, REPLY_HEAD);
+        assert_eq!(info(&t)["action_control_mode"], "recording");
+    }
+    let negative = listing(&b, "abuse.embeddings.post_decisions", &[], &[REPLY_LABEL]);
+    let t = b
+        .run_admitted(&negative, &reply_bot(EntityType::Post))
+        .await;
+    assert_dropped(&t, "negative_label");
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn a_first_page_save_keeps_an_unknown_heads_decisions_admitted() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rules = crate::rules::RulesCache::new();
+    let safety = action_control::SafetyChecksByEntity {
+        user: safety_checks::status(EntityType::User, &rules.resolve(EntityType::User, None)),
+        post: safety_checks::status(EntityType::Post, &rules.resolve(EntityType::Post, None)),
+    };
+    for (admit, admitted) in [(None, true), (Some(false), false)] {
+        let b = bed(vec![], false).await;
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        assert_logged_before_any_fetch(&t);
+        let control = b.ctx.dynamic_config.action_control_config();
+        let out = b
+            .ctx
+            .action_control
+            .set(
+                action_control::ActionControlPutRequest {
+                    entity_type: ControlEntity::User,
+                    head: REPLY_HEAD.into(),
+                    classifier: None,
+                    band: None,
+                    mode: ControlMode::Rows,
+                    actions: vec![],
+                    reason: "log only from the page".into(),
+                    expected_version: None,
+                    confirm: None,
+                    updated_by: None,
+                    confidence: None,
+                    evidence: None,
+                    evidence_override: None,
+                    rows: Some(action_control::RowsRequest::default()),
+                    admit_unlisted_labels: admit,
+                    rollout_bp: None,
+                    follower_threshold: None,
+                    skip_high_credibility: None,
+                },
+                "operator@example.com",
+                "page",
+                now_millis(),
+                &control,
+                &safety,
+            )
+            .await
+            .unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        assert_eq!(out.view.record.admit_unlisted_labels, admitted);
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        if admitted {
+            assert_logged_before_any_fetch(&t);
+            assert!(
+                info(&t).contains_key("action_control_lkey"),
+                "decided by the saved record"
+            );
+        } else {
+            assert_dropped(&t, "no_match");
+        }
+    }
+}
+
+#[tokio::test]
 async fn one_head_on_both_levels_logs_only_where_its_record_is_saved() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![on_rows(ControlEntity::Post)], false).await;
+    let user_rules = of_entity(
+        ControlEntity::User,
+        record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]),
+    );
+    let b = bed(vec![on_rows(ControlEntity::Post), user_rules], false).await;
     let negative = listing(&b, "abuse.embeddings.post_decisions", &[], &[REPLY_LABEL]);
     for processor in [post_topic(&b), negative] {
         let t = b
@@ -1566,6 +1678,10 @@ async fn an_unlisted_head_follows_its_record_and_factory_heads_are_unchanged() {
     let b = bed(
         vec![
             admitting(live(REPLY_HEAD, None, vec![SHR7])),
+            of_entity(
+                ControlEntity::Post,
+                record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]),
+            ),
             admitting(record(FACTORY_HEAD, None, None, ControlMode::Rows, vec![])),
         ],
         false,
@@ -2198,7 +2314,11 @@ async fn the_follower_ceiling_stops_every_decision() {
         ),
         with_skips(live(BB1.0, None, vec![SUSPEND]), Some(0), None),
     ];
-    for (path, records) in [("growthbook rules", vec![]), ("page", page)] {
+    let rules = vec![of_entity(
+        ControlEntity::Post,
+        record(post_head, None, None, ControlMode::Rules, vec![]),
+    )];
+    for (path, records) in [("growthbook rules", rules), ("page", page)] {
         let b = bed(records, false).await;
         for (entity, msg) in [
             ("post", &post as &dyn Fn(Account) -> ScoreResult),

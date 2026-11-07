@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-05T16:00:35Z
+// mirrored from config feature-switch defaults; last sync 2026-11-06T16:00:45Z
 use xai_feature_switches::param;
 
 param!(
@@ -946,6 +946,12 @@ param!(
     "rust_home_mixer_enable_ads_history_xdc_cache_write",
     true
 );
+param!(
+    AdsHistoryCacheTtlSecs,
+    u64,
+    "rust_home_mixer_ads_history_cache_ttl_secs",
+    300
+);
 
 param!(
     EnableAdsFunnelTrace,
@@ -1266,7 +1272,7 @@ param!(
     VideoCarouselCtrModelName,
     String,
     "rust_home_mixer_video_carousel_ctr_model_name",
-    ""
+    "lr_v8_search_video_1_2026-11-03_no_high_risk"
 );
 param!(
     VideoCarouselEmbeddingVersion,

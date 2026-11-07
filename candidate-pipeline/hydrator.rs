@@ -3,6 +3,7 @@ use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::{type_name_of_val, Any};
+use std::borrow::Cow;
 use std::hash::Hash;
 use tonic::async_trait;
 use tracing::warn;
@@ -155,8 +156,7 @@ where
         candidates: &[C],
         stage: PipelineStage,
     ) -> Vec<Result<C, String>> {
-        let mut results = vec![None; candidates.len()];
-        let mut missing_candidates = Vec::new();
+        let mut results = Vec::new();
         let mut missing_keys = Vec::new();
         let mut missing_indices = Vec::new();
         let mut cache_hits = 0usize;
@@ -164,17 +164,22 @@ where
 
         for (index, candidate) in candidates.iter().enumerate() {
             if self.already_hydrated(candidate) {
+                if results.is_empty() {
+                    results.resize_with(candidates.len(), || None);
+                }
                 results[index] = Some(Ok(self.hydrate_from_cache(self.cache_value(candidate))));
                 continue;
             }
             let key = self.cache_key_for(query, candidate);
             match self.cache_store().get(&key).await {
                 Some(value) => {
+                    if results.is_empty() {
+                        results.resize_with(candidates.len(), || None);
+                    }
                     results[index] = Some(Ok(self.hydrate_from_cache(value)));
                     cache_hits += 1;
                 }
                 None => {
-                    missing_candidates.push(candidate.clone());
                     missing_keys.push(key);
                     missing_indices.push(index);
                     cache_misses += 1;
@@ -184,15 +189,36 @@ where
 
         self.stat_cache(cache_hits, cache_misses, stage);
 
-        if !missing_candidates.is_empty() {
+        if !missing_indices.is_empty() {
+            let missing_candidates: Cow<'_, [C]> = if results.is_empty() {
+                Cow::Borrowed(candidates)
+            } else {
+                Cow::Owned(
+                    missing_indices
+                        .iter()
+                        .map(|&i| candidates[i].clone())
+                        .collect(),
+                )
+            };
             let hydrated_missing = self.hydrate_from_client(query, &missing_candidates).await;
-            if hydrated_missing.len() != missing_candidates.len() {
+            if hydrated_missing.len() != missing_indices.len() {
                 let message = format!(
                     "CachedHydrator length_mismatch expected={} got={}",
-                    missing_candidates.len(),
+                    missing_indices.len(),
                     hydrated_missing.len()
                 );
                 return vec![Err(message); candidates.len()];
+            }
+
+            if results.is_empty() {
+                for (key, hydrated) in missing_keys.into_iter().zip(&hydrated_missing) {
+                    if let Ok(hydrated) = hydrated {
+                        self.cache_store()
+                            .insert(key, self.cache_value(hydrated))
+                            .await;
+                    }
+                }
+                return hydrated_missing;
             }
 
             for ((index, key), hydrated) in missing_indices

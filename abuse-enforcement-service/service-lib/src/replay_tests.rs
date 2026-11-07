@@ -203,7 +203,7 @@ impl TestBed {
         let ais = Arc::new(AisRecorder::default());
         let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let control_store = Arc::new(action_control::test_support::MemControlStore::default());
-        for r in &cfg.control_records {
+        for r in rules_records().iter().chain(&cfg.control_records) {
             control_store.put_record(r);
         }
         let action_control = Arc::new(action_control::ActionControl::new(
@@ -283,9 +283,9 @@ impl TestBed {
         }
     }
 
-        pub(crate) async fn set_records(&self, records: &[action_control::ActionControlRecord]) {
+            pub(crate) async fn set_records(&self, records: &[action_control::ActionControlRecord]) {
         self.control_store.rows.lock().unwrap().clear();
-        for r in records {
+        for r in rules_records().iter().chain(records) {
             self.control_store.put_record(r);
         }
         self.ctx.action_control.refresh().await.unwrap();
@@ -539,6 +539,28 @@ pub(crate) const HEADS: &[(&str, &str)] = &[
 ];
 
 pub(crate) const SWITCHED_OFF_HEAD: &str = "SwitchedOffHead";
+
+pub(crate) fn rules_records() -> Vec<action_control::ActionControlRecord> {
+    HEADS
+        .iter()
+        .map(|(h, _)| *h)
+        .chain([SWITCHED_OFF_HEAD])
+        .flat_map(|h| {
+            let user = action_control::test_support::record(
+                h,
+                None,
+                None,
+                action_control::ControlMode::Rules,
+                Vec::new(),
+            );
+            let post = action_control::ActionControlRecord {
+                entity_type: action_control::ControlEntity::Post,
+                ..user.clone()
+            };
+            [user, post]
+        })
+        .collect()
+}
 
 pub(crate) struct Scenario {
     pub id: String,

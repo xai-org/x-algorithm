@@ -454,6 +454,7 @@ pub struct Resolved {
             pub by_row: bool,
             pub factory: bool,
                 pub unlisted: bool,
+            pub unknown: bool,
             pub author_skips: AuthorSkips,
 }
 
@@ -470,6 +471,7 @@ impl Default for Resolved {
             by_row: false,
             factory: false,
             unlisted: false,
+            unknown: false,
             author_skips: AuthorSkips::default(),
         }
     }
@@ -483,10 +485,10 @@ impl Resolved {
     }
 
             pub fn rules_unread(&self) -> bool {
-        self.factory || self.unlisted
+        self.factory || self.unlisted || self.unknown
     }
 
-                        pub fn admit_unlisted(mut self) -> Option<Self> {
+                            pub fn admit_unlisted(mut self) -> Option<Self> {
         if self.factory || self.mode == ControlMode::Rules {
             return None;
         }
@@ -586,6 +588,16 @@ impl Snapshot {
             return Some(Hit::Record(k, r));
         }
         self.unreadable.get(lkey).map(|_| Hit::Unreadable)
+    }
+
+            fn names_head(&self, entity: ControlEntity, names: &[&str]) -> bool {
+        let e = entity.as_str();
+        self.records.keys().chain(self.unreadable.keys()).any(|k| {
+            let mut parts = k.split('/');
+            parts.next() == Some(e)
+                && parts.next().is_some()
+                && parts.next().is_some_and(|h| names.contains(&h))
+        })
     }
 
                     fn levels(
@@ -877,13 +889,28 @@ pub fn harsher_because(
 pub(crate) fn admits_unlisted_after(
     req: &ActionControlPutRequest,
     before: Option<&ActionControlRecord>,
+    unknown: bool,
 ) -> bool {
     req.classifier.is_none()
         && req.band.is_none()
         && req.confidence.is_none()
         && req
             .admit_unlisted_labels
-            .unwrap_or_else(|| before.is_some_and(|b| b.admit_unlisted_labels))
+            .unwrap_or_else(|| unknown || before.is_some_and(|b| b.admit_unlisted_labels))
+}
+
+pub(crate) fn first_save_of_unknown_head(
+    req: &ActionControlPutRequest,
+    unknown: bool,
+) -> Result<(), SetError> {
+    if unknown && (req.classifier.is_some() || req.band.is_some()) {
+        return Err(SetError::Invalid(
+            "unknown_head_needs_head_record",
+            "save the whole head first, so its decisions keep getting past the topic's label list"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn author_skips_after(
@@ -913,8 +940,9 @@ pub(crate) fn author_skips_harsher(
 pub(crate) fn admits_unlisted_harsher(
     before: Option<&ActionControlRecord>,
     after: &ActionControlRecord,
+    unknown: bool,
 ) -> Option<&'static str> {
-    (after.admit_unlisted_labels && !before.is_some_and(|b| b.admit_unlisted_labels))
+    (after.admit_unlisted_labels && !unknown && !before.is_some_and(|b| b.admit_unlisted_labels))
         .then_some("decides this head's decisions that the topic's label list drops")
 }
 
@@ -992,11 +1020,6 @@ impl ActionControl {
         Some(age)
     }
 
-        pub fn has_records(&self) -> bool {
-        let snap = self.snapshot();
-        !snap.records.is_empty() || !snap.unreadable.is_empty()
-    }
-
             pub fn admits_unlisted(&self, entity: EntityType, head: &str) -> bool {
         let lkey = lkey_for(entity_of(entity), head, None, None);
         self.snapshot()
@@ -1056,8 +1079,20 @@ impl ActionControl {
             return out;
         }
         let snap = self.snapshot();
-        if !input.factory && snap.records.is_empty() && snap.unreadable.is_empty() {
-            return out;
+        if !input.factory {
+            let names: Vec<&str> = std::iter::once(input.head)
+                .chain(cfg.aliases.get(input.head).map(String::as_str))
+                .collect();
+            if !snap.names_head(entity_of(input.entity), &names) {
+                if valid_name(input.head) {
+                    out.mode = ControlMode::Recording;
+                    out.row = Some(RowOutcome::new(&claim()));
+                    out.by_row = true;
+                    out.unknown = true;
+                    out.dedup_class = Some(page_class(&[]));
+                }
+                return out;
+            }
         }
         let mut safety_ok = Some(safety_ok);
         let mut safety_seen: Option<bool> = None;
@@ -2142,6 +2177,20 @@ impl ActionControl {
         if stored_version != req.expected_version {
             return Err(SetError::Conflict(before.map(Box::new), stored_version));
         }
+        let alias = cfg.aliases.get(&req.head).map(String::as_str);
+        let names: Vec<&str> = std::iter::once(req.head.as_str()).chain(alias).collect();
+        let factory = seen
+            .iter()
+            .any(|s| s.factory && s.head == req.head && s.entity_type == req.entity_type);
+        let rows = match stored_version {
+            None => Some(self.scan_rows().await?),
+            Some(_) => None,
+        };
+        let unknown = !factory
+            && rows.as_deref().is_some_and(|rows| {
+                !Snapshot::of_rows(rows, &[&lkey]).names_head(req.entity_type, &names)
+            });
+        first_save_of_unknown_head(&req, unknown)?;
         let mut rec = ActionControlRecord {
             v: ACTION_CONTROL_RECORD_VERSION,
             entity_type: req.entity_type,
@@ -2159,7 +2208,7 @@ impl ActionControl {
             confidence: req.confidence,
             evidence: req.evidence.clone().map(Box::new),
             evidence_override: None,
-            admit_unlisted_labels: admits_unlisted_after(&req, before.as_ref()),
+            admit_unlisted_labels: admits_unlisted_after(&req, before.as_ref(), unknown),
             rollout_bp: None,
             follower_threshold: None,
             skip_high_credibility: None,
@@ -2177,9 +2226,9 @@ impl ActionControl {
             (Some(b), _) => vec![Some(b.clone())],
             (None, Some(_)) => vec![Some(recording())],
             (None, None) => {
-                let rows = self.scan_rows().await?;
-                let snap = Snapshot::of_rows(&rows, &[&lkey]);
-                let alias = cfg.aliases.get(&req.head).map(String::as_str);
+                let rows = rows.as_deref().unwrap_or_default();
+                let snap = Snapshot::of_rows(rows, &[&lkey]);
+                let uncovered = || (!snap.names_head(req.entity_type, &names)).then(recording);
                 let exact = match req.band.as_deref() {
                     Some(band) => Some(
                         match snap.plain_decider(
@@ -2191,7 +2240,7 @@ impl ActionControl {
                         ) {
                             Some(Hit::Record(_, r)) => Some(r.clone()),
                             Some(_) => Some(recording()),
-                            None => None,
+                            None => uncovered(),
                         },
                     ),
                     None => None,
@@ -2199,7 +2248,7 @@ impl ActionControl {
                 match exact {
                     Some(p) => vec![p],
                     None => {
-                        let shadowed = Self::shadowed(&lkey, &req, cfg, &rows);
+                        let shadowed = Self::shadowed(&lkey, &req, cfg, rows);
                         let head_covers = shadowed.iter().flatten().any(|r| {
                             r.classifier.is_none() && r.band.is_none() && r.confidence.is_none()
                         });
@@ -2208,7 +2257,7 @@ impl ActionControl {
                             .map(|r| Some(r.unwrap_or_else(recording)))
                             .collect();
                         if !head_covers {
-                            all.push(None);
+                            all.push(uncovered());
                         }
                         all
                     }
@@ -2256,7 +2305,7 @@ impl ActionControl {
                 }
             }
         }
-        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec) {
+        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec, unknown) {
             harsher.push(why.to_owned());
         }
         for why in author_skips_harsher(before.as_ref(), &rec) {
@@ -2758,14 +2807,64 @@ mod tests {
         assert_eq!(r.mode, ControlMode::Live);
     }
 
-    #[tokio::test]
-    async fn no_record_follows_the_rules() {
-        let (ac, _) = loaded(&[live("Other", None, None, vec![SUSPEND])]).await;
-        let r = resolve(&ac, "H", "c", &["x"]);
-        assert_eq!(r, Resolved::default());
-        assert!(!r.record_only());
-        assert_eq!(r.incoming_dedup_class(|| 2), 2);
-        assert_eq!(resolve(&ac, "", "c", &[]).matched, None);
+            #[tokio::test]
+    async fn a_head_no_record_names_records_only() {
+        for store in [vec![], vec![live("Other", None, None, vec![SUSPEND])]] {
+            let (ac, _) = loaded(&store).await;
+            let r = resolve(&ac, "H", "c", &["x"]);
+            assert_eq!(
+                (r.mode, r.forced, r.matched.as_ref()),
+                (ControlMode::Recording, None, None)
+            );
+            assert!(r.unknown && r.by_row && r.page_driven() && r.rules_unread());
+            assert!(r.record_only() && r.page_actions.is_empty());
+            assert_eq!(r.incoming_dedup_class(|| 2), page_class(&[]));
+            assert_eq!(logged_because(&r).as_deref(), Some("no_selection"));
+        }
+        let (ac, _) = loaded(&[]).await;
+        for head in ["", "not a head"] {
+            assert_eq!(
+                resolve(&ac, head, "c", &[]),
+                Resolved::default(),
+                "{head:?}"
+            );
+        }
+        let ls = labels(&[]);
+        let ignore = ControlConfig {
+            ignore_store: true,
+            ..on()
+        };
+        assert_eq!(
+            ac.resolve(&input("H", "c", &ls), &ignore, |_| true),
+            Resolved::default()
+        );
+        for rules in [
+            record("H", None, None, ControlMode::Rules, vec![]),
+            record("H", Some("other"), None, ControlMode::Rules, vec![]),
+            record("H", None, Some("other"), ControlMode::Rules, vec![]),
+        ] {
+            let (ac, _) = loaded(&[rules]).await;
+            let r = resolve(&ac, "H", "c", &["x"]);
+            assert_eq!(r.mode, ControlMode::Rules);
+            assert!(!r.unknown && !r.record_only() && !r.rules_unread());
+            assert!(r.admit_unlisted().is_none());
+        }
+        let post = ActionControlRecord {
+            entity_type: ControlEntity::Post,
+            ..record("H", None, None, ControlMode::Rules, vec![])
+        };
+        let (ac, _) = loaded(&[post]).await;
+        assert!(
+            resolve(&ac, "H", "c", &[]).unknown,
+            "another entity's record"
+        );
+        let (ac, store) = loaded(&[]).await;
+        store.put_raw("user/c/H/c", b"{not json");
+        ac.refresh().await.unwrap();
+        assert!(
+            !resolve(&ac, "H", "other", &[]).unknown,
+            "an unreadable record names it"
+        );
     }
 
     #[tokio::test]
@@ -3245,9 +3344,8 @@ mod tests {
             (ControlMode::Live, vec![SUSPEND])
         );
         let post = ac.resolve(&post_input(&[]), &on(), |_| true);
-        assert_eq!(
-            post,
-            Resolved::default(),
+        assert!(
+            post.unknown && post.matched.is_none() && post.page_actions.is_empty(),
             "a user record never touches post decisions"
         );
         let author = PageAction::SuspendAuthor {};
@@ -3297,10 +3395,8 @@ mod tests {
         .await;
         let ls = labels(&[]);
         let mut cfg = on();
-        assert_eq!(
-            ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true).mode,
-            ControlMode::Rules
-        );
+        let unaliased = ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true);
+        assert!(unaliased.unknown && unaliased.matched.is_none());
         cfg.aliases.insert("NewName".into(), "OldName".into());
         let r = ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true);
         assert_eq!(r.mode, ControlMode::Recording);
@@ -3366,7 +3462,9 @@ mod tests {
         let a = resolve(&ac, "A", "c", &[]);
         assert_eq!((a.dedup_class, a.incoming_dedup_class(|| 3)), (Some(2), 2));
         assert_eq!(resolve(&ac, "R", "c", &[]).incoming_dedup_class(|| 3), 1);
-        for head in ["G", "E", "None"] {
+        let unknown = resolve(&ac, "None", "c", &[]);
+        assert_eq!(unknown.incoming_dedup_class(|| 3), page_class(&[]));
+        for head in ["G", "E"] {
             let r = resolve(&ac, head, "c", &[]);
             assert_eq!(r.dedup_class, None, "{head}");
             assert_eq!(
@@ -3989,6 +4087,9 @@ mod tests {
             let got = set(&ac, req.clone()).await;
             assert!(got.is_ok(), "{req:?}: {got:?}");
         }
+        set(&ac, put("H", ControlMode::Rules, vec![]))
+            .await
+            .unwrap();
         for req in [
             put(
                 "NearDupEmbeddingCseNcmecMatch",
@@ -4033,6 +4134,11 @@ mod tests {
             ("NearDupEmbeddingCseMatch", None),
             ("AnchorHead", Some("anchor_campaign_suspend_cse")),
         ] {
+            if band.is_some() {
+                set(&ac, put(head, ControlMode::Rules, vec![]))
+                    .await
+                    .unwrap();
+            }
             let recording = ActionControlPutRequest {
                 band: band.map(Into::into),
                 ..put(head, ControlMode::Recording, vec![])
@@ -4054,7 +4160,7 @@ mod tests {
         }
     }
 
-            #[tokio::test]
+                #[tokio::test]
     async fn an_unlisted_decision_is_admitted_only_by_a_record_that_decides() {
         let (ac, _) = loaded(&[
             record("Moved", None, None, ControlMode::Rows, vec![]),
@@ -4065,7 +4171,7 @@ mod tests {
             row_rec("RulesRow", LevelRow::Missing, ControlMode::Rules, vec![]),
         ])
         .await;
-        for head in ["Moved", "Recording", "Live"] {
+        for head in ["Moved", "Recording", "Live", "None"] {
             let r = resolve(&ac, head, "c", &[]);
             let page = r.page_actions.clone();
             let r = r
@@ -4081,7 +4187,7 @@ mod tests {
         assert_eq!(moved.mode, ControlMode::Recording);
         assert!(moved.page_actions.is_empty());
         assert_eq!(logged_because(&moved).as_deref(), Some("no_selection"));
-        for head in ["None", "OnRules", "RulesRow"] {
+        for head in ["OnRules", "RulesRow"] {
             assert!(
                 resolve(&ac, head, "c", &[]).admit_unlisted().is_none(),
                 "{head}"
@@ -4301,7 +4407,7 @@ mod tests {
             set(&ac, put("H", ControlMode::Recording, vec![])).await,
             Err(SetError::Store(_))
         ));
-        assert_eq!(resolve(&ac, "H", "c", &[]).mode, ControlMode::Rules);
+        assert!(resolve(&ac, "H", "c", &[]).matched.is_none());
     }
 
     #[tokio::test]
@@ -4312,7 +4418,7 @@ mod tests {
             set(&ac, put("H", ControlMode::Recording, vec![])).await,
             Err(SetError::Store(_))
         ));
-        assert_eq!(resolve(&ac, "H", "c", &[]).mode, ControlMode::Rules);
+        assert!(resolve(&ac, "H", "c", &[]).matched.is_none());
         store.fail_put.store(false, Ordering::Relaxed);
         store.fail_get.store(true, Ordering::Relaxed);
         assert!(matches!(
@@ -4563,7 +4669,7 @@ mod tests {
 
                 #[tokio::test]
     async fn the_unlisted_opt_in_is_saved_on_the_head_record_only() {
-        let (ac, store) = loaded(&[]).await;
+        let (ac, store) = loaded(&[record("H", Some("c"), None, ControlMode::Rules, vec![])]).await;
         let opt_in = |confirm: Option<&str>| ActionControlPutRequest {
             admit_unlisted_labels: Some(true),
             confirm: confirm.map(Into::into),
@@ -4618,6 +4724,71 @@ mod tests {
             code(set(&ac, factory).await),
             "factory_admit_unlisted_labels"
         );
+    }
+
+                    #[tokio::test]
+    async fn a_first_save_of_an_unknown_head_keeps_its_decisions_admitted() {
+        let unconfirmed = |req| ActionControlPutRequest {
+            confirm: None,
+            ..req
+        };
+        for first in [
+            put("H", ControlMode::Recording, vec![]),
+            move_put("H", RowsRequest::default()),
+        ] {
+            let (ac, store) = loaded(&[]).await;
+            let out = set(&ac, unconfirmed(first.clone())).await.unwrap();
+            assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+            assert!(out.view.record.admit_unlisted_labels);
+            assert!(ac.admits_unlisted(EntityType::User, "H"));
+            assert!(!ac.admits_unlisted(EntityType::Post, "H"));
+            assert!(stored(&store, "user/h/H").admit_unlisted_labels);
+
+            let (ac, _) = loaded(&[]).await;
+            let off = ActionControlPutRequest {
+                admit_unlisted_labels: Some(false),
+                ..unconfirmed(first)
+            };
+            set(&ac, off).await.unwrap();
+            assert!(!ac.admits_unlisted(EntityType::User, "H"));
+        }
+
+        let (ac, _) = loaded(&[record("H", Some("c"), None, ControlMode::Rules, vec![])]).await;
+        set(&ac, put("H", ControlMode::Recording, vec![]))
+            .await
+            .unwrap();
+        assert!(!ac.admits_unlisted(EntityType::User, "H"), "a known head");
+
+        let (ac, _) = loaded(&[]).await;
+        for narrow in [
+            ActionControlPutRequest {
+                classifier: Some("c".into()),
+                ..put("H", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                band: Some("b".into()),
+                ..put("H", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                classifier: Some("c".into()),
+                ..move_put("H", RowsRequest::default())
+            },
+        ] {
+            assert_eq!(
+                code(set(&ac, narrow).await),
+                "unknown_head_needs_head_record"
+            );
+        }
+        assert!(resolve(&ac, "H", "c", &[]).unknown, "nothing written");
+
+        let (ac, store) = loaded(&[]).await;
+        seen_factory(&store, "F");
+        let factory_classifier = ActionControlPutRequest {
+            classifier: Some("c".into()),
+            ..put("F", ControlMode::Recording, vec![])
+        };
+        let got = set(&ac, factory_classifier).await;
+        assert!(got.is_ok(), "a factory head is never unknown: {got:?}");
     }
 
     fn stored(store: &MemControlStore, lkey: &str) -> ActionControlRecord {
@@ -5398,8 +5569,13 @@ mod tests {
         assert_eq!(out.view.effective_mode, ControlMode::Rows);
         assert_eq!(
             out.harsher_because,
-            vec!["high row: turns the scope live"],
-            "judged like any other head"
+            vec![
+                "low row: hands the scope back to the GrowthBook rules, which act",
+                "mid row: hands the scope back to the GrowthBook rules, which act",
+                "high row: turns the scope live",
+                "missing row: hands the scope back to the GrowthBook rules, which act",
+            ],
+            "judged like any other head no record names"
         );
         let mut cfg = on();
         cfg.aliases
@@ -5410,6 +5586,9 @@ mod tests {
                 .is_ok(),
             "a rename onto a child-safety head"
         );
+        set(&ac, put("CseRtScoreHiV2DryRun", ControlMode::Rules, vec![]))
+            .await
+            .unwrap();
         let label_row = ActionControlPutRequest {
             classifier: Some("c".into()),
             ..move_put("CseRtScoreHiV2DryRun", all_rules())
@@ -5650,9 +5829,19 @@ mod tests {
             confirm: None,
             ..move_put("H", rows)
         };
-        let (ac, _) = loaded(&[]).await;
-        let out = set(&ac, unconfirmed(all_rules())).await.unwrap();
+        let (ac, _) = loaded(&[record("H", None, None, ControlMode::Rules, vec![])]).await;
+        let req = ActionControlPutRequest {
+            expected_version: Some(1),
+            ..unconfirmed(all_rules())
+        };
+        let out = set(&ac, req).await.unwrap();
         assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+
+        let (ac, _) = loaded(&[]).await;
+        assert_eq!(
+            code(set(&ac, unconfirmed(all_rules())).await),
+            "confirm_required"
+        );
 
         let (ac, _) = loaded(&[]).await;
         assert!(

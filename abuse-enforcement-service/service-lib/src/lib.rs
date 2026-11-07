@@ -1430,12 +1430,6 @@ fn resolve_control(
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     let producer_dry = score.dry_run || action_control::has_dry_run_prefix(labels);
     let factory = is_factory_message(score);
-    if !factory && !ctx.action_control.has_records() {
-        return action_control::Resolved {
-            producer_dry,
-            ..Default::default()
-        };
-    }
     let claim = Some(confidence::message_claim(score, now_millis()));
     let input = action_control::ResolveInput {
         head: crate::facts::head_label(score),
@@ -1537,7 +1531,7 @@ enum Admission {
 }
 
 impl ScoreResultProcessor {
-                        async fn admit(&self, score: &abuse_proto::ScoreResult) -> Admission {
+                            async fn admit(&self, score: &abuse_proto::ScoreResult) -> Admission {
         let msg_labels: Vec<&str> = score
             .summary
             .as_ref()
@@ -1573,10 +1567,16 @@ impl ScoreResultProcessor {
             .await;
         let (entity_type, _) = Facts::resolve_target(score);
         let head = crate::facts::head_label(score);
-        if !self.ctx.action_control.admits_unlisted(entity_type, head) {
+        let control = resolve_control(&self.ctx, score, entity_type);
+        let admits = if control.unknown {
+            dropped == "no_match"
+        } else {
+            self.ctx.action_control.admits_unlisted(entity_type, head)
+        };
+        if !admits {
             return Admission::Dropped(dropped);
         }
-        match resolve_control(&self.ctx, score, entity_type).admit_unlisted() {
+        match control.admit_unlisted() {
             Some(control) => {
                 info!(
                     list = dropped,

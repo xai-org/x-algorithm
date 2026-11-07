@@ -1,5 +1,5 @@
 use crate::models::query::ScoredPostsQuery;
-use crate::params::EnableAdsHistoryXdcCacheWrite;
+use crate::params::{AdsHistoryCacheTtlSecs, EnableAdsHistoryXdcCacheWrite};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::async_trait;
@@ -11,8 +11,6 @@ use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_home_mixer_proto::feed_item::Item as FeedItemKind;
 use xai_home_mixer_proto::FeedItem;
 use xai_recsys_proto::AdIndexInfo;
-
-const AD_HISTORY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub struct ServedAdHistoryCacheSideEffect {
     store: Arc<dyn UserAdHistoryStore>,
@@ -55,6 +53,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ServedAdHistoryCacheSideEffect {
         } else {
             WriteScope::LocalOnly
         };
+        let ttl = Duration::from_secs(query.params.get(AdsHistoryCacheTtlSecs));
         let ads = ads_in_feed(&input.selected_candidates);
         if ads.is_empty() {
             return Ok(());
@@ -66,7 +65,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ServedAdHistoryCacheSideEffect {
                 query.user_id as i64,
                 query.request_time_ms,
                 record,
-                AD_HISTORY_CACHE_TTL,
+                ttl,
                 scope,
             )
             .await
