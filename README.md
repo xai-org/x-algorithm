@@ -365,7 +365,7 @@ Negative      not interested · mute author · block author · report · not dwe
 Final Score = Σ (weight_i × P(action_i))
 ```
 
-Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`xai-value-model/scoring.rs`](xai-value-model/scoring.rs).
+Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`xai-value-model/scoring.rs`](xai-value-model/scoring.rs). Every head with its default in both places it is declared, the transform applied to the sum, and the multipliers that follow are collected in [`docs/SCORING_WEIGHTS.md`](docs/SCORING_WEIGHTS.md).
 
 There is a common misconception to be aware of about the weights: they scale the predicted probabilities (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior.
 
