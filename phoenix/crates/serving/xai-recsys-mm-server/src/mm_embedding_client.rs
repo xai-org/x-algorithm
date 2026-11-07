@@ -255,8 +255,8 @@ impl MmEmbeddingsClient {
             .with_label_values(&["not_found"])
             .inc_by(missing as u64);
 
-        if total_posts > 0 {
-            MM_EMBEDDING_SUCCESS_RATIO.observe((total_posts - missing) as f64 / total_posts as f64);
+        if processed > 0 {
+            MM_EMBEDDING_SUCCESS_RATIO.observe(found as f64 / processed as f64);
         }
 
         FETCH_MM_EMBEDDINGS_DURATION.observe(start_time.elapsed().as_secs_f64());
