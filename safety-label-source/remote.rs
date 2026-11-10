@@ -326,6 +326,7 @@ impl RemoteLabels for RemoteSource {
             BatchStage::ManhattanFallback,
             fallback_ids.len(),
         );
+        let read_at = tokio::time::Instant::now();
         for (tweet_id, result) in self.manhattan.scan(&fallback_ids).await {
             let result = match result {
                 Ok(Scan { items, labels }) => {
@@ -333,7 +334,7 @@ impl RemoteLabels for RemoteSource {
                         fills.push(FillJob {
                             tweet_id,
                             fill: Fill::new(context.now_ms),
-                            labels: FillLabels::Scanned(items),
+                            labels: FillLabels::Scanned { items, read_at },
                         });
                     }
                     Ok(labels)

@@ -6,14 +6,15 @@ use crate::models::{
 use crate::params::CountryLists;
 use crate::rules::action_kind::{ActionKind, Filled};
 use crate::rules::defaults::{Bucket, Defaults, Effect};
-use crate::rules::levels::PostRules;
+use crate::rules::experiment::{Experiment, ExperimentSet};
+use crate::rules::levels::{PostRow, PostRules};
+#[cfg(test)]
+use crate::rules::rule_spec::ActionSpec;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
 use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
 use crate::rules::rule_spec::rule::{self, Rule};
-#[cfg(test)]
-use crate::rules::rule_spec::ActionSpec;
-use crate::rules::rule_spec::{rule_name, Contribution, RuleAction, RuleId, Truth};
+use crate::rules::rule_spec::{Contribution, RuleAction, RuleId, Truth, rule_name};
 use crate::rules::{Predicate, RequestLeaf, RuleContext, SafetyLevel};
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -21,24 +22,35 @@ use std::sync::Arc;
 use strum::VariantArray;
 use tracing::warn;
 
+type Wired<E> = (&'static str, Rule<E>, Option<Experiment>);
+
 pub(super) struct Policy<E: Engine = PostEngine> {
-    rules: Vec<(&'static str, Rule<E>)>,
+    rules: Vec<Wired<E>>,
     hydrators: Hydrators,
 }
 
 impl<E: Fold> Policy<E> {
-    #[expect(
+    pub(super) fn new(rules: Vec<(&'static str, Rule<E>)>) -> Self {
+        Self::gated(
+            rules
+                .into_iter()
+                .map(|(name, rule)| (name, rule, None))
+                .collect(),
+        )
+    }
+
+                    #[expect(
         clippy::panic,
         reason = "invalid authored rules fail startup, before the service takes traffic"
     )]
-    pub(super) fn new(mut rules: Vec<(&'static str, Rule<E>)>) -> Self {
-        if let Err(error) = rule::validate(rules.iter().map(|(_, rule)| rule)) {
+    pub(super) fn gated(mut rules: Vec<Wired<E>>) -> Self {
+        if let Err(error) = rule::validate(rules.iter().map(|(_, rule, _)| rule)) {
             panic!("invalid rules: {error:?}");
         }
-        rules.sort_by_key(|(_, rule)| Reverse(rule.action.spec().kind().severity()));
+        rules.sort_by_key(|(_, rule, _)| Reverse(rule.action.spec().kind().severity()));
         let mut runs: Vec<&'static str> = Vec::new();
         let mut run: Vec<&Rule<E>> = Vec::new();
-        for (name, rule) in &rules {
+        for (name, rule, _) in &rules {
             if runs.last() != Some(name) {
                 assert!(!runs.contains(name), "{name} is wired twice");
                 runs.push(name);
@@ -49,15 +61,22 @@ impl<E: Fold> Policy<E> {
         }
         let hydrators = rules
             .iter()
-            .fold(Hydrators::empty(), |hydrators, (_, rule)| {
+            .fold(Hydrators::empty(), |hydrators, (_, rule, _)| {
                 hydrators.union(rule.requirements())
             });
         Self { rules, hydrators }
     }
 
+    fn experiments(&self) -> ExperimentSet {
+        self.rules
+            .iter()
+            .filter_map(|&(_, _, experiment)| experiment)
+            .collect()
+    }
+
     fn reads(&self, leaf: Predicate) -> bool {
         let mut read = Vec::new();
-        for (_, rule) in &self.rules {
+        for (_, rule, _) in &self.rules {
             rule.leaves(&mut read);
         }
         read.contains(&leaf)
@@ -65,7 +84,7 @@ impl<E: Fold> Policy<E> {
 
     #[cfg(test)]
     fn rule_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = self.rules.iter().map(|&(name, _)| name).collect();
+        let mut names: Vec<&'static str> = self.rules.iter().map(|&(name, ..)| name).collect();
         names.dedup();
         names
     }
@@ -82,7 +101,7 @@ pub(super) struct Folded {
 }
 
 fn fold<E: Fold, O: Observer<E>>(
-    rules: &[(&'static str, Rule<E>)],
+    rules: &[Wired<E>],
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
 ) -> Evaluation {
@@ -92,7 +111,7 @@ fn fold<E: Fold, O: Observer<E>>(
 
 #[inline]
 fn fold_from<E: Fold, O: Observer<E>>(
-    rules: &[(&'static str, Rule<E>)],
+    rules: &[Wired<E>],
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
     Folded {
@@ -101,7 +120,7 @@ fn fold_from<E: Fold, O: Observer<E>>(
     }: Folded,
     first_occurrence: usize,
 ) -> Folded {
-    for (occurrence, (by, rule)) in (first_occurrence..).zip(rules) {
+    for (occurrence, (by, rule, experiment)) in (first_occurrence..).zip(rules) {
         let after = terminal.as_ref().map(|&(decided, ..)| decided);
         if after.is_some() && !O::TOTAL {
             break;
@@ -122,20 +141,41 @@ fn fold_from<E: Fold, O: Observer<E>>(
         } else {
             None
         };
-        let (effect, defaults_admitted) = if after.is_some() {
-            (
-                Effect::AfterTerminal,
-                (Bucket::Withholding, Hydrators::empty()),
-            )
-        } else {
-            let contribution = completed.and_then(|completed| completed.value);
-            let (selected, effect, admitted) =
-                decision.step(rule.id, by, action.kind(), truth, contribution);
-            if let Some(verdict) = selected {
-                terminal = Some((occurrence, verdict));
-            }
-            (effect, admitted)
-        };
+        let (effect, defaults_admitted) =
+            if after.is_some() {
+                (
+                    Effect::AfterTerminal,
+                    (Bucket::Withholding, Hydrators::empty()),
+                )
+            } else {
+                let contribution = completed.and_then(|completed| completed.value);
+                let skipped =
+                    experiment.is_some_and(|experiment| !context.experiments().applies(experiment));
+                let mut discarded = skipped.then(|| decision.clone());
+                let (selected, effect, admitted) = discarded
+                    .as_mut()
+                    .unwrap_or(&mut decision)
+                    .step(rule.id, by, action.kind(), truth, contribution);
+                let exposes = effect.changes_verdict() || !admitted.1.is_empty();
+                if let Some(experiment) = *experiment
+                    && exposes
+                {
+                    context.experiments().expose(experiment);
+                }
+                if skipped {
+                    let effect = if exposes {
+                        Effect::SkippedByExperiment
+                    } else {
+                        effect
+                    };
+                    (effect, (admitted.0, Hydrators::empty()))
+                } else {
+                    if let Some(verdict) = selected {
+                        terminal = Some((occurrence, verdict));
+                    }
+                    (effect, admitted)
+                }
+            };
         observer.row(by, root, truth, effect, defaults_admitted, diagnostic);
     }
     Folded { decision, terminal }
@@ -176,7 +216,7 @@ fn finish<E: Engine, O: Observer<E>>(
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Decision {
     label_interstitial: Option<Decided<LabelInterstitial>>,
     media: Option<Decided<MediaRestriction>>,
@@ -273,24 +313,34 @@ pub(super) struct PostPolicy {
 }
 
 impl PostPolicy {
-    #[expect(
+    #[cfg(test)]
+    fn new(user: Vec<(&'static str, Rule<UserEngine>)>, post: Vec<(&'static str, Rule)>) -> Self {
+        Self::gated(
+            user,
+            post.into_iter()
+                .map(|(name, rule)| (name, rule, None))
+                .collect(),
+        )
+    }
+
+                    #[expect(
         clippy::panic,
         reason = "invalid authored rules fail startup, before the service takes traffic"
     )]
-    fn new(user: Vec<(&'static str, Rule<UserEngine>)>, post: Vec<(&'static str, Rule)>) -> Self {
+    fn gated(user: Vec<(&'static str, Rule<UserEngine>)>, post: Vec<Wired<PostEngine>>) -> Self {
         if let Some((name, _)) = user
             .iter()
-            .find(|(name, _)| post.iter().any(|(other, _)| other == name))
+            .find(|(name, _)| post.iter().any(|(other, ..)| other == name))
         {
             panic!("{name} is wired in both the user and the post list");
         }
         if let Err(error) = rule::validate_across(
             user.iter().map(|(_, rule)| rule),
-            post.iter().map(|(_, rule)| rule),
+            post.iter().map(|(_, rule, _)| rule),
         ) {
             panic!("invalid rules: {error:?}");
         }
-        let (user, post) = (Policy::new(user), Policy::new(post));
+        let (user, post) = (Policy::new(user), Policy::gated(post));
         let hydrators = user.hydrators.union(post.hydrators);
         Self {
             user,
@@ -341,6 +391,7 @@ struct Level {
     policy: PostPolicy,
     plan: HydrationPlan,
     reads_soft_nsfw_new_user_drop: bool,
+    experiments: ExperimentSet,
     post_kinds: Option<PostKinds>,
     recipient_posts: Option<HydrationPlan>,
 }
@@ -358,6 +409,7 @@ impl Level {
         Self {
             reads_soft_nsfw_new_user_drop: policy.user.reads(soft_nsfw_new_user_drop)
                 || policy.post.reads(soft_nsfw_new_user_drop),
+            experiments: policy.post.experiments(),
             policy,
             plan,
             post_kinds: None,
@@ -382,7 +434,10 @@ impl PostKinds {
             .map(|(kind, rules)| {
                 let rules = rules.lists();
                 let user = named(names, &rules.user);
-                (kind, PostPolicy::new(user, named(names, &rules.post)))
+                (
+                    kind,
+                    PostPolicy::gated(user, named_rows(names, &rules.post)),
+                )
             })
             .collect();
         let hydrators = policies
@@ -443,6 +498,18 @@ fn named<E: Engine>(
                 interned_name(names, rule.id, &rule.action.lift()),
                 rule.clone(),
             )
+        })
+        .collect()
+}
+
+fn named_rows(
+    names: &mut Vec<(RuleId, RuleAction, &'static str)>,
+    rows: &[PostRow],
+) -> Vec<Wired<PostEngine>> {
+    rows.iter()
+        .map(|row| {
+            let name = interned_name(names, row.rule.id, &row.rule.action.lift());
+            (name, row.rule.clone(), row.experiment)
         })
         .collect()
 }
@@ -575,16 +642,16 @@ impl RuleEngine {
         Self::with_country_lists(Arc::new(CountryLists::starting_at_default()))
     }
 
-    pub fn with_country_lists(country_lists: Arc<CountryLists>) -> Self {
+                            pub fn with_country_lists(country_lists: Arc<CountryLists>) -> Self {
         let mut names = Vec::new();
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
                 let spec = level.spec();
                 let rules = spec.rules().lists();
-                let policy = PostPolicy::new(
+                let policy = PostPolicy::gated(
                     named(&mut names, &rules.user),
-                    named(&mut names, &rules.post),
+                    named_rows(&mut names, &rules.post),
                 );
                 let mut entry = Level::new(level, policy);
                 assert!(
@@ -598,6 +665,12 @@ impl RuleEngine {
                         plans_from_its_rows(&post_kinds.plan),
                         "{level:?} plans keys its actor post rows cannot give"
                     );
+                    entry.experiments = post_kinds
+                        .policies
+                        .iter()
+                        .fold(entry.experiments, |experiments, (_, policy)| {
+                            experiments.union(policy.post.experiments())
+                        });
                     entry.post_kinds = Some(post_kinds);
                 }
                 entry
@@ -609,7 +682,7 @@ impl RuleEngine {
         }
     }
 
-    pub(crate) fn admit<'a>(
+                    pub(crate) fn admit<'a>(
         &'a self,
         level: SafetyLevel,
         hydration: &'a Hydration,
@@ -617,7 +690,7 @@ impl RuleEngine {
         self.admit_under(self.policy(level), level, hydration)
     }
 
-    pub(crate) fn admit_post_kind<'a>(
+            pub(crate) fn admit_post_kind<'a>(
         &'a self,
         level: SafetyLevel,
         kind: NotificationKind,
@@ -768,16 +841,20 @@ impl RuleEngine {
         &self.level(level).plan
     }
 
-    pub(crate) fn post_kinds_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
+        pub(crate) fn post_kinds_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
         Some(&self.level(level).post_kinds.as_ref()?.plan)
     }
 
-    pub(crate) fn recipient_posts_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
+            pub(crate) fn recipient_posts_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
         self.level(level).recipient_posts.as_ref()
     }
 
-    pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {
+        pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {
         self.level(level).reads_soft_nsfw_new_user_drop
+    }
+
+        pub(crate) fn experiments(&self, level: SafetyLevel) -> ExperimentSet {
+        self.level(level).experiments
     }
 
     #[cfg(test)]
@@ -809,6 +886,7 @@ pub(super) struct WiredRule<'a, E: Engine = PostEngine> {
     pub(super) name: &'static str,
     pub(super) action: &'a ActionSpec<E>,
     pub(super) when: rule::RuleCond<E>,
+    pub(super) experiment: Option<Experiment>,
 }
 
 #[cfg(test)]
@@ -816,13 +894,14 @@ pub(super) type FoldOrder<'a> = (Vec<WiredRule<'a, UserEngine>>, Vec<WiredRule<'
 
 #[cfg(test)]
 fn fold_order(policy: &PostPolicy) -> FoldOrder<'_> {
-    fn wired<'a, E: Engine>(rules: &'a [(&'static str, Rule<E>)]) -> Vec<WiredRule<'a, E>> {
+    fn wired<'a, E: Engine>(rules: &'a [Wired<E>]) -> Vec<WiredRule<'a, E>> {
         rules
             .iter()
-            .map(|&(name, ref rule)| WiredRule {
+            .map(|&(name, ref rule, experiment)| WiredRule {
                 name,
                 action: rule.action.spec(),
                 when: rule.when,
+                experiment,
             })
             .collect()
     }
@@ -885,7 +964,7 @@ mod tests {
         RequestFacts, SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
-        candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
+        CandidateBuilder, VIEWER_ID, candidate, viewer, viewer_with_profile,
     };
     use crate::rules::test_context;
 
@@ -1093,15 +1172,16 @@ country_specific_nsfw_content_gating:
         use crate::models::Withholding;
         use crate::models::{
             AuthorFeatures, DropReason, LimitedEngagementReason, MediaInterstitial,
-            MediaRestriction, PostCandidate, SafetyLabelType, TombstoneReason, UserCandidate,
-            ViewerFeatures,
+            MediaRestriction, PostCandidate, RequestFacts, SafetyLabelType, TombstoneReason,
+            UserCandidate, ViewerFeatures,
         };
-        use crate::rules::fixtures::{allow, author_viewer, blurred, candidate, viewer, VIEWER_ID};
+        use crate::rules::RequestExperiments;
+        use crate::rules::fixtures::{VIEWER_ID, allow, author_viewer, blurred, candidate, viewer};
         use crate::rules::rule_spec::leaves::*;
         use crate::rules::rule_spec::observed::Skip;
         use crate::rules::rule_spec::rule::Audience::{Everyone, NonFollowers};
-        use crate::rules::rule_spec::rule::{all, any, NamedCond, RuleCond, UserRule};
-        use crate::rules::rule_spec::{drop_post, limit, soft_intervention, ActionSpec, DropAs};
+        use crate::rules::rule_spec::rule::{NamedCond, RuleCond, UserRule, all, any};
+        use crate::rules::rule_spec::{ActionSpec, DropAs, drop_post, limit, soft_intervention};
         use crate::rules::test_context;
         use xai_visibility_filtering::models::FilteredReason;
         use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
@@ -1323,6 +1403,97 @@ country_specific_nsfw_content_gating:
                     },
                     "row {index}"
                 );
+            }
+        }
+
+                const ARMS: [(Experiment, bool, bool); 4] = [
+            (Experiment::TestLaunch, true, true),
+            (Experiment::TestLaunch, false, false),
+            (Experiment::TestHoldback, false, true),
+            (Experiment::TestHoldback, true, false),
+        ];
+
+        fn in_arm(experiment: Experiment, on: bool) -> ViewerFeatures {
+            let on = if on {
+                ExperimentSet::NONE.with(experiment)
+            } else {
+                ExperimentSet::NONE
+            };
+            ViewerFeatures {
+                facts: RequestFacts::default().with_experiments(RequestExperiments::resolved(on)),
+                ..ViewerFeatures::default()
+            }
+        }
+
+        #[test]
+        fn a_gated_row_folds_as_listed_in_the_arm_it_applies_to_and_as_absent_in_the_other() {
+            let (_, candidate) = follows_and_blocks_failed();
+            const WHENS: [RuleCond; 2] = [all![], ViewerFollowsAuthor.leaf()];
+            for (index, when) in WHENS.into_iter().enumerate() {
+                let listed = |experiment| {
+                    Policy::gated(vec![
+                        ("blur", rule(all![], INTERSTITIAL_NSFW), None),
+                        ("gated", rule(when, DROP_SUSPENDED), experiment),
+                    ])
+                };
+                for (experiment, on, applies) in ARMS {
+                    let viewer = in_arm(experiment, on);
+                    let context = test_context(&viewer, &candidate);
+                    let expected = if applies {
+                        listed(None)
+                    } else {
+                        Policy::new(vec![always("blur", INTERSTITIAL_NSFW)])
+                    };
+                    assert_eq!(
+                        listed(Some(experiment)).evaluate(&context),
+                        expected.evaluate(&context),
+                        "when {index}, {experiment:?} on={on}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_request_is_exposed_in_either_arm_only_when_the_gated_row_would_change_its_result() {
+            let (_, candidate) = follows_and_blocks_failed();
+            let rows: [(RuleCond, ActionSpec, bool); 4] = [
+                (all![], DROP_SUSPENDED, true),
+                (NEVER, DROP_SUSPENDED, false),
+                (ViewerFollowsAuthor.leaf(), DROP_SUSPENDED, true),
+                (all![], INTERSTITIAL_UNSPECIFIED, false),
+            ];
+            for (index, (when, action, exposed)) in rows.into_iter().enumerate() {
+                for (experiment, on, applies) in ARMS {
+                    let policy = Policy::gated(vec![
+                        ("blur", rule(all![], INTERSTITIAL_NSFW), None),
+                        ("gated", rule(when, action.clone()), Some(experiment)),
+                    ]);
+                    let case = format!("row {index}, {experiment:?} on={on}");
+                    let served = in_arm(experiment, on);
+                    policy.evaluate(&test_context(&served, &candidate));
+                    assert_eq!(
+                        served.facts.experiments().exposed().contains(experiment),
+                        exposed,
+                        "{case}"
+                    );
+                    let viewer = in_arm(experiment, on);
+                    let trace = policy.trace(&test_context(&viewer, &candidate));
+                    assert_eq!(
+                        viewer.facts.experiments().exposed().contains(experiment),
+                        exposed,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        trace
+                            .rows
+                            .iter()
+                            .find(|row| row.by == "gated")
+                            .map(|row| row.effect)
+                            == Some(Effect::SkippedByExperiment),
+                        exposed && !applies,
+                        "{case}"
+                    );
+                }
             }
         }
 
@@ -1559,7 +1730,7 @@ country_specific_nsfw_content_gating:
         use crate::clients::socialgraph_client::{EdgeQuery, Graph};
         use crate::hydration::fallback_cache::FallbackCaches;
         use crate::hydration::sources::Source;
-        use crate::hydration::sources::{suspended, InMemorySources};
+        use crate::hydration::sources::{InMemorySources, suspended};
         use crate::hydration::{HydrationRequest, Hydrator};
         use crate::metrics::{Endpoint, Metrics, RequestLevel};
         use crate::models::{
@@ -1567,28 +1738,28 @@ country_specific_nsfw_content_gating:
             SafetyLabelType, TweetId,
         };
         use crate::models::{LimitedEngagementReason, Notice};
-        use crate::rules::fixtures::{allow, candidate, dropped, viewer, VIEWER_ID};
+        use crate::rules::fixtures::{VIEWER_ID, allow, candidate, dropped, viewer};
         use crate::rules::golden_corpus::post_cases;
+        use crate::rules::rule_spec::Predicate;
         use crate::rules::rule_spec::conditions::VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES;
         use crate::rules::rule_spec::leaves::*;
         use crate::rules::rule_spec::observed::{NodeKind, NodeTrace, RowTrace, Skip, Witness};
         use crate::rules::rule_spec::rule::{
-            all, any, Audience, DescriptionError, NamedCond, RuleCond,
+            Audience, DescriptionError, NamedCond, RuleCond, all, any,
         };
-        use crate::rules::rule_spec::Predicate;
         use crate::rules::rule_spec::{
-            appealable, blur, drop_post, limit, soft_intervention, DropAs,
+            DropAs, appealable, blur, drop_post, limit, soft_intervention,
         };
         use crate::rules::test_context;
         use crate::rules::tweet_rules;
-        use crate::scenario::{raw, Scenario};
+        use crate::scenario::{Scenario, raw};
+        use Audience::{Everyone, NonAuthors, OnlyAuthor};
         use rayon::prelude::*;
         use std::iter::once;
         use xai_core_entities::entities::{GizmoduckUser, Label, Labels};
         use xai_visibility_filtering::models::FilteredReason;
         use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
         use xai_x_thrift::user_labels::LabelValue;
-        use Audience::{Everyone, NonAuthors, OnlyAuthor};
 
         fn rule(audience: Audience, when: RuleCond, action: RuleAction) -> Rule {
             Rule {
@@ -1971,9 +2142,10 @@ country_specific_nsfw_content_gating:
                 .collect();
             assert_eq!(uses.len(), 2);
             assert_ne!(uses[0].node, uses[1].node);
-            assert!(uses
-                .iter()
-                .all(|node| node.truth == Truth::True && node.skip.is_none()));
+            assert!(
+                uses.iter()
+                    .all(|node| node.truth == Truth::True && node.skip.is_none())
+            );
             assert_eq!(
                 trace.rows.iter().map(|row| row.truth).collect::<Vec<_>>(),
                 [
@@ -2065,13 +2237,17 @@ country_specific_nsfw_content_gating:
                 Hydrators::empty(),
             ))
             .await;
-            assert!(unplanned
-                .tweet(TweetId(1))
-                .and_then(|tweet| tweet.candidate())
-                .is_some());
-            assert!(rule_engine
-                .admit(SafetyLevel::TimelineHome, &unplanned)
-                .is_none());
+            assert!(
+                unplanned
+                    .tweet(TweetId(1))
+                    .and_then(|tweet| tweet.candidate())
+                    .is_some()
+            );
+            assert!(
+                rule_engine
+                    .admit(SafetyLevel::TimelineHome, &unplanned)
+                    .is_none()
+            );
             let missing = RuleEngine::unplanned_inputs(
                 rule_engine.policy(SafetyLevel::TimelineHome),
                 &unplanned,
@@ -2082,9 +2258,11 @@ country_specific_nsfw_content_gating:
             );
 
             let planned = hydrate(rule_engine.plan(SafetyLevel::TimelineHome)).await;
-            assert!(rule_engine
-                .admit(SafetyLevel::TimelineHome, &planned)
-                .is_some());
+            assert!(
+                rule_engine
+                    .admit(SafetyLevel::TimelineHome, &planned)
+                    .is_some()
+            );
         }
 
         #[tokio::test]
@@ -2110,9 +2288,11 @@ country_specific_nsfw_content_gating:
                 Hydrators::empty(),
             ))
             .await;
-            assert!(rule_engine
-                .admit(SafetyLevel::FilterAll, &unplanned)
-                .is_none());
+            assert!(
+                rule_engine
+                    .admit(SafetyLevel::FilterAll, &unplanned)
+                    .is_none()
+            );
             assert_eq!(
                 RuleEngine::unplanned_inputs(
                     rule_engine.policy(SafetyLevel::FilterAll),
@@ -2121,9 +2301,11 @@ country_specific_nsfw_content_gating:
                 Hydrators::of(Hydrator::Follows)
             );
             let planned = hydrate(rule_engine.plan(SafetyLevel::FilterAll)).await;
-            assert!(rule_engine
-                .admit(SafetyLevel::FilterAll, &planned)
-                .is_some());
+            assert!(
+                rule_engine
+                    .admit(SafetyLevel::FilterAll, &planned)
+                    .is_some()
+            );
         }
 
         #[tokio::test]
@@ -2260,7 +2442,10 @@ country_specific_nsfw_content_gating:
             let drop = || drop_post(DropAs::UnspecifiedReason);
             let unsorted = |rules: Vec<(&'static str, Rule)>| Policy {
                 hydrators: Policy::new(rules.clone()).hydrators,
-                rules,
+                rules: rules
+                    .into_iter()
+                    .map(|(name, rule)| (name, rule, None))
+                    .collect(),
             };
             for (case, policy, admitted, retained) in [
                 (

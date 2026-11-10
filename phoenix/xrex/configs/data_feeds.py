@@ -6,7 +6,6 @@ from pathlib import Path
 
 from xrex import settings
 from xrex.configs import config_registry
-from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.rust_kafka_recsys import RustKafkaDataset
 from xrex.data.rust_parquet_recsys import RustParquetDataset
 from xrex.data.streaming.kafkadispatcherloader import PhoenixKafkaDispatcherDataset
@@ -226,30 +225,6 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
 
 def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
     del config_name
-    return PhoenixDataset(
-        hash_table=hash_table,
-        path=_RANKING_DUMP_PATH,
-        history_seq_len=mparams["history_seq_len"],
-        candidate_seq_len=mparams["candidate_seq_len"],
-        input_vocab_size=mparams["input_vocab_size"],
-        num_continuous_actions=mparams["num_continuous_actions"],
-        num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-        num_kafka_partitions=1024,
-        output_vocab_size=mparams["output_vocab_size"],
-        multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
-        use_post_sid=use_post_sid,
-        sid_num_levels=sid_num_levels,
-        compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
-        enable_stale_post=mparams.get("enable_stale_post", False),
-        ads_head_masking=mparams.get("ads_head_masking", False),
-        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
-        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
-        page_records=_page_records(mparams),
-    )
-
-
-def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
-    del config_name
     return RustParquetDataset(
         hash_table=hash_table,
         path=_RANKING_DUMP_PATH,
@@ -277,7 +252,7 @@ RANKING_DATASET_FACTORIES = {
     "rust_kafka": _ranking_rust_kafka,
     "kafka_dispatcher": _ranking_kafka_dispatcher,
     "offline_kafka_dump": _ranking_offline_kafka_dump,
-    "rust_parquet": _ranking_rust_parquet,
+    "rust_parquet": _ranking_offline_kafka_dump,
 }
 
 RANKING_EXTRA_DATASET_TYPES = [
@@ -362,7 +337,7 @@ def _retrieval_offline_kafka_dump(
     extra_kwargs: dict = {}
     if global_ids_file_path is not None:
         extra_kwargs["global_ids_file_path"] = global_ids_file_path
-    return PhoenixDataset(
+    return RustParquetDataset(
         hash_table=hash_table,
         path=_RETRIEVAL_DUMP_PATH,
         history_seq_len=mparams["history_seq_len"],

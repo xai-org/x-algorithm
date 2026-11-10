@@ -267,6 +267,7 @@ message ReloadModelRequest {
   bool do_reload = 1;
   repeated string copy_urls = 2;
   string target_prefix = 3;
+  bool peer_progressive = 4;
 }
 
 message ReloadModelResponse {
@@ -274,6 +275,7 @@ message ReloadModelResponse {
   double current_checkpoint_timestamp = 2;
   string serving_prefix = 3;
   bool peer_ready = 4;
+  string staging_prefix = 5;
 }
 
 message RetrieveTopKCandidatesRequest {
@@ -314,6 +316,8 @@ message RetrieveTopKCandidatesRequest {
   repeated uint64 include_author_ids = 18;
 
   repeated uint64 exclude_author_ids = 19;
+
+  map<string, uint32> dataset_top_k = 20;
 }
 
 message ExcludedPostsBloomFilter {
@@ -410,6 +414,12 @@ enum RetrievalDatasetType {
   RETRIEVAL_DATASET_TYPE_ZERO_FAV = 16;
   reserved 17, 18;
   RETRIEVAL_DATASET_TYPE_IMMERSIVE_32FAV_VIDEO_14_TO_30_DAY = 19;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_1DAY = 20;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_2DAY = 21;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_7DAY = 22;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_1DAY = 23;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_2DAY = 24;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_7DAY = 25;
 }
 
 message ScoredCandidate {
@@ -569,6 +579,7 @@ enum ActionName {
   ADS_OPEN_LINK_LATE_WINDOW = 112;
   ADS_LONG_DWELL_LATE_WINDOW = 113;
   DISTILLED_FEEDBACK_RELEVANT_TO_SEARCH = 114;
+  CLIENT_TWEET_SWIPE_TO_PROFILE = 115;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -1645,6 +1656,14 @@ message AdActionInfo {
   map<string, bool> booleanFeatures = 14;
 }
 
+enum MediaContentType {
+  MEDIA_CONTENT_TYPE_NONE = 0;
+  MEDIA_CONTENT_TYPE_IMAGE = 1;
+  MEDIA_CONTENT_TYPE_VIDEO = 2;
+  MEDIA_CONTENT_TYPE_OTHER = 3;
+  MEDIA_CONTENT_TYPE_UNKNOWN = 4;
+}
+
 enum UnifiedCardType {
   UNIFIED_CARD_TYPE_UNSPECIFIED = 0;
   IMAGE_WEBSITE = 1;
@@ -1709,6 +1728,7 @@ message AdInfo {
 
   int64 fundingInstrumentId = 16;
 
+  MediaContentType media_content_type = 17;
   UnifiedCardType unified_card_type = 18;
 
   int64 product_set_id = 19;
@@ -1963,6 +1983,7 @@ enum UserActionAggregationType {
   DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
   DENSE_WITH_LONG_DWELL_DEDUP_ATTRIBUTION = 33;
   DENSE_WITH_RECENT_IMPRESSIONS = 34;
+  DENSE_WITH_LONG_DWELL_LINGER_TRIM = 35;
 }
 
 message UserActionAggregationResponse {

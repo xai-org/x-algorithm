@@ -353,6 +353,59 @@ def buildImagineIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRece
   }
 }
 
+def aiVideoIndexName(postId: Long): Option[String] = {
+  val disclosureOpt = #Tweet<tweetypie/federated/contentDisclosure>.fetch(postId, ()).v
+  disclosureOpt.flatMap { disclosure => disclosure.aiGeneratedDisclosure } match {
+    case Some(ai) if ai.hasAiGeneratedMedia =>
+      ai.aiGeneratedDetectionSource match {
+        case Some(UserDeclared) => Some("ai_video_self")
+        case Some(C2paClient) => Some("ai_video_detected")
+        case Some(GrokSignature) => Some("ai_video_detected")
+        case Some(AgentApplied) => Some("ai_video_detected")
+        case _ => None
+      }
+    case _ => None
+  }
+}
+
+def reusedAiVideoIndexNames(postId: Long, tweet: Tweet): Seq[String] = {
+  tweet.media.map { entities =>
+    entities.flatMap { entity =>
+      val sourcePostIdOpt: Option[Long] = entity.sourceStatus
+      sourcePostIdOpt match {
+        case Some(sourcePostId) if sourcePostId != postId => aiVideoIndexName(sourcePostId)
+        case _ => None
+      }
+    }
+  }.getOrElse(Seq.empty[String])
+}
+
+def emitAiVideoIndex(candidate: PhoenixRankAllCandidate, indexName: String, stats: Stats.StatsReceiver): Unit = {
+  val object = {
+    postId = candidate.postId,
+    authorId = candidate.authorId,
+    indexName = indexName
+  }
+  #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
+  stats.counter(indexName + "_indexing_event_created").incr(1)
+}
+
+def buildAiVideoIndexes(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+  candidate.tweetMedadata match {
+    case Some(tweet) if eventProcessing.hasValidImmersiveVideo(tweet) =>
+      aiVideoIndexName(candidate.postId) match {
+        case Some(indexName) =>
+          emitAiVideoIndex(candidate, indexName, stats)
+        case None =>
+          val emitted = reusedAiVideoIndexNames(candidate.postId, tweet).map { indexName =>
+            emitAiVideoIndex(candidate, indexName, stats)
+          }
+          stats.counter("ai_video_reuse_indexing_event_created").incr(emitted.foldLeft(0) { (acc, x) => acc + 1 })
+      }
+    case _ => ()
+  }
+}
+
 def buildMetadataDump(
   candidate: PhoenixRankAllCandidate,
   stats: Stats.StatsReceiver,
@@ -514,6 +567,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                     buildVideoIndex(candidate, receiverStats)
                     build1FavVideoIndex(candidate, receiverStats)
                     buildImagineIndex(candidate, receiverStats)
+                    buildAiVideoIndexes(candidate, receiverStats)
                   }
                   buildMetadataDump(candidate, receiverStats, isReply)
                   buildMMEmbMetadataDump(candidate, receiverStats)
@@ -521,6 +575,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                   buildPostCreationIndex(candidate, receiverStats)
                   if(hasImmersiveVideo) {
                     buildVideoIndex(candidate, receiverStats)
+                    buildAiVideoIndexes(candidate, receiverStats)
                   }
                   buildMetadataDump(candidate, receiverStats, isReply)
                 case _ =>

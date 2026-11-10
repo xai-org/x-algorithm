@@ -180,6 +180,75 @@ pub const EXACT_PHRASE_CATEGORICAL_IDX: usize = EXACT_PHRASE_SEQ;
 
 const AUTHOR_NSFW_BIT: u64 = 2;
 
+pub mod ad_side {
+    const ID_BUCKETS: u64 = 1 << 19;
+    const CARD_TYPES: i32 = 48;
+    const MEDIA_TYPES: i32 = 8;
+    const MEDIA_CONTENT_TYPE_UNKNOWN: i32 = 4;
+    const CREATIVE_UNKNOWN: i32 = CARD_TYPES + MEDIA_CONTENT_TYPE_UNKNOWN;
+    const OBJECTIVES: i64 = 64;
+    const CREATIVE_UNLOGGED_START_MS: i64 = 1_787_788_800_000;
+    const CREATIVE_UNLOGGED_END_MS: i64 = 1_789_833_600_000;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Field {
+        Campaign,
+        LineItem,
+        Creative,
+        Objective,
+    }
+
+    impl std::str::FromStr for Field {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "campaign" => Ok(Self::Campaign),
+                "line_item" => Ok(Self::LineItem),
+                "creative" => Ok(Self::Creative),
+                "objective" => Ok(Self::Objective),
+                other => Err(format!(
+                    "ad-side field {other:?} cannot be served \
+                     (expected campaign|line_item|creative|objective)"
+                )),
+            }
+        }
+    }
+
+    pub fn parse_fields<S: AsRef<str>>(names: &[S]) -> Result<Vec<Field>, String> {
+        names.iter().map(|name| name.as_ref().parse()).collect()
+    }
+
+    pub fn hash_id(id: i64) -> i32 {
+        if id == 0 {
+            return 0;
+        }
+        let mut x = id as u64;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        (x % (ID_BUCKETS - 1)) as i32 + 1
+    }
+
+    pub fn creative_format(card_type: i32, media_type: i32, impressed_time_ms: i64) -> i32 {
+        let card = card_type.clamp(0, CARD_TYPES - 1);
+        let media = media_type.clamp(0, MEDIA_TYPES - 1);
+        let unlogged =
+            (CREATIVE_UNLOGGED_START_MS..CREATIVE_UNLOGGED_END_MS).contains(&impressed_time_ms);
+        if card > 0 {
+            card
+        } else if media == 0 && unlogged {
+            CREATIVE_UNKNOWN
+        } else {
+            CARD_TYPES + media
+        }
+    }
+
+    pub fn objective(objective: i64) -> i32 {
+        objective.clamp(0, OBJECTIVES - 1) as i32
+    }
+}
+
 pub mod ads_counts {
     use xai_recsys_proto as pb;
 
@@ -559,6 +628,7 @@ pub struct InputBuffer {
     pub user_conversion_history_hashes: Vec<i32>,
     pub candidate_account_hashes: Vec<i32>,
     pub candidate_ads_count_buckets: Vec<u8>,
+    pub candidate_ad_side_ids: Vec<i32>,
     pub history_post_ids: Vec<i64>,
     pub history_web_conv_url_ids: Vec<(u32, i64)>,
     pub history_semantic_ids: Vec<u16>,
@@ -618,6 +688,48 @@ impl InputBuffer {
             user_row.copy_from_slice(&user);
         }
         self.candidate_ads_count_buckets = out;
+    }
+
+    pub fn stamp_candidate_ad_side_ids(
+        &mut self,
+        model_config: &ModelConfig,
+        candidate_set: &pb::CandidateSet,
+    ) {
+        use ad_side::Field;
+        let fields = &model_config.hash_table.ad_side_fields;
+        if fields.is_empty() {
+            return;
+        }
+        let num_item_hashes = model_config.hash_table.num_item_hashes().max(1);
+        let mut out = vec![0i32; model_config.candidate_seq_len * fields.len()];
+        for (j, (row, candidate)) in out
+            .chunks_exact_mut(fields.len())
+            .zip(&candidate_set.candidates)
+            .enumerate()
+        {
+            if self
+                .candidate_post_hashes
+                .get(j * num_item_hashes)
+                .is_none_or(|&h| h == 0)
+            {
+                continue;
+            }
+            let ad = candidate.ad_info.as_ref();
+            let impressed_time_ms = i64::from(self.candidate_impr_ts[j]) * 1000;
+            for (id, field) in row.iter_mut().zip(fields) {
+                *id = match field {
+                    Field::Campaign => ad_side::hash_id(self.candidate_campaign_ids[j]),
+                    Field::LineItem => ad_side::hash_id(self.candidate_line_item_ids[j]),
+                    Field::Creative => ad_side::creative_format(
+                        ad.map_or(0, |a| a.unified_card_type),
+                        ad.map_or(0, |a| a.media_content_type),
+                        impressed_time_ms,
+                    ),
+                    Field::Objective => ad_side::objective(ad.map_or(0, |a| a.line_item_objective)),
+                };
+            }
+        }
+        self.candidate_ad_side_ids = out;
     }
 }
 
@@ -1338,6 +1450,7 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             candidate_ads_count_buckets: Vec::new(),
+            candidate_ad_side_ids: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids: Vec::new(),
             history_semantic_ids,
@@ -1505,6 +1618,7 @@ impl InputBuffer {
                     user_conversion_history_hashes,
                     candidate_account_hashes,
                     candidate_ads_count_buckets: Vec::new(),
+                    candidate_ad_side_ids: Vec::new(),
                     history_post_ids: vec![0i64; history_seq_len],
                     history_web_conv_url_ids: Vec::new(),
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
@@ -1812,6 +1926,7 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             candidate_ads_count_buckets: Vec::new(),
+            candidate_ad_side_ids: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids,
             history_semantic_ids,
@@ -2006,6 +2121,7 @@ mod tests {
                 enable_stale_post: false,
                 enable_stale_post_30d: false,
                 ads_count_features: false,
+                ad_side_fields: Vec::new(),
             },
             history_seq_len: 4,
             candidate_seq_len: 3,
@@ -2213,6 +2329,133 @@ mod tests {
                 "padding product_surfaces[{j}] should be zero"
             );
         }
+    }
+
+    #[test]
+    fn ad_side_ids_match_python() {
+        use ad_side::{creative_format, hash_id, objective};
+        let hashes = [
+            (0, 0),
+            (1, 61_547),
+            (7, 460_609),
+            (1 << 40, 463_028),
+            (-5, 498_382),
+            (i64::MAX, 478_915),
+            (i64::MIN, 156_306),
+        ];
+        for (id, row) in hashes {
+            assert_eq!(hash_id(id), row, "id {id}");
+        }
+        let (start, end) = (1_787_788_800_000, 1_789_833_600_000);
+        let creatives = [
+            ((1, 0, end), 1),
+            ((0, 0, end), 48),
+            ((0, 0, start - 1), 48),
+            ((0, 0, start), 52),
+            ((0, 0, end - 1), 52),
+            ((0, 2, start), 50),
+            ((0, 4, end), 52),
+            ((-3, 9, end), 55),
+            ((60, 2, end), 47),
+        ];
+        for ((card, media, t), creative) in creatives {
+            assert_eq!(
+                creative_format(card, media, t),
+                creative,
+                "{card} {media} {t}"
+            );
+        }
+        assert_eq!(
+            [-3, 0, 11, 63, 64, 1 << 40].map(objective),
+            [0, 0, 11, 63, 63, 63]
+        );
+    }
+
+    #[test]
+    fn ad_side_fields_parse_servable_names_only() {
+        use ad_side::Field;
+        assert_eq!(
+            ad_side::parse_fields(&["objective", "campaign", "creative", "line_item"]),
+            Ok(vec![
+                Field::Objective,
+                Field::Campaign,
+                Field::Creative,
+                Field::LineItem
+            ])
+        );
+        for bad in ["url_domain", "advertiser", ""] {
+            assert!(ad_side::parse_fields(&[bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_ad_side_ids_match_the_trainer() {
+        use ad_side::Field;
+        let ad = |tweet_id: u64, campaign_id, line_item_id, card, media, objective| pb::TweetInfo {
+            tweet_id,
+            author_id: 2000,
+            ad_info: Some(pb::AdInfo {
+                campaign_id,
+                line_item_id,
+                unified_card_type: card,
+                media_content_type: media,
+                line_item_objective: objective,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let organic = pb::TweetInfo {
+            tweet_id: 1003,
+            author_id: 2001,
+            ..Default::default()
+        };
+        let stamp = |model_config: &ModelConfig, candidates: Vec<pb::TweetInfo>, request_ms| {
+            let candidate_set = pb::CandidateSet {
+                candidates,
+                request_timestamp_ms: Some(request_ms),
+                ..Default::default()
+            };
+            let mut input = InputBuffer::compute_for_item(
+                model_config,
+                &None,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            );
+            input.stamp_candidate_ad_side_ids(model_config, &candidate_set);
+            input.candidate_ad_side_ids
+        };
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.ad_side_fields = vec![
+            Field::Campaign,
+            Field::LineItem,
+            Field::Creative,
+            Field::Objective,
+        ];
+        let served_ms = 1_793_750_400_000;
+
+        let first = vec![ad(1000, 11, 31, 2, 0, 5), ad(1001, 12, 0, 0, 4, 99)];
+        assert_eq!(
+            stamp(&model_config, first, served_ms),
+            [353_680, 323_194, 2, 5, 348_192, 0, 52, 63, 0, 0, 0, 0]
+        );
+        let second = vec![ad(1002, 23, 43, 29, 0, 11)];
+        assert_eq!(
+            stamp(&model_config, second, served_ms),
+            [228_842, 15_213, 29, 11, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let organic_ids = stamp(&model_config, vec![organic.clone()], served_ms);
+        assert_eq!(organic_ids[..4], [0, 0, 48, 0]);
+        let unlogged = stamp(&model_config, vec![organic], 1_788_000_000_000);
+        assert_eq!(unlogged[..4], [0, 0, 52, 0]);
+
+        model_config.hash_table.ad_side_fields = vec![Field::Objective, Field::Creative];
+        let one = || vec![ad(1000, 11, 31, 2, 0, 5)];
+        assert_eq!(stamp(&model_config, one(), served_ms), [5, 2, 0, 0, 0, 0]);
+        model_config.hash_table.ad_side_fields.clear();
+        assert!(stamp(&model_config, one(), served_ms).is_empty());
     }
 
     #[test]

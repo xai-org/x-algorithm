@@ -1324,7 +1324,7 @@ class RecsysTrainer(Trainer):
         if self.follow_data_end_check_every_n <= 0:
             needs.append("follow_data_end_check_every_n > 0")
         if not isinstance(dataset, PhoenixDataset) or not dataset.supports_follow_data_end():
-            needs.append("the Python offline reader (PhoenixDataset)")
+            needs.append("an offline reader that can follow the data end (PhoenixDataset)")
         else:
             if dataset.path is None:
                 needs.append("dataset.path")

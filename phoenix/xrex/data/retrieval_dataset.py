@@ -323,6 +323,12 @@ class RetrievalDataset(Enum):
     HOME_COLD = (13, *_sid_window("1fav_1day.parquet"))
     HOME_HOT = (14, *_sid_window("1fav_1day.parquet"))
     IMMERSIVE32FavVideo14To30Day = (19, *_sid_window("32fav_video_14to30day.parquet"))
+    AI_VIDEO_SELF_1DAY = (20, *_sid_window("ai_video_self_1day.parquet"))
+    AI_VIDEO_SELF_2DAY = (21, *_sid_window("ai_video_self_2day.parquet"))
+    AI_VIDEO_SELF_7DAY = (22, *_sid_window("ai_video_self_7day.parquet"))
+    AI_VIDEO_DETECTED_1DAY = (23, *_sid_window("ai_video_detected_1day.parquet"))
+    AI_VIDEO_DETECTED_2DAY = (24, *_sid_window("ai_video_detected_2day.parquet"))
+    AI_VIDEO_DETECTED_7DAY = (25, *_sid_window("ai_video_detected_7day.parquet"))
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)

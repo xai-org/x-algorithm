@@ -219,6 +219,12 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 24 * 14),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("imagine", 96),
+                WindowConfig::new("ai_video_self", 24).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_self", 48).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_self", 24 * 7).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 24).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 48).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 24 * 7).excluding_posts_in("nsfw_video"),
                 WindowConfig::bounded("video", 24 * 4, 24 * 14),
                 WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14),
             ],
@@ -247,6 +253,7 @@ pub struct WindowConfig {
     pub name: String,
     pub retention: Duration,
     pub min_age: Option<Duration>,
+    pub exclude_posts_in: Option<String>,
 }
 
 impl WindowConfig {
@@ -255,7 +262,13 @@ impl WindowConfig {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: None,
+            exclude_posts_in: None,
         }
+    }
+
+    pub fn excluding_posts_in(mut self, index_name: impl Into<String>) -> Self {
+        self.exclude_posts_in = Some(index_name.into());
+        self
     }
 
     pub fn bounded(name: impl Into<String>, min_age_hours: u64, retention_hours: u64) -> Self {
@@ -264,6 +277,7 @@ impl WindowConfig {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: Some(Duration::from_secs(min_age_hours * 3600)),
+            exclude_posts_in: None,
         }
     }
 

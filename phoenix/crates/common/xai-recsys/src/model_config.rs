@@ -108,6 +108,7 @@ pub struct HashTableConfig {
     pub enable_stale_post: bool,
     pub enable_stale_post_30d: bool,
     pub ads_count_features: bool,
+    pub ad_side_fields: Vec<crate::util::ad_side::Field>,
 }
 
 impl HashTableConfig {
@@ -355,6 +356,7 @@ impl ModelConfig {
                 enable_stale_post,
                 enable_stale_post_30d: false,
                 ads_count_features: false,
+                ad_side_fields: Vec::new(),
             },
             history_seq_len,
             candidate_seq_len,

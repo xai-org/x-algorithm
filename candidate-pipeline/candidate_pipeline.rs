@@ -296,9 +296,15 @@ where
         let source_futures = sources.iter().map(|s| s.run(query, PipelineStage::Source));
         let results = join_all(source_futures).await;
 
-        let mut collected = Vec::new();
-        for mut candidates in results.into_iter().flatten() {
-            collected.append(&mut candidates);
+        let total = results.iter().flatten().map(Vec::len).sum::<usize>();
+        let mut sources = results
+            .into_iter()
+            .flatten()
+            .filter(|candidates| !candidates.is_empty());
+        let mut collected = sources.next().unwrap_or_default();
+        collected.reserve(total - collected.len());
+        for candidates in sources {
+            collected.extend(candidates);
         }
         Span::current().record("candidate_count", collected.len());
         stats.finish_with_size(collected.len());

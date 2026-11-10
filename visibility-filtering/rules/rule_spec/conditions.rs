@@ -141,7 +141,7 @@ mod tests {
         for &level in SafetyLevel::VARIANTS {
             let rules = level.spec().rules().lists();
             named.extend(leaf_sets(&rules.user));
-            named.extend(leaf_sets(&rules.post));
+            named.extend(leaf_sets(&rules.post_rules().collect::<Vec<_>>()));
         }
         for (index, (name, leaves)) in named.iter().enumerate() {
             for (other, other_leaves) in &named[..index] {

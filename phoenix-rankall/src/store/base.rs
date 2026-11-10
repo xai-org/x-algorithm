@@ -92,6 +92,58 @@ fn upsert_stored(map: &mut WindowData, post_id: PostId, incoming: StoredValue) {
 
 type BufferMap = HashMap<String, WindowData>;
 
+fn posts_in_index_windows(
+    main_data: &BufferMap,
+    pending: &BufferMap,
+    window_name: &str,
+    windows: &[WindowConfig],
+    index_name: &str,
+) -> Vec<PostId> {
+    let Some(target) = main_data.get(window_name) else {
+        return Vec::new();
+    };
+    let index_windows: Vec<String> = windows
+        .iter()
+        .filter(|w| w.name == index_name)
+        .map(WindowConfig::window_name)
+        .collect();
+    target
+        .keys()
+        .filter(|post_id| {
+            index_windows.iter().any(|w| {
+                main_data.get(w).is_some_and(|m| m.contains_key(*post_id))
+                    || pending.get(w).is_some_and(|m| m.contains_key(*post_id))
+            })
+        })
+        .copied()
+        .collect()
+}
+
+fn drop_posts_in_excluded_index(
+    main_data: &mut BufferMap,
+    pending: &BufferMap,
+    wc: &WindowConfig,
+    windows: &[WindowConfig],
+) -> usize {
+    let Some(index_name) = &wc.exclude_posts_in else {
+        return 0;
+    };
+    let window_name = wc.window_name();
+    let excluded = posts_in_index_windows(main_data, pending, &window_name, windows, index_name);
+    if let Some(main) = main_data.get_mut(&window_name) {
+        for post_id in &excluded {
+            main.remove(post_id);
+        }
+    }
+    if !excluded.is_empty() {
+        info!(
+            "dropped {} records from '{window_name}' that are in '{index_name}' windows",
+            excluded.len()
+        );
+    }
+    excluded.len()
+}
+
 struct SharedState {
         main_data: BufferMap,
         pending: BufferMap,
@@ -354,11 +406,17 @@ impl BaseSnapshotStore {
 
             let cutoff = timestamp_secs_to_snowflake(now - retention_secs);
             let mut state = self.state.lock().await;
+            let dropped = drop_posts_in_excluded_index(
+                &mut state.main_data,
+                &pending_snapshot,
+                wc,
+                &self.config.windows,
+            );
             let main = state.main_data.entry(window_name.clone()).or_default();
 
             let before_count = main.len();
             main.retain(|post_id, _| *post_id >= cutoff);
-            let removed = before_count - main.len();
+            let removed = before_count - main.len() + dropped;
             if removed > 0 {
                 self.metrics
                     .store_compaction_removed_total
@@ -519,11 +577,17 @@ impl SnapshotStore for BaseSnapshotStore {
 
                     let cutoff = timestamp_secs_to_snowflake(now - retention_secs);
                     let mut st = store_state.lock().await;
+                    let dropped = drop_posts_in_excluded_index(
+                        &mut st.main_data,
+                        &pending_snapshot,
+                        wc,
+                        &config.windows,
+                    );
                     let main = st.main_data.entry(window_name.clone()).or_default();
 
                     let before = main.len();
                     main.retain(|pid, _| *pid >= cutoff);
-                    let removed = before - main.len();
+                    let removed = before - main.len() + dropped;
                     if removed > 0 {
                         metrics
                             .store_compaction_removed_total

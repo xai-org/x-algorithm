@@ -102,11 +102,7 @@ impl LabelClients {
             let Some(eds) = &label_cache_eds else {
                 return Ok(None);
             };
-            let dragonfly = retry("dragonfly", init_deadline, || {
-                dragonfly_client(eds, s2s.clone())
-            })
-            .await?;
-            warm_cache(&dragonfly).await;
+            let dragonfly = connect_label_cache(eds, &s2s, init_deadline).await?;
             Ok::<_, String>(Some(Arc::new(dragonfly)))
         };
         match tokio::join!(manhattan, twemcache, dragonfly) {
@@ -126,9 +122,9 @@ impl LabelClients {
         }
     }
 
-    pub fn label_cache_invalidator(&self) -> Option<LabelCacheInvalidator> {
+    pub fn spawn_label_cache_invalidator(&self) -> Option<LabelCacheInvalidator> {
         let cache: Arc<CacheClient> = Arc::clone(self.dragonfly.as_ref()?);
-        Some(LabelCacheInvalidator::new(cache))
+        Some(LabelCacheInvalidator::spawn(cache, self.metrics.clone()))
     }
 
     pub fn into_source(self, warm_fetcher: Option<Arc<dyn WarmFetcher>>) -> SafetyLabelSource {
@@ -153,6 +149,33 @@ impl LabelClients {
         }
         SafetyLabelSource::new(Arc::new(remote), cache_capacity, metrics)
     }
+}
+
+impl LabelCacheInvalidator {
+    pub async fn connect(
+        label_cache_eds: &str,
+        s2s: &S2sPaths,
+        stats: Option<Arc<dyn StatsReceiverExt>>,
+        init_deadline: tokio::time::Instant,
+    ) -> Result<Self, ConnectError> {
+        let dragonfly = connect_label_cache(label_cache_eds, s2s, init_deadline)
+            .await
+            .map_err(|e| ConnectError(vec![e]))?;
+        Ok(Self::spawn(Arc::new(dragonfly), LabelMetrics::new(stats)))
+    }
+}
+
+async fn connect_label_cache(
+    eds: &str,
+    s2s: &S2sPaths,
+    init_deadline: tokio::time::Instant,
+) -> Result<CacheClient, String> {
+    let dragonfly = retry("dragonfly", init_deadline, || {
+        dragonfly_client(eds, s2s.clone())
+    })
+    .await?;
+    warm_cache(&dragonfly).await;
+    Ok(dragonfly)
 }
 
 struct NoTwemcache;

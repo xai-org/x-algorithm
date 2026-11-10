@@ -19,8 +19,10 @@ struct CatalogRule {
     named: Vec<(&'static str, String)>,
 }
 
-fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = CatalogRule> {
-    rules.iter().map(|rule| {
+fn catalog_rules<E: Engine>(
+    rules: impl Iterator<Item = &'static Rule<E>>,
+) -> impl Iterator<Item = CatalogRule> {
+    rules.map(|rule| {
         let action = rule.action.spec();
         let mut named: Vec<&'static NamedCond<E>> = Vec::new();
         rule.when.named(&mut named);
@@ -47,7 +49,9 @@ pub(super) fn catalog() -> String {
     for &level in SafetyLevel::VARIANTS {
         let level_name: &'static str = level.into();
         for listed in level.rule_lists() {
-            for entry in catalog_rules(&listed.user).chain(catalog_rules(&listed.post)) {
+            for entry in
+                catalog_rules(listed.user.iter().copied()).chain(catalog_rules(listed.post_rules()))
+            {
                 match rules.iter_mut().find(|(other, _)| *other == entry) {
                     Some((_, levels)) if levels.last() == Some(&level_name) => {}
                     Some((_, levels)) => levels.push(level_name),
@@ -138,10 +142,19 @@ fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E
             }
             .unwrap();
         }
+        let gate = rule.experiment.map_or_else(String::new, |experiment| {
+            format!(" ({:?} on `{}`)", experiment.shape(), experiment.key())
+        });
         if rules.iter().filter(|other| other.name == rule.name).count() > 1 {
-            writeln!(doc, "  - `{}` when `{}`", rule.name, spelled(rule.when)).unwrap();
+            writeln!(
+                doc,
+                "  - `{}` when `{}`{gate}",
+                rule.name,
+                spelled(rule.when)
+            )
+            .unwrap();
         } else {
-            writeln!(doc, "  - `{}`", rule.name).unwrap();
+            writeln!(doc, "  - `{}`{gate}", rule.name).unwrap();
         }
     }
 }
@@ -159,10 +172,9 @@ mod tests {
     }
 
     fn viewer_gated_drop_rules<E: Engine>(
-        rules: &[&'static Rule<E>],
+        rules: impl Iterator<Item = &'static Rule<E>>,
     ) -> impl Iterator<Item = String> {
         rules
-            .iter()
             .filter(|rule| {
                 matches!(
                     rule.action.spec(),
@@ -178,8 +190,8 @@ mod tests {
             .iter()
             .flat_map(|level| {
                 let listed = level.spec().rules().lists();
-                viewer_gated_drop_rules(&listed.user)
-                    .chain(viewer_gated_drop_rules(&listed.post))
+                viewer_gated_drop_rules(listed.user.iter().copied())
+                    .chain(viewer_gated_drop_rules(listed.post_rules()))
                     .collect::<Vec<_>>()
             })
             .collect();

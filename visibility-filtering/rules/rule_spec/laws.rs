@@ -53,7 +53,7 @@ fn wired_user_rules() -> Vec<&'static Rule<UserEngine>> {
 }
 
 fn wired_rules() -> Vec<&'static Rule> {
-    wired(|rules| rules.post)
+    wired(|rules| rules.post_rules().collect())
 }
 
 fn wired_leaves() -> Vec<Predicate> {
@@ -549,8 +549,8 @@ fn only_the_quote_pass_reads_the_quote() {
         for rule in user {
             rule.when.leaves(&mut read);
         }
-        for rule in post {
-            rule.when.leaves(&mut read);
+        for row in post {
+            row.rule.when.leaves(&mut read);
         }
         let reads_quote = read.iter().any(|leaf| {
             matches!(
@@ -655,7 +655,7 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
             .filter(|rule| rule.action.spec().kind().ends_the_fold())
         {
             let severity = user_rule.action.spec().kind().severity();
-            for &post_rule in &post {
+            for post_rule in post.iter().map(|row| row.rule) {
                 if post_rule.action.spec().kind().severity() > severity
                     && !disjoint(user_rule.audience, post_rule.audience)
                 {
@@ -694,7 +694,11 @@ fn each_rule_name_wires_the_same_rules_at_every_level() {
             .user
             .iter()
             .map(|rule| (rule.name(), rule.authored()))
-            .chain(rules.post.iter().map(|rule| (rule.name(), rule.authored())));
+            .chain(
+                rules
+                    .post_rules()
+                    .map(|rule| (rule.name(), rule.authored())),
+            );
         let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
         for (name, rule) in authored {
             match by_name.iter_mut().find(|(other, _)| *other == name) {

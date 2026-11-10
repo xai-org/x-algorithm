@@ -1,3 +1,4 @@
+use xai_candidate_pipeline::component_library::clients::{JetfuelClient, JetfuelView};
 use xai_candidate_pipeline::pipeline_summary::{ComponentTrace, PipelineTrace, StageTrace};
 use xai_home_mixer_proto as pb;
 
@@ -86,4 +87,77 @@ pub fn post_scores(query: &ScoredPostsQuery, candidate: &PostCandidate) -> pb::U
             })
             .collect(),
     }
+}
+
+pub const TRACE_FRAME_ROUTE: &str = "/cards/under_the_hood/trace";
+
+pub async fn trace_frame(
+    jetfuel_client: &dyn JetfuelClient,
+    query: &ScoredPostsQuery,
+    trace: &pb::PipelineTrace,
+) -> Option<pb::Frame> {
+    let view = JetfuelView {
+        client_app_id: i64::from(query.client_app_id),
+        client_version: query.client_version.clone(),
+        locale: query.language_code.clone(),
+        country_code: query.country_code.clone(),
+        user_id: (query.user_id != 0).then_some(query.user_id),
+        ..Default::default()
+    };
+    let body = trace_json(trace).to_string();
+    let payload = match jetfuel_client
+        .post_frame(TRACE_FRAME_ROUTE, &body, &view)
+        .await
+    {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                request_id = query.request_id,
+                error = %e,
+                "under-the-hood trace frame fetch failed"
+            );
+            return None;
+        }
+    };
+    Some(pb::Frame {
+        payload,
+        height: 0,
+        is_dismissible: false,
+        placement_id: 0,
+        route: TRACE_FRAME_ROUTE.to_string(),
+        occurrence: 0,
+        fetch_route: TRACE_FRAME_ROUTE.to_string(),
+    })
+}
+
+fn trace_json(trace: &pb::PipelineTrace) -> serde_json::Value {
+    serde_json::json!({
+        "pipeline": trace.pipeline,
+        "latency_us": trace.latency_us,
+        "code_url": trace.code_url,
+        "stages": trace.stages.iter().map(|stage| serde_json::json!({
+            "name": stage.name,
+            "total_count": stage.total_count,
+            "enabled_count": stage.enabled_count,
+            "offset_us": stage.offset_us,
+            "latency_us": stage.latency_us,
+            "input_count": stage.input_count,
+            "candidate_count": stage.candidate_count,
+            "kept_count": stage.kept_count,
+            "removed_count": stage.removed_count,
+            "components": stage.components.iter().map(|component| serde_json::json!({
+                "name": component.name,
+                "offset_us": component.offset_us,
+                "latency_us": component.latency_us,
+                "input_count": component.input_count,
+                "candidate_count": component.candidate_count,
+                "kept_count": component.kept_count,
+                "removed_count": component.removed_count,
+                "filter_rate": component.filter_rate,
+                "code_url": component.code_url,
+            })).collect::<Vec<_>>(),
+            "nested": stage.nested.iter().map(trace_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
 }

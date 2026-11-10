@@ -12,6 +12,7 @@ pub mod push_to_home_source;
 pub mod reverse_chron_posts_source;
 pub mod scored_posts_source;
 pub mod seed_candidates_source;
+pub mod shuffled_history_phoenix_source;
 pub mod sid_source;
 pub mod simclusters_source;
 pub mod thunder_source;

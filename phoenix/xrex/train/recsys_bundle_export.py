@@ -1093,6 +1093,11 @@ def build_bundle(
             "StableHLO bundle export supports ranking (RecsysAggregatedModelConfig) and "
             f"retrieval (RecsysTwoTowerModelConfig) only, got {type(model_config).__name__}"
         )
+    if not two_tower and model_config.ad_side_ids_emb_dim:
+        raise NotImplementedError(
+            "StableHLO bundle export does not support ad_side_ids_emb_dim > 0; "
+            "serve with the JAX backend"
+        )
     retrieval = _retrieval_export(trainer, dataset_capacities) if two_tower else None
     if mesh_devices < 1:
         raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")

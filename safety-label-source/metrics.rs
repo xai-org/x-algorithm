@@ -17,6 +17,7 @@ const SHADOW_KEYS: &str = "safety_labels_shadow_keys";
 const SHADOW_MANHATTAN_KEYS: &str = "safety_labels_shadow_manhattan_keys";
 const SHADOW_MH_CHECK_KEYS: &str = "safety_labels_shadow_mh_check_keys";
 const OUTAGE_KEYS: &str = "safety_labels_outage_keys";
+const DELETES: &str = "safety_label_store_deletes";
 
 #[derive(Clone, Default)]
 pub(crate) struct LabelMetrics {
@@ -143,6 +144,7 @@ pub(crate) enum FillKeyResult {
     Enqueued,
     Deduped,
     DroppedQueueFull,
+    DroppedOldRead,
     Written,
     Failed,
 }
@@ -214,6 +216,31 @@ pub(crate) enum OutageResult {
     Stale,
     Manhattan,
     Failed,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum DeleteAttempt {
+    First,
+    Repeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum DeleteResult {
+    Deleted,
+    Failed,
+    DroppedQueueFull,
+}
+
+pub(crate) fn record_deletes(
+    metrics: &LabelMetrics,
+    attempt: DeleteAttempt,
+    result: DeleteResult,
+    count: usize,
+) {
+    let labels = [("attempt", attempt.into()), ("result", result.into())];
+    metrics.incr(DELETES, &labels, count);
 }
 
 pub(crate) fn record_outage_keys(metrics: &LabelMetrics, result: OutageResult, count: usize) {

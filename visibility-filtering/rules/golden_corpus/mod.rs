@@ -572,8 +572,13 @@ fn one_fold(LevelLists { user, post }: &LevelLists) -> Policy {
         when: lifted(rule.when),
         action: rule.action.lift(),
     });
-    let rules = user.chain(post.iter().map(|&rule| rule.clone()));
-    Policy::new(rules.map(|rule| (&*rule.name().leak(), rule)).collect())
+    let rows = user
+        .map(|rule| (rule, None))
+        .chain(post.iter().map(|row| (row.rule.clone(), row.experiment)));
+    Policy::gated(
+        rows.map(|(rule, experiment)| (&*rule.name().leak(), rule, experiment))
+            .collect(),
+    )
 }
 
 fn outcome(evaluation: &Evaluation) -> (&'static str, Vec<&'static str>) {
@@ -618,7 +623,7 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
                 .user
                 .iter()
                 .map(|rule| rule.requirements())
-                .chain(rules.post.iter().map(|rule| rule.requirements()))
+                .chain(rules.post_rules().map(|rule| rule.requirements()))
                 .fold(Hydrators::empty(), Hydrators::union);
             let failures: Vec<Hydrators> = once(Hydrators::empty())
                 .chain(used.iter().map(Hydrators::of))

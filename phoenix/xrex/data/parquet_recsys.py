@@ -1018,7 +1018,15 @@ class InterleavingRecordBatchProvider:
                 saved_reads = resume_position["rows_read_in_batch"]
                 saved_batch_size = resume_position.get("batch_size")
 
-                if saved_batch_size is not None and saved_batch_size != batch_size:
+                if (rows_in_file := resume_position.get("rows_in_file")) is not None:
+                    ahead = saved_reads % self._interleave_k
+                    reads = -(-rows_in_file // batch_size)
+                    lead_reads = -(-(rows_in_file + (saved_batch_size or batch_size)) // batch_size)
+                    if not ahead or lead_reads <= reads:
+                        self._record_batches_to_skip = reads * self._interleave_k
+                    else:
+                        self._record_batches_to_skip = (lead_reads - 1) * self._interleave_k + ahead
+                elif saved_batch_size is not None and saved_batch_size != batch_size:
                     assert saved_batch_size > 0, (
                         f"saved_batch_size must be positive, got {saved_batch_size}"
                     )
@@ -2279,6 +2287,113 @@ class PhoenixDataset(Dataset):
     _producer_thread: Thread | None = dataclasses.field(init=False, default=None, repr=False)
     _end_batch_id: int | None = dataclasses.field(init=False, default=None, repr=False)
 
+    def _conversion_delay_columns(self) -> list[str] | None:
+        if not self.use_conversion_labels:
+            return None
+        return [conversion_labels.DELAY_COLUMN] + [
+            conversion_labels.type_delay_column(t) for t in self.conversion_label_types
+        ]
+
+    def _record_batches(
+        self,
+        *,
+        batch_size: int,
+        shard_index: int,
+        num_shards: int,
+        skip_rows: int,
+        resume_position: DataPosition | None,
+    ) -> Iterator[pa.RecordBatch]:
+        assert self.path is not None
+        assert self.num_kafka_partitions is not None
+        assert (
+            self.num_kafka_partitions % num_shards == 0
+            or num_shards % self.num_kafka_partitions == 0
+        ), (
+            self.num_kafka_partitions,
+            num_shards,
+        )
+        interleave_k = max(1, self.num_kafka_partitions // num_shards)
+
+        topic_dir = self.path
+        metadata_path = str(Path(topic_dir) / ".valid_batches.json")
+        index_path = str(Path(topic_dir) / ".index")
+        conversion_delay_columns = self._conversion_delay_columns()
+
+        min_timestamp_ms: int | None = None
+        max_timestamp_ms: int | None = None
+        if self.date_range is not None:
+            min_timestamp_ms = self._parse_date_bound(self.date_range[0])
+            max_timestamp_ms = self._parse_date_bound(self.date_range[1])
+
+        shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
+        shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
+        shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
+
+        if os.path.isfile(metadata_path):
+            rank_logger.info(f"Using metadata mode: {metadata_path}")
+            rb_provider = InterleavingRecordBatchProvider(
+                metadata_path=metadata_path,
+                topic_dir=topic_dir,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                shard_index=shard_index,
+                interleave_k=interleave_k,
+                skip_rows=skip_rows if not self.is_eval else 0,
+                date_range=self.date_range,
+                continuous=self.continuous,
+                num_kafka_partitions=self.num_kafka_partitions,
+                resume_position=resume_position,
+                min_timestamp_ms=min_timestamp_ms,
+                max_timestamp_ms=max_timestamp_ms,
+                conversion_delay_columns=conversion_delay_columns,
+                include_action_delay_columns=self.use_conversion_labels
+                and self.fold_conversion_actions_into_multihot,
+                id_list_sidecar_root=self.id_list_sidecar_root,
+                id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                id_list_sidecar_strict=self.id_list_sidecar_strict,
+                ad_fields_sidecar_root=self.ad_fields_sidecar_root,
+                shuffle_window_time_slices=shuffle_window,
+                shuffle_in_memory_buffer_rows=shuffle_buffer,
+                shuffle_seed=self.shuffle_seed,
+                shuffle_mode=shuffle_mode,
+                block_shuffle_block_time_slices=self.block_shuffle_block_time_slices,
+                block_shuffle_order_per_shard=(
+                    self.block_shuffle_order_per_shard and not self.is_eval
+                ),
+                end_batch_id=self._end_batch_id,
+            )
+        else:
+            if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:
+                raise ValueError(
+                    f"read-time shuffle needs metadata mode; {metadata_path} does not exist"
+                )
+            if resume_position is not None:
+                rank_logger.warning(
+                    "resume_position was provided but dataset is in index mode; "
+                    "ignoring resume_position and falling back to skip_rows."
+                )
+            rank_logger.info(f"Using index mode: {index_path}")
+            rb_provider = InterleavingRecordBatchProvider(
+                index_path=index_path,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                shard_index=shard_index,
+                interleave_k=interleave_k,
+                skip_rows=skip_rows if not self.is_eval else 0,
+                date_range=self.date_range,
+                continuous=self.continuous,
+                num_kafka_partitions=self.num_kafka_partitions,
+                conversion_delay_columns=conversion_delay_columns,
+                include_action_delay_columns=self.use_conversion_labels
+                and self.fold_conversion_actions_into_multihot,
+                id_list_sidecar_root=self.id_list_sidecar_root,
+                id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                id_list_sidecar_strict=self.id_list_sidecar_strict,
+                ad_fields_sidecar_root=self.ad_fields_sidecar_root,
+            )
+        self._rb_provider = rb_provider
+        return rb_provider.get_record_batches()
+
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
             return self._rb_provider.get_position()
@@ -2329,25 +2444,7 @@ class PhoenixDataset(Dataset):
                         sid_num_levels=self.sid_num_levels,
                     )
 
-                assert self.num_kafka_partitions is not None
-                assert (
-                    self.num_kafka_partitions % num_shards == 0
-                    or num_shards % self.num_kafka_partitions == 0
-                ), (
-                    self.num_kafka_partitions,
-                    num_shards,
-                )
-                interleave_k = max(1, self.num_kafka_partitions // num_shards)
-
-                topic_dir = self.path
-                metadata_path = str(Path(topic_dir) / ".valid_batches.json")
-                index_path = str(Path(topic_dir) / ".index")
-
-                conversion_delay_columns: list[str] | None = None
-                if self.use_conversion_labels:
-                    conversion_delay_columns = [conversion_labels.DELAY_COLUMN] + [
-                        conversion_labels.type_delay_column(t) for t in self.conversion_label_types
-                    ]
+                conversion_delay_columns = self._conversion_delay_columns()
                 id_list_specs = self.id_list_specs or None
                 if id_list_specs:
                     rank_logger.info(
@@ -2376,82 +2473,13 @@ class PhoenixDataset(Dataset):
                     )
                 id_list_fill_logged = False
 
-                min_timestamp_ms: int | None = None
-                max_timestamp_ms: int | None = None
-                if self.date_range is not None:
-                    min_timestamp_ms = self._parse_date_bound(self.date_range[0])
-                    max_timestamp_ms = self._parse_date_bound(self.date_range[1])
-
-                shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
-                shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
-                shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
-
-                if os.path.isfile(metadata_path):
-                    rank_logger.info(f"Using metadata mode: {metadata_path}")
-                    rb_provider = InterleavingRecordBatchProvider(
-                        metadata_path=metadata_path,
-                        topic_dir=topic_dir,
-                        batch_size=batch_size,
-                        num_shards=num_shards,
-                        shard_index=shard_index,
-                        interleave_k=interleave_k,
-                        skip_rows=skip_rows if not self.is_eval else 0,
-                        date_range=self.date_range,
-                        continuous=self.continuous,
-                        num_kafka_partitions=self.num_kafka_partitions,
-                        resume_position=resume_position,
-                        min_timestamp_ms=min_timestamp_ms,
-                        max_timestamp_ms=max_timestamp_ms,
-                        conversion_delay_columns=conversion_delay_columns,
-                        include_action_delay_columns=self.use_conversion_labels
-                        and self.fold_conversion_actions_into_multihot,
-                        id_list_sidecar_root=self.id_list_sidecar_root,
-                        id_list_prefer_sidecar=self.id_list_prefer_sidecar,
-                        id_list_sidecar_strict=self.id_list_sidecar_strict,
-                        ad_fields_sidecar_root=self.ad_fields_sidecar_root,
-                        shuffle_window_time_slices=shuffle_window,
-                        shuffle_in_memory_buffer_rows=shuffle_buffer,
-                        shuffle_seed=self.shuffle_seed,
-                        shuffle_mode=shuffle_mode,
-                        block_shuffle_block_time_slices=self.block_shuffle_block_time_slices,
-                        block_shuffle_order_per_shard=(
-                            self.block_shuffle_order_per_shard and not self.is_eval
-                        ),
-                        end_batch_id=self._end_batch_id,
-                    )
-                else:
-                    if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:
-                        raise ValueError(
-                            f"read-time shuffle needs metadata mode; {metadata_path} does not exist"
-                        )
-                    if resume_position is not None:
-                        rank_logger.warning(
-                            "resume_position was provided but dataset is in index mode; "
-                            "ignoring resume_position and falling back to skip_rows."
-                        )
-                    rank_logger.info(f"Using index mode: {index_path}")
-                    rb_provider = InterleavingRecordBatchProvider(
-                        index_path=index_path,
-                        batch_size=batch_size,
-                        num_shards=num_shards,
-                        shard_index=shard_index,
-                        interleave_k=interleave_k,
-                        skip_rows=skip_rows if not self.is_eval else 0,
-                        date_range=self.date_range,
-                        continuous=self.continuous,
-                        num_kafka_partitions=self.num_kafka_partitions,
-                        conversion_delay_columns=conversion_delay_columns,
-                        include_action_delay_columns=self.use_conversion_labels
-                        and self.fold_conversion_actions_into_multihot,
-                        id_list_sidecar_root=self.id_list_sidecar_root,
-                        id_list_prefer_sidecar=self.id_list_prefer_sidecar,
-                        id_list_sidecar_strict=self.id_list_sidecar_strict,
-                        ad_fields_sidecar_root=self.ad_fields_sidecar_root,
-                    )
-                self._rb_provider = rb_provider
-                data_iter = self._rb_provider.get_record_batches()
-
-                for record_batch in data_iter:
+                for record_batch in self._record_batches(
+                    batch_size=batch_size,
+                    shard_index=shard_index,
+                    num_shards=num_shards,
+                    skip_rows=skip_rows,
+                    resume_position=resume_position,
+                ):
                     if record_batch.num_rows * 2 < batch_size:
                         rank_logger.warning(
                             "Skipping record batch that doesn't contain enough rows"
@@ -2591,15 +2619,17 @@ class PhoenixDataset(Dataset):
         thread.start()
 
         def generator():
-            while True:
-                item = queue.get()
-                if item is SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item, None
-
-            thread.join()
+            try:
+                while True:
+                    item = queue.get()
+                    if item is SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item, None
+                thread.join()
+            finally:
+                stop_event.set()
 
         return generator()
 

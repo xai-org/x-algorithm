@@ -1229,8 +1229,7 @@ mod tests {
         use crate::rules::levels::{TIMELINE_HOME, TIMELINE_HOME_HYDRATION};
         let label_blurs: Vec<&Rule> = TIMELINE_HOME
             .lists()
-            .post
-            .into_iter()
+            .post_rules()
             .filter(|rule| {
                 matches!(rule.action.spec(), ActionSpec::MediaRestriction(_))
                     && rule
@@ -1247,8 +1246,7 @@ mod tests {
             assert!(
                 TIMELINE_HOME_HYDRATION
                     .lists()
-                    .post
-                    .iter()
+                    .post_rules()
                     .any(|rule| rule.id == home.id
                         && rule.action == home.action
                         && rule.when.conjuncts() == gated.as_slice()),

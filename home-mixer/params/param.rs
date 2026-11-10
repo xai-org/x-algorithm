@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-06T16:00:45Z
+// mirrored from config feature-switch defaults; last sync 2026-11-09T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -95,6 +95,7 @@ param!(
     vec![
         "Experiment18Fou:0.3".to_string(),
         "Experiment19Fou:0.3".to_string(),
+        "Experiment20Fou:0.3".to_string(),
         "Experiment22Fou:0.3".to_string(),
         "Experiment23Fou:0.3".to_string()
     ]
@@ -182,6 +183,12 @@ param!(
     EnablePhoenixMOESource,
     bool,
     "rust_home_mixer_enable_phoenix_moe_source",
+    false
+);
+param!(
+    EnableShuffledHistoryRetrieval,
+    bool,
+    "rust_home_mixer_enable_shuffled_history_retrieval",
     false
 );
 param!(
@@ -699,6 +706,12 @@ param!(
     false
 );
 param!(
+    EnableUnderTheHoodFrame,
+    bool,
+    "rust_home_mixer_enable_under_the_hood_frame",
+    false
+);
+param!(
     MaxPostsToCache,
     usize,
     "rust_home_mixer_max_posts_to_cache",
@@ -864,13 +877,13 @@ param!(
     NewUserMinEngagementFilterUseRatio,
     bool,
     "rust_home_mixer_new_user_min_engagement_filter_use_ratio",
-    false
+    true
 );
 param!(
     NewUserMinEngagementThreshold,
     f64,
     "rust_home_mixer_new_user_min_engagement_threshold",
-    0.0
+    0.004
 );
 param!(
     NewUserMinEngagementFilterMaxAccountAgeSecs,
@@ -964,7 +977,7 @@ param!(
     AdsBlenderType,
     String,
     "rust_home_mixer_ads_blender",
-    "multi_risk"
+    "slot_spread"
 );
 
 param!(
@@ -1239,6 +1252,12 @@ param!(
     6
 );
 param!(
+    EnableVideoCarouselHeaderIcon,
+    bool,
+    "rust_home_mixer_enable_video_carousel_header_icon",
+    false
+);
+param!(
     EnableVideoCarouselAuthorDedupe,
     bool,
     "rust_home_mixer_enable_video_carousel_author_dedupe",
@@ -1332,6 +1351,12 @@ param!(
     VideoCarouselVideoContinuationWeight,
     f64,
     "rust_home_mixer_video_carousel_video_continuation_weight",
+    0.0
+);
+param!(
+    VideoCarouselNotInterestedWeight,
+    f64,
+    "rust_home_mixer_video_carousel_not_interested_weight",
     0.0
 );
 param!(

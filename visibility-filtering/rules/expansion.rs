@@ -1,6 +1,6 @@
 use crate::hydration::inventory::Stake;
 use crate::hydration::{Relation, BEST_EFFORT_HYDRATION_TIMEOUT};
-use crate::rules::levels;
+use crate::rules::levels::{self, Listed};
 use crate::rules::rule_spec::rule::Rule;
 use std::time::Duration;
 use strum::VariantArray;
@@ -46,11 +46,12 @@ impl Expansion {
     )]
     pub(super) const fn placed<const N: usize>(
         self,
-        parent: &'static [&'static [&'static Rule]],
-    ) -> [&'static Rule; N] {
+        parent: &'static [&'static [&'static dyn Listed]],
+    ) -> [&'static dyn Listed; N] {
         let rules = self.spec().rules;
         assert!(!rules.is_empty() && levels::rule_count(parent) + rules.len() == N);
-        let mut placed = [rules[0]; N];
+        let first: &'static dyn Listed = rules[0];
+        let mut placed = [first; N];
         let mut at = 0;
         let mut i = 0;
         while i < rules.len() {
@@ -109,7 +110,7 @@ mod tests {
                 );
             }
             for &level in SafetyLevel::VARIANTS {
-                let post = level.spec().rules().lists().post;
+                let post: Vec<&Rule> = level.spec().rules().lists().post_rules().collect();
                 let listed = spec.rules.iter().filter(|rule| post.contains(rule)).count();
                 assert!(
                     listed == 0 || listed == spec.rules.len(),

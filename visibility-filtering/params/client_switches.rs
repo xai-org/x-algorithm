@@ -1,8 +1,12 @@
 use super::limited_actions_policy::REASON_FIELD;
 use super::LimitedActionsPolicies;
 use crate::metrics::Metrics;
-use crate::models::{ClientCapability, ClientSwitch, LimitedEngagementReason, VerifyBlurSupport};
+use crate::models::{
+    ClientCapability, ClientSwitch, LimitedEngagementReason, RequestFacts, RequestViewer,
+    VerifyBlurSupport,
+};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
+use crate::rules::{ExperimentSet, RequestExperiments};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use strum::VariantArray;
@@ -70,6 +74,53 @@ impl ClientSwitches {
     }
 
     #[cfg(test)]
+    pub(crate) fn in_ddg_arm(
+        ddg: &str,
+        arm: &str,
+        files: &[(&str, &str)],
+        impressor: &Arc<xai_feature_switches::SpyingBucketImpressor>,
+    ) -> Self {
+        Self::in_ddg_arm_with(ddg, arm, files, |store| {
+            crate::params::Experiments::from_parts(store, Arc::clone(impressor) as _)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_ddg_arm_with(
+        ddg: &str,
+        arm: &str,
+        files: &[(&str, &str)],
+        experiments: impl FnOnce(
+            Arc<xai_feature_switches::ReloadableAbDeciderStore>,
+        ) -> crate::params::Experiments,
+    ) -> Self {
+        use crate::params::SwitchFiles;
+        let root = tempfile::tempdir().unwrap();
+        let abdecider = root.path().join("abdecider.yml");
+        let all_slots = "f".repeat(1280);
+        std::fs::write(
+            &abdecider,
+            format!(
+                "_common: &common\n  {ddg}:\n    version: 1\n    logged_in_only: true\n    darkmode: false\n    group: g\n    group_bucket_strategy: splitted\n    diversion: user_id\n    experiment_id: 1\n    buckets:\n    - name: {arm}\n      value: 10000\n      allocated_slots: \"{all_slots}\"\nproduction:\n  <<: *common\n"
+            ),
+        )
+        .unwrap();
+        for (name, yaml) in files {
+            std::fs::write(root.path().join(name), yaml).unwrap();
+        }
+        let experiments =
+            experiments(xai_feature_switches::ReloadableAbDeciderStore::new(&abdecider).unwrap());
+        let fs_path = root.path().join("rust_vf.yml");
+        let engine = SwitchFiles::beside(fs_path.to_str().unwrap(), experiments)
+            .load(&Metrics::none())
+            .unwrap();
+        Self::new(
+            Arc::new(ArcSwap::from_pointee(engine)),
+            LimitedActionsCopy::from_json("[]"),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_tests_with(copy: LimitedActionsCopy) -> Self {
         const SCALA_RULES_COPY: &str =
             include_str!("../../tests/fixtures/scala_client_switches.yml");
@@ -130,6 +181,37 @@ impl ClientSwitches {
             .match_recipient(&recipient(None, Some(viewer_id), country_code).build())
             .get_bool(SOFT_NSFW_NEW_USER_DROP)
             .unwrap_or(false)
+    }
+
+    pub fn experiments(&self, wired: ExperimentSet, viewer: &RequestViewer) -> RequestExperiments {
+        let Some(viewer_id) = viewer.id().filter(|_| !wired.is_empty()) else {
+            return RequestExperiments::default();
+        };
+        let results = self
+            .feature_switches
+            .load()
+            .match_recipient(&recipient(None, Some(viewer_id), viewer.country_code()).build());
+        RequestExperiments::resolved(
+            wired
+                .iter()
+                .filter(|experiment| {
+                    experiment.is_on(results.get_bool_no_impression(experiment.key()))
+                })
+                .collect(),
+        )
+    }
+
+    pub fn log_exposures(&self, facts: &RequestFacts) {
+        let exposed = facts.experiments().exposed();
+        let Some(viewer_id) = facts.viewer_id().filter(|_| !exposed.is_empty()) else {
+            return;
+        };
+        let results = self.feature_switches.load().match_recipient(
+            &recipient(None, Some(viewer_id), facts.viewer().country_code()).build(),
+        );
+        for experiment in exposed.iter() {
+            results.get_bool(experiment.key());
+        }
     }
 
     pub fn limited_actions_policies(
@@ -204,43 +286,65 @@ mod tests {
 
     use crate::rules::fixtures::CLIENT_CLASSES;
 
+    const SOFT_NSFW_DDG_FILE: (&str, &str) = (
+        "soft_nsfw.yml",
+        "soft_nsfw:\n  parameters:\n    soft_nsfw_tweet_label_new_user_rule_enabled: {type: boolean, default: false}\n  rules:\n  - query: \"[soft_nsfw_ddg_1 bucket_membership treatment]\"\n    values: {soft_nsfw_tweet_label_new_user_rule_enabled: true}\n",
+    );
+
     #[test]
     fn a_viewer_in_the_ddg_treatment_gets_the_switch_and_one_impression() {
-        use crate::params::{Experiments, SwitchFiles};
-        use xai_feature_switches::{ReloadableAbDeciderStore, SpyingBucketImpressor};
-        let root = tempfile::tempdir().unwrap();
-        let abdecider = root.path().join("abdecider.yml");
-        let all_slots = "f".repeat(1280);
-        std::fs::write(
-            &abdecider,
-            format!(
-                "_common: &common\n  soft_nsfw_ddg_1:\n    version: 1\n    logged_in_only: true\n    darkmode: false\n    group: g\n    group_bucket_strategy: splitted\n    diversion: user_id\n    experiment_id: 1\n    buckets:\n    - name: treatment\n      value: 10000\n      allocated_slots: \"{all_slots}\"\nproduction:\n  <<: *common\n"
-            ),
-        )
-        .unwrap();
-        let fs_path = root.path().join("rust_vf.yml");
-        std::fs::write(
-            root.path().join("soft_nsfw.yml"),
-            "soft_nsfw:\n  parameters:\n    soft_nsfw_tweet_label_new_user_rule_enabled: {type: boolean, default: false}\n  rules:\n  - query: \"[soft_nsfw_ddg_1 bucket_membership treatment]\"\n    values: {soft_nsfw_tweet_label_new_user_rule_enabled: true}\n",
-        )
-        .unwrap();
-        let impressor = Arc::new(SpyingBucketImpressor::new());
-        let experiments = Experiments::from_parts(
-            ReloadableAbDeciderStore::new(&abdecider).unwrap(),
-            Arc::clone(&impressor) as _,
-        );
-        let engine = SwitchFiles::beside(fs_path.to_str().unwrap(), experiments)
-            .load(&Metrics::none())
-            .unwrap();
-        let switches = ClientSwitches::new(
-            Arc::new(ArcSwap::from_pointee(engine)),
-            LimitedActionsCopy::from_json("[]"),
+        let impressor = Arc::new(xai_feature_switches::SpyingBucketImpressor::new());
+        let switches = ClientSwitches::in_ddg_arm(
+            "soft_nsfw_ddg_1",
+            "treatment",
+            &[SOFT_NSFW_DDG_FILE],
+            &impressor,
         );
 
         assert!(switches.soft_nsfw_new_user_drop(Some(TEST_USER_ID), Some("us")));
         assert_eq!(impressor.impression_count("soft_nsfw_ddg_1"), 1);
         assert!(!switches.soft_nsfw_new_user_drop(None, Some("us")));
         assert_eq!(impressor.impression_count("soft_nsfw_ddg_1"), 1);
+    }
+
+    #[test]
+    fn outside_prod_a_viewer_in_the_ddg_treatment_still_gets_the_switch() {
+        let switches = ClientSwitches::in_ddg_arm_with(
+            "soft_nsfw_ddg_1",
+            "treatment",
+            &[SOFT_NSFW_DDG_FILE],
+            |store| crate::params::Experiments::without_impressions(Some(store)),
+        );
+
+        assert!(switches.soft_nsfw_new_user_drop(Some(TEST_USER_ID), Some("us")));
+    }
+
+    #[test]
+    fn a_viewer_gets_its_arms_without_an_impression_and_one_per_exposed_experiment() {
+        use crate::rules::Experiment::{TestHoldback, TestLaunch};
+        let impressor = Arc::new(xai_feature_switches::SpyingBucketImpressor::new());
+        let switches = ClientSwitches::in_ddg_arm(
+            "test_ddg_1",
+            "treatment",
+            &[(
+                "rust_vf.yml",
+                "rust_vf:\n  parameters:\n    rust_vf_test_launch_rule_enabled: {type: boolean, default: false}\n    rust_vf_test_holdback_rule_enabled: {type: boolean, default: true}\n  rules:\n  - query: \"[test_ddg_1 bucket_membership treatment]\"\n    values: {rust_vf_test_launch_rule_enabled: true, rust_vf_test_holdback_rule_enabled: false}\n",
+            )],
+            &impressor,
+        );
+        let wired = ExperimentSet::NONE.with(TestLaunch).with(TestHoldback);
+
+        let facts = RequestFacts::logged_in(TEST_USER_ID);
+        let arms = switches.experiments(wired, facts.viewer());
+        assert!(arms.applies(TestLaunch));
+        assert!(!arms.applies(TestHoldback));
+        assert_eq!(impressor.impression_count("test_ddg_1"), 0);
+        arms.expose(TestHoldback);
+        switches.log_exposures(&facts.with_experiments(arms));
+        assert_eq!(impressor.impression_count("test_ddg_1"), 1);
+
+        let logged_out = switches.experiments(wired, RequestFacts::default().viewer());
+        assert!(!logged_out.applies(TestLaunch) && logged_out.applies(TestHoldback));
     }
 
     const TEST_USER_ID: u64 = 1_000_000_000_000_000_001;

@@ -25,6 +25,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
 use xai_candidate_pipeline::candidate_pipeline::PipelineResult;
+use xai_candidate_pipeline::component_library::clients::{JetfuelClient, ProdJetfuelClient};
 use xai_candidate_pipeline::component_library::utils::{
     generate_request_id, non_zero, resolve_request_id,
 };
@@ -842,6 +843,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let (
             gizmoduck_client,
             resurrection_date_client,
+            jetfuel_client,
             phoenix_candidate_pipeline,
             phoenix_scores_pipeline,
         ) = tokio::join!(
@@ -862,6 +864,13 @@ impl xai_x_service_builder::XService for HomeMixerServer {
                         .await
                         .expect("Failed to create ResurrectionDate client"),
                 ) as Arc<dyn ResurrectionDateClient>
+            },
+            async {
+                Arc::new(
+                    ProdJetfuelClient::new(&datacenter)
+                        .await
+                        .expect("Failed to create Jetfuel client"),
+                ) as Arc<dyn JetfuelClient>
             },
             async {
                 Arc::new(
@@ -915,6 +924,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let for_you = Arc::new(ForYouFeedServer::new(
             query_builder.clone(),
             for_you_pipeline,
+            jetfuel_client,
         ));
 
         let ranked_following = Arc::new(RankedFollowingFeedServer::new(

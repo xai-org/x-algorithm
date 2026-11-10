@@ -41,6 +41,7 @@ class DataPosition(TypedDict):
     block_shuffle_fingerprint: NotRequired[str]
     block_shuffle_rows_in_file: NotRequired[int]
     block_shuffle_rows_in_next_file: NotRequired[int]
+    rows_in_file: NotRequired[int]
 
 
 def batch_path(topic_dir: str, partition_id: int, batch_id: int) -> str:

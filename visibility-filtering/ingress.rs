@@ -119,6 +119,8 @@ pub(crate) fn evaluate_tweets(
 pub(crate) fn filter_notifications(
     request: &vf_pb::FilterNotificationsRequest,
     level: Result<SafetyLevel, Status>,
+    rule_engine: &RuleEngine,
+    client_switches: &ClientSwitches,
 ) -> Result<(SafetyLevel, NotificationRequest), Status> {
     let facts = RequestFacts::logged_in(request.recipient_id);
     if facts.viewer_id().is_none() {
@@ -176,6 +178,8 @@ pub(crate) fn filter_notifications(
             }
         }
     }
+    let experiments = client_switches.experiments(rule_engine.experiments(level), facts.viewer());
+    let facts = facts.with_experiments(experiments);
     let request = match (users.is_empty(), posts.is_empty()) {
         (false, false) => {
             return Err(Status::invalid_argument(
@@ -214,9 +218,11 @@ pub(crate) fn filter_tweets_batch(
 ) -> PostBatch {
     let soft_nsfw_new_user_drop = rule_engine.reads_soft_nsfw_new_user_drop(safety_level)
         && client_switches.soft_nsfw_new_user_drop(viewer.id(), viewer.country_code());
+    let experiments = client_switches.experiments(rule_engine.experiments(safety_level), &viewer);
     PostBatch {
         facts: RequestFacts::new(viewer, ClientCapability::DEFAULT)
-            .with_soft_nsfw_new_user_drop(soft_nsfw_new_user_drop),
+            .with_soft_nsfw_new_user_drop(soft_nsfw_new_user_drop)
+            .with_experiments(experiments),
         safety_level,
         candidates,
         retweet_merge: RetweetMerge::Unmerged,

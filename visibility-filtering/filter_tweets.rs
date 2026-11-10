@@ -58,9 +58,11 @@ impl FilterTweetsEndpoint {
             safety_level,
             request.rows,
         );
-        let (_, outcomes) = context
+        let (hydrated, outcomes) = context
             .scope(self.post_evaluator.run(request, &metrics, &mut NoTrace))
             .await;
+        self.client_switches
+            .log_exposures(&hydrated.hydration().viewer().facts);
         ft_metrics::record_sent(
             &metrics,
             outcomes.iter().map(|outcome| &outcome.evaluation),

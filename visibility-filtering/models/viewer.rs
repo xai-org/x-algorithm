@@ -1,3 +1,4 @@
+use crate::rules::RequestExperiments;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use strum::VariantArray;
@@ -68,6 +69,7 @@ pub(crate) struct RequestFacts {
     request_country: Option<String>,
     client_capability: ClientCapability,
     soft_nsfw_new_user_drop: bool,
+    experiments: RequestExperiments,
 }
 
 impl RequestFacts {
@@ -77,6 +79,7 @@ impl RequestFacts {
             viewer,
             client_capability,
             soft_nsfw_new_user_drop: false,
+            experiments: RequestExperiments::default(),
         }
     }
 
@@ -95,6 +98,14 @@ impl RequestFacts {
         }
     }
 
+    #[must_use]
+    pub(crate) fn with_experiments(self, experiments: RequestExperiments) -> Self {
+        Self {
+            experiments,
+            ..self
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_country(self, country_code: &str) -> Self {
@@ -104,6 +115,7 @@ impl RequestFacts {
         };
         Self::new(viewer, self.client_capability)
             .with_soft_nsfw_new_user_drop(self.soft_nsfw_new_user_drop)
+            .with_experiments(self.experiments)
     }
 
     #[cfg(test)]
@@ -133,6 +145,10 @@ impl RequestFacts {
 
     pub(crate) fn soft_nsfw_new_user_drop(&self) -> bool {
         self.soft_nsfw_new_user_drop
+    }
+
+    pub(crate) fn experiments(&self) -> &RequestExperiments {
+        &self.experiments
     }
 }
 

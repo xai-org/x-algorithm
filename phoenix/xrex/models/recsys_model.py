@@ -19,6 +19,11 @@ from numpy import typing as npt
 from xai_configlib import Config as Config
 from xai_configlib import configclass as configclass
 from xai_proto import recsys_pb2
+from xrex.data.recsys.ad_side_ids import (
+    AD_SIDE_DEFAULT_FIELDS,
+    AD_SIDE_FIELD_VOCAB,
+    parse_ad_side_fields,
+)
 from xrex.data.recsys.ads_head_masking import (
     ADS_FAMILY_SLICE_HEADS,
     EARLY_RELABEL_STREAM_ID,
@@ -1222,11 +1227,15 @@ class RecsysAggregatedModelConfig(Config):
 
     @property
     def has_side_inputs(self) -> bool:
-        return bool(self.ads_counts_emb_dim or self.wallclock_recency)
+        return bool(self.ads_counts_emb_dim or self.wallclock_recency or self.ad_side_ids_emb_dim)
 
     def validate_side_inputs(self) -> None:
         if self.has_side_inputs and self.feature_prep_enabled:
-            raise ValueError("ads_counts_emb_dim / wallclock_recency need feature_prep off")
+            raise ValueError(
+                "ads_counts_emb_dim / wallclock_recency / ad_side_ids_emb_dim need feature_prep off"
+            )
+        if self.ad_side_ids_emb_dim:
+            parse_ad_side_fields(self.ad_side_fields)
 
     continuous_action_hidden_dim: int = 64
 
@@ -1249,6 +1258,8 @@ class RecsysAggregatedModelConfig(Config):
     use_seqpack: bool = False
 
     ads_counts_emb_dim: int = 0
+    ad_side_ids_emb_dim: int = 0
+    ad_side_fields: str = ",".join(AD_SIDE_DEFAULT_FIELDS)
     wallclock_recency: bool = False
 
     effective_sequence_len: int | None = None
@@ -3704,6 +3715,33 @@ class RecsysAggregatedModel(hk.Module):
             if pad > 0:
                 emb = jnp.pad(emb, ((0, 0), (0, pad), (0, 0)))
             candidate_embeddings = add(candidate_embeddings, emb, "ads_counts_proj")
+
+        if cfg.ad_side_ids_emb_dim > 0:
+            ids = batch["candidate_seq"].get("ad_side_ids")
+            assert ids is not None, (
+                "ad_side_ids_emb_dim needs the dataset flag read_ad_side_ids=True"
+            )
+            ids = cast_jax(ids).astype(jnp.int32)
+            dim = cfg.ad_side_ids_emb_dim
+            fields = parse_ad_side_fields(cfg.ad_side_fields)
+            assert ids.shape[-1] == len(fields), (
+                f"ad_side_ids has {ids.shape[-1]} fields, model ad_side_fields {fields}"
+            )
+            parts = []
+            for j, name in enumerate(fields):
+                table = get_parameter(
+                    f"ad_side_{name}_table",
+                    shape=[AD_SIDE_FIELD_VOCAB[name], dim],
+                    init=hk.initializers.VarianceScaling(scale, mode="fan_out"),
+                    dtype=f32,
+                    pspec=P(),
+                )
+                parts.append(jnp.take(table, ids[..., j], axis=0))
+            emb = jnp.concatenate(parts, axis=-1).astype(DTYPE_BY_NAME[cfg.fprop_dtype])
+            pad = candidate_embeddings.shape[1] - emb.shape[1]
+            if pad > 0:
+                emb = jnp.pad(emb, ((0, 0), (0, pad), (0, 0)))
+            candidate_embeddings = add(candidate_embeddings, emb, "ad_side_proj")
 
         if cfg.wallclock_recency:
             hist_impr = batch["history_seq"]["impr_ts"]

@@ -1194,6 +1194,7 @@ impl pb::recsys_predictor_server::RecsysPredictor for RecsysPredictorImpl {
             ),
             serving_prefix: self.serving_prefix.lock().unwrap().clone(),
             peer_ready: self.peer_ready.load(Ordering::SeqCst),
+            staging_prefix: String::new(),
         }))
     }
 }
@@ -2983,6 +2984,7 @@ impl pb::recsys_retrieval_predictor_server::RecsysRetrievalPredictor
             ),
             serving_prefix: self.serving_prefix.lock().unwrap().clone(),
             peer_ready: self.peer_ready.load(Ordering::SeqCst),
+            staging_prefix: String::new(),
         }))
     }
 }

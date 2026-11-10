@@ -263,9 +263,10 @@ impl ServerDeps {
                 comparator,
                 QuotePassRunner::new(crate::config::quote_pass()),
             ),
-            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(
-                &self.post_evaluator,
-            )),
+            filter_notifications: FilterNotificationsEndpoint::new(
+                Arc::clone(&self.post_evaluator),
+                self.client_switches.clone(),
+            ),
             filter_tweets: FilterTweetsEndpoint::new(self.post_evaluator, self.client_switches),
             get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source, self.metrics),
         }

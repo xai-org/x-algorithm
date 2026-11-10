@@ -133,16 +133,25 @@ pub(crate) struct Experiments {
 
 impl Experiments {
     pub fn none() -> Self {
-        Self {
-            store: None,
-            impressor: Arc::new(NullBucketImpressor::new()),
-        }
+        Self::without_impressions(None)
     }
 
     pub async fn serving(datacenter: &str) -> Self {
+        let store = abdecider_store();
+        if crate::config::logs_ddg_impressions() {
+            Self {
+                store,
+                impressor: kafka_impressor(datacenter).await,
+            }
+        } else {
+            Self::without_impressions(store)
+        }
+    }
+
+    fn without_impressions(store: Option<Arc<ReloadableAbDeciderStore>>) -> Self {
         Self {
-            store: abdecider_store(),
-            impressor: kafka_impressor(datacenter).await,
+            store,
+            impressor: Arc::new(NullBucketImpressor::new()),
         }
     }
 

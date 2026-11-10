@@ -137,6 +137,7 @@ use crate::sources::phoenix_moe_source::PhoenixMOESource;
 use crate::sources::phoenix_source::PhoenixSource;
 use crate::sources::phoenix_topics_source::PhoenixTopicsSource;
 use crate::sources::popular_posts_source::PopularPostsSource;
+use crate::sources::shuffled_history_phoenix_source::ShuffledHistoryPhoenixSource;
 use crate::sources::sid_source::SidSource;
 use crate::sources::simclusters_source::SimclustersSource;
 use crate::sources::thunder_source::ThunderSource;
@@ -354,6 +355,9 @@ impl PhoenixCandidatePipeline {
         let phoenix_source = Box::new(PhoenixSource {
             phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
+        let shuffled_history_phoenix_source = Box::new(ShuffledHistoryPhoenixSource {
+            phoenix_retrieval_client: phoenix_retrieval_client.clone(),
+        });
         let phoenix_topics_source = Box::new(PhoenixTopicsSource {
             phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
@@ -383,6 +387,7 @@ impl PhoenixCandidatePipeline {
             tweet_mixer_source,
             simclusters_source,
             phoenix_source,
+            shuffled_history_phoenix_source,
             phoenix_topics_source,
             phoenix_moe_source,
             sid_source,

@@ -14,6 +14,26 @@ pub enum Effect {
     FilledEngagement,
     AddedEngagementReason,
     DuplicateEngagementReason,
+    SkippedByExperiment,
+}
+
+impl Effect {
+    pub(super) const fn changes_verdict(self) -> bool {
+        match self {
+            Self::Decided
+            | Self::FilledMedia
+            | Self::FilledLabelInterstitial
+            | Self::FilledEngagement
+            | Self::AddedEngagementReason => true,
+            Self::DidNotApply
+            | Self::AfterTerminal
+            | Self::KeptEarlierMedia
+            | Self::KeptEarlierMediaInsteadOfFosnr
+            | Self::KeptEarlierLabelInterstitial
+            | Self::DuplicateEngagementReason
+            | Self::SkippedByExperiment => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

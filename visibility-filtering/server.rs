@@ -203,7 +203,10 @@ mod tests {
         let post_evaluator = Arc::clone(wire.post_evaluator());
         VFServer {
             evaluate_tweets: wire.into_endpoint(),
-            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(&post_evaluator)),
+            filter_notifications: FilterNotificationsEndpoint::new(
+                Arc::clone(&post_evaluator),
+                ClientSwitches::for_tests(),
+            ),
             filter_tweets: FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests()),
             get_safety_labels: GetSafetyLabelsEndpoint::new(
                 Arc::new(FakeLabels::default().into_source()),

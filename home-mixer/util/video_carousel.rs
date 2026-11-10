@@ -2,9 +2,9 @@ use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
-    VideoCarouselImmersiveVqvWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
-    VideoCarouselVideoContinuationWeight, VideoCarouselVideoOpenWeight,
-    VideoCarouselWeightedScoreWeight,
+    VideoCarouselImmersiveVqvWeight, VideoCarouselNotInterestedWeight,
+    VideoCarouselOpenTimesImmersiveDwellWeight, VideoCarouselVideoContinuationWeight,
+    VideoCarouselVideoOpenWeight, VideoCarouselWeightedScoreWeight,
 };
 use crate::util::video_carousel_ctr_model::CtrModel;
 use std::cmp::Ordering;
@@ -38,6 +38,7 @@ pub(crate) struct CarouselScoring {
     open_times_immersive_dwell_weight: f64,
     weighted_score_weight: f64,
     video_continuation_weight: f64,
+    not_interested_weight: f64,
     ctr_model: Option<Arc<CtrModel>>,
 }
 
@@ -51,6 +52,7 @@ impl CarouselScoring {
                 .get(VideoCarouselOpenTimesImmersiveDwellWeight),
             weighted_score_weight: query.params.get(VideoCarouselWeightedScoreWeight),
             video_continuation_weight: query.params.get(VideoCarouselVideoContinuationWeight),
+            not_interested_weight: query.params.get(VideoCarouselNotInterestedWeight),
             ctr_model: query.video_carousel_ctr_model.get().cloned(),
         }
     }
@@ -71,6 +73,7 @@ impl CarouselScoring {
             + self.video_continuation_weight
                 * video_open_score(candidate)
                 * video_continuation_secs(candidate)
+            + self.not_interested_weight * not_interested_score(candidate)
     }
 
     pub(crate) fn needs_immersive_scores(&self) -> bool {
@@ -244,6 +247,10 @@ fn video_continuation_secs(candidate: &PostCandidate) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn not_interested_score(candidate: &PostCandidate) -> f64 {
+    candidate.phoenix_scores.not_interested_score.unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +262,7 @@ mod tests {
             open_times_immersive_dwell_weight: 0.0,
             weighted_score_weight: 0.0,
             video_continuation_weight: 0.0,
+            not_interested_weight: 0.0,
             ctr_model: None,
         }
     }
@@ -411,11 +419,16 @@ mod tests {
         }
     }
 
+    fn with_not_interested(mut candidate: PostCandidate, score: f64) -> PostCandidate {
+        candidate.phoenix_scores.not_interested_score = Some(score);
+        candidate
+    }
+
     #[test]
-    fn ranks_by_weighted_sum_with_missing_immersive_scores_as_zero() {
+    fn ranks_by_weighted_sum_with_missing_scores_as_zero() {
         let candidates = vec![
             with_immersive_vqv(vertical(1, 10, &[], 0.9), 0.1),
-            with_immersive_vqv(vertical(2, 20, &[], 0.2), 0.9),
+            with_not_interested(with_immersive_vqv(vertical(2, 20, &[], 0.2), 0.9), 0.02),
             vertical(3, 30, &[], 0.5),
             with_immersive_vqv(vertical(4, 40, &[], 0.3), 0.95),
         ];
@@ -424,12 +437,15 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                &scoring(1.0, 1.0),
+                &CarouselScoring {
+                    not_interested_weight: -25.0,
+                    ..scoring(1.0, 1.0)
+                },
                 false,
                 0,
                 None
             )),
-            vec![4, 2, 1, 3]
+            vec![4, 1, 2, 3]
         );
     }
 

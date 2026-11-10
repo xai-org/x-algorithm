@@ -6,6 +6,7 @@ mod context;
 mod defaults;
 pub mod engine;
 mod expansion;
+mod experiment;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
@@ -25,9 +26,12 @@ use context::RuleContext;
 pub use defaults::Effect;
 pub use engine::RuleEngine;
 pub(crate) use expansion::Expansion;
+#[cfg(test)]
+pub(crate) use experiment::Experiment;
+pub(crate) use experiment::{ExperimentSet, RequestExperiments};
+pub(crate) use rule_spec::RuleId;
 pub(crate) use rule_spec::observed::NoTrace;
 pub use rule_spec::observed::{NodeKind, NodeTrace, PolicyTrace, RowTrace, Skip, Witness};
-pub(crate) use rule_spec::RuleId;
 pub use rule_spec::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,

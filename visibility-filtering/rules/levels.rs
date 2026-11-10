@@ -1,19 +1,59 @@
 use crate::rules::author_rules::*;
 use crate::rules::expansion::Expansion;
+use crate::rules::experiment::Experiment;
 use crate::rules::rule_spec::rule::{Rule, UserRule};
 use crate::rules::tweet_rules::*;
+
+pub(crate) trait Listed {
+    fn row(&'static self) -> PostRow;
+}
+
+impl Listed for Rule {
+    fn row(&'static self) -> PostRow {
+        PostRow {
+            rule: self,
+            experiment: None,
+        }
+    }
+}
+
+#[expect(dead_code, reason = "no level lists a gated row yet")]
+pub(crate) struct Gated {
+    pub(super) experiment: Experiment,
+    pub(super) rule: &'static Rule,
+}
+
+impl Listed for Gated {
+    fn row(&'static self) -> PostRow {
+        PostRow {
+            rule: self.rule,
+            experiment: Some(self.experiment),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct PostRow {
+    pub(super) rule: &'static Rule,
+    pub(super) experiment: Option<Experiment>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PostRules {
     pub(super) user: &'static [&'static [&'static UserRule]],
-    pub(super) post: &'static [&'static [&'static Rule]],
+    pub(super) post: &'static [&'static [&'static dyn Listed]],
 }
 
 impl PostRules {
     pub(super) fn lists(self) -> LevelLists {
         LevelLists {
             user: self.user.concat(),
-            post: self.post.concat(),
+            post: self
+                .post
+                .iter()
+                .flat_map(|family| family.iter())
+                .map(|row| row.row())
+                .collect(),
         }
     }
 }
@@ -38,10 +78,17 @@ impl LevelRules {
 
 pub(crate) struct LevelLists {
     pub(super) user: Vec<&'static UserRule>,
-    pub(super) post: Vec<&'static Rule>,
+    pub(super) post: Vec<PostRow>,
 }
 
-pub(super) const fn rule_count(families: &[&[&Rule]]) -> usize {
+impl LevelLists {
+    #[cfg(test)]
+    pub(super) fn post_rules(&self) -> impl Iterator<Item = &'static Rule> {
+        self.post.iter().map(|row| row.rule)
+    }
+}
+
+pub(super) const fn rule_count(families: &[&[&dyn Listed]]) -> usize {
     let mut count = 0;
     let mut rest = families;
     while let [family, tail @ ..] = rest {
@@ -99,19 +146,19 @@ const NOTIFICATION_AUTHOR_LABEL_DROPS: &[&UserRule] = &[
     &DOWNRANK_SPAM_REPLY_USER_LABEL_DROP_UNSPECIFIED,
 ];
 
-const FOSNR_DROPS: &[&Rule] = &[
+const FOSNR_DROPS: &[&dyn Listed] = &[
     &FOSNR_HATEFUL_CONDUCT_DROP_UNDESIRABLE,
     &FOSNR_VIOLENT_SPEECH_DROP_UNDESIRABLE,
     &FOSNR_ABUSE_DROP_UNDESIRABLE,
     &FOSNR_CIVIC_INTEGRITY_DROP_UNDESIRABLE,
 ];
 
-const TAKEDOWN_DROPS: &[&Rule] = &[
+const TAKEDOWN_DROPS: &[&dyn Listed] = &[
     &LEGAL_TAKEDOWN_DROP_UNSPECIFIED,
     &LOCAL_LAWS_TAKEDOWN_DROP_UNSPECIFIED,
 ];
 
-const AGE_GATING_DROPS: &[&Rule] = &[
+const AGE_GATING_DROPS: &[&dyn Listed] = &[
     &SENSITIVE_VIEWER_LOGGED_OUT_DROP_MEDIA_LABEL,
     &SENSITIVE_VIEWER_LOGGED_OUT_DROP_NSFW_FLAG,
     &SENSITIVE_VIEWER_LOGGED_OUT_DROP_TEXT_OR_CARD_LABEL,
@@ -123,14 +170,14 @@ const AGE_GATING_DROPS: &[&Rule] = &[
     &SENSITIVE_VIEWER_NO_STATED_AGE_DROP_TEXT_OR_CARD_LABEL,
 ];
 
-const EXCLUSIVE_CONTENT_DROPS: &[&Rule] = &[
+const EXCLUSIVE_CONTENT_DROPS: &[&dyn Listed] = &[
     &EXCLUSIVE_TWEET_DROP_LOGGED_OUT,
     &EXCLUSIVE_TWEET_DROP_RETWEET,
     &EXCLUSIVE_TWEET_DROP_NON_SUPER_FOLLOWER,
     &TRUSTED_FRIENDS_TWEET_DROP_UNSPECIFIED,
 ];
 
-const HOME_BLURS: &[&Rule] = &[
+const HOME_BLURS: &[&dyn Listed] = &[
     &NSFW_HIGH_PRECISION_BLUR_NUDITY,
     &NSFW_HIGH_PRECISION_BLUR_SENSITIVE,
     &GORE_AND_VIOLENCE_HIGH_PRECISION_BLUR,
@@ -139,12 +186,12 @@ const HOME_BLURS: &[&Rule] = &[
     &NSFW_USER_BLUR_SENSITIVE_USER,
 ];
 
-const MEDIA_TAKEDOWN_DROPS: &[&Rule] = &[
+const MEDIA_TAKEDOWN_DROPS: &[&dyn Listed] = &[
     &DMCA_MEDIA_DROP_UNSPECIFIED,
     &GEO_RESTRICTED_MEDIA_DROP_UNSPECIFIED,
 ];
 
-const OON_POST_DROPS: &[&Rule] = &[
+const OON_POST_DROPS: &[&dyn Listed] = &[
     &DO_NOT_AMPLIFY_DROP_UNDESIRABLE,
     &MALICIOUS_URL_DROP_UNDESIRABLE,
     &SPAM_HIGH_RECALL_DROP_UNDESIRABLE,
@@ -377,11 +424,11 @@ pub(super) const TIMELINE_HOME_PROMOTED_HYDRATION: PostRules = PostRules {
     post: TIMELINE_HOME_HYDRATION_OWN,
 };
 
-const TIMELINE_HOME_HYDRATION_POST: [&Rule;
+const TIMELINE_HOME_HYDRATION_POST: [&dyn Listed;
     rule_count(TIMELINE_HOME_HYDRATION_OWN) + Expansion::ReactedTo.spec().rules.len()] =
     Expansion::ReactedTo.placed(TIMELINE_HOME_HYDRATION_OWN);
 
-const TIMELINE_HOME_HYDRATION_OWN: &[&[&Rule]] = &[
+const TIMELINE_HOME_HYDRATION_OWN: &[&[&dyn Listed]] = &[
     FOSNR_DROPS,
     &[
         &FOSNR_ABUSE_INSULTS_NON_FOLLOWER_DROP_UNDESIRABLE,

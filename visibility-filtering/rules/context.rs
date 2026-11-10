@@ -6,6 +6,7 @@ use crate::models::{
 use crate::params::{CountryList, CountryLists};
 use crate::rules::rule_spec::engine::Candidate;
 use crate::rules::rule_spec::features::Reads;
+use crate::rules::RequestExperiments;
 
 pub(crate) struct RuleContext<'a, C = PostCandidate> {
     facts: CoreFacts<'a>,
@@ -74,6 +75,11 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
     #[inline]
     pub(super) fn failed(&self) -> Hydrators {
         self.candidate.failed()
+    }
+
+    #[inline]
+    pub(super) fn experiments(&self) -> &'a RequestExperiments {
+        self.facts.request_facts.experiments()
     }
 
     #[inline]

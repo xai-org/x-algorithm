@@ -4,6 +4,7 @@ use super::client_event::{
 use super::post_marshaller::{make_tweet, make_tweet_item, ENTRY_NAMESPACE_TWEET};
 use xai_home_mixer_proto::{ScoredPost, VideoCarouselModule};
 use xai_urt_thrift::entry::{TimelineEntry, TimelineEntryContent};
+use xai_urt_thrift::icon::HorizonIcon;
 use xai_urt_thrift::timeline_module::{
     ModuleDisplayType, ModuleHeader, ModuleHeaderDisplayType, ModuleItem, TimelineModule,
 };
@@ -18,6 +19,7 @@ pub(super) fn marshal_video_carousel(
     module_id: i64,
     language: &str,
     country: Option<&str>,
+    header_icon: bool,
 ) -> Option<TimelineEntry> {
     if carousel.videos.is_empty() {
         return None;
@@ -55,7 +57,7 @@ pub(super) fn marshal_video_carousel(
         content: TimelineEntryContent::TimelineModule(TimelineModule {
             items,
             display_type: ModuleDisplayType::COMPACT_CAROUSEL,
-            header: header(lookup(HEADER_KEY, language, country)),
+            header: header(lookup(HEADER_KEY, language, country), header_icon),
             footer: None,
             client_event_info: Some(video_carousel_module_client_event_info()),
             feedback_info: None,
@@ -79,13 +81,13 @@ fn as_source_tweet(video: &ScoredPost) -> ScoredPost {
     }
 }
 
-fn header(text: Option<String>) -> Option<ModuleHeader> {
+fn header(text: Option<String>, show_icon: bool) -> Option<ModuleHeader> {
     text.map(|text| ModuleHeader {
         text,
         sticky: Some(false),
         context: None,
         social_context: None,
-        icon: None,
+        icon: show_icon.then_some(HorizonIcon::VIDEO_PLAYER_LIST),
         button: None,
         custom_icon: None,
         display_type: Some(ModuleHeaderDisplayType::CLASSIC),
@@ -134,7 +136,7 @@ mod tests {
             ],
         };
 
-        let entry = marshal_video_carousel(&carousel, 3, 900, "en", None).unwrap();
+        let entry = marshal_video_carousel(&carousel, 3, 900, "en", None, false).unwrap();
         let TimelineEntryContent::TimelineModule(module) = &entry.content else {
             panic!("expected a timeline module");
         };
@@ -177,7 +179,10 @@ mod tests {
         let module_event = module.client_event_info.as_ref().unwrap();
         assert_eq!(module_event.component.as_deref(), Some("video_carousel"));
         assert_eq!(injection_type(module_event), Some("VideoCarousel"));
-        let header = header(Some("Videos for you".to_string())).unwrap();
-        assert!(header.landing_url.is_none());
+        let with_icon = header(Some("Videos for you".to_string()), true).unwrap();
+        assert!(with_icon.landing_url.is_none());
+        assert_eq!(with_icon.icon, Some(HorizonIcon::VIDEO_PLAYER_LIST));
+        let without_icon = header(Some("Videos for you".to_string()), false).unwrap();
+        assert_eq!(without_icon.icon, None);
     }
 }

@@ -31,7 +31,7 @@ use crate::params::{ClientSwitches, CountryLists};
 use crate::post_card::PostCards;
 use crate::post_evaluator::{self, HydratedRequest, PostEvaluator};
 use crate::result_label::{label, state_label, Class, NONE};
-use crate::rules::RuleEngine;
+use crate::rules::{RequestExperiments, RuleEngine};
 use crate::server_deps::{self, CacheWarming};
 use crate::treatment;
 use futures::future::{join, join_all};
@@ -367,16 +367,17 @@ impl Explainer {
         });
         let candidates = vec![requested];
         let (request, endpoint) = match route.rpc {
-            Rpc::FilterTweets => (
-                ingress::filter_tweets_batch(
+            Rpc::FilterTweets => {
+                let mut batch = ingress::filter_tweets_batch(
                     self.post_evaluator.rule_engine(),
                     &self.client_switches,
                     RequestViewer::new(viewer_id, ask.country.clone()),
                     route.level,
                     candidates,
-                ),
-                Endpoint::FilterTweets,
-            ),
+                );
+                batch.facts = batch.facts.with_experiments(RequestExperiments::default());
+                (batch, Endpoint::FilterTweets)
+            }
             Rpc::EvaluateTweets => (
                 ingress::evaluate_tweets_batch(
                     &self.client_switches,

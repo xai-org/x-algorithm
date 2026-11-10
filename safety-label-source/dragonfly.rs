@@ -8,6 +8,7 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use prost::Message;
 use rustc_hash::FxHashSet;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use tracing::warn;
 use xai_cache::{KVCacheError, Key};
 use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
@@ -16,8 +17,8 @@ use xai_visibility_filtering_proto as vf_pb;
 
 use super::decode::{self, RawSafetyLabel};
 use super::metrics::{
-    self, CacheResult, CacheTier, FillKeyResult, LabelMetrics, MhCheckClass, MhCheckSample,
-    MhCheckView, ShadowResult, SourceOutcome,
+    self, CacheResult, CacheTier, DeleteAttempt, DeleteResult, FillKeyResult, LabelMetrics,
+    MhCheckClass, MhCheckSample, MhCheckView, ShadowResult, SourceOutcome,
 };
 use super::remote::{CacheWrite, FallbackReason, LabelSource, ManhattanSource, fallback_reason};
 use super::source::{drop_expired_labels, tweet_timestamp_ms};
@@ -25,6 +26,9 @@ use super::source::{drop_expired_labels, tweet_timestamp_ms};
 const KEY_PREFIX: &str = "sls:";
 const VALUE_VERSION: u8 = 2;
 const REFRESH_STEPS: [Duration; 2] = [Duration::from_secs(30), Duration::from_secs(90)];
+const REPEAT_AFTER: Duration = Duration::from_secs(30);
+const REPEAT_QUEUE: usize = 500_000;
+const DELETE_PERMITS: u32 = 256;
 const WRITE_TTL_SECS: u32 = 24 * 60 * 60;
 const FILL_QUEUE_KEYS: usize = 10_000;
 const FILL_BATCH_KEYS: usize = 100;
@@ -410,18 +414,132 @@ fn cache_key(tweet_id: u64) -> Result<Key, KVCacheError> {
     Key::new(format!("{KEY_PREFIX}{tweet_id}").into_bytes())
 }
 
-#[derive(Clone)]
 pub struct LabelCacheInvalidator {
     cache: Arc<dyn CacheWrite>,
+    permits: Arc<Semaphore>,
+    repeat_tx: mpsc::Sender<Repeat>,
+    repeats: JoinHandle<()>,
+    metrics: LabelMetrics,
+}
+
+struct Repeat {
+    tweet_id: u64,
+    due: tokio::time::Instant,
 }
 
 impl LabelCacheInvalidator {
-    pub(crate) fn new(cache: Arc<dyn CacheWrite>) -> Self {
-        Self { cache }
+    pub(crate) fn spawn(cache: Arc<dyn CacheWrite>, metrics: LabelMetrics) -> Self {
+        Self::with_repeat_queue(cache, metrics, REPEAT_QUEUE)
     }
 
-    pub async fn invalidate(&self, tweet_id: u64) -> Result<(), KVCacheError> {
-        self.cache.delete(&cache_key(tweet_id)?).await
+    fn with_repeat_queue(cache: Arc<dyn CacheWrite>, metrics: LabelMetrics, queue: usize) -> Self {
+        let (repeat_tx, repeat_rx) = mpsc::channel(queue);
+        let permits = Arc::new(Semaphore::new(DELETE_PERMITS as usize));
+        let repeats = tokio::spawn(repeat(
+            repeat_rx,
+            Arc::clone(&cache),
+            Arc::clone(&permits),
+            metrics.clone(),
+        ));
+        Self {
+            cache,
+            permits,
+            repeat_tx,
+            repeats,
+            metrics,
+        }
+    }
+
+            pub async fn drain(self, deadline: tokio::time::Instant) {
+        let Self {
+            permits,
+            repeat_tx,
+            mut repeats,
+            ..
+        } = self;
+        drop(repeat_tx);
+        let drained = tokio::time::timeout_at(deadline, async {
+            if let Err(error) = (&mut repeats).await {
+                warn!(%error, "Label cache repeat task failed while draining");
+            }
+            drop(permits.acquire_many(DELETE_PERMITS).await);
+        })
+        .await;
+        if drained.is_err() {
+            repeats.abort();
+            warn!(
+                "Label cache invalidator drain reached its deadline; its queued repeats are lost"
+            );
+        }
+    }
+
+            pub async fn invalidate(&self, tweet_ids: &[u64]) {
+        let results = futures::future::join_all(tweet_ids.iter().map(|&tweet_id| async move {
+            let Ok(_permit) = self.permits.acquire().await else {
+                return DeleteResult::Failed;
+            };
+            delete(self.cache.as_ref(), tweet_id).await
+        }))
+        .await;
+        let failed = results
+            .iter()
+            .filter(|&&result| result == DeleteResult::Failed)
+            .count();
+        metrics::record_deletes(
+            &self.metrics,
+            DeleteAttempt::First,
+            DeleteResult::Deleted,
+            results.len() - failed,
+        );
+        metrics::record_deletes(
+            &self.metrics,
+            DeleteAttempt::First,
+            DeleteResult::Failed,
+            failed,
+        );
+
+        let due = tokio::time::Instant::now() + REPEAT_AFTER;
+        let dropped = tweet_ids
+            .iter()
+            .filter(|&&tweet_id| self.repeat_tx.try_send(Repeat { tweet_id, due }).is_err())
+            .count();
+        metrics::record_deletes(
+            &self.metrics,
+            DeleteAttempt::Repeat,
+            DeleteResult::DroppedQueueFull,
+            dropped,
+        );
+    }
+}
+
+async fn delete(cache: &dyn CacheWrite, tweet_id: u64) -> DeleteResult {
+    let Ok(key) = cache_key(tweet_id) else {
+        return DeleteResult::Failed;
+    };
+    match cache.delete(&key).await {
+        Ok(()) => DeleteResult::Deleted,
+        Err(_) => DeleteResult::Failed,
+    }
+}
+
+async fn repeat(
+    mut rx: mpsc::Receiver<Repeat>,
+    cache: Arc<dyn CacheWrite>,
+    permits: Arc<Semaphore>,
+    metrics: LabelMetrics,
+) {
+    while let Some(Repeat { tweet_id, due }) = rx.recv().await {
+        tokio::time::sleep_until(due).await;
+        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+            return;
+        };
+        let cache = Arc::clone(&cache);
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let result = delete(cache.as_ref(), tweet_id).await;
+            metrics::record_deletes(&metrics, DeleteAttempt::Repeat, result, 1);
+            drop(permit);
+        });
     }
 }
 
@@ -441,7 +559,10 @@ pub(crate) struct FillJob {
 }
 
 pub(crate) enum FillLabels {
-        Scanned(Vec<RawSafetyLabel>),
+        Scanned {
+        items: Vec<RawSafetyLabel>,
+        read_at: tokio::time::Instant,
+    },
         Reread,
 }
 
@@ -761,6 +882,7 @@ impl DragonflySource {
             return;
         }
         let ids: Vec<u64> = hits.iter().map(|hit| hit.tweet_id).collect();
+        let read_at = tokio::time::Instant::now();
         let mut manhattan = tokio::time::timeout_at(deadline, self.manhattan.scan(&ids))
             .await
             .unwrap_or_default();
@@ -810,7 +932,7 @@ impl DragonflySource {
                 repairs.push(FillJob {
                     tweet_id: hit.tweet_id,
                     fill: Fill::new(now_ms),
-                    labels: FillLabels::Scanned(items),
+                    labels: FillLabels::Scanned { items, read_at },
                 });
             }
         }
@@ -933,21 +1055,29 @@ struct Writer {
 }
 
 impl Writer {
-        async fn write(&self, jobs: Vec<FillJob>) {
+            async fn write(&self, jobs: Vec<FillJob>) {
         let ids: Vec<u64> = jobs.iter().map(|job| job.tweet_id).collect();
         let reread: Vec<u64> = jobs
             .iter()
             .filter(|job| matches!(job.labels, FillLabels::Reread))
             .map(|job| job.tweet_id)
             .collect();
+        let reread_at = tokio::time::Instant::now();
         let mut reread_results = self.manhattan.scan(&reread).await;
+        let mut old_reads = 0;
         let writes: Vec<_> = jobs
             .into_iter()
             .filter_map(|job| {
-                let items = match job.labels {
-                    FillLabels::Scanned(items) => items,
-                    FillLabels::Reread => reread_results.remove(&job.tweet_id)?.ok()?.items,
+                let (items, read_at) = match job.labels {
+                    FillLabels::Scanned { items, read_at } => (items, read_at),
+                    FillLabels::Reread => {
+                        (reread_results.remove(&job.tweet_id)?.ok()?.items, reread_at)
+                    }
                 };
+                if read_at.elapsed() >= REPEAT_AFTER {
+                    old_reads += 1;
+                    return None;
+                }
                 let key = cache_key(job.tweet_id).ok()?;
                 let value = encode_entry(job.fill, items);
                 Some(async move { self.cache.set(&key, value, WRITE_TTL_SECS).await.is_ok() })
@@ -959,7 +1089,12 @@ impl Writer {
             .filter(|&written| written)
             .count();
         metrics::record_cache_fill_keys(&self.metrics, FillKeyResult::Written, written);
-        metrics::record_cache_fill_keys(&self.metrics, FillKeyResult::Failed, ids.len() - written);
+        metrics::record_cache_fill_keys(&self.metrics, FillKeyResult::DroppedOldRead, old_reads);
+        metrics::record_cache_fill_keys(
+            &self.metrics,
+            FillKeyResult::Failed,
+            ids.len() - written - old_reads,
+        );
         let mut pending = self
             .pending_fills
             .lock()
@@ -1008,9 +1143,26 @@ mod tests {
         failing: AtomicBool,
         failing_keys: Mutex<FxHashSet<Key>>,
         keys_read: AtomicUsize,
+        deleted: Mutex<Vec<Key>>,
+        delete_latency: Mutex<Duration>,
+                set_gate: Mutex<Option<Arc<Semaphore>>>,
     }
 
     impl FakeDragonfly {
+        fn hold_sets(&self) {
+            *self.set_gate.lock().unwrap() = Some(Arc::new(Semaphore::new(0)));
+        }
+
+        fn release_sets(&self) {
+            if let Some(gate) = self.set_gate.lock().unwrap().take() {
+                gate.close();
+            }
+        }
+
+        fn deleted(&self) -> Vec<Key> {
+            self.deleted.lock().unwrap().clone()
+        }
+
         fn fail(&self, id: u64) {
             self.failing_keys
                 .lock()
@@ -1065,6 +1217,10 @@ mod tests {
     #[async_trait]
     impl CacheWrite for FakeDragonfly {
         async fn set(&self, key: &Key, value: Value, ttl_secs: u32) -> CacheOpResult<()> {
+            let gate = self.set_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                assert!(gate.acquire().await.is_err(), "the gate only closes");
+            }
             self.entries
                 .lock()
                 .unwrap()
@@ -1073,6 +1229,14 @@ mod tests {
         }
 
         async fn delete(&self, key: &Key) -> CacheOpResult<()> {
+            self.deleted.lock().unwrap().push(key.clone());
+            let latency = *self.delete_latency.lock().unwrap();
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(KVCacheError::Timeout("delete".into()));
+            }
             self.entries.lock().unwrap().remove(key);
             Ok(())
         }
@@ -2543,24 +2707,189 @@ rust_vf:
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn an_invalidated_entry_reads_as_a_miss_and_refills_from_manhattan() {
-        let w = world(LabelCacheSwitches::serving_every_post());
-        w.dragonfly
-            .put(1, Status::Found(spam(0.5)), fill(BASE_MS, 2));
-        w.manhattan.set_spam(1, 0.9);
-        let invalidator = LabelCacheInvalidator::new(Arc::<FakeDragonfly>::clone(&w.dragonfly));
+    fn invalidator(w: &World, repeat_queue: usize) -> LabelCacheInvalidator {
+        LabelCacheInvalidator::with_repeat_queue(
+            Arc::<FakeDragonfly>::clone(&w.dragonfly),
+            LabelMetrics::new(Some(Arc::<RecordedStats>::clone(&w.stats) as _)),
+            repeat_queue,
+        )
+    }
 
-        invalidator.invalidate(1).await.unwrap();
-        assert_eq!(w.dragonfly.entry(1), None);
-        let answers = w.source.get(&[1]).await;
+    fn deletes(w: &World, attempt: &str, result: &str) -> u64 {
+        w.stats.count(
+            "safety_label_store_deletes",
+            &[("attempt", attempt), ("result", result)],
+        )
+    }
+
+    fn keys(ids: &[u64]) -> Vec<Key> {
+        ids.iter().map(|&id| cache_key(id).unwrap()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fill_that_read_manhattan_before_the_label_write_is_deleted_by_the_repeat() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, REPEAT_QUEUE);
+        w.manhattan.set_spam(1, 0.5);
+        w.dragonfly.hold_sets();
+
+        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.5));
+        settle().await;
+        w.manhattan.set_spam(1, 0.9);
+        invalidator.invalidate(&[1]).await;
+        w.dragonfly.release_sets();
         settle().await;
 
-        assert_eq!(labels(&answers, 1), spam(0.9));
-        assert_eq!(w.manhattan.calls(), vec![vec![1]]);
         assert_eq!(
-            w.dragonfly.entry(1).unwrap().0.status,
-            Status::Found(spam(0.9))
+            labels(&w.source.get(&[1]).await, 1),
+            spam(0.5),
+            "the fill landed after the first delete"
         );
+        tokio::time::sleep(REPEAT_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(w.dragonfly.deleted(), keys(&[1]));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        settle().await;
+
+        assert_eq!(w.dragonfly.entry(1), None);
+        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
+        assert_eq!(deletes(&w, "first", "deleted"), 1);
+        assert_eq!(deletes(&w, "repeat", "deleted"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_read_manhattan_before_the_label_write_is_deleted_by_the_repeat() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, REPEAT_QUEUE);
+        let filled_at_ms = BASE_MS - 30_000;
+        w.dragonfly
+            .put(1, Status::Found(spam(0.5)), fill(filled_at_ms, 0));
+        w.manhattan.set_spam(1, 0.5);
+        w.dragonfly.hold_sets();
+
+        w.source.get(&[1]).await;
+        settle().await;
+        w.manhattan.set_spam(1, 0.9);
+        invalidator.invalidate(&[1]).await;
+        assert_eq!(w.dragonfly.entry(1), None);
+        w.dragonfly.release_sets();
+        settle().await;
+
+        assert_eq!(
+            w.dragonfly.entry(1).unwrap().0,
+            Envelope {
+                fill: fill(filled_at_ms, 1),
+                status: Status::Found(spam(0.5)),
+            },
+            "the refresh landed after the first delete"
+        );
+        tokio::time::sleep(REPEAT_AFTER).await;
+        settle().await;
+
+        assert_eq!(w.dragonfly.entry(1), None);
+        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fill_whose_manhattan_read_is_repeat_after_old_is_dropped_and_a_refresh_is_not() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        for id in 1..=4 {
+            w.manhattan.set_spam(id, 0.5);
+        }
+        let filled_at_ms = BASE_MS - 30_000;
+        w.dragonfly
+            .put(3, Status::Found(spam(0.5)), fill(filled_at_ms, 0));
+        w.dragonfly.hold_sets();
+
+        w.source.get(&[1]).await;
+        settle().await;
+        w.source.get(&[2, 3]).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        w.source.get(&[4]).await;
+        tokio::time::sleep(REPEAT_AFTER - Duration::from_secs(1)).await;
+        w.dragonfly.release_sets();
+        settle().await;
+
+        assert!(w.dragonfly.entry(1).is_some());
+        assert_eq!(w.dragonfly.entry(2), None, "its read waited in the queue");
+        assert!(w.dragonfly.entry(4).is_some(), "its read is 29 s old");
+        assert_eq!(
+            w.dragonfly.entry(3).unwrap().0.fill,
+            fill(filled_at_ms, 1),
+            "a refresh reads Manhattan when it leaves the queue"
+        );
+        let fills = |result| {
+            w.stats
+                .count("safety_labels_cache_fill_keys", &[("result", result)])
+        };
+        assert_eq!(fills("dropped_old_read"), 1);
+        assert_eq!(fills("written"), 3);
+        assert_eq!(fills("failed"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_delete_is_counted_and_still_repeated() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, REPEAT_QUEUE);
+        w.dragonfly.failing.store(true, Ordering::SeqCst);
+
+        invalidator.invalidate(&[1]).await;
+        w.dragonfly.failing.store(false, Ordering::SeqCst);
+        tokio::time::sleep(REPEAT_AFTER).await;
+        settle().await;
+
+        assert_eq!(w.dragonfly.deleted(), keys(&[1, 1]));
+        assert_eq!(deletes(&w, "first", "failed"), 1);
+        assert_eq!(deletes(&w, "repeat", "deleted"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_repeat_queue_drops_the_repeat_but_not_the_first_delete() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, 1);
+
+        invalidator.invalidate(&[1, 2]).await;
+        tokio::time::sleep(REPEAT_AFTER).await;
+        settle().await;
+
+        assert_eq!(w.dragonfly.deleted(), keys(&[1, 2, 1]));
+        assert_eq!(deletes(&w, "first", "deleted"), 2);
+        assert_eq!(deletes(&w, "repeat", "dropped_queue_full"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_once_the_queued_repeats_have_answered() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, REPEAT_QUEUE);
+        let start = tokio::time::Instant::now();
+
+        invalidator.invalidate(&[1]).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        invalidator.invalidate(&[2]).await;
+        *w.dragonfly.delete_latency.lock().unwrap() = Duration::from_secs(1);
+        invalidator.drain(start + Duration::from_secs(60)).await;
+
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10) + REPEAT_AFTER + Duration::from_secs(1),
+            "the last repeat answered"
+        );
+        assert_eq!(w.dragonfly.deleted(), keys(&[1, 2, 1, 2]));
+        assert_eq!(deletes(&w, "repeat", "deleted"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_abandons_the_repeats_not_due_by_its_deadline() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let invalidator = invalidator(&w, REPEAT_QUEUE);
+        let start = tokio::time::Instant::now();
+
+        invalidator.invalidate(&[1]).await;
+        invalidator.drain(start + Duration::from_secs(10)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        tokio::time::sleep(REPEAT_AFTER).await;
+        settle().await;
+
+        assert_eq!(w.dragonfly.deleted(), keys(&[1]));
+        assert_eq!(deletes(&w, "repeat", "deleted"), 0);
     }
 }

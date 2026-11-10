@@ -16,7 +16,10 @@ use rand::prelude::*;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::adler32::adler32_combine;
-use crate::emb_table::{get_channels_with_endpoints, list_entries, send_entries};
+use crate::emb_table::{
+    duplicated_urls, get_channels, get_channels_with_endpoints, list_entries, send_entries,
+    send_entries_reporting,
+};
 use crate::grpc_util::TRANSFER_FAILED_SENTINEL;
 
 pub struct TensorBuf<'a> {
@@ -43,6 +46,26 @@ pub struct DenseEntry {
 pub struct ShardLayout {
     pub piece_bytes: usize,
     pub pieces: usize,
+}
+
+pub trait DownloadProgress: Send + Sync {
+    fn layout(&self, layout: ShardLayout);
+    fn written(&self, start: usize, end: usize);
+}
+
+#[derive(Clone)]
+pub(crate) struct ProgressAt {
+    pub(crate) progress: Arc<dyn DownloadProgress>,
+    pub(crate) offset: usize,
+}
+
+impl ProgressAt {
+    fn at(progress: &Option<Arc<dyn DownloadProgress>>, offset: usize) -> Option<ProgressAt> {
+        progress.as_ref().map(|progress| ProgressAt {
+            progress: progress.clone(),
+            offset,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -592,6 +615,7 @@ pub async fn download_dense_and_embeddings(
         max_concurrent_downloads,
         &endpoints,
         trainer_conns_per_source,
+        None,
     )
     .await?;
     let secs = t_emb.elapsed().as_secs_f64();
@@ -623,6 +647,7 @@ pub async fn download_dense_and_embeddings(
                 max_concurrent_downloads,
                 &endpoints,
                 trainer_conns_per_source,
+                None,
             )
             .await?,
         )
@@ -652,6 +677,7 @@ async fn download_sharded_with_channels(
     max_concurrent_downloads: Option<usize>,
     endpoints: &[Endpoint],
     trainer_conns_per_source: usize,
+    progress: Option<Arc<dyn DownloadProgress>>,
 ) -> Result<u32, CopyPortError> {
     let layout = ShardedLayout::from_listing(name, entries)?;
     layout.check_buffer_size(name, buf.len())?;
@@ -679,10 +705,11 @@ async fn download_sharded_with_channels(
             endpoints,
             buf,
             connection_limit,
+            &progress,
         )
         .await?
     } else {
-        spawn_sharded_downloads(&layout, prefix, name, channels, buf).await?
+        spawn_sharded_downloads(&layout, prefix, name, channels, buf, &progress).await?
     };
     let results = if trainer_opt_in
         && rate_limit_bytes_per_sec.is_none_or(|r| r == 0)
@@ -831,11 +858,13 @@ pub async fn download_embedding_table(
         rate_limit_bytes_per_sec,
         max_concurrent_downloads,
         false,
+        None,
     )
     .await
     .map(|(checksum, _)| checksum)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_embedding_table_with_layout(
     path: &str,
     urls: &str,
@@ -844,6 +873,7 @@ pub async fn download_embedding_table_with_layout(
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
     replicas: bool,
+    progress: Option<Arc<dyn DownloadProgress>>,
 ) -> Result<(u32, ShardLayout), CopyPortError> {
     download_embedding_table_with_conns(
         path,
@@ -855,6 +885,7 @@ pub async fn download_embedding_table_with_layout(
         crate::emb_table::peer_conns_per_source(),
         crate::emb_table::trainer_conns_per_source(),
         replicas,
+        progress,
     )
     .await
 }
@@ -869,6 +900,7 @@ async fn download_embedding_table_with_conns(
     peer_conns_per_source: usize,
     trainer_conns_per_source: usize,
     replicas: bool,
+    progress: Option<Arc<dyn DownloadProgress>>,
 ) -> Result<(u32, ShardLayout), CopyPortError> {
     let prefix = checkpoint_prefix_from_path(path)?;
     let resolved = resolve_copy_urls(urls).await?;
@@ -882,6 +914,9 @@ async fn download_embedding_table_with_conns(
         piece_bytes: layout.piece_bytes,
         pieces: layout.total_pieces(),
     };
+    if let Some(progress) = &progress {
+        progress.layout(shard_layout);
+    }
     if trainer_conns_per_source > 1 && matches!(layout.ownership, ShardOwnership::Sharded { .. }) {
         let checksum = download_sharded_with_channels(
             &channels,
@@ -893,6 +928,7 @@ async fn download_embedding_table_with_conns(
             max_concurrent_downloads,
             &endpoints,
             trainer_conns_per_source,
+            progress,
         )
         .await?;
         return Ok((checksum, shard_layout));
@@ -908,13 +944,436 @@ async fn download_embedding_table_with_conns(
     }
 
     let (futures, expected, schedule) =
-        spawn_sharded_downloads(&layout, &prefix, name, &channels, buf).await?;
+        spawn_sharded_downloads(&layout, &prefix, name, &channels, buf, &progress).await?;
     let concurrent = max_concurrent_downloads.or(Some((channels.len() / 2).max(1)));
     let results = run_downloads(futures, rate_limit_bytes_per_sec, concurrent).await?;
     sfence_after_download();
     let results = results_in_piece_order(results, &schedule)?;
     let checksum = combine_transfer_checksums(&results, &expected)?;
     Ok((checksum, shard_layout))
+}
+
+pub const PEER_PIECE_MAX_BYTES: usize = 1 << 30;
+
+const PROGRESSIVE_LIST_INTERVAL: Duration = Duration::from_millis(200);
+const PROGRESSIVE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRESSIVE_LIST_FRESH: Duration = Duration::from_secs(2);
+const PROGRESSIVE_SOURCE_FAILURES: u32 = 8;
+const PROGRESSIVE_PIECE_ATTEMPTS: u32 = 6;
+const PROGRESSIVE_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_LISTED_PIECES: usize = 1 << 20;
+
+impl ShardLayout {
+    pub fn split(self, max_piece_bytes: usize) -> ShardLayout {
+        if self.piece_bytes <= max_piece_bytes {
+            return self;
+        }
+        let fewest = self.piece_bytes.div_ceil(max_piece_bytes.max(1));
+        (fewest..=fewest * 4)
+            .find(|&k| {
+                self.piece_bytes.is_multiple_of(k) && (self.piece_bytes / k).is_multiple_of(64)
+            })
+            .map_or(self, |k| ShardLayout {
+                piece_bytes: self.piece_bytes / k,
+                pieces: self.pieces * k,
+            })
+    }
+}
+
+struct ProgressiveSource {
+    url: String,
+    list: Channel,
+    sends: Vec<Channel>,
+    next_send: usize,
+    piece_bytes: usize,
+    listed: Vec<bool>,
+    skipped: bool,
+    listing: bool,
+    next_list: tokio::time::Instant,
+    listed_at: Option<tokio::time::Instant>,
+    inflight: usize,
+    failures: u32,
+    retry_at: tokio::time::Instant,
+}
+
+impl ProgressiveSource {
+    fn lists(&self, start: usize) -> bool {
+        self.piece_bytes != 0 && self.listed.get(start / self.piece_bytes) == Some(&true)
+    }
+
+    fn can_send(&self, now: tokio::time::Instant) -> bool {
+        self.listed_at
+            .is_some_and(|at| now.duration_since(at) < PROGRESSIVE_LIST_FRESH)
+            && self.failures < PROGRESSIVE_SOURCE_FAILURES
+            && now >= self.retry_at
+            && self.inflight < self.sends.len()
+    }
+
+    fn record_listing(
+        &mut self,
+        listing: Option<(usize, Vec<bool>)>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        self.listing = false;
+        self.next_list = now + PROGRESSIVE_LIST_INTERVAL;
+        let Some((piece_bytes, listed)) = listing.filter(|_| !self.skipped) else {
+            return false;
+        };
+        self.listed_at = Some(now);
+        let before = (self.piece_bytes == piece_bytes).then_some(&self.listed);
+        let appeared = listed
+            .iter()
+            .enumerate()
+            .any(|(j, &is_listed)| is_listed && before.and_then(|b| b.get(j)) != Some(&true));
+        self.piece_bytes = piece_bytes;
+        self.listed = listed;
+        appeared
+    }
+}
+
+type ProgressiveListing = (usize, Option<(usize, Vec<bool>)>);
+
+async fn connect_progressive_sources(
+    urls: &str,
+    sends_per_source: usize,
+) -> Result<Vec<ProgressiveSource>, CopyPortError> {
+    let resolved = resolve_copy_urls(urls).await?;
+    let connected = join_all(
+        resolved
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| async move {
+                let channels = get_channels(duplicated_urls(url, sends_per_source + 1)).await;
+                (url.to_string(), channels)
+            }),
+    )
+    .await;
+    let now = tokio::time::Instant::now();
+    let mut sources = Vec::new();
+    for (url, channels) in connected {
+        match channels {
+            Ok(mut channels) if channels.len() >= 2 => {
+                let list = channels.remove(0);
+                sources.push(ProgressiveSource {
+                    url,
+                    list,
+                    sends: channels,
+                    next_send: 0,
+                    piece_bytes: 0,
+                    listed: Vec::new(),
+                    skipped: false,
+                    listing: false,
+                    next_list: now,
+                    listed_at: None,
+                    inflight: 0,
+                    failures: 0,
+                    retry_at: now,
+                });
+            }
+            Ok(_) => log::warn!("copy_port: progressive source {url} did not connect"),
+            Err(e) => log::warn!("copy_port: progressive source {url}: {}", e.message()),
+        }
+    }
+    if sources.is_empty() {
+        return Err(CopyPortError::Grpc(
+            "no copy_port channels connected".into(),
+        ));
+    }
+    Ok(sources)
+}
+
+fn listed_pieces(name: &str, entries: &[(String, usize)]) -> (usize, Vec<bool>) {
+    let piece_prefix = format!("{name}/c/");
+    let mut piece_bytes = 0;
+    let mut listed = Vec::new();
+    for (entry, size) in entries {
+        let Some(j) = entry
+            .strip_prefix(&piece_prefix)
+            .and_then(|rest| rest.strip_suffix("/0"))
+            .and_then(|j| j.parse::<usize>().ok())
+            .filter(|&j| j < MAX_LISTED_PIECES)
+        else {
+            continue;
+        };
+        if *size == 0 || (piece_bytes != 0 && *size != piece_bytes) {
+            return (0, Vec::new());
+        }
+        piece_bytes = *size;
+        if listed.len() <= j {
+            listed.resize(j + 1, false);
+        }
+        listed[j] = true;
+    }
+    (piece_bytes, listed)
+}
+
+fn list_progressive_source(
+    listings: &mut tokio::task::JoinSet<ProgressiveListing>,
+    sources: &mut [ProgressiveSource],
+    s: usize,
+    prefix: &str,
+    name: &str,
+) {
+    sources[s].listing = true;
+    let list = sources[s].list.clone();
+    let (prefix, name) = (prefix.to_string(), name.to_string());
+    listings.spawn(async move {
+        let listed = tokio::time::timeout(
+            PROGRESSIVE_LIST_TIMEOUT,
+            list_entries(slice::from_ref(&list), &prefix),
+        )
+        .await;
+        let listed = match listed {
+            Ok(Ok(mut entries)) => Some(listed_pieces(&name, &entries.pop().unwrap_or_default())),
+            _ => None,
+        };
+        (s, listed)
+    });
+}
+
+fn next_progressive_unit(
+    sources: &[ProgressiveSource],
+    claimed: &[bool],
+    unit_bytes: usize,
+    now: tokio::time::Instant,
+) -> Option<(usize, usize)> {
+    claimed
+        .iter()
+        .enumerate()
+        .filter(|&(_, &claimed)| !claimed)
+        .find_map(|(j, _)| {
+            sources
+                .iter()
+                .enumerate()
+                .filter(|(_, source)| source.can_send(now) && source.lists(j * unit_bytes))
+                .min_by_key(|(_, source)| (source.failures, source.inflight))
+                .map(|(s, _)| (s, j))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_embedding_table_progressive(
+    path: &str,
+    urls: &str,
+    name: &str,
+    buf: &mut [u8],
+    rate_limit_bytes_per_sec: Option<u64>,
+    max_concurrent_downloads: Option<usize>,
+    progress: Option<Arc<dyn DownloadProgress>>,
+    stall_timeout: Duration,
+) -> Result<(u32, ShardLayout), CopyPortError> {
+    let prefix = checkpoint_prefix_from_path(path)?;
+    let mut sources =
+        connect_progressive_sources(urls, crate::emb_table::peer_conns_per_source()).await?;
+    let max_concurrent = max_concurrent_downloads
+        .unwrap_or_else(|| sources.iter().map(|s| s.sends.len()).sum())
+        .max(1);
+    let rate = rate_limit_bytes_per_sec.unwrap_or(0);
+    let send_timeout = stall_timeout / 2;
+    let (base, buf_len) = (buf.as_mut_ptr() as usize, buf.len());
+    let start = tokio::time::Instant::now();
+    let (mut next_start, mut last_progress) = (start, start);
+    let mut listings = tokio::task::JoinSet::new();
+    let mut unit: Option<ShardLayout> = None;
+    let (mut claimed, mut checksums, mut attempts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut running: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut active = ActiveTransfers::default();
+    let (mut next_index, mut done, mut total_bytes) = (0usize, 0usize, 0u64);
+    let (mut starved_since, mut starved) = (None, Duration::ZERO);
+
+    while unit.is_none_or(|unit| done < unit.pieces) {
+        let now = tokio::time::Instant::now();
+        for s in 0..sources.len() {
+            if !sources[s].listing && now >= sources[s].next_list {
+                list_progressive_source(&mut listings, &mut sources, s, &prefix, name);
+            }
+        }
+        if let Some(layout) = unit {
+            let piece = layout.piece_bytes;
+            while active.tasks.len() < max_concurrent && now >= next_start {
+                let Some((s, j)) = next_progressive_unit(&sources, &claimed, piece, now) else {
+                    if active.tasks.is_empty() {
+                        starved_since.get_or_insert(now);
+                    }
+                    break;
+                };
+                if let Some(since) = starved_since.take() {
+                    starved += now - since;
+                }
+                let source = &mut sources[s];
+                let channel = source.sends[source.next_send % source.sends.len()].clone();
+                source.next_send += 1;
+                source.inflight += 1;
+                claimed[j] = true;
+                let dest: &'static mut [u8] =
+                    unsafe { slice::from_raw_parts_mut((base + j * piece) as *mut u8, piece) };
+                let label = format!("source={} piece={j}", source.url);
+                let send = send_entries(
+                    channel,
+                    vec![
+                        format!("{prefix}{name}/c/{}/0", j * piece / source.piece_bytes)
+                            .into_bytes(),
+                    ],
+                    vec![j * piece % source.piece_bytes],
+                    vec![piece],
+                    dest,
+                    label.clone(),
+                    #[cfg(target_os = "linux")]
+                    (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
+                );
+                active.push(
+                    next_index,
+                    Box::pin(async move {
+                        tokio::time::timeout(send_timeout, send)
+                            .await
+                            .unwrap_or_else(|_| {
+                                log::warn!("copy_port: {label} took over {send_timeout:?}");
+                                (TRANSFER_FAILED_SENTINEL, 0)
+                            })
+                    }),
+                );
+                running.insert(next_index, (s, j));
+                next_index += 1;
+            }
+        }
+        if sources
+            .iter()
+            .all(|s| s.failures >= PROGRESSIVE_SOURCE_FAILURES)
+        {
+            return Err(CopyPortError::TransferFailed(format!(
+                "{name}: every progressive source failed {PROGRESSIVE_SOURCE_FAILURES} \
+                 sends in a row"
+            )));
+        }
+        if now - last_progress > stall_timeout {
+            return Err(CopyPortError::Timeout(format!(
+                "{name}: no new piece from {} peer(s) in {stall_timeout:?} ({done} done)",
+                sources.len()
+            )));
+        }
+
+        let mut wake = now + PROGRESSIVE_LIST_INTERVAL;
+        for source in sources.iter().filter(|source| !source.listing) {
+            wake = wake.min(source.next_list);
+        }
+        if next_start > now {
+            wake = wake.min(next_start);
+        }
+        tokio::select! {
+            biased;
+            Some(joined) = listings.join_next(), if !listings.is_empty() => {
+                let (s, listing) = joined.map_err(|error| {
+                    CopyPortError::Other(format!("copy_port listing task join: {error}"))
+                })?;
+                let now = tokio::time::Instant::now();
+                if sources[s].record_listing(listing, now) {
+                    last_progress = now;
+                }
+                if unit.is_none()
+                    && let Some(first) = sources.iter().find(|s| s.piece_bytes != 0)
+                {
+                    if buf_len % first.piece_bytes != 0 {
+                        return Err(CopyPortError::SizeMismatch {
+                            key: name.to_string(),
+                            listed: first.piece_bytes,
+                            requested: buf_len,
+                        });
+                    }
+                    let layout = ShardLayout {
+                        piece_bytes: first.piece_bytes,
+                        pieces: buf_len / first.piece_bytes,
+                    }
+                    .split(PEER_PIECE_MAX_BYTES);
+                    (claimed, checksums, attempts) = (
+                        vec![false; layout.pieces],
+                        vec![None; layout.pieces],
+                        vec![0u32; layout.pieces],
+                    );
+                    if let Some(progress) = &progress {
+                        progress.layout(layout);
+                    }
+                    unit = Some(layout);
+                }
+                if let Some(layout) = unit {
+                    for source in sources.iter_mut().filter(|source| !source.skipped) {
+                        let whole = layout.piece_bytes * layout.pieces;
+                        if source.piece_bytes % layout.piece_bytes != 0
+                            || source.piece_bytes * source.listed.len() > whole
+                        {
+                            log::warn!(
+                                "copy_port: {name} from {} lists {} pieces of {} bytes, \
+                                 not {} of {}; skipping it",
+                                source.url,
+                                source.listed.len(),
+                                source.piece_bytes,
+                                layout.pieces,
+                                layout.piece_bytes
+                            );
+                            (source.piece_bytes, source.listed) = (0, Vec::new());
+                            source.skipped = true;
+                        }
+                    }
+                }
+            }
+            Some(joined) = active.tasks.join_next(), if !active.tasks.is_empty() => {
+                let (index, (sent, checksum)) = joined.unwrap_or_else(|error| {
+                    Err(CopyPortError::Other(format!("copy_port download task join: {error}")))
+                })?;
+                let (s, j) = running.remove(&index).expect("a running transfer");
+                let piece = unit.expect("a layout before any transfer").piece_bytes;
+                let source = &mut sources[s];
+                source.inflight -= 1;
+                let now = tokio::time::Instant::now();
+                if sent == piece {
+                    checksums[j] = Some(checksum);
+                    done += 1;
+                    source.failures = 0;
+                    total_bytes += sent as u64;
+                    last_progress = now;
+                    next_start = now + pacing_sleep(total_bytes, rate, now - start);
+                    if let Some(progress) = &progress {
+                        sfence_after_download();
+                        progress.written(j * piece, (j + 1) * piece);
+                    }
+                } else {
+                    claimed[j] = false;
+                    attempts[j] += 1;
+                    source.failures += 1;
+                    source.retry_at = now + PROGRESSIVE_RETRY_BACKOFF * (1 << source.failures.min(5));
+                    log::warn!(
+                        "copy_port: {name} piece {j} from {} failed (attempt {}, {} in a row)",
+                        source.url, attempts[j], source.failures
+                    );
+                    if attempts[j] >= PROGRESSIVE_PIECE_ATTEMPTS {
+                        return Err(CopyPortError::TransferFailed(format!(
+                            "{name} piece {j} failed {} times", attempts[j]
+                        )));
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+    }
+    sfence_after_download();
+    let layout = unit.expect("a finished download has a layout");
+    let mut checksum = 1u32;
+    for piece_checksum in checksums {
+        adler32_combine(
+            &mut checksum,
+            piece_checksum.expect("every piece downloaded"),
+            layout.piece_bytes,
+        );
+    }
+    let secs = start.elapsed().as_secs_f64();
+    log::info!(
+        "copy_port: {name} progressive download of {buf_len} bytes from {} peer(s) in \
+         {secs:.2}s ({:.2} GB/s), {:.1}s waiting for pieces",
+        sources.len(),
+        buf_len as f64 / secs.max(1e-9) / 1e9,
+        starved.as_secs_f64()
+    );
+    Ok((checksum, layout))
 }
 
 struct DenseListing<'a> {
@@ -1273,6 +1732,7 @@ async fn spawn_striped_trainer_downloads(
     endpoints: &[Endpoint],
     buf: &mut [u8],
     connections: usize,
+    progress: &Option<Arc<dyn DownloadProgress>>,
 ) -> Result<(Vec<TransferFuture>, Vec<usize>, Vec<usize>), CopyPortError> {
     let ShardOwnership::Sharded { owner, .. } = &layout.ownership else {
         return Err(CopyPortError::Other(
@@ -1368,13 +1828,14 @@ async fn spawn_striped_trainer_downloads(
             }
             expected.push(hi - lo);
             let b: &'static mut [u8] = unsafe { mem::transmute(&mut buf[lo..hi]) };
-            futures.push(Box::pin(send_entries(
+            futures.push(Box::pin(send_entries_reporting(
                 channel.clone(),
                 names,
                 offsets,
                 sizes,
                 b,
                 format!("source={source} connection={connection}"),
+                ProgressAt::at(progress, lo),
                 #[cfg(target_os = "linux")]
                 (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
             )));
@@ -1395,6 +1856,7 @@ async fn spawn_sharded_downloads(
     name: &str,
     channels: &[Channel],
     buf: &mut [u8],
+    progress: &Option<Arc<dyn DownloadProgress>>,
 ) -> Result<(Vec<TransferFuture>, Vec<usize>, Vec<usize>), CopyPortError> {
     let name_prefix = format!("{name}/c/");
     let piece = layout.piece_bytes;
@@ -1491,7 +1953,7 @@ async fn spawn_sharded_downloads(
         let slice = &mut buf[a * piece..b * piece];
         let slice: &'static mut [u8] =
             unsafe { mem::transmute(slice::from_raw_parts_mut(slice.as_mut_ptr(), slice.len())) };
-        let fut: TransferFuture = Box::pin(send_entries(
+        let fut: TransferFuture = Box::pin(send_entries_reporting(
             channels[idx].clone(),
             (a..b)
                 .map(|j| format!("{prefix}{name_prefix}{j}/0").into_bytes())
@@ -1500,6 +1962,7 @@ async fn spawn_sharded_downloads(
             vec![piece; n],
             slice,
             format!("rank={i}"),
+            ProgressAt::at(progress, a * piece),
             #[cfg(target_os = "linux")]
             (devicez[i].clone(), contexts.clone(), mrx[i].clone()),
         ));
@@ -1867,6 +2330,85 @@ mod tests {
         );
         let partial = vec![entries[0].clone(), vec![]];
         assert!(choose_prefix(Some("elapsed_samples_1/run"), &partial).is_err());
+    }
+
+    #[test]
+    fn re_served_pieces_split_to_at_most_a_gib() {
+        let layout = |piece_bytes, pieces| ShardLayout {
+            piece_bytes,
+            pieces,
+        };
+        assert_eq!(
+            layout(960_002_048, 512),
+            layout(7_680_016_384, 64).split(PEER_PIECE_MAX_BYTES)
+        );
+        assert_eq!(layout(1 << 20, 3), layout(1 << 20, 3).split(1 << 30));
+        assert_eq!(layout(4099, 2), layout(4099, 2).split(1024));
+        assert_eq!(layout(1024, 8), layout(4096, 2).split(1024));
+    }
+
+    #[test]
+    fn listed_pieces_of_one_tensor() {
+        let entries = |names: &[(&str, usize)]| -> Vec<(String, usize)> {
+            names.iter().map(|&(n, s)| (n.to_string(), s)).collect()
+        };
+        assert_eq!(
+            (8, vec![true, false, true]),
+            listed_pieces(
+                "emb",
+                &entries(&[
+                    ("emb/c/2/0", 8),
+                    ("emb/c/0/0", 8),
+                    ("emb_other/c/1/0", 4),
+                    ("params.w/c/0", 3),
+                    ("checksums.0.json", 2),
+                ])
+            )
+        );
+        assert_eq!(
+            (0, vec![]),
+            listed_pieces("emb", &entries(&[("emb/c/0/0", 8), ("emb/c/1/0", 4)])),
+            "pieces disagree on size"
+        );
+        assert_eq!((0, vec![]), listed_pieces("emb", &entries(&[])));
+    }
+
+    #[tokio::test]
+    async fn a_failed_piece_goes_to_a_replica_that_is_not_failing() {
+        let now = tokio::time::Instant::now();
+        let source = |listed: &[bool], failures: u32, inflight: usize| {
+            let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+            ProgressiveSource {
+                url: String::new(),
+                list: channel.clone(),
+                sends: vec![channel; 4],
+                next_send: 0,
+                piece_bytes: 10,
+                listed: listed.to_vec(),
+                skipped: false,
+                listing: false,
+                next_list: now,
+                listed_at: Some(now),
+                inflight,
+                failures,
+                retry_at: now,
+            }
+        };
+        let sources = [source(&[true, true], 1, 0), source(&[true, false], 0, 3)];
+        assert_eq!(
+            Some((1, 0)),
+            next_progressive_unit(&sources, &[false, false], 10, now)
+        );
+        assert_eq!(
+            Some((0, 1)),
+            next_progressive_unit(&sources, &[true, false], 10, now),
+            "only the failing replica has it"
+        );
+        assert_eq!(
+            None,
+            next_progressive_unit(&sources, &[false, false], 10, now + PROGRESSIVE_LIST_FRESH),
+            "neither answered a listing lately"
+        );
     }
 
     fn tracking_downloads(
@@ -2522,6 +3064,7 @@ mod trainer_e2e_tests {
                 16,
                 2,
                 false,
+                None,
             )
             .await;
             assert_eq!(traffic.active.load(Ordering::SeqCst), 0);
@@ -2556,6 +3099,7 @@ mod trainer_e2e_tests {
                 4,
                 1,
                 replicas,
+                None,
             )
             .await
             .unwrap();
@@ -2658,6 +3202,7 @@ mod p2p_e2e_tests {
             2,
             1,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -2719,6 +3264,7 @@ mod p2p_e2e_tests {
             2,
             1,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -2880,6 +3426,7 @@ mod p2p_e2e_tests {
             None,
             None,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -2892,5 +3439,282 @@ mod p2p_e2e_tests {
             },
             layout
         );
+    }
+
+    async fn spawn_memory_peer() -> (Arc<PeerServeState>, String) {
+        spawn_paced_memory_peer(None).await
+    }
+
+    async fn spawn_paced_memory_peer(rate: Option<f64>) -> (Arc<PeerServeState>, String) {
+        let state = Arc::new(PeerServeState::new(16, rate));
+        let sender = Arc::new(
+            Sender::new(12)
+                .with_peer_state(state.clone())
+                .manifest_only(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CopyService::from_arc(sender))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        (state, url)
+    }
+
+    fn publish_pieces(state: &PeerServeState, emb: &Bytes, piece: usize, pieces: &[usize]) {
+        let mut memory = vec![(
+            format!("{PREFIX}checksums.0.json"),
+            Bytes::from_static(b"{}"),
+        )];
+        memory.extend(pieces.iter().map(|&j| {
+            (
+                format!("{PREFIX}emb/c/{j}/0"),
+                emb.slice(j * piece..(j + 1) * piece),
+            )
+        }));
+        state.publish_with_memory(vec![], memory).unwrap();
+    }
+
+    fn table_bytes(seed: usize) -> Bytes {
+        Bytes::from(
+            (0..PIECE * PIECES)
+                .map(|i| ((i * 7 + seed) % 251) as u8)
+                .collect::<Vec<u8>>(),
+        )
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        layout: Mutex<Option<ShardLayout>>,
+        written: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl DownloadProgress for Recorded {
+        fn layout(&self, layout: ShardLayout) {
+            *self.layout.lock().unwrap() = Some(layout);
+        }
+
+        fn written(&self, start: usize, end: usize) {
+            self.written.lock().unwrap().push((start, end));
+        }
+    }
+
+    async fn progressive(
+        urls: &str,
+        buf: &mut [u8],
+        progress: Option<Arc<dyn DownloadProgress>>,
+        stall: Duration,
+    ) -> Result<(u32, ShardLayout), CopyPortError> {
+        download_embedding_table_progressive(
+            &format!("/dev/shm/{PREFIX}"),
+            urls,
+            "emb",
+            buf,
+            None,
+            Some(4),
+            progress,
+            stall,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progressive_download_follows_a_growing_manifest() {
+        let emb = table_bytes(1);
+        let (a, url_a) = spawn_memory_peer().await;
+        let (b, url_b) = spawn_memory_peer().await;
+        publish_pieces(&a, &emb, PIECE, &[]);
+        publish_pieces(&b, &emb, PIECE, &[]);
+        let grow = {
+            let emb = emb.clone();
+            tokio::spawn(async move {
+                for j in 0..PIECES - 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let state = if j % 2 == 0 { &a } else { &b };
+                    let listed: Vec<usize> = (0..=j).filter(|i| i % 2 == j % 2).collect();
+                    publish_pieces(state, &emb, PIECE, &listed);
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                a.unpublish();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                publish_pieces(&b, &emb, PIECE, &(0..PIECES).collect::<Vec<_>>());
+            })
+        };
+        let recorded = Arc::new(Recorded::default());
+        let mut buf = vec![0u8; emb.len()];
+        let (checksum, layout) = progressive(
+            &format!("{url_a},{url_b}"),
+            &mut buf,
+            Some(recorded.clone()),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        grow.await.unwrap();
+
+        assert_eq!(&emb[..], &buf[..]);
+        assert_eq!(adler32(&&emb[..]), checksum);
+        let want = ShardLayout {
+            piece_bytes: PIECE,
+            pieces: PIECES,
+        };
+        assert_eq!(
+            (want, Some(want)),
+            (layout, *recorded.layout.lock().unwrap())
+        );
+        let mut written = recorded.written.lock().unwrap().clone();
+        written.sort();
+        assert_eq!(
+            (0..PIECES)
+                .map(|j| (j * PIECE, (j + 1) * PIECE))
+                .collect::<Vec<_>>(),
+            written,
+            "each piece reported once, whole"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progressive_download_reads_finer_pieces_out_of_coarser_ones() {
+        let emb = table_bytes(2);
+        let (fine, url_fine) = spawn_memory_peer().await;
+        let (coarse, url_coarse) = spawn_memory_peer().await;
+        let fine_pieces: Vec<usize> = (0..PIECES).collect();
+        publish_pieces(&fine, &emb, PIECE, &fine_pieces[..PIECES - 1]);
+        publish_pieces(&coarse, &emb, PIECE * PIECES, &[]);
+        let grow = {
+            let emb = emb.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                publish_pieces(&coarse, &emb, PIECE * PIECES, &[0]);
+            })
+        };
+
+        let mut buf = vec![0u8; emb.len()];
+        let (checksum, layout) = progressive(
+            &format!("{url_fine},{url_coarse}"),
+            &mut buf,
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        grow.await.unwrap();
+        assert_eq!(&emb[..], &buf[..]);
+        assert_eq!(adler32(&&emb[..]), checksum);
+        assert_eq!(PIECE, layout.piece_bytes);
+    }
+
+    async fn spawn_freezable_proxy(target: String) -> (Arc<std::sync::atomic::AtomicBool>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let pump = |mut from: tokio::net::tcp::OwnedReadHalf,
+                    mut to: tokio::net::tcp::OwnedWriteHalf,
+                    frozen: Arc<std::sync::atomic::AtomicBool>| async move {
+            let mut buf = vec![0u8; 64 << 10];
+            while let Ok(n @ 1..) = from.read(&mut buf).await {
+                while frozen.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if to.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        };
+        let flag = frozen.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let server = tokio::net::TcpStream::connect(&target).await.unwrap();
+                let ((client_read, client_write), (server_read, server_write)) =
+                    (client.into_split(), server.into_split());
+                tokio::spawn(pump(client_read, server_write, flag.clone()));
+                tokio::spawn(pump(server_read, client_write, flag.clone()));
+            }
+        });
+        (frozen, url)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progressive_download_is_not_held_up_by_a_hung_replica() {
+        let emb = table_bytes(4);
+        let (good, url_good) = spawn_memory_peer().await;
+        let (hung, url_hung) = spawn_memory_peer().await;
+        let (frozen, url_hung) = spawn_freezable_proxy(url_hung).await;
+        publish_pieces(&good, &emb, PIECE, &[]);
+        publish_pieces(&hung, &emb, PIECE, &[]);
+        let grow = {
+            let emb = emb.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+                for j in 0..PIECES {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    publish_pieces(&good, &emb, PIECE, &(0..=j).collect::<Vec<_>>());
+                }
+            })
+        };
+        let mut buf = vec![0u8; emb.len()];
+        let t0 = Instant::now();
+        let (checksum, _) = progressive(
+            &format!("{url_good},{url_hung}"),
+            &mut buf,
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        grow.await.unwrap();
+        assert_eq!(&emb[..], &buf[..]);
+        assert_eq!(adler32(&&emb[..]), checksum);
+        assert!(
+            t0.elapsed() < PROGRESSIVE_LIST_TIMEOUT,
+            "waited on the hung replica's listings: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progressive_download_fetches_again_a_piece_whose_send_hangs() {
+        let emb = table_bytes(5);
+        let (slow, url_slow) = spawn_paced_memory_peer(Some(1.0)).await;
+        let (good, url_good) = spawn_memory_peer().await;
+        publish_pieces(&slow, &emb, PIECE, &(0..PIECES).collect::<Vec<_>>());
+        publish_pieces(&good, &emb, PIECE, &[]);
+        let grow = {
+            let emb = emb.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                publish_pieces(&good, &emb, PIECE, &(0..PIECES).collect::<Vec<_>>());
+            })
+        };
+        let mut buf = vec![0u8; emb.len()];
+        let stall = Duration::from_secs(4);
+        let t0 = Instant::now();
+        let (checksum, _) = progressive(&format!("{url_slow},{url_good}"), &mut buf, None, stall)
+            .await
+            .unwrap();
+        grow.await.unwrap();
+        assert_eq!(&emb[..], &buf[..]);
+        assert_eq!(adler32(&&emb[..]), checksum);
+        assert!(t0.elapsed() < stall, "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn progressive_download_fails_once_no_piece_arrives() {
+        let emb = table_bytes(3);
+        let (stuck, url) = spawn_memory_peer().await;
+        publish_pieces(&stuck, &emb, PIECE, &[0, 1]);
+
+        let mut buf = vec![0u8; emb.len()];
+        let t0 = Instant::now();
+        let err = progressive(&url, &mut buf, None, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CopyPortError::Timeout(_)), "{err}");
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(t0.elapsed() >= Duration::from_millis(500));
+        assert_eq!(&emb[..2 * PIECE], &buf[..2 * PIECE]);
     }
 }

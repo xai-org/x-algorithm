@@ -69,6 +69,14 @@ fn refuse_test_users(app_env: Option<&str>) {
     }
 }
 
+pub(crate) fn logs_ddg_impressions() -> bool {
+    app_env_logs_ddg_impressions(std::env::var(ENV_APP_ENV).ok().as_deref())
+}
+
+pub fn app_env_logs_ddg_impressions(app_env: Option<&str>) -> bool {
+    app_env == Some("prod")
+}
+
 const DEFAULT_CACHE_CAPACITY: usize = 1_000_000;
 
 pub(crate) fn author_cache_capacity() -> Option<usize> {
@@ -137,8 +145,9 @@ pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CACHE_CAPACITY, QuotePassMode, parse_capacity, parse_env_flag, parse_quote_pass,
-        refuse_test_users, resolve_gizmoduck_client_id, resolve_twemcache_client_name,
+        DEFAULT_CACHE_CAPACITY, QuotePassMode, app_env_logs_ddg_impressions, parse_capacity,
+        parse_env_flag, parse_quote_pass, refuse_test_users, resolve_gizmoduck_client_id,
+        resolve_twemcache_client_name,
     };
 
     #[test]
@@ -146,6 +155,23 @@ mod tests {
         refuse_test_users(Some("staging"));
         refuse_test_users(None);
         assert!(std::panic::catch_unwind(|| refuse_test_users(Some("prod"))).is_err());
+    }
+
+    #[test]
+    fn only_prod_logs_ddg_impressions() {
+        for (app_env, expected) in [
+            (Some("prod"), true),
+            (Some("staging"), false),
+            (Some("devel"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                app_env_logs_ddg_impressions(app_env),
+                expected,
+                "{app_env:?}"
+            );
+        }
     }
 
     #[test]
