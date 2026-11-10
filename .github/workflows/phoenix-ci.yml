@@ -1,0 +1,87 @@
+name: Phoenix CI
+
+# Scoped to phoenix/ only: it's the one component in this repo documented and
+# designed to build and run outside X's internal infrastructure (see
+# phoenix/README.md, "What's not in this repo"). Other services import
+# internal-only packages and have no standalone build manifest, so they
+# aren't included here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "phoenix/**"
+      - ".github/workflows/phoenix-ci.yml"
+  pull_request:
+    paths:
+      - "phoenix/**"
+      - ".github/workflows/phoenix-ci.yml"
+
+defaults:
+  run:
+    working-directory: phoenix
+
+jobs:
+  python-tests:
+    name: Python tests (xrex)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.11"
+
+      # Base deps only (no --extra engine): the engine extra needs a Rust
+      # toolchain to build xai-recsys-engine via maturin, which the
+      # rust-check job below covers. Keeping this job to the pure-Python
+      # surface keeps it fast and independent of the Rust build.
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest -v
+
+  rust-check:
+    name: Rust check (crates/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the workspace's documented minimum (see
+      # phoenix/Cargo.toml's rust-version and the README prerequisites) so
+      # this job actually verifies the MSRV, not just "whatever ships on the
+      # runner today."
+      - name: Install Rust 1.85.0
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            phoenix/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('phoenix/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config unzip \
+            libibverbs-dev libnl-3-dev libnl-route-3-dev libclang-dev libnuma-dev
+
+      # Matches phoenix/README.md's protoc guidance (>=3.15 for proto3
+      # `optional` support), using the x86_64 build to match this runner --
+      # see the corresponding fix to the README's copy-pasteable command.
+      - name: Install protoc
+        run: |
+          curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local 'bin/*' 'include/*'
+          protoc --version
+
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace
