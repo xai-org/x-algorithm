@@ -24,7 +24,10 @@ import com.twitter.botmaker.runtime.Runtime;
     },
     returnType = "List<T>",
     deprecated = false,
-    description = "Returns the first n values of the list. if n > len(list) return list.",
+    description =
+        "Returns the first n values of the list."
+            + " Returns an empty list if n is negative."
+            + " Returns the whole list if n is greater than the length of the list.",
     actionLevel = ActionLevel.NO_ACTION,
     examples = {
         "FirstN(List(\"asdf\", \"bas\", \"biz\"), 2)"
@@ -54,6 +57,7 @@ public class FirstN extends FunctionNode2<Runtime, List<Object>, Long> {
 
   @Override
   public Object apply(Context<Runtime> context, List<Object> list, Long n) {
-    return list.subList(0, Math.min(n.intValue(), list.size()));
+    long itemCount = Math.max(0L, Math.min(n.longValue(), (long) list.size()));
+    return list.subList(0, (int) itemCount);
   }
 }
