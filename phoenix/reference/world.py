@@ -483,7 +483,7 @@ def generate_world(
 
     urng = _rng(seed, 3)
     arrays["user_id"] = np.arange(1, num_users + 1, dtype=np.int64)
-    k = urng.integers(2, 5, size=num_users)
+    k = urng.integers(2, min(4, num_topics) + 1, size=num_users)
     topic_ids = np.full((num_users, 4), -1, dtype=np.int64)
     topic_w = np.zeros((num_users, 4), dtype=np.float64)
     pref_matrix = np.zeros((num_users, num_topics), dtype=np.float64)
