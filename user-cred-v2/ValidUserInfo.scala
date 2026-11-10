@@ -5,15 +5,7 @@ import com.twitter.usersource.snapshot.flat.thriftscala.FlatUser
 final case class ValidUserInfo(
   id: Long,
   isNearZero: Boolean,
-  isBlueVerified: Boolean,
-  isGrayVerified: Boolean,
-  isGoldVerified: Boolean,
-  isVerifiedOrg: Boolean,
-  isVOAffiliate: Boolean,
-) {
-  def isPremium: Boolean =
-    isBlueVerified || isGrayVerified || isGoldVerified || isVerifiedOrg || isVOAffiliate
-}
+)
 
 object ValidUserInfo {
   private val NearZeroState = 1
@@ -29,11 +21,6 @@ object ValidUserInfo {
         ValidUserInfo(
           id = id,
           isNearZero = flatUser.userState.contains(NearZeroState),
-          isBlueVerified = flatUser.isBlueVerified.getOrElse(false),
-          isGrayVerified = flatUser.isGrayVerified.getOrElse(false),
-          isGoldVerified = flatUser.isGoldVerified.getOrElse(false),
-          isVerifiedOrg = flatUser.isVerifiedOrganization.getOrElse(false),
-          isVOAffiliate = flatUser.isVerifiedOrganizationAffiliate.getOrElse(false),
         )
       }
     } else {
