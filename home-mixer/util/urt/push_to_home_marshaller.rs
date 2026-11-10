@@ -23,6 +23,11 @@ pub(super) fn marshal_push_to_home(post: &PushToHomePost, sort_index: i64) -> Ti
     } else {
         None
     };
+    let parent = if post.in_reply_to_tweet_id != 0 && post.in_reply_to_tweet_id != focal_id {
+        Some(post.in_reply_to_tweet_id)
+    } else {
+        None
+    };
 
     let focal_tweet = if is_root && !post.facepile_user_ids.is_empty() {
         let facepile = TweetFacepile::new(
@@ -34,7 +39,7 @@ pub(super) fn marshal_push_to_home(post: &PushToHomePost, sort_index: i64) -> Ti
         make_tweet(focal_id)
     };
 
-    let mut module_items: Vec<ModuleItem> = Vec::with_capacity(2);
+    let mut module_items: Vec<ModuleItem> = Vec::with_capacity(3);
     if let Some(root_id) = root {
         module_items.push(ModuleItem {
             entry_id: format!("{ENTRY_NAMESPACE_TWEET}-{root_id}"),
@@ -43,6 +48,17 @@ pub(super) fn marshal_push_to_home(post: &PushToHomePost, sort_index: i64) -> Ti
             tree_display: None,
             pill_group: None,
         });
+    }
+    if let Some(parent_id) = parent {
+        if root != Some(parent_id) {
+            module_items.push(ModuleItem {
+                entry_id: format!("{ENTRY_NAMESPACE_TWEET}-{parent_id}"),
+                item: make_tweet_item(make_tweet(parent_id), Some(cei.clone()), None),
+                dispensable: None,
+                tree_display: None,
+                pill_group: None,
+            });
+        }
     }
     module_items.push(ModuleItem {
         entry_id: format!("{ENTRY_NAMESPACE_TWEET}-{focal_id}"),
@@ -116,3 +132,89 @@ fn build_all_tweet_ids(post: &PushToHomePost) -> Vec<i64> {
     }
     ids
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_post_marshaling() {
+        let post = PushToHomePost {
+            tweet_id: 100,
+            author_id: 1,
+            in_reply_to_tweet_id: 0,
+            conversation_id: 0,
+            facepile_user_ids: vec![],
+            served_type: 0,
+        };
+        let entry = marshal_push_to_home(&post, 1);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 1);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+
+    #[test]
+    fn test_direct_reply_to_root() {
+        let post = PushToHomePost {
+            tweet_id: 200,
+            author_id: 2,
+            in_reply_to_tweet_id: 100,
+            conversation_id: 100,
+            facepile_user_ids: vec![],
+            served_type: 0,
+        };
+        let entry = marshal_push_to_home(&post, 1);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 2);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+            assert_eq!(module.items[1].entry_id, "tweet-200");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+
+    #[test]
+    fn test_multi_level_reply_renders_root_and_parent() {
+        let post = PushToHomePost {
+            tweet_id: 300,
+            author_id: 3,
+            in_reply_to_tweet_id: 200,
+            conversation_id: 100,
+            facepile_user_ids: vec![],
+            served_type: 0,
+        };
+        let entry = marshal_push_to_home(&post, 1);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 3);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+            assert_eq!(module.items[1].entry_id, "tweet-200");
+            assert_eq!(module.items[2].entry_id, "tweet-300");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+
+    #[test]
+    fn test_reply_with_missing_conversation_id_still_renders_parent() {
+        let post = PushToHomePost {
+            tweet_id: 200,
+            author_id: 2,
+            in_reply_to_tweet_id: 100,
+            conversation_id: 0,
+            facepile_user_ids: vec![],
+            served_type: 0,
+        };
+        let entry = marshal_push_to_home(&post, 1);
+        if let TimelineEntryContent::TimelineModule(module) = entry.content {
+            assert_eq!(module.items.len(), 2);
+            assert_eq!(module.items[0].entry_id, "tweet-100");
+            assert_eq!(module.items[1].entry_id, "tweet-200");
+        } else {
+            panic!("Expected TimelineModule");
+        }
+    }
+}
+
