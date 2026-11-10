@@ -8,8 +8,10 @@ pub struct InNetworkCandidateHydrator;
 
 #[async_trait]
 impl Hydrator<ScoredPostsQuery, PostCandidate> for InNetworkCandidateHydrator {
-    fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        !query.has_cached_posts
+    fn enable(&self, _query: &ScoredPostsQuery) -> bool {
+        // FollowedUserIdsQueryHydrator still runs on cache hits. Skipping here
+        // would keep the cached in_network bit after follow/unfollow.
+        true
     }
 
     async fn hydrate(
@@ -41,5 +43,59 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for InNetworkCandidateHydrator {
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.in_network = hydrated.in_network;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::user_features::UserFeatures;
+
+    fn query(user_id: u64, followed: Vec<i64>, has_cached_posts: bool) -> ScoredPostsQuery {
+        ScoredPostsQuery {
+            user_id,
+            has_cached_posts,
+            user_features: UserFeatures {
+                followed_user_ids: followed,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn candidate(tweet_id: u64, author_id: u64, in_network: Option<bool>) -> PostCandidate {
+        PostCandidate {
+            tweet_id,
+            author_id,
+            in_network,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enable_on_cache_hit_and_miss() {
+        let hydrator = InNetworkCandidateHydrator;
+        assert!(hydrator.enable(&query(1, vec![10], true)));
+        assert!(hydrator.enable(&query(1, vec![10], false)));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_recomputes_from_current_follow_list() {
+        let hydrator = InNetworkCandidateHydrator;
+        let q = query(1, vec![10], true);
+        let mut candidates = vec![
+            candidate(1, 10, Some(false)),
+            candidate(2, 20, Some(true)),
+            candidate(3, 1, Some(false)),
+        ];
+
+        let hydrated = hydrator.hydrate(&q, &candidates).await;
+        for (c, h) in candidates.iter_mut().zip(hydrated) {
+            hydrator.update(c, h.expect("hydrate ok"));
+        }
+
+        assert_eq!(candidates[0].in_network, Some(true));
+        assert_eq!(candidates[1].in_network, Some(false));
+        assert_eq!(candidates[2].in_network, Some(true));
     }
 }
