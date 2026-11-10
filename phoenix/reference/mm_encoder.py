@@ -158,8 +158,6 @@ def _render_single_post(
 
     if getattr(post, "cards", None):
         for card in post.cards:
-            if max_images is not None and len(images) >= max_images:
-                break
             _process_cardv2(card, text_parts, images, max_images)
 
     if article and article.media:
