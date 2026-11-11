@@ -771,7 +771,7 @@ mod tests {
         );
         let unmapped = label_map(&[
             SafetyLabelType::BOUNCE,
-            SafetyLabelType::HIGH_SPAMMY_TWEET_CONTENT_SCORE,
+            SafetyLabelType::DEPRECATED_LABEL_144,
         ]);
         assert_eq!(
             case.judge(&answer(vec![(2, unmapped)], vec![])).result,

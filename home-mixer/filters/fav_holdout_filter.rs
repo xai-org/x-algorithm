@@ -58,11 +58,10 @@ impl Filter<ScoredPostsQuery, PostCandidate> for FavHoldoutFilter {
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
         let viewer_id = query.user_id;
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        FilterResult::partition(candidates, |c| {
             let percent = Self::holdout_percent(c.fav_count);
-            InventoryHoldoutFilter::is_held_out(c.get_original_tweet_id(), viewer_id, percent)
-        });
-        FilterResult { kept, removed }
+            !InventoryHoldoutFilter::is_held_out(c.get_original_tweet_id(), viewer_id, percent)
+        })
     }
 }
 

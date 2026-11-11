@@ -65,6 +65,11 @@ pub struct ScoredPostsQuery {
     #[serde(skip)]
     pub stats_history_topics: Option<xai_vm_ranker_proto::experiment::HistoryTopics>,
     #[serde(skip)]
+    pub recent_views: Vec<xai_vm_ranker_proto::experiment::RecentView>,
+    #[serde(skip)]
+    pub recent_view_topics:
+        std::collections::HashMap<u64, xai_vm_ranker_proto::experiment::PostTopics>,
+    #[serde(skip)]
     pub immersive_columnar_scoring_sequence: Option<bytes::Bytes>,
     #[serde(skip)]
     pub retrieval_sequence: Option<xai_recsys_proto::UserActionSequence>,
@@ -200,6 +205,8 @@ impl ScoredPostsQuery {
             columnar_scoring_sequence: None,
             history_topics: None,
             stats_history_topics: None,
+            recent_views: Vec::new(),
+            recent_view_topics: std::collections::HashMap::new(),
             immersive_columnar_scoring_sequence: None,
             retrieval_sequence: None,
             columnar_retrieval_sequence: None,

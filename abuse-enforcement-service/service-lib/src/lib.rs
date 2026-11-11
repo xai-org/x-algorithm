@@ -24,6 +24,7 @@ pub mod manhattan;
 pub mod metrics;
 pub mod off_switch;
 pub mod overturn_hold;
+pub mod post_labels;
 pub mod restart_on_config_change;
 pub mod rules;
 pub mod safety_checks;
@@ -54,7 +55,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::dedup_cache::{DedupCheck, DedupSlot};
+use crate::dedup_cache::{DedupCheck, DedupKey, DedupSlot};
 use anyhow::{Context, Result};
 use axum::Router;
 
@@ -163,6 +164,11 @@ impl DecisionContext {
         self.global_dry_run || self.control.record_only()
     }
 
+            fn dedup_key(&self, entity_type: EntityType, entity_id: i64) -> DedupKey {
+        DedupKey::entity(entity_type, entity_id)
+            .with_post_labels(self.control.dedup_labels().as_deref())
+    }
+
         fn claimed(&self) -> bool {
         !self.records_only()
     }
@@ -210,6 +216,7 @@ struct EnforcementCtx {
             head_guard: Arc<head_guard::HeadGuard>,
             action_control: Arc<action_control::ActionControl>,
             backfill: Arc<backfill::Backfill>,
+            post_labels: Option<Arc<dyn post_labels::PostLabelReader>>,
         #[cfg(test)]
     outcome_log: Option<Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>>,
 }
@@ -309,6 +316,65 @@ fn decision_outcome(
 const ALREADY_SUSPENDED: &str = "already_suspended";
 
 const ALREADY_SUSPENDED_STRIPPED: &str = "already_suspended_stripped";
+
+const ALREADY_POST_LABELED: &str = "already_post_labeled";
+
+const POST_LABELS_CARRIED: &str = "post_labels_carried";
+
+const POST_LABELS_READ: &str = "post_labels_read";
+
+async fn drop_carried_post_labels(
+    reader: Option<&dyn post_labels::PostLabelReader>,
+    facts: &mut Facts,
+    specs: &mut Vec<decision::ActionSpec>,
+    extra: &mut BTreeMap<String, String>,
+) -> bool {
+    let Some(reader) = reader else {
+        metrics::POST_LABEL_READ_TOTAL
+            .with_label_values(&["unavailable"])
+            .inc();
+        extra.insert(POST_LABELS_READ.into(), "unavailable".into());
+        return false;
+    };
+    let now_ms = now_millis();
+    let carried = match reader.labels(facts.entity_id, now_ms).await {
+        Ok(Some(carried)) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["ok"])
+                .inc();
+            carried
+        }
+        Ok(None) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["not_found"])
+                .inc();
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                post_id = facts.entity_id,
+                "post label read failed: {e:#}; sending every label"
+            );
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["failed"])
+                .inc();
+            extra.insert(POST_LABELS_READ.into(), "failed".into());
+            return false;
+        }
+    };
+    if let EntityFacts::Post(post) = &mut facts.entity {
+        post.present = true;
+        post.labels = carried.keys().cloned().collect();
+    }
+    let dropped = post_labels::drop_carried(specs, &carried, now_ms);
+    if !dropped.is_empty() {
+        extra.insert(
+            POST_LABELS_CARRIED.into(),
+            serde_json::to_string(&dropped).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+    specs.is_empty()
+}
 
 fn strip_redundant_suspends(
     specs: &mut Vec<decision::ActionSpec>,
@@ -639,6 +705,24 @@ async fn run_enforcement_inner(
                     "already_spam_high_recall_labeled"
                 };
                 return Ok(skip_outcome(reason.into(), dry_run, &facts, score));
+            }
+            if control.page_driven()
+                && facts.entity_type == EntityType::Post
+                && post_labels::sent_labels(&specs).next().is_some()
+                && drop_carried_post_labels(
+                    ctx.post_labels.as_deref(),
+                    &mut facts,
+                    &mut specs,
+                    extra,
+                )
+                .await
+            {
+                return Ok(skip_outcome(
+                    ALREADY_POST_LABELED.into(),
+                    dry_run,
+                    &facts,
+                    score,
+                ));
             }
             if control.page_driven() {
                 let account = facts.user();
@@ -1161,8 +1245,7 @@ fn dedup_retention_for(status: &str) -> DedupRetention {
 
 async fn write_dedup_outcome(
     dedup_cache: &dyn DedupSlot,
-    entity_type: EntityType,
-    entity_id: i64,
+    key: &DedupKey,
     score: &abuse_proto::ScoreResult,
     topic: &str,
     outcome: &abuse_proto::DecisionOutcome,
@@ -1173,9 +1256,7 @@ async fn write_dedup_outcome(
         .info
         .contains_key(action_control::FORCED_RECORDING_KEY);
     if retention == DedupRetention::Release || forced_recording {
-        dedup_cache
-            .invalidate(entity_type, entity_id, claim_nonce)
-            .await;
+        dedup_cache.invalidate(key, claim_nonce).await;
         return;
     }
     let mut score_for_dedup = score.clone();
@@ -1197,23 +1278,11 @@ async fn write_dedup_outcome(
     let compressed = zstd::encode_all(json_bytes.as_slice(), 3).unwrap_or(json_bytes);
     if retention == DedupRetention::Full {
         dedup_cache
-            .update(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update(key, &compressed, acted_class, claim_nonce)
             .await;
     } else {
         dedup_cache
-            .update_skip(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update_skip(key, &compressed, acted_class, claim_nonce)
             .await;
     }
 }
@@ -1673,16 +1742,14 @@ impl ScoreResultProcessor {
         let incoming_class = decision.control.incoming_dedup_class(|| {
             incoming_dedup_class(&self.ctx.dynamic_config, &self.ctx.rules_cache, score)
         });
+        let dedup_key = decision.dedup_key(entity_type, entity_id);
         let claim_nonce = if decision.records_only() {
-            decision.would_dedup_held = self
-                .dedup_cache
-                .peek(entity_type, entity_id, incoming_class)
-                .await;
+            decision.would_dedup_held = self.dedup_cache.peek(&dedup_key, incoming_class).await;
             None
         } else {
             match self
                 .dedup_cache
-                .try_insert(entity_type, entity_id, incoming_class)
+                .try_insert(&dedup_key, incoming_class)
                 .await
             {
                 DedupCheck::New { claim_nonce } => claim_nonce,
@@ -1738,9 +1805,7 @@ impl ScoreResultProcessor {
             Err(source) => {
                 let permanent = source.downcast_ref::<PermanentAisFailure>().is_some();
                 if permanent && decision.claimed() {
-                    self.dedup_cache
-                        .invalidate(entity_type, entity_id, claim_nonce)
-                        .await;
+                    self.dedup_cache.invalidate(&dedup_key, claim_nonce).await;
                 }
                 return Err(EnforcementFailed {
                     permanent,
@@ -1754,8 +1819,7 @@ impl ScoreResultProcessor {
         if decision.claimed() {
             write_dedup_outcome(
                 self.dedup_cache.as_ref(),
-                entity_type,
-                entity_id,
+                &dedup_key,
                 score,
                 topic,
                 &outcome,
@@ -3094,6 +3158,21 @@ pub async fn start_kafka_consumers(
         cfg.uas_column
     );
 
+    let post_labels: Option<Arc<dyn post_labels::PostLabelReader>> =
+        match post_labels::VfPostLabels::connect(&cfg.post_labels_zone).await {
+            Ok(reader) => {
+                info!(zone = %cfg.post_labels_zone, "post label reader initialised");
+                Some(Arc::new(reader))
+            }
+            Err(e) => {
+                warn!(
+                    "post label reader unavailable: {e:#}; page post labels are sent \
+                     without checking the labels a post already carries"
+                );
+                None
+            }
+        };
+
     let retry_queue = Arc::new(Mutex::new(BinaryHeap::<RetryEntry>::new()));
 
     let enforcement_ctx = EnforcementCtx {
@@ -3111,6 +3190,7 @@ pub async fn start_kafka_consumers(
         head_guard: state.head_guard.clone(),
         action_control: state.action_control.clone(),
         backfill: state.backfill.clone(),
+        post_labels,
         #[cfg(test)]
         outcome_log: None,
     };
@@ -3140,6 +3220,7 @@ pub async fn start_kafka_consumers(
 
                 for mut entry in ready {
                     let (entity_type, entity_id) = Facts::resolve_target(&entry.score);
+                    let dedup_key = entry.decision.dedup_key(entity_type, entity_id);
                     let span = tracing::info_span!(
                         "retry",
                         entity_type = entity_type.as_str(),
@@ -3159,8 +3240,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 write_dedup_outcome(
                                     entry.dedup_cache.as_ref(),
-                                    entity_type,
-                                    entity_id,
+                                    &dedup_key,
                                     &entry.score,
                                     &entry.topic,
                                     &outcome,
@@ -3177,7 +3257,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 entry
                                     .dedup_cache
-                                    .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                    .invalidate(&dedup_key, entry.claim_nonce)
                                     .await;
                             }
                         }
@@ -3191,7 +3271,7 @@ pub async fn start_kafka_consumers(
                                 if entry.decision.claimed() {
                                     entry
                                         .dedup_cache
-                                        .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                        .invalidate(&dedup_key, entry.claim_nonce)
                                         .await;
                                 }
                             } else {
@@ -5838,6 +5918,7 @@ rules:
                 None,
                 String::new(),
             )),
+            post_labels: None,
             outcome_log: None,
         };
         Harness {

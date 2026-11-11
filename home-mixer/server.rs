@@ -914,6 +914,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let (for_you_pipeline, ranked_following_pipeline, following_pipeline) = tokio::join!(
             ForYouCandidatePipeline::new(
                 Arc::clone(&scored_posts),
+                Arc::clone(&jetfuel_client),
                 config.shard_coordinate,
                 &datacenter,
             ),

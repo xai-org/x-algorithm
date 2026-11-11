@@ -66,16 +66,14 @@ impl Filter<ScoredPostsQuery, PostCandidate> for InventoryHoldoutFilter {
         let replies_pct = query.params.get(InventoryHoldoutRepliesPercent).min(100);
         let retweets_pct = query.params.get(InventoryHoldoutRetweetsPercent).min(100);
 
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        FilterResult::partition(candidates, |c| {
             let percent = match PostKind::of(c) {
                 PostKind::Original => originals_pct,
                 PostKind::Reply => replies_pct,
                 PostKind::Retweet => retweets_pct,
             };
-            Self::is_held_out(c.get_original_tweet_id(), viewer_id, percent)
-        });
-
-        FilterResult { kept, removed }
+            !Self::is_held_out(c.get_original_tweet_id(), viewer_id, percent)
+        })
     }
 }
 

@@ -13,6 +13,7 @@ const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
 const EXPIRED_LABELS: &str = "safety_labels_expired_labels";
 const CACHE_FILL_KEYS: &str = "safety_labels_cache_fill_keys";
+const CACHE_REFRESH_KEYS: &str = "safety_labels_cache_refresh_keys";
 const SHADOW_KEYS: &str = "safety_labels_shadow_keys";
 const SHADOW_MANHATTAN_KEYS: &str = "safety_labels_shadow_manhattan_keys";
 const SHADOW_MH_CHECK_KEYS: &str = "safety_labels_shadow_mh_check_keys";
@@ -151,6 +152,36 @@ pub(crate) enum FillKeyResult {
 
 pub(crate) fn record_cache_fill_keys(metrics: &LabelMetrics, result: FillKeyResult, count: usize) {
     metrics.incr(CACHE_FILL_KEYS, &[("result", result.into())], count);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum RefreshResult {
+    Unchanged,
+        Rewritten,
+        Changed,
+        Added,
+        Removed,
+}
+
+pub(crate) fn record_cache_refresh_keys(
+    metrics: &LabelMetrics,
+    step: u8,
+    status: &'static str,
+    result: RefreshResult,
+    count: usize,
+) {
+    let step = match step {
+        0 => "0",
+        1 => "1",
+        _ => "2_plus",
+    };
+    let labels = [
+        ("step", step),
+        ("status", status),
+        ("result", result.into()),
+    ];
+    metrics.incr(CACHE_REFRESH_KEYS, &labels, count);
 }
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]

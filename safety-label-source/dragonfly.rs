@@ -18,14 +18,14 @@ use xai_visibility_filtering_proto as vf_pb;
 use super::decode::{self, RawSafetyLabel};
 use super::metrics::{
     self, CacheResult, CacheTier, DeleteAttempt, DeleteResult, FillKeyResult, LabelMetrics,
-    MhCheckClass, MhCheckSample, MhCheckView, ShadowResult, SourceOutcome,
+    MhCheckClass, MhCheckSample, MhCheckView, RefreshResult, ShadowResult, SourceOutcome,
 };
 use super::remote::{CacheWrite, FallbackReason, LabelSource, ManhattanSource, fallback_reason};
 use super::source::{drop_expired_labels, tweet_timestamp_ms};
 
 const KEY_PREFIX: &str = "sls:";
 const VALUE_VERSION: u8 = 2;
-const REFRESH_STEPS: [Duration; 2] = [Duration::from_secs(30), Duration::from_secs(90)];
+const REFRESH_STEPS: [Duration; 1] = [Duration::from_secs(60)];
 const REPEAT_AFTER: Duration = Duration::from_secs(30);
 const REPEAT_QUEUE: usize = 500_000;
 const DELETE_PERMITS: u32 = 256;
@@ -47,7 +47,7 @@ pub struct LabelCacheSwitches {
         pub serve_buckets: u64,
         pub found_ttl: Duration,
     pub not_found_ttl: Duration,
-            pub refresh_cutoff_ms: u64,
+                    pub refresh_cutoff_ms: u64,
             pub replay_bucket: Option<u64>,
         pub shadow_mh_check_keys_per_sec: u32,
         pub shadow_fill_keys_per_sec: u32,
@@ -59,7 +59,7 @@ impl Default for LabelCacheSwitches {
             shadow_buckets: 0,
             serve_buckets: 0,
             found_ttl: Duration::from_secs(24 * 60 * 60),
-            not_found_ttl: Duration::from_secs(10 * 60),
+            not_found_ttl: Duration::from_secs(60 * 60),
             refresh_cutoff_ms: 0,
             replay_bucket: None,
             shadow_mh_check_keys_per_sec: 0,
@@ -371,6 +371,24 @@ impl LabelDiff {
         }
         diff
     }
+
+    fn refresh_result(&self) -> RefreshResult {
+        if !self.only_answer.is_empty() {
+            RefreshResult::Added
+        } else if !self.only_entry.is_empty() {
+            RefreshResult::Removed
+        } else if self
+            .changed
+            .iter()
+            .any(|label| label.fields != ["created_at_msec"])
+        {
+            RefreshResult::Changed
+        } else if self.changed.is_empty() {
+            RefreshResult::Unchanged
+        } else {
+            RefreshResult::Rewritten
+        }
+    }
 }
 
 fn source_tag(label: &vf_pb::SafetyLabel) -> Option<String> {
@@ -564,6 +582,7 @@ pub(crate) enum FillLabels {
         read_at: tokio::time::Instant,
     },
         Reread,
+        Refresh { entry: Envelope },
 }
 
 #[derive(Default)]
@@ -827,6 +846,15 @@ impl DragonflySource {
                         }
                         MhCheckSample::Mismatch
                     };
+                    if refresh.is_some() {
+                        would_read += 1;
+                    }
+                    let job = refresh.map(|fill| {
+                        let labels = FillLabels::Refresh {
+                            entry: envelope.clone(),
+                        };
+                        (fill, labels)
+                    });
                     if budget.is_some() {
                         hits.push(ShadowHit {
                             tweet_id,
@@ -835,10 +863,7 @@ impl DragonflySource {
                             answer: answer.clone(),
                         });
                     }
-                    if refresh.is_some() {
-                        would_read += 1;
-                    }
-                    refresh.map(|fill| (fill, FillLabels::Reread))
+                    job
                 }
                 EntryRead::Miss => {
                     would_read += 1;
@@ -1054,17 +1079,27 @@ struct Writer {
     metrics: LabelMetrics,
 }
 
+fn refresh_result(entry: &Envelope, items: &[RawSafetyLabel]) -> Option<RefreshResult> {
+    let reread = if items.is_empty() {
+        vf_pb::SafetyLabelMap::default()
+    } else {
+        twemcache_types_only(decode::raw_labels(items)?)
+    };
+    Some(LabelDiff::new(entry, &reread).refresh_result())
+}
+
 impl Writer {
             async fn write(&self, jobs: Vec<FillJob>) {
         let ids: Vec<u64> = jobs.iter().map(|job| job.tweet_id).collect();
         let reread: Vec<u64> = jobs
             .iter()
-            .filter(|job| matches!(job.labels, FillLabels::Reread))
+            .filter(|job| !matches!(job.labels, FillLabels::Scanned { .. }))
             .map(|job| job.tweet_id)
             .collect();
         let reread_at = tokio::time::Instant::now();
         let mut reread_results = self.manhattan.scan(&reread).await;
         let mut old_reads = 0;
+        let mut refreshes: BTreeMap<(u8, &'static str, RefreshResult), usize> = BTreeMap::new();
         let writes: Vec<_> = jobs
             .into_iter()
             .filter_map(|job| {
@@ -1072,6 +1107,16 @@ impl Writer {
                     FillLabels::Scanned { items, read_at } => (items, read_at),
                     FillLabels::Reread => {
                         (reread_results.remove(&job.tweet_id)?.ok()?.items, reread_at)
+                    }
+                    FillLabels::Refresh { entry } => {
+                        let items = reread_results.remove(&job.tweet_id)?.ok()?.items;
+                        if let Some(result) = refresh_result(&entry, &items) {
+                            let status = <&'static str>::from(&entry.status);
+                            *refreshes
+                                .entry((entry.fill.step, status, result))
+                                .or_default() += 1;
+                        }
+                        (items, reread_at)
                     }
                 };
                 if read_at.elapsed() >= REPEAT_AFTER {
@@ -1095,6 +1140,9 @@ impl Writer {
             FillKeyResult::Failed,
             ids.len() - written - old_reads,
         );
+        for ((step, status, result), count) in refreshes {
+            metrics::record_cache_refresh_keys(&self.metrics, step, status, result, count);
+        }
         let mut pending = self
             .pending_fills
             .lock()
@@ -1684,6 +1732,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_refresh_result_prefers_added_then_removed_then_changed_and_a_new_created_at_is_rewritten()
+    {
+        let spam = |score, at| label_created_at(SafetyLabelType::SPAM, score, Some(at));
+        let abusive = || label_created_at(SafetyLabelType::ABUSIVE, 0.5, Some(BASE_MS));
+        let result = |entry: Vec<_>, reread: Vec<_>| {
+            LabelDiff::new(&found(entry), &label_map(reread)).refresh_result()
+        };
+
+        let unchanged = result(vec![spam(0.5, BASE_MS)], vec![spam(0.5, BASE_MS)]);
+        let rewritten = result(vec![spam(0.5, BASE_MS)], vec![spam(0.5, BASE_MS + 1)]);
+        let changed = result(vec![spam(0.5, BASE_MS)], vec![spam(0.9, BASE_MS + 1)]);
+        let removed = result(
+            vec![spam(0.5, BASE_MS), abusive()],
+            vec![spam(0.9, BASE_MS)],
+        );
+        let added = result(
+            vec![spam(0.5, BASE_MS)],
+            vec![spam(0.9, BASE_MS), abusive()],
+        );
+
+        assert_eq!(unchanged, RefreshResult::Unchanged);
+        assert_eq!(rewritten, RefreshResult::Rewritten);
+        assert_eq!(changed, RefreshResult::Changed);
+        assert_eq!(removed, RefreshResult::Removed);
+        assert_eq!(added, RefreshResult::Added);
+    }
+
     fn spam_expiring_at(score: f64, expires_at_ms: u64) -> (i32, vf_pb::SafetyLabel) {
         let label = vf_pb::SafetyLabel {
             score: Some(score),
@@ -2053,13 +2129,12 @@ rust_vf:
     #[tokio::test(start_paused = true)]
     async fn entries_expire_at_read_from_their_fill_time_under_the_ttl_switches() {
         let w = world(LabelCacheSwitches::serving_every_post());
-        let ten_minutes_ago = BASE_MS - 600_000;
+        let an_hour_ago = BASE_MS - 3_600_000;
         w.dragonfly
-            .put(1, Status::Found(spam(0.5)), fill(ten_minutes_ago, 2));
+            .put(1, Status::Found(spam(0.5)), fill(an_hour_ago, 2));
+        w.dragonfly.put(2, Status::NotFound, fill(an_hour_ago, 2));
         w.dragonfly
-            .put(2, Status::NotFound, fill(ten_minutes_ago, 2));
-        w.dragonfly
-            .put(3, Status::NotFound, fill(ten_minutes_ago + 1, 2));
+            .put(3, Status::NotFound, fill(an_hour_ago + 1, 2));
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(2, 0.7);
 
@@ -2101,7 +2176,7 @@ rust_vf:
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_filled_entry_is_reread_at_30s_and_90s_then_never() {
+    async fn a_filled_entry_is_reread_once_at_60s_then_never() {
         let w = world(LabelCacheSwitches::serving_every_post());
         let start = tokio::time::Instant::now();
         let at = |secs| tokio::time::sleep_until(start + Duration::from_secs(secs));
@@ -2110,7 +2185,12 @@ rust_vf:
         settle().await;
         w.manhattan.set_spam(1, 0.9);
 
-        at(30).await;
+        at(59).await;
+        w.source.get(&[1]).await;
+        settle().await;
+        assert_eq!(w.manhattan.calls().len(), 1, "not due before 60 s");
+
+        at(60).await;
         let first = w.source.get(&[1]).await;
         let second = w.source.get(&[1]).await;
         assert_eq!(labels(&first, 1), spam(0.5));
@@ -2124,39 +2204,25 @@ rust_vf:
         assert_eq!(w.dragonfly.entry(1).unwrap().0.fill, fill(BASE_MS, 1));
         assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
 
-        at(89).await;
-        w.source.get(&[1]).await;
-        settle().await;
-        assert_eq!(
-            w.manhattan.calls().len(),
-            2,
-            "step 1 waits for 90 s after the fill"
-        );
-
-        at(90).await;
-        w.source.get(&[1]).await;
-        settle().await;
-        assert_eq!(w.manhattan.calls().len(), 3);
-        assert_eq!(w.dragonfly.entry(1).unwrap().0.fill, fill(BASE_MS, 2));
-
         at(3600).await;
         w.source.get(&[1]).await;
         settle().await;
-        assert_eq!(w.manhattan.calls().len(), 3, "step 2 is never reread");
+        assert_eq!(w.manhattan.calls().len(), 2, "step 1 is never reread");
     }
 
     #[tokio::test(start_paused = true)]
     async fn fills_and_rereads_drop_the_label_types_twemcache_does_not_decode() {
         let w = world(LabelCacheSwitches::serving_every_post());
-        let abusive = i32::from(SafetyLabelType::ABUSIVE);
+        let undecoded = i32::from(SafetyLabelType::DEPRECATED_LABEL_144);
         w.manhattan.set_spam(1, 0.5);
-        w.manhattan.add_label(1, SafetyLabelType::ABUSIVE);
+        w.manhattan
+            .add_label(1, SafetyLabelType::DEPRECATED_LABEL_144);
 
         let answers = w.source.get(&[1]).await;
         settle().await;
 
         assert!(
-            labels(&answers, 1).labels.contains_key(&abusive),
+            labels(&answers, 1).labels.contains_key(&undecoded),
             "a miss answers with Manhattan's labels, as a twemcache miss does"
         );
         assert_eq!(
@@ -2165,7 +2231,7 @@ rust_vf:
         );
 
         w.dragonfly
-            .put(1, Status::Found(spam(0.1)), fill(BASE_MS - 30_000, 0));
+            .put(1, Status::Found(spam(0.1)), fill(BASE_MS - 60_000, 0));
         w.source.get(&[1]).await;
         settle().await;
 
@@ -2173,35 +2239,37 @@ rust_vf:
         assert_eq!(
             w.dragonfly.entry(1).unwrap().0,
             Envelope {
-                fill: fill(BASE_MS - 30_000, 1),
+                fill: fill(BASE_MS - 60_000, 1),
                 status: Status::Found(spam(0.5)),
             }
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_entry_first_read_after_90s_is_reread_once_to_the_last_step() {
-        let w = world(LabelCacheSwitches {
-            serve_buckets: RAMP_BUCKETS,
-            ..LabelCacheSwitches::default()
-        });
-        w.dragonfly
-            .put(1, Status::Found(spam(0.5)), fill(BASE_MS - 100_000, 0));
-        w.manhattan.set_spam(1, 0.9);
+    async fn a_refresh_counts_what_its_reread_found_by_the_entry_step_and_status() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        let due = fill(BASE_MS - 60_000, 0);
+        w.dragonfly.put(1, Status::Found(spam(0.5)), due);
+        w.dragonfly.put(2, Status::Found(spam(0.5)), due);
+        w.dragonfly.put(3, Status::NotFound, due);
+        w.dragonfly.put(4, Status::Found(spam(0.5)), due);
+        w.manhattan.set_spam(1, 0.5);
+        w.manhattan.set_spam(2, 0.9);
+        w.manhattan.set_spam(3, 0.7);
 
-        w.source.get(&[1]).await;
-        settle().await;
-        w.source.get(&[1]).await;
+        w.source.get(&[1, 2, 3, 4]).await;
         settle().await;
 
-        assert_eq!(w.manhattan.calls(), vec![vec![1]]);
-        assert_eq!(
-            w.dragonfly.entry(1).unwrap().0,
-            Envelope {
-                fill: fill(BASE_MS - 100_000, 2),
-                status: Status::Found(spam(0.9)),
-            }
-        );
+        let refreshes = |step, status, result| {
+            w.stats.count(
+                "safety_labels_cache_refresh_keys",
+                &[("step", step), ("status", status), ("result", result)],
+            )
+        };
+        assert_eq!(refreshes("0", "found", "unchanged"), 1);
+        assert_eq!(refreshes("0", "found", "changed"), 1);
+        assert_eq!(refreshes("0", "not_found", "added"), 1);
+        assert_eq!(refreshes("0", "found", "removed"), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2346,7 +2414,8 @@ rust_vf:
     async fn a_fill_stores_manhattans_items_as_scanned_and_reads_back_twemcache_types_only() {
         let w = world(LabelCacheSwitches::serving_every_post());
         w.manhattan.set_spam(1, 0.5);
-        w.manhattan.add_label(1, SafetyLabelType::ABUSIVE);
+        w.manhattan
+            .add_label(1, SafetyLabelType::DEPRECATED_LABEL_144);
 
         w.source.get(&[1]).await;
         settle().await;
@@ -2359,7 +2428,7 @@ rust_vf:
                     mval: mval_with_score(0.5),
                 },
                 StoredItem {
-                    lkey: encode_lkey(SafetyLabelType::ABUSIVE).to_vec(),
+                    lkey: encode_lkey(SafetyLabelType::DEPRECATED_LABEL_144).to_vec(),
                     mval: minimal_mval(),
                 },
             ]
@@ -2374,14 +2443,14 @@ rust_vf:
     async fn shadow_refreshes_and_refresh_cutoff_refills_reread_manhattan() {
         let w = world(LabelCacheSwitches {
             shadow_buckets: RAMP_BUCKETS,
-            refresh_cutoff_ms: BASE_MS - 40_000,
+            refresh_cutoff_ms: BASE_MS - 70_000,
             ..LabelCacheSwitches::default()
         });
         w.twemcache.found.lock().unwrap().extend([1, 2]);
         w.dragonfly
-            .put(1, Status::Found(nsfa()), fill(BASE_MS - 30_000, 0));
+            .put(1, Status::Found(nsfa()), fill(BASE_MS - 60_000, 0));
         w.dragonfly
-            .put(2, Status::Found(nsfa()), fill(BASE_MS - 40_001, 2));
+            .put(2, Status::Found(nsfa()), fill(BASE_MS - 70_001, 2));
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(2, 0.8);
 
@@ -2393,7 +2462,7 @@ rust_vf:
         assert_eq!(
             w.dragonfly.entry(1).unwrap().0,
             Envelope {
-                fill: fill(BASE_MS - 30_000, 1),
+                fill: fill(BASE_MS - 60_000, 1),
                 status: Status::Found(spam(0.9)),
             }
         );
@@ -2405,6 +2474,16 @@ rust_vf:
             }
         );
         assert_eq!(w.stats.count("safety_labels_shadow_manhattan_keys", &[]), 2);
+        for step in ["0", "2_plus"] {
+            assert_eq!(
+                w.stats.count(
+                    "safety_labels_cache_refresh_keys",
+                    &[("step", step), ("status", "found"), ("result", "added")],
+                ),
+                1,
+                "step {step}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2514,7 +2593,7 @@ rust_vf:
 
         fn with_decoder_gaps(mut labels: vf_pb::SafetyLabelMap) -> vf_pb::SafetyLabelMap {
         labels.labels.insert(
-            i32::from(SafetyLabelType::ABUSIVE),
+            i32::from(SafetyLabelType::DEPRECATED_LABEL_144),
             vf_pb::SafetyLabel::default(),
         );
         labels
@@ -2760,7 +2839,7 @@ rust_vf:
     async fn a_refresh_that_read_manhattan_before_the_label_write_is_deleted_by_the_repeat() {
         let w = world(LabelCacheSwitches::serving_every_post());
         let invalidator = invalidator(&w, REPEAT_QUEUE);
-        let filled_at_ms = BASE_MS - 30_000;
+        let filled_at_ms = BASE_MS - 60_000;
         w.dragonfly
             .put(1, Status::Found(spam(0.5)), fill(filled_at_ms, 0));
         w.manhattan.set_spam(1, 0.5);
@@ -2795,7 +2874,7 @@ rust_vf:
         for id in 1..=4 {
             w.manhattan.set_spam(id, 0.5);
         }
-        let filled_at_ms = BASE_MS - 30_000;
+        let filled_at_ms = BASE_MS - 60_000;
         w.dragonfly
             .put(3, Status::Found(spam(0.5)), fill(filled_at_ms, 0));
         w.dragonfly.hold_sets();

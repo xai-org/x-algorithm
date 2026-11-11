@@ -24,6 +24,16 @@ pub(crate) fn was_seen(seen: &HashSet<u64>, candidate: &PostCandidate) -> bool {
     seen.contains(&candidate.tweet_id) || seen.contains(&candidate.get_original_tweet_id())
 }
 
+pub(crate) fn shows_carousel_video(post: &PostCandidate, carousel: &[PostCandidate]) -> bool {
+    carousel.iter().any(|video| {
+        video.tweet_id == post.tweet_id
+            || video
+                .video_media_id
+                .is_some_and(|id| post.video_media_id == Some(id))
+            || md5_hashes(video).any(|hash| md5_hashes(post).any(|other| other == hash))
+    })
+}
+
 pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)

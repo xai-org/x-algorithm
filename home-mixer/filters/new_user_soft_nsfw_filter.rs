@@ -49,10 +49,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for NewUserSoftNsfwFilter {
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(is_labeled_soft_nsfw_out_of_network);
-        FilterResult { kept, removed }
+        FilterResult::partition(candidates, |c| !is_labeled_soft_nsfw_out_of_network(c))
     }
 }
 

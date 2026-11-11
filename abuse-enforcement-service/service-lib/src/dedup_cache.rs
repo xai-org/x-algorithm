@@ -152,6 +152,41 @@ fn claim_nonce() -> u64 {
         ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DedupKey {
+    pub entity_type: EntityType,
+    pub entity_id: i64,
+    labels: Option<String>,
+}
+
+impl DedupKey {
+    pub fn entity(entity_type: EntityType, entity_id: i64) -> Self {
+        Self {
+            entity_type,
+            entity_id,
+            labels: None,
+        }
+    }
+
+            pub fn with_post_labels(mut self, labels: Option<&[&str]>) -> Self {
+        if self.entity_type == EntityType::Post {
+            self.labels = labels.filter(|l| !l.is_empty()).map(|l| l.join(","));
+        }
+        self
+    }
+
+                            fn pkey(&self) -> String {
+        let entity = match self.entity_type {
+            EntityType::User => self.entity_id.to_string(),
+            other => format!("{}:{}", other.as_str(), self.entity_id),
+        };
+        match &self.labels {
+            None => entity,
+            Some(labels) => format!("{entity}/labels:{labels}"),
+        }
+    }
+}
+
 enum SlotView {
     Held(HeldMeta),
     Empty,
@@ -243,20 +278,8 @@ impl ManhattanDedupCache {
         }
     }
 
-                                fn pkey(entity_type: EntityType, entity_id: i64) -> String {
-        match entity_type {
-            EntityType::User => entity_id.to_string(),
-            other => format!("{}:{}", other.as_str(), entity_id),
-        }
-    }
-
-                                                            pub async fn try_insert(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        incoming_class: u8,
-    ) -> DedupCheck {
-        let pkey = Self::pkey(entity_type, entity_id);
+                                                            pub async fn try_insert(&self, key: &DedupKey, incoming_class: u8) -> DedupCheck {
+        let pkey = key.pkey();
         match self.store.get(&pkey).await {
             Ok(Some(entry)) => {
                 let held_exp_secs = entry
@@ -416,13 +439,12 @@ impl ManhattanDedupCache {
 
                                                                         pub async fn update(
         &self,
-        entity_type: EntityType,
-        entity_id: i64,
+        key: &DedupKey,
         value: &[u8],
         acted_class: u8,
         claim_nonce: Option<u64>,
     ) {
-        let pkey = Self::pkey(entity_type, entity_id);
+        let pkey = key.pkey();
         if acted_class < CLASS_SUSPEND_PERMANENT {
             match self.slot_view(&pkey).await {
                 SlotView::Held(meta) => {
@@ -441,13 +463,12 @@ impl ManhattanDedupCache {
 
                                                                                                         pub async fn update_skip(
         &self,
-        entity_type: EntityType,
-        entity_id: i64,
+        key: &DedupKey,
         value: &[u8],
         acted_class: u8,
         claim_nonce: Option<u64>,
     ) {
-        let pkey = Self::pkey(entity_type, entity_id);
+        let pkey = key.pkey();
         match self.slot_view(&pkey).await {
             SlotView::Held(meta) => {
                 let now = now_secs();
@@ -484,13 +505,8 @@ impl ManhattanDedupCache {
         }
     }
 
-                                                                        pub async fn invalidate(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        claim_nonce: Option<u64>,
-    ) {
-        let pkey = Self::pkey(entity_type, entity_id);
+                                                                        pub async fn invalidate(&self, key: &DedupKey, claim_nonce: Option<u64>) {
+        let pkey = key.pkey();
         match self.slot_view(&pkey).await {
             SlotView::Held(meta) => {
                 if meta.kind == HeldKind::Outcome {
@@ -526,7 +542,7 @@ impl ManhattanDedupCache {
         entity_type: EntityType,
         entity_id: i64,
     ) -> Option<(Vec<u8>, i64)> {
-        let pkey = Self::pkey(entity_type, entity_id);
+        let pkey = DedupKey::entity(entity_type, entity_id).pkey();
         match self.store.get(&pkey).await {
             Ok(Some(entry)) => {
                 let ttl_secs = crate::manhattan::remaining_ttl_secs(
@@ -545,13 +561,8 @@ impl ManhattanDedupCache {
         }
     }
 
-                    pub async fn peek(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        incoming_class: u8,
-    ) -> Option<u8> {
-        let pkey = Self::pkey(entity_type, entity_id);
+                    pub async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8> {
+        let pkey = key.pkey();
         match self.store.get(&pkey).await {
             Ok(Some(entry)) => {
                 let meta = held_entry_meta(&entry.bytes);
@@ -569,89 +580,47 @@ impl ManhattanDedupCache {
 
 #[async_trait::async_trait]
 pub trait DedupSlot: Send + Sync {
-    async fn try_insert(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        incoming_class: u8,
-    ) -> DedupCheck;
-    async fn peek(&self, entity_type: EntityType, entity_id: i64, incoming_class: u8)
-    -> Option<u8>;
-    async fn update(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        value: &[u8],
-        acted_class: u8,
-        claim_nonce: Option<u64>,
-    );
+    async fn try_insert(&self, key: &DedupKey, incoming_class: u8) -> DedupCheck;
+    async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8>;
+    async fn update(&self, key: &DedupKey, value: &[u8], acted_class: u8, claim_nonce: Option<u64>);
     async fn update_skip(
         &self,
-        entity_type: EntityType,
-        entity_id: i64,
+        key: &DedupKey,
         value: &[u8],
         acted_class: u8,
         claim_nonce: Option<u64>,
     );
-    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>);
+    async fn invalidate(&self, key: &DedupKey, claim_nonce: Option<u64>);
 }
 
 #[async_trait::async_trait]
 impl DedupSlot for ManhattanDedupCache {
-    async fn try_insert(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        incoming_class: u8,
-    ) -> DedupCheck {
-        ManhattanDedupCache::try_insert(self, entity_type, entity_id, incoming_class).await
+    async fn try_insert(&self, key: &DedupKey, incoming_class: u8) -> DedupCheck {
+        ManhattanDedupCache::try_insert(self, key, incoming_class).await
     }
-    async fn peek(
-        &self,
-        entity_type: EntityType,
-        entity_id: i64,
-        incoming_class: u8,
-    ) -> Option<u8> {
-        ManhattanDedupCache::peek(self, entity_type, entity_id, incoming_class).await
+    async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8> {
+        ManhattanDedupCache::peek(self, key, incoming_class).await
     }
     async fn update(
         &self,
-        entity_type: EntityType,
-        entity_id: i64,
+        key: &DedupKey,
         value: &[u8],
         acted_class: u8,
         claim_nonce: Option<u64>,
     ) {
-        ManhattanDedupCache::update(
-            self,
-            entity_type,
-            entity_id,
-            value,
-            acted_class,
-            claim_nonce,
-        )
-        .await
+        ManhattanDedupCache::update(self, key, value, acted_class, claim_nonce).await
     }
     async fn update_skip(
         &self,
-        entity_type: EntityType,
-        entity_id: i64,
+        key: &DedupKey,
         value: &[u8],
         acted_class: u8,
         claim_nonce: Option<u64>,
     ) {
-        ManhattanDedupCache::update_skip(
-            self,
-            entity_type,
-            entity_id,
-            value,
-            acted_class,
-            claim_nonce,
-        )
-        .await
+        ManhattanDedupCache::update_skip(self, key, value, acted_class, claim_nonce).await
     }
-    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>) {
-        ManhattanDedupCache::invalidate(self, entity_type, entity_id, claim_nonce).await
+    async fn invalidate(&self, key: &DedupKey, claim_nonce: Option<u64>) {
+        ManhattanDedupCache::invalidate(self, key, claim_nonce).await
     }
 }
 
@@ -667,17 +636,18 @@ pub(crate) mod test_support {
     #[derive(Default)]
     pub(crate) struct RecordingDedup {
         pub calls: Mutex<Vec<String>>,
-                pub slots: Mutex<HashMap<(String, i64), Slot>>,
+                pub slots: Mutex<HashMap<DedupKey, Slot>>,
                 carries: Mutex<HashMap<u64, u8>>,
         next_nonce: std::sync::atomic::AtomicU64,
     }
 
     impl RecordingDedup {
         pub(crate) fn hold(&self, entity_type: EntityType, id: i64, class: u8) {
-            self.slots
-                .lock()
-                .unwrap()
-                .insert((entity_type.as_str().into(), id), (class, false, None));
+            self.hold_key(DedupKey::entity(entity_type, id), class);
+        }
+
+        pub(crate) fn hold_key(&self, key: DedupKey, class: u8) {
+            self.slots.lock().unwrap().insert(key, (class, false, None));
         }
 
         pub(crate) fn take_calls(&self) -> Vec<String> {
@@ -690,8 +660,8 @@ pub(crate) mod test_support {
 
                 fn own_carry(
             &self,
-            slots: &HashMap<(String, i64), Slot>,
-            key: &(String, i64),
+            slots: &HashMap<DedupKey, Slot>,
+            key: &DedupKey,
             n: Option<u64>,
         ) -> Option<u8> {
             match slots.get(key) {
@@ -705,8 +675,8 @@ pub(crate) mod test_support {
 
     #[async_trait::async_trait]
     impl DedupSlot for RecordingDedup {
-        async fn try_insert(&self, et: EntityType, id: i64, incoming: u8) -> DedupCheck {
-            let key = (et.as_str().to_owned(), id);
+        async fn try_insert(&self, key: &DedupKey, incoming: u8) -> DedupCheck {
+            let key = key.clone();
             let mut slots = self.slots.lock().unwrap();
             let nonce = self
                 .next_nonce
@@ -746,28 +716,23 @@ pub(crate) mod test_support {
             out
         }
 
-        async fn peek(&self, et: EntityType, id: i64, incoming: u8) -> Option<u8> {
-            let held = self
-                .slots
-                .lock()
-                .unwrap()
-                .get(&(et.as_str().to_owned(), id))
-                .map(|(c, _, _)| *c);
+        async fn peek(&self, key: &DedupKey, incoming: u8) -> Option<u8> {
+            let held = self.slots.lock().unwrap().get(key).map(|(c, _, _)| *c);
             let out = held.filter(|h| incoming <= *h);
             self.log(format!("peek(class={incoming})={out:?}"));
             out
         }
 
-        async fn update(&self, et: EntityType, id: i64, _v: &[u8], class: u8, n: Option<u64>) {
+        async fn update(&self, key: &DedupKey, _v: &[u8], class: u8, n: Option<u64>) {
             self.slots
                 .lock()
                 .unwrap()
-                .insert((et.as_str().into(), id), (class, false, None));
+                .insert(key.clone(), (class, false, None));
             self.log(format!("update(class={class},own_claim={})", n.is_some()));
         }
 
-        async fn update_skip(&self, et: EntityType, id: i64, _v: &[u8], class: u8, n: Option<u64>) {
-            let key = (et.as_str().to_owned(), id);
+        async fn update_skip(&self, key: &DedupKey, _v: &[u8], class: u8, n: Option<u64>) {
+            let key = key.clone();
             let mut slots = self.slots.lock().unwrap();
             let kept = self.own_carry(&slots, &key, n).unwrap_or(CLASS_NONE);
             slots.insert(key, (kept, false, None));
@@ -778,8 +743,8 @@ pub(crate) mod test_support {
             ));
         }
 
-        async fn invalidate(&self, et: EntityType, id: i64, n: Option<u64>) {
-            let key = (et.as_str().to_owned(), id);
+        async fn invalidate(&self, key: &DedupKey, n: Option<u64>) {
+            let key = key.clone();
             let mut slots = self.slots.lock().unwrap();
             if let Some(c) = self.own_carry(&slots, &key, n) {
                 slots.insert(key, (c, false, None));
@@ -1129,7 +1094,7 @@ mod tests {
 
         async fn bypass(cache: &ManhattanDedupCache) -> u64 {
         match cache
-            .try_insert(EntityType::User, USER, CLASS_SUSPEND)
+            .try_insert(&DedupKey::entity(EntityType::User, USER), CLASS_SUSPEND)
             .await
         {
             DedupCheck::ClassBypass {
@@ -1148,10 +1113,17 @@ mod tests {
             let nonce = bypass(&cache).await;
             store.take_puts();
             if invalidate {
-                cache.invalidate(EntityType::User, USER, Some(nonce)).await;
+                cache
+                    .invalidate(&DedupKey::entity(EntityType::User, USER), Some(nonce))
+                    .await;
             } else {
                 cache
-                    .update_skip(EntityType::User, USER, b"skip", CLASS_NONE, Some(nonce))
+                    .update_skip(
+                        &DedupKey::entity(EntityType::User, USER),
+                        b"skip",
+                        CLASS_NONE,
+                        Some(nonce),
+                    )
                     .await;
             }
             let puts = store.take_puts();
@@ -1177,7 +1149,12 @@ mod tests {
         store.take_puts();
         for writer in [Some(nonce.wrapping_add(1)), None] {
             cache
-                .update_skip(EntityType::User, USER, b"skip", CLASS_NONE, writer)
+                .update_skip(
+                    &DedupKey::entity(EntityType::User, USER),
+                    b"skip",
+                    CLASS_NONE,
+                    writer,
+                )
                 .await;
             assert!(store.take_puts().is_empty(), "{writer:?}");
             assert_eq!(store.bytes("7").unwrap(), claim, "claim intact");
@@ -1205,7 +1182,12 @@ mod tests {
             (now + TTL) as i64 * NANOS,
         );
         cache
-            .update_skip(EntityType::User, USER, b"skip", CLASS_NONE, Some(42))
+            .update_skip(
+                &DedupKey::entity(EntityType::User, USER),
+                b"skip",
+                CLASS_NONE,
+                Some(42),
+            )
             .await;
         let puts = store.take_puts();
         assert_eq!(puts.len(), 1);
@@ -1229,7 +1211,12 @@ mod tests {
             .fail_puts
             .store(true, std::sync::atomic::Ordering::Relaxed);
         cache
-            .update_skip(EntityType::User, USER, b"skip", CLASS_NONE, Some(nonce))
+            .update_skip(
+                &DedupKey::entity(EntityType::User, USER),
+                b"skip",
+                CLASS_NONE,
+                Some(nonce),
+            )
             .await;
         let puts = store.take_puts();
         assert_eq!(puts.len(), 1, "the restore only; no skip write after it");
@@ -1242,11 +1229,69 @@ mod tests {
 
     #[test]
     fn pkey_keeps_user_bare_and_namespaces_others() {
-        assert_eq!(ManhattanDedupCache::pkey(EntityType::User, 123), "123");
-        assert_eq!(ManhattanDedupCache::pkey(EntityType::Post, 123), "post:123");
-        assert_ne!(
-            ManhattanDedupCache::pkey(EntityType::User, 123),
-            ManhattanDedupCache::pkey(EntityType::Post, 123),
+        let pkey = |et, id| DedupKey::entity(et, id).pkey();
+        assert_eq!(pkey(EntityType::User, 123), "123");
+        assert_eq!(pkey(EntityType::Post, 123), "post:123");
+        assert_ne!(pkey(EntityType::User, 123), pkey(EntityType::Post, 123));
+    }
+
+    #[test]
+    fn a_post_key_narrowed_to_labels_is_its_own_slot() {
+        let post = DedupKey::entity(EntityType::Post, 123);
+        let one = post.clone().with_post_labels(Some(&["NsfwHighPrecision"]));
+        let two = post
+            .clone()
+            .with_post_labels(Some(&["NsfwHighPrecision", "SpamHighRecall"]));
+        assert_eq!(one.pkey(), "post:123/labels:NsfwHighPrecision");
+        assert_eq!(
+            two.pkey(),
+            "post:123/labels:NsfwHighPrecision,SpamHighRecall"
         );
+        assert_ne!(one.pkey(), post.pkey());
+        assert_ne!(one.pkey(), two.pkey());
+        assert_eq!(post.clone().with_post_labels(None), post);
+        assert_eq!(post.clone().with_post_labels(Some(&[])), post);
+        let user = DedupKey::entity(EntityType::User, 123);
+        assert_eq!(
+            user.clone().with_post_labels(Some(&["NsfwHighPrecision"])),
+            user,
+            "a user key is never narrowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_on_a_post_neither_blocks_nor_is_blocked_by_another_heads_hold() {
+        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;
+        let store = Arc::new(MemStore::default());
+        let cache = ManhattanDedupCache::with_store(store.clone(), TTL, SKIP_TTL);
+        let post = DedupKey::entity(EntityType::Post, 9);
+        let nsfw = post.clone().with_post_labels(Some(&["NsfwHighPrecision"]));
+        let acted =
+            zstd_json(serde_json::json!({ "status": "success", "acted_class": CLASS_LABEL }));
+
+        assert!(matches!(
+            cache.try_insert(&post, CLASS_LABEL).await,
+            DedupCheck::New { .. }
+        ));
+        cache.update(&post, &acted, CLASS_LABEL, None).await;
+        assert_eq!(
+            cache.try_insert(&post, CLASS_LABEL).await,
+            DedupCheck::Duplicate
+        );
+
+        let DedupCheck::New { claim_nonce } = cache.try_insert(&nsfw, CLASS_LABEL).await else {
+            panic!("the narrowed slot is empty");
+        };
+        cache.update(&nsfw, &acted, CLASS_LABEL, claim_nonce).await;
+        assert_eq!(
+            cache.try_insert(&nsfw, CLASS_LABEL).await,
+            DedupCheck::Duplicate
+        );
+        assert_eq!(cache.peek(&nsfw, CLASS_LABEL).await, Some(CLASS_LABEL));
+
+        assert!(store.bytes("post:9").is_some());
+        assert!(store.bytes("post:9/labels:NsfwHighPrecision").is_some());
+        let other = DedupKey::entity(EntityType::Post, 10);
+        assert_eq!(cache.peek(&other, CLASS_LABEL).await, None);
     }
 }

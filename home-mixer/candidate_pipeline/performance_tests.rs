@@ -393,6 +393,7 @@ impl Fixture {
                                 )),
                             ),
                         },
+                        strato_client: Arc::new(MockStratoClient::default()),
                     })
                 }
                 _ => {}

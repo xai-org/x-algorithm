@@ -53,11 +53,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for NewUserMinEngagementFilter {
         }
 
         let threshold = query.params.get(NewUserMinEngagementThreshold);
-        let (kept, removed): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(|c| should_keep(c, metric, use_ratio, threshold));
-
-        FilterResult { kept, removed }
+        FilterResult::partition(candidates, |c| should_keep(c, metric, use_ratio, threshold))
     }
 }
 

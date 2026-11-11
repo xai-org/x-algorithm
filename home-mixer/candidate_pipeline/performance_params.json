@@ -110,6 +110,8 @@
   "rust_home_mixer_inventory_holdout_originals_percent": 0,
   "rust_home_mixer_inventory_holdout_replies_percent": 0,
   "rust_home_mixer_inventory_holdout_retweets_percent": 0,
+  "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled": false,
+  "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_fatigue_hours": 0,
   "rust_home_mixer_jetfuel_frame_mlb_carousel_enabled": false,
   "rust_home_mixer_jetfuel_frame_nfl_enabled": false,
   "rust_home_mixer_jetfuel_frame_nfl_timeline_pinned_enabled": false,

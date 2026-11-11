@@ -88,6 +88,7 @@ pub(crate) struct TestBed {
     pub outcomes: Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>,
     pub control_store: Arc<action_control::test_support::MemControlStore>,
     pub backfill_store: Arc<action_control::test_support::MemControlStore>,
+        pub post_labels: Arc<crate::post_labels::test_support::FakePostLabels>,
     gizmoduck: Arc<MockGizmoduckClient>,
     strato: wiremock::MockServer,
 }
@@ -214,6 +215,7 @@ impl TestBed {
         action_control.refresh().await.unwrap();
         let backfill_store = Arc::new(action_control::test_support::MemControlStore::default());
         let claims = Arc::new(backfill_claims::test_support::MemClaimStore::listing_all());
+        let post_labels = Arc::new(crate::post_labels::test_support::FakePostLabels::default());
         let ctx = EnforcementCtx {
             ais_client: ais_client::AisClient::recording(ais.clone()),
             gd: gizmoduck::GizmoduckCoreClient::from_client(gd.clone()),
@@ -241,6 +243,7 @@ impl TestBed {
                 Some(claims.clone()),
                 String::new(),
             )),
+            post_labels: Some(post_labels.clone()),
             outcome_log: Some(outcomes.clone()),
         };
         TestBed {
@@ -252,6 +255,7 @@ impl TestBed {
             outcomes,
             control_store,
             backfill_store,
+            post_labels,
             gizmoduck: gd,
             strato: server,
         }
@@ -319,6 +323,14 @@ impl TestBed {
         score: &ScoreResult,
     ) -> Trace {
         self.dedup.slots.lock().unwrap().clear();
+        self.run_admitted_on_held(processor, score).await
+    }
+
+        pub(crate) async fn run_admitted_on_held(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
         self.dedup.take_calls();
         self.ais.take();
         self.outcomes.lock().unwrap().clear();

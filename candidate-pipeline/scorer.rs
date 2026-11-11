@@ -27,8 +27,7 @@ where
         let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         let scored = self.score(query, candidates).await;
         let expected_len = candidates.len();
-        stats.finish_with_input(expected_len);
-        if scored.len() == expected_len {
+        let results = if scored.len() == expected_len {
             scored
         } else {
             let message = format!(
@@ -42,7 +41,9 @@ where
                 scored.len()
             );
             vec![Err(message); expected_len]
-        }
+        };
+        stats.finish_with_results(&results);
+        results
     }
 
     async fn score(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>>;

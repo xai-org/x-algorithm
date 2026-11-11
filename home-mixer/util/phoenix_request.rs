@@ -294,6 +294,7 @@ pub fn build_prediction_request(
     serve_time_ms: i64,
 ) -> PredictNextActionsRequest {
     let mut request = build_request_without_sequence_and_candidates(query, product_surface);
+    request.return_candidate_tweet_id_only = true;
     request.candidate_sets[0].candidates = build_tweet_infos(query, candidates, serve_time_ms);
     let mut sequence = query.scoring_sequence.clone().unwrap_or_default();
     sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);
@@ -309,6 +310,7 @@ pub fn build_immersive_prediction_request(
     let mut request =
         build_request_without_sequence_and_candidates(query, ProductSurface::GalleryPage);
     request.return_backbone_scores = false;
+    request.return_candidate_tweet_id_only = true;
     let followed_ids = followed_user_ids(query);
     request.candidate_sets[0].candidates = candidates
         .iter()
@@ -327,4 +329,42 @@ pub fn build_immersive_prediction_request(
         .cloned()
         .collect();
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query() -> ScoredPostsQuery {
+        ScoredPostsQuery {
+            user_id: 42,
+            ..Default::default()
+        }
+    }
+
+    fn candidate(tweet_id: u64) -> PostCandidate {
+        PostCandidate {
+            tweet_id,
+            author_id: 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prediction_request_asks_for_tweet_id_only_candidates() {
+        let request = build_prediction_request(
+            &query(),
+            &[candidate(1)],
+            ProductSurface::HomeTimelineRanking,
+            0,
+        );
+        assert!(request.return_candidate_tweet_id_only);
+    }
+
+    #[test]
+    fn immersive_prediction_request_asks_for_tweet_id_only_candidates() {
+        let candidate = candidate(1);
+        let request = build_immersive_prediction_request(&query(), &[&candidate]);
+        assert!(request.return_candidate_tweet_id_only);
+    }
 }

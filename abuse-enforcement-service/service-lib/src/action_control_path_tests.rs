@@ -1323,7 +1323,10 @@ fn held(b: &TestBed, account: Account) -> Option<(u8, bool, Option<u64>)> {
         .slots
         .lock()
         .unwrap()
-        .get(&(EntityType::User.as_str().to_owned(), account.user_id()))
+        .get(&dedup_cache::DedupKey::entity(
+            EntityType::User,
+            account.user_id(),
+        ))
         .copied()
 }
 
@@ -1867,6 +1870,210 @@ async fn a_row_this_image_cannot_read_logs_only() {
     assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
     assert!(t.ais.is_empty() && t.tickets == 0 && t.outcomes[0].dry_run);
     assert_eq!(info(&t)["logged_because"], "unreadable");
+}
+
+fn post_label(name: &str, lifetime: Lifetime) -> PageAction {
+    PageAction::PostLabel {
+        label: action_control::PostLabelName::parse(name).unwrap(),
+        lifetime,
+    }
+}
+
+fn nsfw_label(lifetime: Lifetime) -> PageAction {
+    post_label("NsfwHighPrecision", lifetime)
+}
+
+fn labelling(actions: Vec<PageAction>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::Post),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            ..of_entity(ControlEntity::Post, live(REPLY_HEAD, None, actions))
+        },
+    ]
+}
+
+fn post_id(account: Account) -> i64 {
+    reply_by(account).entity_id
+}
+
+fn nsfw_key(account: Account) -> dedup_cache::DedupKey {
+    dedup_cache::DedupKey::entity(EntityType::Post, post_id(account))
+        .with_post_labels(Some(&["NsfwHighPrecision"]))
+}
+
+fn sends_label(t: &Trace, label: &str) -> bool {
+    t.ais.iter().any(|(_, r)| {
+        r.to_string()
+            .contains(&format!(r#""safetyTweetLabels":"{label}""#))
+    })
+}
+
+#[tokio::test]
+async fn a_page_post_label_is_sent_to_ais() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"), "{:?}", t.ais);
+    assert_eq!(
+        *b.post_labels.reads.lock().unwrap(),
+        [post_id(Account::Clean)]
+    );
+    let i = info(&t);
+    assert!(i["action_specs"].contains("NsfwHighPrecision"), "{i:?}");
+    assert!(!i.contains_key("post_labels_carried"));
+    assert!(!i.contains_key("post_labels_read"));
+}
+
+#[tokio::test]
+async fn a_post_already_carrying_the_label_is_skipped() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let id = post_id(Account::Clean);
+    b.post_labels
+        .carry(id, &[("NsfwHighPrecision", None), ("NsfwHighRecall", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "already_post_labeled", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    let i = info(&t);
+    assert_eq!(i["post_labels_carried"], r#"["NsfwHighPrecision"]"#);
+    assert_eq!(i["post_present"], "true");
+    assert_eq!(
+        i["post_labels"],
+        r#"["NsfwHighPrecision","NsfwHighRecall"]"#
+    );
+
+    let week = crate::now_millis() + 7 * 86_400_000;
+    b.post_labels
+        .carry(id, &[("NsfwHighPrecision", Some(week))]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"));
+    assert!(!info(&t).contains_key("post_labels_carried"));
+}
+
+#[tokio::test]
+async fn a_carried_label_leaves_the_rest_of_the_row() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(
+        labelling(vec![nsfw_label(Lifetime::Permanent), HIDE_REPLY]),
+        false,
+    )
+    .await;
+    b.post_labels
+        .carry(post_id(Account::Clean), &[("NsfwHighPrecision", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "RiskyHighVizReply"));
+    assert!(!sends_label(&t, "NsfwHighPrecision"));
+    assert_eq!(info(&t)["post_labels_carried"], r#"["NsfwHighPrecision"]"#);
+}
+
+#[tokio::test]
+async fn a_failed_label_read_sends_the_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Days30)]), false).await;
+    b.post_labels.fail(post_id(Account::Clean));
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"));
+    assert_eq!(info(&t)["post_labels_read"], "failed");
+}
+
+#[tokio::test]
+async fn a_page_label_is_not_blocked_by_another_heads_hold_on_the_post() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let entity = dedup_cache::DedupKey::entity(EntityType::Post, post_id(Account::Clean));
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup.hold_key(entity.clone(), dedup_cache::CLASS_LABEL);
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert_eq!(
+        t.dedup_calls[0],
+        format!("try_insert(class={})=new", dedup_cache::CLASS_LABEL)
+    );
+    {
+        let slots = b.dedup.slots.lock().unwrap();
+        assert_eq!(slots[&entity].0, dedup_cache::CLASS_LABEL, "untouched");
+        assert_eq!(slots[&nsfw_key(Account::Clean)].0, dedup_cache::CLASS_LABEL);
+    }
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "dedup_skipped");
+    assert!(t.ais.is_empty());
+
+    b.set_records(&labelling(vec![
+        nsfw_label(Lifetime::Permanent),
+        PageAction::SuspendAuthor {},
+    ]))
+    .await;
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert!(
+        t.dedup_calls[0].ends_with("=bypass"),
+        "a row that also suspends dedups on the post itself: {:?}",
+        t.dedup_calls
+    );
+}
+
+#[tokio::test]
+async fn soft_nsfw_is_sent_skipped_and_deduped_like_any_listed_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let soft = post_label("SoftNsfw", Lifetime::Permanent);
+    let b = bed(labelling(vec![soft]), false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"), "{:?}", t.ais);
+
+    let id = post_id(Account::Clean);
+    b.post_labels.carry(id, &[("SoftNsfw", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "already_post_labeled", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty());
+
+    b.post_labels.carry(id, &[("NsfwHighPrecision", None)]);
+    b.set_records(&labelling(vec![nsfw_label(Lifetime::Permanent), soft]))
+        .await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"));
+    assert!(!sends_label(&t, "NsfwHighPrecision"));
+
+    b.set_records(&labelling(vec![soft])).await;
+    b.post_labels.carry(id, &[]);
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup
+        .hold_key(nsfw_key(Account::Clean), dedup_cache::CLASS_LABEL);
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"));
+    let soft_key =
+        dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&["SoftNsfw"]));
+    assert!(b.dedup.slots.lock().unwrap().contains_key(&soft_key));
 }
 
 fn with_skips(

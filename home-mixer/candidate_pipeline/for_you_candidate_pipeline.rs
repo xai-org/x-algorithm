@@ -33,6 +33,7 @@ use crate::side_effects::update_served_history_side_effect::UpdateServedHistoryS
 use crate::side_effects::video_carousel_candidates_kafka_side_effect::VideoCarouselCandidatesKafkaSideEffect;
 use crate::sources::ads_source::AdsSource;
 use crate::sources::feed_survey_source::FeedSurveySource;
+use crate::sources::jetfuel_direct_frame_source::JetfuelDirectFrameSource;
 use crate::sources::jetfuel_frame_source::JetfuelFrameSource;
 use crate::sources::prompts_source::PromptsSource;
 use crate::sources::push_to_home_source::PushToHomeSource;
@@ -46,8 +47,8 @@ use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::
 };
 use xai_candidate_pipeline::component_library::clients::redis_client::MockRedisClient;
 use xai_candidate_pipeline::component_library::clients::{
-    MockReplyMixerClient, MockStratoClient, ProdReplyMixerClient, ProdStratoClient,
-    ReplyMixerClient, StratoClient,
+    JetfuelClient, MockJetfuelClient, MockReplyMixerClient, MockStratoClient, ProdReplyMixerClient,
+    ProdStratoClient, ReplyMixerClient, StratoClient,
 };
 use xai_candidate_pipeline::filter::Filter;
 use xai_candidate_pipeline::hydrator::Hydrator;
@@ -71,6 +72,7 @@ pub struct ForYouCandidatePipeline {
 impl ForYouCandidatePipeline {
     pub async fn new(
         scored_posts_server: Arc<ScoredPostsServer>,
+        jetfuel_client: Arc<dyn JetfuelClient>,
         shard_coordinate: Option<ShardCoordinate>,
         datacenter: &str,
     ) -> Self {
@@ -167,6 +169,7 @@ impl ForYouCandidatePipeline {
         Self::build(
             scored_posts_server,
             strato_client,
+            jetfuel_client,
             ad_index_client,
             ads_injection_logging,
             funnel_trace,
@@ -190,6 +193,7 @@ impl ForYouCandidatePipeline {
     fn build(
         scored_posts_server: Arc<ScoredPostsServer>,
         strato_client: Arc<dyn StratoClient + Send + Sync>,
+        jetfuel_client: Arc<dyn JetfuelClient>,
         ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
         ads_injection_logging: AdsInjectionLoggingSideEffect,
         funnel_trace: FunnelTraceSideEffect,
@@ -230,6 +234,7 @@ impl ForYouCandidatePipeline {
                 reply_mixer_client,
             }),
             Box::new(JetfuelFrameSource { strato_client }),
+            Box::new(JetfuelDirectFrameSource { jetfuel_client }),
             Box::new(FeedSurveySource),
         ];
 
@@ -296,6 +301,7 @@ impl ForYouCandidatePipeline {
         let reply_mixer_client: Arc<dyn ReplyMixerClient> = Arc::new(MockReplyMixerClient);
         let strato_client: Arc<dyn StratoClient + Send + Sync> =
             Arc::new(MockStratoClient::default());
+        let jetfuel_client: Arc<dyn JetfuelClient> = Arc::new(MockJetfuelClient::default());
         let served_slate_cache = ServedSlateCacheSideEffect::new(
             Arc::new(MockRedisClient::default()),
             Arc::new(MockRedisClient::default()),
@@ -303,6 +309,7 @@ impl ForYouCandidatePipeline {
         Self::build(
             scored_posts_server,
             strato_client,
+            jetfuel_client,
             ad_index_client,
             ads_injection,
             funnel_trace,

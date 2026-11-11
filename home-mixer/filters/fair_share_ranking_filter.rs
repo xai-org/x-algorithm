@@ -27,17 +27,8 @@ impl Filter<ScoredPostsQuery, PostCandidate> for FairShareRankingFilter {
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
         let budget = query.params.get(PhoenixScoresResultSize) as usize;
-        let selected = selection_mask(&candidates, budget);
-        let mut kept = Vec::new();
-        let mut removed = Vec::new();
-        for (candidate, keep) in candidates.into_iter().zip(selected) {
-            if keep {
-                kept.push(candidate);
-            } else {
-                removed.push(candidate);
-            }
-        }
-        FilterResult { kept, removed }
+        let mut selected = selection_mask(&candidates, budget).into_iter();
+        FilterResult::partition(candidates, |_| selected.next().unwrap_or(false))
     }
 }
 

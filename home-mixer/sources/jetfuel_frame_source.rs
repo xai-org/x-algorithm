@@ -2,107 +2,43 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use tonic::async_trait;
-use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::source::Source;
-use xai_home_mixer_proto::{feed_item, FeedItem, Frame};
-use xai_stats_receiver::global_stats_receiver;
+use xai_home_mixer_proto::FeedItem;
 use xai_twittercontext_proto::GetTwitterContextViewer;
 
-use crate::frames;
-use crate::frames::Placement;
+use crate::frames::{self, Fetch, FrameDef};
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{FOR_YOU_MAX_RESULT_SIZE, MAX_JETFUEL_FRAMES_PER_RESPONSE};
-
-const PAYLOAD_FAILED_METRIC: &str = "JetfuelFrameSource.payload_failed";
-
-const MAX_ORGANIC_FEED_LEN: usize = FOR_YOU_MAX_RESULT_SIZE - MAX_JETFUEL_FRAMES_PER_RESPONSE;
 
 pub struct JetfuelFrameSource {
     pub strato_client: Arc<dyn StratoClient + Send + Sync>,
 }
 
+fn via_strato(frame: &FrameDef) -> bool {
+    frame.fetch == Fetch::Strato
+}
+
 #[async_trait]
 impl Source<ScoredPostsQuery, FeedItem> for JetfuelFrameSource {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        frames::eligible(query).next().is_some()
+        frames::eligible(query).any(via_strato)
     }
 
     async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {
         let viewer = query.get_viewer();
         let viewer = viewer.as_ref();
-
-        let mut wanted: Vec<(&'static frames::FrameDef, u32)> = Vec::new();
-        for frame in frames::eligible(query) {
-            for occurrence in 0..frame.placement.occurrences(MAX_ORGANIC_FEED_LEN) {
-                wanted.push((frame, occurrence as u32));
-            }
-        }
-        wanted.sort_by_key(|(frame, occurrence)| {
-            let recurring = !matches!(frame.placement, Placement::Pinned { .. });
-            (recurring, *occurrence)
-        });
-        wanted.truncate(MAX_JETFUEL_FRAMES_PER_RESPONSE);
-
-        let fetched = join_all(wanted.into_iter().map(|(frame, occurrence)| {
-            let fetch_route = match frame.placement {
-                Placement::EveryNItems { rotating: true, .. } => {
-                    let next_card = frames::resume_index(&query.served_history, frame.route)
-                        .map_or(0, |last_served| last_served.wrapping_add(1));
-                    format!("{}?i={}", frame.route, next_card.wrapping_add(occurrence))
-                }
-                _ => frame.route.to_string(),
-            };
-            async move {
+        let fetched = join_all(frames::requests(query, via_strato).into_iter().map(
+            |request| async move {
                 let payload = self
                     .strato_client
-                    .get_jetfuel_payload(&fetch_route, viewer)
+                    .get_jetfuel_payload(&request.fetch_route, viewer)
                     .await
                     .map_err(|e| e.to_string());
-                (frame, occurrence, fetch_route, payload)
-            }
-        }))
+                (request, payload)
+            },
+        ))
         .await;
-
-        let mut items = Vec::new();
-        let mut failed_routes = Vec::new();
-        for (frame, occurrence, fetch_route, payload) in fetched {
-            match payload {
-                Ok(Some((payload, height))) if !payload.is_empty() => items.push(FeedItem {
-                    position: 0,
-                    item: Some(feed_item::Item::Frame(Frame {
-                        payload,
-                        height,
-                        is_dismissible: frame.is_dismissible,
-                        placement_id: frame.placement_id,
-                        route: frame.route.to_string(),
-                        occurrence,
-                        fetch_route,
-                    })),
-                }),
-                Ok(_) => {}
-                Err(_) => failed_routes.push(frame.route),
-            }
-        }
-
-        if !failed_routes.is_empty() {
-            if let Some(receiver) = global_stats_receiver() {
-                for route in &failed_routes {
-                    receiver.incr(PAYLOAD_FAILED_METRIC, &[("route", route)], 1);
-                }
-            }
-            if items.is_empty() {
-                return Err(format!(
-                    "jetfuel payload fetch failed for {}",
-                    failed_routes.join(", ")
-                ));
-            }
-            warn!(
-                routes = failed_routes.join(", "),
-                "JetfuelFrameSource: some jetfuel payloads failed, serving the rest"
-            );
-        }
-        Ok(items)
+        frames::collect("JetfuelFrameSource", fetched)
     }
 }
 
@@ -112,6 +48,7 @@ mod tests {
     use crate::frames::{BASEBALL_TOPIC_ID, MLB_TOPIC_ID, NFL_TOPIC_ID, SOCCER_TOPIC_ID};
     use xai_candidate_pipeline::component_library::clients::MockStratoClient;
     use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
+    use xai_home_mixer_proto::{feed_item, Frame};
     use xai_x_thrift::served_history::{
         EntryWithItemIds, ItemIds, RequestType as ServedRequestType, ServedHistory,
     };
@@ -191,6 +128,19 @@ mod tests {
     fn enabled_when_configured_topic_is_requested() {
         let q = query(true, vec![SOCCER_TOPIC_ID]);
         assert!(source(None).enable(&q));
+    }
+
+    #[test]
+    fn frames_fetched_directly_from_jetfuel_are_left_to_their_own_source() {
+        let q = query_with(
+            &[(
+                "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled",
+                true,
+            )],
+            vec![],
+        );
+        assert!(frames::eligible(&q).next().is_some());
+        assert!(!source(None).enable(&q));
     }
 
     #[test]

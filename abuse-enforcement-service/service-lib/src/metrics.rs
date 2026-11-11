@@ -55,6 +55,13 @@ lazy_static! {
             "Bypass claims lost to a concurrent claimant at nonce verification.")
             .unwrap();
 
+            pub static ref POST_LABEL_READ_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_post_label_read_total",
+            "Reads of a post's current labels before a page decision labels it.",
+            &["result"])
+            .unwrap();
+
                             pub static ref STRATO_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_strato_latency_seconds",
@@ -452,6 +459,7 @@ pub fn init() {
     let _ = &*DEDUP_WRITE_FENCED_TOTAL;
     let _ = &*DEDUP_DISPLACED_RESTORED_TOTAL;
     let _ = &*DEDUP_BYPASS_CLAIM_LOST_TOTAL;
+    let _ = &*POST_LABEL_READ_TOTAL;
     let _ = &*STRATO_LATENCY;
     let _ = &*AIS_LATENCY;
     let _ = &*KAFKA_MESSAGE_LATENCY;

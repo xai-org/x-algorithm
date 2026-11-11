@@ -107,6 +107,7 @@ use crate::query_hydrators::ip_query_hydrator::IpQueryHydrator;
 use crate::query_hydrators::muted_user_ids_query_hydrator::MutedUserIdsQueryHydrator;
 use crate::query_hydrators::mutual_follow_query_hydrator::MutualFollowQueryHydrator;
 use crate::query_hydrators::recent_search_queries_query_hydrator::RecentSearchQueriesQueryHydrator;
+use crate::query_hydrators::recent_views_query_hydrator::RecentViewsQueryHydrator;
 use crate::query_hydrators::retrieval_sequence_query_hydrator::RetrievalSequenceQueryHydrator;
 use crate::query_hydrators::scoring_sequence_query_hydrator::ScoringSequenceQueryHydrator;
 use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserIdsQueryHydrator;
@@ -293,6 +294,10 @@ impl PhoenixCandidatePipeline {
             Box::new(RetrievalSequenceQueryHydrator::new(
                 user_action_aggregation_client.clone(),
             )),
+            Box::new(RecentViewsQueryHydrator {
+                user_action_aggregation_client: user_action_aggregation_client.clone(),
+                strato_client: strato_client.clone(),
+            }),
             Box::new(BlockedUserIdsQueryHydrator {
                 socialgraph_client: socialgraph_client.clone(),
             }),
@@ -470,6 +475,7 @@ impl PhoenixCandidatePipeline {
             client: vm_ranker_client,
             xds_client: xds_vm_ranker_client,
             author_cold_start,
+            strato_client: strato_client.clone(),
         });
         let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
             dispatch: crate::util::egress::PredictionDispatch {

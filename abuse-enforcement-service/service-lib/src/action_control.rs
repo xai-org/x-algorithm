@@ -14,9 +14,9 @@ pub use xai_abuse_enforcement_types::action_control::{
     ActionControlListResponse, ActionControlPutRequest, ActionControlRecord, ActionControlSeen,
     ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,
     ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,
-    PageAction, PodActionControlView, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION, RowSetting, RowView,
-    RowsRequest, SafetyChecksByEntity, SuspensionPolicy, UnreadableRecord, in_rollout,
-    rollout_bucket,
+    PageAction, PodActionControlView, PostLabelName, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION,
+    RowSetting, RowView, RowsRequest, SafetyChecksByEntity, SuspensionPolicy, UnreadableRecord,
+    in_rollout, rollout_bucket,
 };
 
 mod levels;
@@ -146,7 +146,8 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
         PageAction::SpamHighRecall { .. }
         | PageAction::PhoenixSkip { .. }
         | PageAction::PostSpamHighRecall { .. }
-        | PageAction::HideReply { .. } => 0,
+        | PageAction::HideReply { .. }
+        | PageAction::PostLabel { .. } => 0,
         PageAction::LivenessCheck {} => 1,
         PageAction::Suspend { .. } | PageAction::SuspendAuthor {} => 2,
     };
@@ -171,6 +172,10 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
                 labels: vec![RISKY_HIGH_VIZ_REPLY.into()],
                 ttl_msec: lifetime.ttl_msec(),
             },
+            PageAction::PostLabel { label, lifetime } => ActionSpec::AddPostLabelsV2 {
+                labels: vec![label.as_str().into()],
+                ttl_msec: lifetime.ttl_msec(),
+            },
             PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,
             PageAction::Suspend { permanent, policy } => ActionSpec::SuspendUser {
                 perm: permanent,
@@ -190,6 +195,22 @@ pub fn label_only(actions: &[PageAction]) -> Option<&'static str> {
         [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),
         _ => None,
     }
+}
+
+pub fn post_labels_only(actions: &[PageAction]) -> Option<Vec<&'static str>> {
+    let mut labels = actions
+        .iter()
+        .map(|a| match a {
+            PageAction::PostSpamHighRecall { .. } => Some(SPAM_HIGH_RECALL),
+            PageAction::HideReply { .. } => Some(RISKY_HIGH_VIZ_REPLY),
+            PageAction::PostLabel { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|l| !l.is_empty())?;
+    labels.sort_unstable();
+    labels.dedup();
+    Some(labels)
 }
 
 fn ttl_days(ttl_msec: i64) -> Value {
@@ -521,6 +542,13 @@ impl Resolved {
         self.dedup_class.unwrap_or_else(rules)
     }
 
+                    pub fn dedup_labels(&self) -> Option<Vec<&'static str>> {
+        if !self.page_driven() {
+            return None;
+        }
+        post_labels_only(&self.page_actions)
+    }
+
             pub fn info_keys(&self) -> Vec<(String, String)> {
         let mut keys = vec![(
             "action_control_mode".to_owned(),
@@ -795,7 +823,8 @@ fn label_days(a: &PageAction) -> Option<i64> {
         PageAction::SpamHighRecall { lifetime }
         | PageAction::PhoenixSkip { lifetime }
         | PageAction::PostSpamHighRecall { lifetime }
-        | PageAction::HideReply { lifetime } => {
+        | PageAction::HideReply { lifetime }
+        | PageAction::PostLabel { lifetime, .. } => {
             Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))
         }
         _ => None,
@@ -5247,7 +5276,7 @@ mod tests {
     async fn the_list_says_the_service_takes_the_skips_and_their_default() {
         let (ac, _) = loaded(&[]).await;
         let list = ac.list(&on(), baked_safety()).await;
-        assert_eq!(list.feature_version, 6);
+        assert_eq!(list.feature_version, 7);
         let view = list.follower_skip.unwrap();
         assert_eq!(view, crate::safety_checks::follower_skip_view());
         assert!(view.today_threshold < view.ceiling);

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 6;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 7;
+pub const POST_LABEL_RECORD_VERSION: u32 = 7;
 pub const SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 6;
 pub const AUTHOR_SKIPS_RECORD_VERSION: u32 = 5;
 pub const ROLLOUT_RECORD_VERSION: u32 = 4;
@@ -225,6 +226,45 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+pub const PAGE_POST_LABELS: &[&str] = &["NsfwHighPrecision", "SoftNsfw"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PostLabelName(&'static str);
+
+impl PostLabelName {
+    pub fn parse(name: &str) -> Option<Self> {
+        PAGE_POST_LABELS
+            .iter()
+            .find(|l| **l == name)
+            .map(|l| Self(l))
+    }
+
+    pub fn all() -> impl Iterator<Item = Self> {
+        PAGE_POST_LABELS.iter().map(|l| Self(l))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl Serialize for PostLabelName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PostLabelName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Self::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{name}` is not a label the page may put on a post"
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -241,6 +281,11 @@ pub enum PageAction {
         PostSpamHighRecall { lifetime: Lifetime },
             HideReply { lifetime: Lifetime },
         SuspendAuthor {},
+        PostLabel {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        label: PostLabelName,
+        lifetime: Lifetime,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -278,8 +323,13 @@ impl PageAction {
             | PageAction::PhoenixSkip { .. } => ControlEntity::User,
             PageAction::PostSpamHighRecall { .. }
             | PageAction::HideReply { .. }
-            | PageAction::SuspendAuthor {} => ControlEntity::Post,
+            | PageAction::SuspendAuthor {}
+            | PageAction::PostLabel { .. } => ControlEntity::Post,
         }
+    }
+
+        pub fn is_post_label(self) -> bool {
+        matches!(self, PageAction::PostLabel { .. })
     }
 
                 pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
@@ -330,7 +380,13 @@ impl PageAction {
                     lifetime: Lifetime::Permanent,
                 },
                 PageAction::SuspendAuthor {},
-            ],
+            ]
+            .into_iter()
+            .chain(PostLabelName::all().flat_map(|label| {
+                [Lifetime::Days7, Lifetime::Days30, Lifetime::Permanent]
+                    .map(|lifetime| PageAction::PostLabel { label, lifetime })
+            }))
+            .collect(),
         }
     }
 
@@ -354,7 +410,7 @@ impl PageAction {
         }
     }
 
-            pub fn kind(self) -> &'static str {
+                pub fn kind(self) -> &'static str {
         match self {
             PageAction::Suspend { .. } => "suspend",
             PageAction::LivenessCheck {} => "liveness_check",
@@ -363,6 +419,7 @@ impl PageAction {
             PageAction::PostSpamHighRecall { .. } => "post_spam_high_recall",
             PageAction::HideReply { .. } => "hide_reply",
             PageAction::SuspendAuthor {} => "suspend_author",
+            PageAction::PostLabel { label, .. } => label.as_str(),
         }
     }
 }
@@ -446,8 +503,14 @@ impl ActionControlRecord {
         self.follower_threshold.is_some() || self.skip_high_credibility.is_some()
     }
 
+        pub fn uses_post_label(&self) -> bool {
+        self.actions.iter().any(|a| a.is_post_label())
+    }
+
                             pub fn schema_version(&self) -> u32 {
-        if self.uses_suspension_options() {
+        if self.uses_post_label() {
+            POST_LABEL_RECORD_VERSION
+        } else if self.uses_suspension_options() {
             SUSPENSION_OPTIONS_RECORD_VERSION
         } else if self.sets_author_skips() {
             AUTHOR_SKIPS_RECORD_VERSION
@@ -1345,5 +1408,94 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json["factory_evidence_max_age_ms"], 9);
+    }
+
+    #[test]
+    fn a_post_label_names_a_listed_label_and_round_trips() {
+        let json = r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"permanent"}"#;
+        let a: PageAction = serde_json::from_str(json).unwrap();
+        let label = PostLabelName::parse("NsfwHighPrecision").unwrap();
+        assert_eq!(
+            a,
+            PageAction::PostLabel {
+                label,
+                lifetime: Lifetime::Permanent
+            }
+        );
+        assert_eq!(serde_json::to_string(&a).unwrap(), json);
+        assert_eq!(a.entity(), ControlEntity::Post);
+        assert_eq!(a.kind(), "NsfwHighPrecision");
+        assert!(a.is_post_label());
+        let soft = r#"{"kind":"post_label","label":"SoftNsfw","lifetime":"30d"}"#;
+        let a: PageAction = serde_json::from_str(soft).unwrap();
+        assert_eq!(a.kind(), "SoftNsfw");
+        assert_eq!(serde_json::to_string(&a).unwrap(), soft);
+        for bad in [
+            r#"{"kind":"post_label","label":"softnsfw","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighRecall","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"nsfwhighprecision","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"90d"}"#,
+            r#"{"kind":"post_label","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"7d","ttl":1}"#,
+        ] {
+            assert!(serde_json::from_str::<PageAction>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_listed_label_is_on_the_post_menu_with_every_lifetime() {
+        let post = PageAction::menu(ControlEntity::Post);
+        let user = PageAction::menu(ControlEntity::User);
+        for label in PostLabelName::all() {
+            for lifetime in [Lifetime::Days7, Lifetime::Days30, Lifetime::Permanent] {
+                let a = PageAction::PostLabel { label, lifetime };
+                assert!(post.contains(&a), "{a:?}");
+                assert!(!user.contains(&a), "{a:?}");
+            }
+        }
+        assert_eq!(
+            post.iter().filter(|a| a.is_post_label()).count(),
+            3 * PAGE_POST_LABELS.len()
+        );
+    }
+
+    #[test]
+    fn listed_labels_never_shadow_an_action_of_their_own() {
+        let mut seen = std::collections::HashSet::new();
+        for label in PAGE_POST_LABELS {
+            assert!(seen.insert(label), "{label} listed twice");
+            assert!(
+                !["SpamHighRecall", "RiskyHighVizReply"].contains(label),
+                "{label} has its own page action"
+            );
+            let kinds: Vec<&str> = PageAction::menu(ControlEntity::Post)
+                .into_iter()
+                .chain(PageAction::menu(ControlEntity::User))
+                .filter(|a| !a.is_post_label())
+                .map(PageAction::kind)
+                .collect();
+            assert!(!kinds.contains(label), "{label} is another action's kind");
+        }
+    }
+
+    #[test]
+    fn a_record_with_a_post_label_is_refused_by_older_images() {
+        let json = r#"{"v":3,"entity_type":"post","head":"H","mode":"live","actions":[{"kind":"hide_reply","lifetime":"permanent"}],"version":1,"confidence":"high"}"#;
+        let mut r = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
+        assert!(!r.uses_post_label());
+        assert_eq!(r.schema_version(), ROWS_RECORD_VERSION);
+        r.actions = vec![PageAction::PostLabel {
+            label: PostLabelName::parse("NsfwHighPrecision").unwrap(),
+            lifetime: Lifetime::Permanent,
+        }];
+        r.rollout_bp = Some(1_000);
+        assert_eq!(r.schema_version(), 7);
+        assert_eq!(r.schema_version(), POST_LABEL_RECORD_VERSION);
+        assert!(r.schema_version() > SUSPENSION_OPTIONS_RECORD_VERSION);
+        r.v = r.schema_version();
+        let back = ActionControlRecord::parse_strict(serde_json::to_string(&r).unwrap().as_bytes())
+            .unwrap();
+        assert_eq!(back, r);
     }
 }

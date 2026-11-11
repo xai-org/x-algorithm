@@ -5,11 +5,15 @@ use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
 use crate::scorers::value_model;
 use crate::scorers::vm_ranker_request::RequestShape;
+use crate::util::post_annotations::fetch_post_topics;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::scorer::Scorer;
 use xai_stats_receiver::global_stats_receiver;
+use xai_vm_ranker_proto::experiment::PostTopics;
 use xai_vm_ranker_proto::{RankRequest, RankResponse, RankedCandidate};
 
 const METRIC_PREFIX: &str = "VMRanker";
@@ -18,6 +22,7 @@ pub struct VMRanker {
     pub client: Arc<dyn VMRankerClient>,
     pub xds_client: Option<Arc<dyn VMRankerClient>>,
     pub author_cold_start: AuthorColdStart,
+    pub strato_client: Arc<dyn StratoClient + Send + Sync>,
 }
 
 struct LocalScores {
@@ -73,6 +78,35 @@ impl VMRanker {
             cold_start,
         }
     }
+
+    async fn candidate_topics(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        weighted: &[f64],
+    ) -> Vec<Option<PostTopics>> {
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|&a, &b| weighted[b].total_cmp(&weighted[a]));
+        order.truncate(query.params.get(PostTopicsMaxCandidates));
+        let source_id = |c: &PostCandidate| c.retweeted_tweet_id.unwrap_or(c.tweet_id);
+        let ids: Vec<u64> = order.iter().map(|&i| source_id(&candidates[i])).collect();
+        let Some(by_id) = fetch_post_topics(
+            self.strato_client.as_ref(),
+            &ids,
+            Duration::from_millis(query.params.get(PostTopicsTimeoutMs)),
+        )
+        .await
+        else {
+            record_post_topics("timeout");
+            return Vec::new();
+        };
+        record_post_topics("hydrated");
+        let mut topics = vec![None; candidates.len()];
+        for i in order {
+            topics[i] = by_id.get(&source_id(&candidates[i])).cloned();
+        }
+        topics
+    }
 }
 
 #[async_trait]
@@ -100,8 +134,14 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             })
             .collect();
 
+        let topics = if shape.sends_post_topics() {
+            self.candidate_topics(query, candidates, &local.weighted)
+                .await
+        } else {
+            Vec::new()
+        };
         let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let request = shape.build(query, candidates, &scored);
+        let request = shape.build(query, candidates, &scored, &topics);
         record_request(&cluster);
 
         let response = match self.rank(query, cluster, request).await {
@@ -168,6 +208,16 @@ fn record_request(cluster: &VMRankerCluster) {
         receiver.incr(
             &format!("{METRIC_PREFIX}.request"),
             &[("vm_cluster", &format!("{cluster:?}"))],
+            1,
+        );
+    }
+}
+
+fn record_post_topics(outcome: &str) {
+    if let Some(receiver) = global_stats_receiver() {
+        receiver.incr(
+            &format!("{METRIC_PREFIX}.post_topics"),
+            &[("outcome", outcome)],
             1,
         );
     }

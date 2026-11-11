@@ -298,7 +298,9 @@ impl RemoteLabels for RemoteSource {
                         fills.push(FillJob {
                             tweet_id,
                             fill,
-                            labels: FillLabels::Reread,
+                            labels: FillLabels::Refresh {
+                                entry: envelope.clone(),
+                            },
                         });
                     }
                     results.insert(tweet_id, Ok(envelope.into_labels()));

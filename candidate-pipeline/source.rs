@@ -27,7 +27,7 @@ where
                 Ok(candidates)
             }
             Err(err) => {
-                stats.finish();
+                stats.finish_failed();
                 error!("{} Failed: {}", self.name(), err);
                 Err(err)
             }

@@ -1,19 +1,16 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableTopicFeedbackContext;
+use crate::util::post_annotations::decode_post_annotations;
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
-use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::hydrator::Hydrator;
 use xai_recsys_proto::grok_topics::{topic_index, PARENT_TOPIC_IDS};
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
 
-const FID_TOPICS: i16 = -9948;
-const FID_ANNOTATIONS: i16 = 31524;
 const TOP_TOPIC_COUNT: usize = 2;
 
 pub struct TopicFeedbackContextHydrator {
@@ -33,33 +30,27 @@ impl TopicFeedbackContextHydrator {
     }
 
     fn decode_topics(bytes: &[u8]) -> (Vec<TopicAnnotation>, Vec<String>) {
-        match strato_decode::<UnifiedPostAnnotationsValue>(bytes) {
-            Ok(StratoResult::Ok {
-                value: Some(tv), ..
-            }) => {
-                let annotations: Vec<TopicAnnotation> = tv
-                    .annotations
+        match decode_post_annotations(bytes) {
+            Ok(Some(annotations)) => {
+                let topics = annotations
                     .entities
                     .iter()
                     .enumerate()
                     .filter_map(|(i, entity)| {
-                        let topic_id = entity.qualified_id.entity_id;
+                        let topic_id = entity.entity_id;
                         if topic_id == 0 || !Self::is_subtopic(topic_id) {
                             return None;
                         }
-                        let topic_name = tv.topics.get(i)?.clone();
+                        let topic_name = annotations.topics.get(i)?.clone();
                         Some(TopicAnnotation {
                             topic_id,
                             topic_name,
                         })
                     })
                     .collect();
-
-                (annotations, tv.topics)
+                (topics, annotations.topics)
             }
-            Ok(StratoResult::Ok { value: None, .. }) | Ok(StratoResult::Err { .. }) => {
-                (Vec::new(), Vec::new())
-            }
+            Ok(None) => (Vec::new(), Vec::new()),
             Err(e) => {
                 warn!("TopicFeedbackContextHydrator: decode error: {}", e);
                 (Vec::new(), Vec::new())
@@ -192,139 +183,4 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator 
 struct TopicAnnotation {
     topic_id: i64,
     topic_name: String,
-}
-
-#[derive(Debug, Default, Clone)]
-struct QualifiedId {
-    entity_id: i64,
-}
-
-impl TSerializable for QualifiedId {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut q = QualifiedId::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(2) => q.entity_id = i_prot.read_i64()?,
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(q)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct EntityWithMetadata {
-    qualified_id: QualifiedId,
-}
-
-impl TSerializable for EntityWithMetadata {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut e = EntityWithMetadata::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(1) => e.qualified_id = QualifiedId::read_from_in_protocol(i_prot)?,
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(e)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct UnifiedPostAnnotations {
-    entities: Vec<EntityWithMetadata>,
-}
-
-impl TSerializable for UnifiedPostAnnotations {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut a = UnifiedPostAnnotations::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(2) if field.field_type == TType::List => {
-                    let list = i_prot.read_list_begin()?;
-                    a.entities = Vec::with_capacity(list.size.max(0) as usize);
-                    for _ in 0..list.size {
-                        a.entities
-                            .push(EntityWithMetadata::read_from_in_protocol(i_prot)?);
-                    }
-                    i_prot.read_list_end()?;
-                }
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(a)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct UnifiedPostAnnotationsValue {
-    topics: Vec<String>,
-    annotations: UnifiedPostAnnotations,
-}
-
-impl TSerializable for UnifiedPostAnnotationsValue {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut tv = UnifiedPostAnnotationsValue::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(FID_TOPICS) if field.field_type == TType::List => {
-                    let list = i_prot.read_list_begin()?;
-                    tv.topics = Vec::with_capacity(list.size.max(0) as usize);
-                    for _ in 0..list.size {
-                        tv.topics.push(i_prot.read_string()?);
-                    }
-                    i_prot.read_list_end()?;
-                }
-                Some(FID_ANNOTATIONS) if field.field_type == TType::Struct => {
-                    tv.annotations = UnifiedPostAnnotations::read_from_in_protocol(i_prot)?;
-                }
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(tv)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
 }

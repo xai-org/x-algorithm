@@ -13,6 +13,7 @@ pub mod muted_user_ids_query_hydrator;
 pub mod mutual_follow_query_hydrator;
 pub mod past_request_timestamps_query_hydrator;
 pub mod recent_search_queries_query_hydrator;
+pub mod recent_views_query_hydrator;
 pub mod retrieval_sequence_query_hydrator;
 pub mod scoring_sequence_query_hydrator;
 pub mod served_history_query_hydrator;

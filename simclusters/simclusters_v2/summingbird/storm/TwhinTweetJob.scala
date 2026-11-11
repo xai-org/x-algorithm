@@ -48,7 +48,12 @@ object TwhinTweetJob {
 
     val uuaSource = uuaEventSource.name(NodeName.UUASourceNodeName)
 
-    val qualifiedFavEvents = uuaSource
+    val favOrVideoQualityViewEvents = uuaSource.filter { uua =>
+      uua.actionType == ActionType.ServerTweetFav ||
+      uua.actionType == ActionType.ClientTweetVideoQualityView
+    }
+
+    val qualifiedFavEvents = favOrVideoQualityViewEvents
       .collect {
         case UnifiedUserAction(
               UserIdentifier(Some(userId), _, _, _, _, _, _, _, _, _, _, _, _, _, _),
@@ -90,7 +95,7 @@ object TwhinTweetJob {
       .write(tweetEmbeddingKafkaPipe)
       .name(NodeName.KeyedPersistentTwhinTweetEmbeddingWriteNodeName)
 
-    val qualifiedVideoWatchEvents = uuaSource
+    val qualifiedVideoWatchEvents = favOrVideoQualityViewEvents
       .collect {
         case UnifiedUserAction(
               UserIdentifier(Some(userId), _, _, _, _, _, _, _, _, _, _, _, _, _, _),

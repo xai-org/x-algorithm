@@ -4,6 +4,7 @@ use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
 use xai_vm_ranker_proto as pb;
+use xai_vm_ranker_proto::experiment::PostTopics;
 
 const DPP_VALUE_MODEL_ID: &str = "dpp";
 
@@ -11,6 +12,7 @@ pub(crate) struct RequestShape {
     debias: bool,
     pacing: bool,
     history_topics: bool,
+    post_topics: bool,
 }
 
 impl RequestShape {
@@ -21,7 +23,12 @@ impl RequestShape {
             pacing: query.params.get(VMRankerSendPacingInputs),
             history_topics: query.params.get(VMRankerSendHistoryTopics)
                 && query.history_topics.is_some(),
+            post_topics: query.params.get(VMRankerSendPostTopics) && !query.recent_views.is_empty(),
         }
+    }
+
+    pub(crate) fn sends_post_topics(&self) -> bool {
+        self.post_topics
     }
 
     pub(crate) fn build(
@@ -29,11 +36,13 @@ impl RequestShape {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
         local: &[PostCandidate],
+        topics: &[Option<PostTopics>],
     ) -> pb::RankRequest {
         let proto_candidates = candidates
             .iter()
             .zip(local)
-            .map(|(c, local)| self.candidate(c, local))
+            .enumerate()
+            .map(|(i, (c, local))| self.candidate(c, local, topics.get(i).and_then(Option::as_ref)))
             .collect();
         let mut request = pb::RankRequest {
             viewer_id: query.user_id,
@@ -45,14 +54,25 @@ impl RequestShape {
             include_top_heads: query.is_under_the_hood_request,
             ..Default::default()
         };
-        if self.debias || self.history_topics {
-            request.experiment_payload =
-                request_payload(query, candidates, self.debias, self.history_topics).into();
+        if self.debias || self.history_topics || self.post_topics {
+            request.experiment_payload = request_payload(
+                query,
+                candidates,
+                self.debias,
+                self.history_topics,
+                self.post_topics,
+            )
+            .into();
         }
         request
     }
 
-    fn candidate(&self, c: &PostCandidate, local: &PostCandidate) -> pb::RankCandidate {
+    fn candidate(
+        &self,
+        c: &PostCandidate,
+        local: &PostCandidate,
+        topics: Option<&PostTopics>,
+    ) -> pb::RankCandidate {
         let mut out = pb::RankCandidate {
             tweet_id: c.tweet_id,
             author_id: c.author_id,
@@ -69,8 +89,8 @@ impl RequestShape {
             semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()
         };
-        if self.debias || self.pacing {
-            out.experiment_payload = candidate_payload(c, self.debias, self.pacing).into();
+        if self.debias || self.pacing || topics.is_some() {
+            out.experiment_payload = candidate_payload(c, self.debias, self.pacing, topics).into();
         }
         out
     }

@@ -252,7 +252,8 @@ pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool
             .any(|l| l == crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP),
         PageAction::LivenessCheck {}
         | PageAction::PostSpamHighRecall { .. }
-        | PageAction::HideReply { .. } => false,
+        | PageAction::HideReply { .. }
+        | PageAction::PostLabel { .. } => false,
     })
 }
 
@@ -1183,6 +1184,11 @@ impl Backfill {
     }
 }
 
+fn lists_an_action_twice(actions: &[PageAction]) -> bool {
+    let mut kinds = HashSet::new();
+    actions.iter().any(|a| !kinds.insert(a.kind()))
+}
+
 fn validate_start(
     req: &BackfillRunStartRequest,
     cfg: &BackfillConfig,
@@ -1235,9 +1241,7 @@ fn validate_start(
             format!("every action must be a {} action", req.entity.as_str()),
         );
     }
-    let kinds: HashSet<std::mem::Discriminant<PageAction>> =
-        req.actions.iter().map(std::mem::discriminant).collect();
-    if kinds.len() != req.actions.len() {
+    if lists_an_action_twice(&req.actions) {
         return bad("duplicate_actions", "an action is listed twice".into());
     }
     if req.source == RunSource::LighterAction && req.entity != ControlEntity::User {
@@ -2307,6 +2311,27 @@ mod tests {
         assert_eq!(again.state, RunState::Paused);
         assert_eq!(again.paused_reason, Some(PausedReason::OffSwitch));
         assert_eq!(again, bf.run("run-00000001").await.unwrap().unwrap());
+    }
+
+    #[test]
+    fn two_different_post_labels_are_two_actions() {
+        use xai_abuse_enforcement_types::action_control::Lifetime;
+        let label = |name, lifetime| PageAction::PostLabel {
+            label: crate::action_control::PostLabelName::parse(name).unwrap(),
+            lifetime,
+        };
+        assert!(!lists_an_action_twice(&[
+            label("NsfwHighPrecision", Lifetime::Permanent),
+            label("SoftNsfw", Lifetime::Permanent),
+        ]));
+        assert!(lists_an_action_twice(&[
+            label("SoftNsfw", Lifetime::Days7),
+            label("SoftNsfw", Lifetime::Permanent),
+        ]));
+        assert!(lists_an_action_twice(&[
+            PageAction::SUSPEND,
+            PageAction::SUSPEND
+        ]));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-09T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-11-10T16:00:31Z
 use xai_feature_switches::param;
 
 param!(
@@ -95,9 +95,13 @@ param!(
     vec![
         "Experiment18Fou:0.3".to_string(),
         "Experiment19Fou:0.3".to_string(),
-        "Experiment20Fou:0.3".to_string(),
         "Experiment22Fou:0.3".to_string(),
-        "Experiment23Fou:0.3".to_string()
+        "Experiment23Fou:0.3".to_string(),
+        "Experiment24Fou:0.3".to_string(),
+        "Experiment25Fou:0.3".to_string(),
+        "Experiment26Fou:0.3".to_string(),
+        "Experiment27Fou:0.3".to_string(),
+        "Experiment28Fou:0.3".to_string()
     ]
 );
 param!(
@@ -377,6 +381,36 @@ param!(
     usize,
     "rust_home_mixer_page_rl_exploration_top_k",
     64
+);
+param!(
+    VMRankerSendPostTopics,
+    bool,
+    "rust_home_mixer_vm_ranker_send_post_topics",
+    false
+);
+param!(
+    PostTopicsMaxCandidates,
+    usize,
+    "rust_home_mixer_post_topics_max_candidates",
+    200
+);
+param!(
+    PostTopicsTimeoutMs,
+    u64,
+    "rust_home_mixer_post_topics_timeout_ms",
+    80
+);
+param!(
+    RecentViewsRows,
+    usize,
+    "rust_home_mixer_recent_views_rows",
+    64
+);
+param!(
+    RecentViewsSequenceLength,
+    u32,
+    "rust_home_mixer_recent_views_sequence_length",
+    256
 );
 
 // These weights reflect a combination of how much an action is
@@ -1219,6 +1253,18 @@ param!(
     "rust_home_mixer_jetfuel_frame_nfl_timeline_rotation_enabled",
     false
 );
+param!(
+    EnableJetfuelFrameGrokbotSuggestedTasks,
+    bool,
+    "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled",
+    false
+);
+param!(
+    JetfuelFrameGrokbotSuggestedTasksFatigueHours,
+    u32,
+    "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_fatigue_hours",
+    6
+);
 
 param!(
     EnableFeedSurvey,
@@ -1309,12 +1355,18 @@ param!(
     EnableVideoCarouselMediumRiskFilter,
     bool,
     "rust_home_mixer_enable_video_carousel_medium_risk_filter",
-    false
+    true
 );
 param!(
     EnableVideoCarouselSeenFilter,
     bool,
     "rust_home_mixer_enable_video_carousel_seen_filter",
+    true
+);
+param!(
+    EnableVideoCarouselTakeFromFeed,
+    bool,
+    "rust_home_mixer_enable_video_carousel_take_from_feed",
     false
 );
 param!(

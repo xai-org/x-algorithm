@@ -123,6 +123,9 @@ pub struct Config {
     )]
     pub gizmoduck_client_id: String,
 
+    #[arg(long, default_value = "atla", env = "POST_LABELS_ZONE")]
+    pub post_labels_zone: String,
+
     #[arg(
         long,
         default_value = "platform-manipulation/isHighPageRankV2.User",

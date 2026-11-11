@@ -2,6 +2,7 @@ pub mod ads_source;
 pub mod cached_posts_source;
 pub mod feed_survey_source;
 pub mod following_night_owl_source;
+pub mod jetfuel_direct_frame_source;
 pub mod jetfuel_frame_source;
 pub mod phoenix_moe_source;
 pub mod phoenix_source;

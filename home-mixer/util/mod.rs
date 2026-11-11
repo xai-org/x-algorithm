@@ -6,6 +6,7 @@ pub mod feed_log;
 pub mod phoenix_request;
 pub mod popular_authors;
 pub mod popular_posts;
+pub mod post_annotations;
 pub mod post_engagers;
 pub mod rescore;
 pub mod shadow;

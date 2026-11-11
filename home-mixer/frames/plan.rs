@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use xai_home_mixer_proto::Frame;
 
-use super::catalog::{placement_in, TopicTimeline, TIMELINES};
+use super::catalog::{placement_in, Timeline, TIMELINES};
 use super::placement::Placement;
 use crate::params::MAX_JETFUEL_FRAMES_PER_RESPONSE;
 
@@ -11,13 +11,13 @@ pub fn plan(frames: Vec<Frame>, feed_len: usize) -> Vec<(usize, Frame)> {
 }
 
 fn plan_in(
-    timelines: &'static [TopicTimeline],
+    timelines: &'static [Timeline],
     frames: Vec<Frame>,
     feed_len: usize,
 ) -> Vec<(usize, Frame)> {
     let mut seen = HashSet::new();
     let mut pinned = Vec::new();
-    let mut recurring: BTreeMap<String, Vec<Frame>> = BTreeMap::new();
+    let mut slotted: BTreeMap<String, Vec<Frame>> = BTreeMap::new();
     for frame in frames {
         if !seen.insert((frame.route.clone(), frame.occurrence)) {
             continue;
@@ -27,10 +27,9 @@ fn plan_in(
         };
         match placement {
             Placement::Pinned { rank } => pinned.push((rank, frame)),
-            Placement::EveryNItems { .. } => recurring
-                .entry(frame.route.clone())
-                .or_default()
-                .push(frame),
+            Placement::AtSlot { .. } | Placement::EveryNItems { .. } => {
+                slotted.entry(frame.route.clone()).or_default().push(frame)
+            }
         }
     }
 
@@ -38,12 +37,12 @@ fn plan_in(
     let mut planned: Vec<(usize, Frame)> =
         pinned.into_iter().map(|(_, frame)| (0, frame)).collect();
 
-    for (route, mut occurrences) in recurring {
+    for (route, mut occurrences) in slotted {
         let Some(placement) = placement_in(timelines, &route) else {
             continue;
         };
         occurrences.sort_by_key(|frame| frame.occurrence);
-        let slots = placement.recurring_slots(feed_len);
+        let slots = placement.slots(feed_len);
         planned.extend(slots.into_iter().zip(occurrences));
     }
 
@@ -55,7 +54,9 @@ fn plan_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::catalog::{Cadence, FrameDef};
+    use crate::frames::catalog::{
+        Cadence, Fetch, FrameDef, Surface, GROKBOT_SUGGESTED_TASKS_ROUTE,
+    };
     use crate::frames::placement::Placement;
 
     const TOPIC: i64 = 1;
@@ -63,6 +64,7 @@ mod tests {
     const fn pinned(route: &'static str, rank: usize) -> FrameDef {
         FrameDef {
             route,
+            fetch: Fetch::Strato,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::Pinned { rank },
@@ -74,6 +76,7 @@ mod tests {
     const fn recurring(route: &'static str, first_slot: usize, interval: usize) -> FrameDef {
         FrameDef {
             route,
+            fetch: Fetch::Strato,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::EveryNItems {
@@ -86,19 +89,19 @@ mod tests {
         }
     }
 
-    const fn timeline(frames: &'static [FrameDef]) -> [TopicTimeline; 1] {
-        [TopicTimeline {
-            topic_id: TOPIC,
+    const fn timeline(frames: &'static [FrameDef]) -> [Timeline; 1] {
+        [Timeline {
+            surface: Surface::Topic(TOPIC),
             enabled: |_| true,
             frames,
         }]
     }
 
-    static MANY_PINNED: [TopicTimeline; 1] =
+    static MANY_PINNED: [Timeline; 1] =
         timeline(&[pinned("/a", 0), pinned("/b", 1), pinned("/c", 2)]);
-    static ONE_RECURRING: [TopicTimeline; 1] = timeline(&[recurring("/r", 5, 5)]);
-    static EVERY_SLOT: [TopicTimeline; 1] = timeline(&[recurring("/flood", 0, 1)]);
-    static MIXED: [TopicTimeline; 1] = timeline(&[
+    static ONE_RECURRING: [Timeline; 1] = timeline(&[recurring("/r", 5, 5)]);
+    static EVERY_SLOT: [Timeline; 1] = timeline(&[recurring("/flood", 0, 1)]);
+    static MIXED: [Timeline; 1] = timeline(&[
         pinned("/a", 0),
         pinned("/b", 1),
         recurring("/r", 6, 6),
@@ -158,6 +161,12 @@ mod tests {
     }
 
     #[test]
+    fn the_grokbot_suggested_tasks_frame_lands_on_its_slot() {
+        let planned = plan(vec![frame(GROKBOT_SUGGESTED_TASKS_ROUTE)], 30);
+        assert_eq!(routes(&planned), vec![(3, GROKBOT_SUGGESTED_TASKS_ROUTE)]);
+    }
+
+    #[test]
     fn a_route_that_is_not_in_the_catalog_is_dropped() {
         assert!(plan(vec![frame("/cards/unknown/thing")], 30).is_empty());
     }
@@ -174,7 +183,7 @@ mod tests {
         assert_eq!(routes(&planned), vec![(0, "/cards/mlb/timelineCarousel")]);
     }
 
-    fn placed(timelines: &'static [TopicTimeline], routes: &[&str]) -> Vec<(usize, String)> {
+    fn placed(timelines: &'static [Timeline], routes: &[&str]) -> Vec<(usize, String)> {
         let frames = routes.iter().map(|route| frame(route)).collect();
         plan_in(timelines, frames, 30)
             .into_iter()
