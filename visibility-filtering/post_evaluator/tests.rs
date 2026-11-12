@@ -2,7 +2,9 @@ use super::*;
 use crate::clients::socialgraph_client::{EdgeQuery, Graph};
 use crate::hydration::sources::Source;
 use crate::hydration::sources::{control, found_user, Fault, InMemorySources};
-use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator, Hydrators};
+use crate::hydration::{
+    author_fallback_cache, tweet_fallback_cache, Hydrator, Hydrators, Relation,
+};
 use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};
 use crate::rules::fixtures::{allow, dropped, limited, limited_for};
 use crate::scenario::{raw, Scenario};

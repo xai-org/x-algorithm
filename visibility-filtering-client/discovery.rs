@@ -1,6 +1,11 @@
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
+use futures::future::{Either, ErrInto};
+use futures::TryFutureExt;
+use tonic::body::Body;
+use tonic::codegen::{http, Service, StdError};
 use tonic::transport::Channel;
 use tracing::{info, warn};
 use xai_stats_receiver::global_stats_receiver;
@@ -31,6 +36,8 @@ const VF_XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 const VF_READINESS_PROBE_PORT: u16 = 9090;
 
 const VF_READINESS_PROBE_PATH: &str = "/readyz";
+
+const VF_APERTURE_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VfDiscovery {
@@ -72,8 +79,6 @@ impl std::fmt::Display for VfChannelError {
         write!(f, "{e:#}")
     }
 }
-
-impl std::error::Error for VfChannelError {}
 
 pub(crate) fn env_override(value: Option<&str>, default: String) -> String {
     match value.map(str::trim) {
@@ -139,14 +144,41 @@ pub(crate) struct VfChannelParams<'a> {
     pub dc: &'a str,
     pub discovery: VfDiscovery,
     pub xds: XdsTarget,
-    pub aperture_size: usize,
-    pub deterministic_aperture: bool,
-    pub xds_lb_policy: LbPolicy,
 }
 
+#[derive(Clone)]
 pub(crate) enum VfChannel {
     Wily(Channel),
     Xds(LoadBalancedChannel),
+}
+
+type GrpcRequest = http::Request<Body>;
+
+impl Service<GrpcRequest> for VfChannel {
+    type Response = http::Response<Body>;
+    type Error = StdError;
+    type Future = Either<
+        ErrInto<<Channel as Service<GrpcRequest>>::Future, StdError>,
+        <LoadBalancedChannel as Service<GrpcRequest>>::Future,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StdError>> {
+        match self {
+            Self::Wily(c) => c.poll_ready(cx).map_err(Into::into),
+            Self::Xds(c) => c.poll_ready(cx),
+        }
+    }
+
+    fn call(&mut self, request: GrpcRequest) -> Self::Future {
+        match self {
+            Self::Wily(c) => Either::Left(c.call(request).err_into()),
+            Self::Xds(c) => Either::Right(c.call(request)),
+        }
+    }
+}
+
+fn deterministic_aperture() -> bool {
+    std::env::var("APP_ENV").as_deref() == Ok("prod")
 }
 
 pub(crate) async fn build_vf_channel(
@@ -158,20 +190,18 @@ pub(crate) async fn build_vf_channel(
     }
 }
 
-pub(crate) async fn build_vf_xds_channel(
+async fn build_vf_xds_channel(
     params: &VfChannelParams<'_>,
 ) -> Result<LoadBalancedChannel, VfChannelError> {
     let name = params.name;
     let listener = &params.xds.listener;
-    let result =
-        match tokio::time::timeout(VF_XDS_BUILD_TIMEOUT, build_xds_channel(params, listener)).await
-        {
-            Ok(result) => result,
-            Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
-                "timed out after {}s",
-                VF_XDS_BUILD_TIMEOUT.as_secs()
-            ))),
-        };
+    let result = match tokio::time::timeout(VF_XDS_BUILD_TIMEOUT, build_xds_channel(params)).await {
+        Ok(result) => result,
+        Err(_) => Err(VfChannelError::Connect(anyhow::anyhow!(
+            "timed out after {}s",
+            VF_XDS_BUILD_TIMEOUT.as_secs()
+        ))),
+    };
     match result {
         Ok(channel) => {
             incr_build_metric(name, "xds", "built");
@@ -233,8 +263,8 @@ async fn build_wily_channel(params: &VfChannelParams<'_>) -> Result<Channel, VfC
     let mut builder = ChannelBuilder::new(name)
         .tls(s2s_tls(&vf_tls_domain(dc))?)
         .endpoint_source(source)
-        .aperture(params.aperture_size);
-    if params.deterministic_aperture {
+        .aperture(VF_APERTURE_SIZE);
+    if deterministic_aperture() {
         builder = builder.deterministic();
     }
     builder
@@ -246,15 +276,17 @@ async fn build_wily_channel(params: &VfChannelParams<'_>) -> Result<Channel, VfC
 
 async fn build_xds_channel(
     params: &VfChannelParams<'_>,
-    listener: &str,
 ) -> Result<LoadBalancedChannel, VfChannelError> {
     let name = params.name;
+    let listener = &params.xds.listener;
+    let deterministic_aperture = deterministic_aperture();
+    let lb_policy = LbPolicy::least_request();
     info!(
         channel = name,
         xds_listener = listener,
-        aperture_size = params.aperture_size,
-        deterministic_aperture = params.deterministic_aperture,
-        lb_policy = ?params.xds_lb_policy,
+        aperture_size = VF_APERTURE_SIZE,
+        deterministic_aperture,
+        lb_policy = ?lb_policy,
         "building VF channel over xDS"
     );
 
@@ -270,12 +302,12 @@ async fn build_xds_channel(
         .readiness_probe(VF_READINESS_PROBE_PORT, VF_READINESS_PROBE_PATH)
         .buffer_max_wait(DEFAULT_BUFFER_MAX_WAIT)
         .total_timeout(DEFAULT_TOTAL_TIMEOUT)
-        .aperture(params.aperture_size);
-    if params.deterministic_aperture {
+        .aperture(VF_APERTURE_SIZE);
+    if deterministic_aperture {
         builder = builder.deterministic();
     }
     let channel = builder
-        .build_load_balanced(params.xds_lb_policy)
+        .build_load_balanced(lb_policy)
         .await
         .with_context(|| format!("{name}: failed to build xDS channel for {listener}"))
         .map_err(VfChannelError::Connect)?;

@@ -4,7 +4,6 @@ use crate::hydration::Lookup;
 use crate::models::{Decided, Deletion, Evaluation, Verdict, VerdictAction};
 use crate::params::LimitedActionsPolicies;
 use crate::post_evaluator::PostEvaluation;
-use crate::result_label::{label, state_label, Class, Label, NONE};
 use crate::rules::{RuleId, SafetyLevel};
 use std::sync::Arc;
 use vf_pb::tweet_evaluation::Outcome as TweetEvaluationOutcome;
@@ -12,24 +11,10 @@ use vf_pb::NotificationDropReason;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::tweet_service::{TweetFieldsResultNotFound, TweetFieldsResultState};
 
-#[cfg(test)]
-pub(super) const BY_RULE_ACTIONS: [VerdictAction; 6] = [
-    VerdictAction::Drop,
-    VerdictAction::Tombstone,
-    VerdictAction::Interstitial,
-    VerdictAction::LimitedEngagement,
-    VerdictAction::SoftIntervention,
-    VerdictAction::Appealable,
-];
-
 pub(crate) fn verdict_action(verdict: &Verdict) -> VerdictAction {
     match verdict {
         Verdict::Withheld(decided) => decided.value.kind().verdict_action(),
         Verdict::Fosnr(decided) => decided.value.kind().verdict_action(),
-        Verdict::Shown {
-            label_interstitial: Some(_),
-            ..
-        } => VerdictAction::TweetInterstitial,
         Verdict::Shown {
             label_interstitial: None,
             media: None,
@@ -45,11 +30,7 @@ pub(crate) fn verdict_action(verdict: &Verdict) -> VerdictAction {
             media: None,
             engagement: Some(_),
         } => VerdictAction::LimitedEngagement,
-        Verdict::Shown {
-            label_interstitial: None,
-            media: Some(_),
-            engagement: Some(_),
-        } => VerdictAction::TweetInterstitial,
+        Verdict::Shown { .. } => VerdictAction::TweetInterstitial,
     }
 }
 
@@ -65,13 +46,13 @@ pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
     decided_rows(verdict).next().map(|(rule, _)| rule)
 }
 
-pub(crate) fn filter_tweets_result(outcome: PostEvaluation) -> vf_pb::TweetVisibilityResult {
-    let (action, filtered_reason) = proto_action(outcome.evaluation.verdict());
+pub(crate) fn filter_tweets_result(evaluated: PostEvaluation) -> vf_pb::TweetVisibilityResult {
+    let (action, filtered_reason) = proto_action(evaluated.evaluation.verdict());
     vf_pb::TweetVisibilityResult {
-        tweet_id: outcome.tweet_id.0,
+        tweet_id: evaluated.tweet_id.0,
         action: Some(action),
         filtered_reason,
-        safety_labels: outcome.safety_labels.map(Arc::unwrap_or_clone),
+        safety_labels: evaluated.safety_labels.map(Arc::unwrap_or_clone),
     }
 }
 
@@ -104,15 +85,6 @@ pub(crate) fn evaluate_tweets_state(
         )),
         Evaluation::Partial { .. } | Evaluation::Failed(_) => None,
     }
-}
-
-pub(crate) fn evaluate_tweets_label(
-    evaluation: &Evaluation,
-    level: SafetyLevel,
-    policies: &LimitedActionsPolicies,
-) -> Label {
-    evaluate_tweets_state(evaluation, level, policies)
-        .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
 }
 
 pub(crate) fn notification_result(
@@ -189,7 +161,7 @@ fn notification_drop_reason(rule: RuleId) -> NotificationDropReason {
         .map_or(NotificationDropReason::Unspecified, |&(_, reason)| reason)
 }
 
-fn notification_reason_label(reason: NotificationDropReason) -> &'static str {
+pub(crate) fn notification_reason_label(reason: NotificationDropReason) -> &'static str {
     match reason {
         NotificationDropReason::Unspecified => "unspecified",
         NotificationDropReason::ActorNotFound => "actor_not_found",

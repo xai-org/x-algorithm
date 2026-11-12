@@ -2,6 +2,7 @@ pub mod ads_injection_logging_side_effect;
 pub mod author_served_metrics_side_effect;
 pub mod client_events_kafka_side_effect;
 pub mod debug_side_effect;
+pub mod frame_dismissal_side_effect;
 pub mod funnel_trace_side_effect;
 pub mod mutual_follow_stats_side_effect;
 pub mod phoenix_experiments_side_effect;

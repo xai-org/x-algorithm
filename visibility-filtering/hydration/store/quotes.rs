@@ -4,9 +4,9 @@ use super::{RequestRow, Store};
 use crate::hydration::fetcher::{AnyFetcher, Fetcher};
 use crate::hydration::hydrator::{EdgeKey, UserPair};
 use crate::hydration::inventory::classify;
-use crate::hydration::relation::{quoting_author, Related};
+use crate::hydration::relation::{Related, quoting_author};
 use crate::hydration::sources::source;
-use crate::hydration::{candidate_count_by_key, Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
+use crate::hydration::{Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
 use crate::models::{AuthorId, EdgeSet, Quote, QuoteLink, TweetId};
 use rustc_hash::FxHashMap;
 use xai_core_entities::entities::QuotedTweet;
@@ -17,38 +17,35 @@ pub(super) struct Quotes {
 }
 
 impl Quotes {
-    pub(super) fn new(entries: &[QuoteEntry]) -> Self {
-        let mut entries = entries.to_vec();
+    pub(super) fn new(mut entries: Vec<QuoteEntry>) -> Self {
         entries.sort_unstable();
         entries.dedup();
         Self { entries }
     }
 
-    pub(super) fn outer_of(&self, inner: TweetId) -> Option<TweetId> {
+    pub(super) fn outers_of(&self, inner: TweetId) -> impl Iterator<Item = TweetId> + '_ {
         self.entries
             .iter()
-            .find(|quote| quote.inner == inner)
+            .filter(move |quote| quote.inner == inner)
             .map(|quote| quote.outer)
     }
 
-    pub(super) fn quoted_author(
+            pub(super) fn quoted_author(
         &self,
         quoted_tweets: &Fetcher<QuotedTweet>,
         inner: TweetId,
     ) -> Result<AuthorId, Cause> {
-        let quotes = || {
-            self.entries
-                .iter()
-                .filter(move |quote| quote.inner == inner)
-        };
-        let named = quotes().find_map(|quote| {
+        let named = self.outers_of(inner).find_map(|outer| {
             quoted_tweets
-                .get(quote.outer.0)
+                .get(outer.0)
                 .filter(|quoted| quoted.tweet_id == inner.0 && quoted.user_id != 0)
         });
         match named {
             Some(quoted) => Ok(AuthorId(quoted.user_id)),
-            None if quotes().any(|quote| quoted_tweets.is_incomplete(quote.outer.0)) => {
+            None if self
+                .outers_of(inner)
+                .any(|outer| quoted_tweets.is_incomplete(outer.0)) =>
+            {
                 Err(Cause::Failed)
             }
             None => Err(Cause::NotFound),
@@ -84,7 +81,7 @@ impl Store {
     fn quoting_author(&self, outer: TweetId) -> Option<AuthorId> {
         self.request_fetcher::<source::TesPureCoreData>()
             .get(outer.0)
-            .map(quoting_author)
+            .and_then(quoting_author)
     }
 
     pub(super) fn quote_pair(
@@ -142,21 +139,20 @@ impl Store {
         claimed
     }
 
-    pub(super) fn candidate_count_by_pair(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
-        let destinations = |node| {
-            self.paired_rows().filter_map(move |(parent, outer)| {
-                match self.pair_key(node, parent, outer) {
-                    PairKey::Asked(asked) => Some(asked.destination),
-                    PairKey::Unasked | PairKey::InputFailed => None,
+    pub(super) fn count_pair_candidates(
+        &self,
+        nodes: Hydrators,
+        counts: &mut FxHashMap<u64, usize>,
+    ) {
+        for node in nodes.iter().filter(|node| node.is_quote_pair_edge()) {
+            for (parent, outer) in self.paired_rows() {
+                if let PairKey::Asked(asked) = self.pair_key(node, parent, outer)
+                    && let Some(count) = counts.get_mut(&asked.destination)
+                {
+                    *count += 1;
                 }
-            })
-        };
-        candidate_count_by_key(
-            nodes
-                .iter()
-                .filter(|node| node.is_quote_pair_edge())
-                .flat_map(destinations),
-        )
+            }
+        }
     }
 
     pub(super) fn quoted(&self) -> FxHashMap<QuoteEntry, Quoted> {

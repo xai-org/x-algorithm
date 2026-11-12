@@ -124,7 +124,8 @@ pub(super) fn is_younger_than(created_at_msec: Option<i64>, age: Duration) -> bo
     };
     std::time::SystemTime::now()
         .duration_since(created_at)
-        .is_ok_and(|elapsed| elapsed < age)
+        .unwrap_or_default()
+        < age
 }
 
 fn profile(data: ViewerData) -> ViewerProfile {
@@ -337,5 +338,13 @@ mod tests {
             );
         }
         assert_eq!(decode_viewer(None, &[QueryFields::SAFETY]).state, None);
+    }
+
+    #[test]
+    fn a_creation_time_ahead_of_the_clock_reads_as_new() {
+        let ahead = std::time::SystemTime::now() + Duration::from_secs(60);
+        let since = ahead.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ms = i64::try_from(since.as_millis()).unwrap();
+        assert!(is_younger_than(Some(ms), NEW_VIEWER_AGE));
     }
 }

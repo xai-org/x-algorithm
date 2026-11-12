@@ -60,6 +60,7 @@ impl Source<ScoredPostsQuery, FeedItem> for JetfuelDirectFrameSource {
 mod tests {
     use super::*;
     use crate::frames::GROKBOT_SUGGESTED_TASKS_ROUTE;
+    use std::collections::HashMap;
     use xai_candidate_pipeline::component_library::clients::MockJetfuelClient;
     use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
     use xai_home_mixer_proto::{feed_item, Frame};
@@ -78,6 +79,7 @@ mod tests {
         ScoredPostsQuery {
             user_id: VIEWER,
             params: results.into(),
+            frame_dismissals: Some(HashMap::new()),
             ..Default::default()
         }
     }

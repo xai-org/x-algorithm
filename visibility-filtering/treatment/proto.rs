@@ -20,11 +20,11 @@ pub(crate) fn proto_action(verdict: &Verdict) -> (vf_pb::Action, Option<vf_pb::F
         ),
         Verdict::Shown {
             label_interstitial: None | Some(_),
-            media: Some(Decided { value, .. }),
+            media: Some(_),
             engagement: None | Some(_),
         } => (
             vf_pb::action::Kind::Interstitial(true),
-            Some(value.legacy().clone().into()),
+            Some(FilteredReason::ContainNsfwMedia.into()),
         ),
         Verdict::Fosnr(_)
         | Verdict::Shown {

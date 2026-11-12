@@ -5,7 +5,7 @@ use crate::models::{
 };
 use crate::params::CountryLists;
 use crate::rules::action_kind::{ActionKind, Filled};
-use crate::rules::defaults::{Bucket, Defaults, Effect};
+use crate::rules::defaults::{Defaults, Effect};
 use crate::rules::experiment::{Experiment, ExperimentSet};
 use crate::rules::levels::{PostRow, PostRules};
 #[cfg(test)]
@@ -16,7 +16,6 @@ use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, To
 use crate::rules::rule_spec::rule::{self, Rule};
 use crate::rules::rule_spec::{Contribution, RuleAction, RuleId, Truth, rule_name};
 use crate::rules::{Predicate, RequestLeaf, RuleContext, SafetyLevel};
-use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::sync::Arc;
 use strum::VariantArray;
@@ -97,7 +96,7 @@ impl<E: Fold> Policy<E> {
 #[derive(Default)]
 pub(super) struct Folded {
     decision: Decision,
-    terminal: Option<(usize, Verdict)>,
+    terminal: Option<Verdict>,
 }
 
 fn fold<E: Fold, O: Observer<E>>(
@@ -105,7 +104,7 @@ fn fold<E: Fold, O: Observer<E>>(
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
 ) -> Evaluation {
-    let folded = fold_from(rules, context, observer, Folded::default(), 0);
+    let folded = fold_from(rules, context, observer, Folded::default());
     finish(folded, context.failed(), observer)
 }
 
@@ -118,11 +117,10 @@ fn fold_from<E: Fold, O: Observer<E>>(
         mut decision,
         mut terminal,
     }: Folded,
-    first_occurrence: usize,
 ) -> Folded {
-    for (occurrence, (by, rule, experiment)) in (first_occurrence..).zip(rules) {
-        let after = terminal.as_ref().map(|&(decided, ..)| decided);
-        if after.is_some() && !O::TOTAL {
+    for (by, rule, experiment) in rules {
+        let after = terminal.is_some();
+        if after && !O::TOTAL {
             break;
         }
         let (truth, root) = observed::evaluate_rule(rule, context, observer, after);
@@ -131,8 +129,7 @@ fn fold_from<E: Fold, O: Observer<E>>(
         }
         let action = rule.action.spec();
         let completed = (truth.resolves_true()
-            && (O::TOTAL
-                || (after.is_none() && action.kind().kept_by(decision.filled()).is_none())))
+            && (O::TOTAL || (!after && action.kind().kept_by(decision.filled()).is_none())))
         .then(|| action.interpret(&EvaluateInputs(context)));
         let diagnostic = if O::TOTAL {
             completed
@@ -142,11 +139,8 @@ fn fold_from<E: Fold, O: Observer<E>>(
             None
         };
         let (effect, defaults_admitted) =
-            if after.is_some() {
-                (
-                    Effect::AfterTerminal,
-                    (Bucket::Withholding, Hydrators::empty()),
-                )
+            if after {
+                (Effect::AfterTerminal, Hydrators::empty())
             } else {
                 let contribution = completed.and_then(|completed| completed.value);
                 let skipped =
@@ -156,7 +150,7 @@ fn fold_from<E: Fold, O: Observer<E>>(
                     .as_mut()
                     .unwrap_or(&mut decision)
                     .step(rule.id, by, action.kind(), truth, contribution);
-                let exposes = effect.changes_verdict() || !admitted.1.is_empty();
+                let exposes = effect.changes_verdict() || !admitted.is_empty();
                 if let Some(experiment) = *experiment
                     && exposes
                 {
@@ -168,15 +162,23 @@ fn fold_from<E: Fold, O: Observer<E>>(
                     } else {
                         effect
                     };
-                    (effect, (admitted.0, Hydrators::empty()))
+                    (effect, Hydrators::empty())
                 } else {
                     if let Some(verdict) = selected {
-                        terminal = Some((occurrence, verdict));
+                        terminal = Some(verdict);
                     }
                     (effect, admitted)
                 }
             };
-        observer.row(by, root, truth, effect, defaults_admitted, diagnostic);
+        observer.row(
+            by,
+            root,
+            truth,
+            effect,
+            action.kind(),
+            defaults_admitted,
+            diagnostic,
+        );
     }
     Folded { decision, terminal }
 }
@@ -189,7 +191,7 @@ fn finish<E: Engine, O: Observer<E>>(
 ) -> Evaluation {
     let admitted = decision.defaults;
     let verdict = match terminal {
-        Some((_, verdict)) => verdict,
+        Some(verdict) => verdict,
         None => decision.finish(),
     };
     let defaults = admitted.relied_on_by(&verdict);
@@ -241,19 +243,18 @@ impl Decision {
         kind: ActionKind,
         truth: Truth,
         contribution: Option<Contribution>,
-    ) -> (Option<Verdict>, Effect, (Bucket, Hydrators)) {
+    ) -> (Option<Verdict>, Effect, Hydrators) {
         let filled = self.filled();
         let reads = match truth {
             Truth::Unknown { failed, .. } if kind.admits_defaults(filled) => failed,
             Truth::Unknown { .. } | Truth::True | Truth::False => Hydrators::empty(),
         };
-        let admitted = (kind.bucket(), reads);
         self.defaults.admit(kind.bucket(), reads);
         if !truth.resolves_true() {
-            return (None, Effect::DidNotApply, admitted);
+            return (None, Effect::DidNotApply, reads);
         }
         if let Some(effect) = kind.kept_by(filled) {
-            return (None, effect, admitted);
+            return (None, effect, reads);
         }
         let (terminal, effect) = match contribution {
             None => (None, Effect::DidNotApply),
@@ -294,7 +295,7 @@ impl Decision {
                 (None, effect)
             }
         };
-        (terminal, effect, admitted)
+        (terminal, effect, reads)
     }
 
     fn finish(self) -> Verdict {
@@ -355,7 +356,7 @@ impl PostPolicy {
         context: &RuleContext<'_, UserCandidate>,
         observer: &mut O,
     ) -> Folded {
-        fold_from(&self.user.rules, context, observer, Folded::default(), 0)
+        fold_from(&self.user.rules, context, observer, Folded::default())
     }
 
     #[inline]
@@ -368,13 +369,7 @@ impl PostPolicy {
         let folded = if user.terminal.is_some() && !O::TOTAL {
             user
         } else {
-            fold_from(
-                &self.post.rules,
-                context,
-                observer,
-                user,
-                self.user.rules.len(),
-            )
+            fold_from(&self.post.rules, context, observer, user)
         };
         finish(folded, context.failed(), observer)
     }
@@ -527,13 +522,8 @@ struct AdmittedLevel<'a> {
 }
 
 impl<'a> Admitted<'a> {
-    pub(crate) fn post(
-        &self,
-        tweet_id: TweetId,
-        copied: bool,
-        placement: Placement,
-    ) -> Option<AdmittedPost<'a>> {
-        let candidate = self.hydration.candidate(tweet_id, copied)?;
+    pub(crate) fn post(&self, tweet_id: TweetId, placement: Placement) -> Option<AdmittedPost<'a>> {
+        let candidate = self.hydration.tweet(tweet_id)?.candidate()?;
         let author = self.author(tweet_id, placement)?;
         Some(AdmittedPost { author, candidate })
     }
@@ -569,17 +559,17 @@ impl<'a> AdmittedLevel<'a> {
 
 pub(crate) struct AdmittedPost<'a> {
     author: AdmittedUser<'a>,
-    candidate: Cow<'a, PostCandidate>,
+    candidate: &'a PostCandidate,
 }
 
 impl AdmittedPost<'_> {
     pub(crate) fn evaluate(&self) -> Evaluation {
-        self.author.fold(&self.candidate, &mut NoTrace)
+        self.author.fold(self.candidate, &mut NoTrace)
     }
 
     pub(crate) fn trace(&self) -> PolicyTrace {
         let mut total = Total::default();
-        let evaluation = self.author.fold(&self.candidate, &mut total);
+        let evaluation = self.author.fold(self.candidate, &mut total);
         total.into_trace(evaluation)
     }
 }
@@ -733,13 +723,11 @@ impl RuleEngine {
     }
 
     fn unplanned_inputs(policy: &PostPolicy, hydration: &Hydration) -> Hydrators {
-        let logged_in = hydration.viewer().viewer.user_id().is_some();
-        policy
-            .hydrators
-            .iter()
-            .filter(|&node| logged_in || !node.needs_viewer())
-            .fold(Hydrators::empty(), Hydrators::with)
-            .difference(hydration.planned())
+        let required = match hydration.viewer().viewer.user_id() {
+            Some(_) => policy.hydrators,
+            None => policy.hydrators.without_viewer(),
+        };
+        required.difference(hydration.planned())
     }
 
     #[cfg(test)]
@@ -1201,18 +1189,15 @@ country_specific_nsfw_content_gating:
 
         const NEVER: RuleCond = TweetCreatedAfter(u64::MAX).leaf();
 
-        const DROP_SUSPENDED: ActionSpec =
-            ActionSpec::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended));
+        const DROP_SUSPENDED: ActionSpec = ActionSpec::Drop(DropAs::AuthorIsSuspended);
         const TOMBSTONE: ActionSpec = ActionSpec::Tombstone(TombstoneReason::LocalRegulations);
         const INTERSTITIAL_NSFW: ActionSpec =
             ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(MediaInterstitial {
-                legacy: FilteredReason::ContainNsfwMedia,
                 reason: InterstitialReason::Sensitive(true),
                 prompt: None,
             }));
-        const INTERSTITIAL_UNSPECIFIED: ActionSpec =
+        const INTERSTITIAL_NUDITY: ActionSpec =
             ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(MediaInterstitial {
-                legacy: FilteredReason::UnspecifiedReason,
                 reason: InterstitialReason::Nudity(true),
                 prompt: None,
             }));
@@ -1263,7 +1248,7 @@ country_specific_nsfw_content_gating:
         fn an_identity_recurring_after_another_fails_construction() {
             Policy::new(vec![
                 always("blur", INTERSTITIAL_NSFW),
-                always("other_blur", INTERSTITIAL_UNSPECIFIED),
+                always("other_blur", INTERSTITIAL_NUDITY),
                 always("blur", INTERSTITIAL_NSFW),
             ]);
         }
@@ -1271,21 +1256,17 @@ country_specific_nsfw_content_gating:
         #[test]
         #[should_panic(expected = "derive filter_all/blur/sensitive")]
         fn two_identities_deriving_one_name_fail_construction() {
-            let blur = |legacy| {
+            let blur = |sensitive| {
                 ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(
                     MediaInterstitial {
-                        legacy,
-                        reason: InterstitialReason::Sensitive(true),
+                        reason: InterstitialReason::Sensitive(sensitive),
                         prompt: None,
                     },
                 ))
             };
             let mut names = Vec::new();
-            for reason in [
-                FilteredReason::ContainNsfwMedia,
-                FilteredReason::UnspecifiedReason,
-            ] {
-                let rule = rule(all![], blur(reason));
+            for sensitive in [true, false] {
+                let rule = rule(all![], blur(sensitive));
                 interned_name(&mut names, rule.id, &rule.action);
             }
         }
@@ -1383,7 +1364,7 @@ country_specific_nsfw_content_gating:
                 (
                     [
                         always("blur", INTERSTITIAL_NSFW),
-                        unknown(INTERSTITIAL_UNSPECIFIED),
+                        unknown(INTERSTITIAL_NUDITY),
                     ],
                     blur.clone(),
                     Hydrators::empty(),
@@ -1460,7 +1441,7 @@ country_specific_nsfw_content_gating:
                 (all![], DROP_SUSPENDED, true),
                 (NEVER, DROP_SUSPENDED, false),
                 (ViewerFollowsAuthor.leaf(), DROP_SUSPENDED, true),
-                (all![], INTERSTITIAL_UNSPECIFIED, false),
+                (all![], INTERSTITIAL_NUDITY, false),
             ];
             for (index, (when, action, exposed)) in rows.into_iter().enumerate() {
                 for (experiment, on, applies) in ARMS {
@@ -1618,9 +1599,9 @@ country_specific_nsfw_content_gating:
                     (
                         "post_tombstone",
                         Effect::AfterTerminal,
-                        Some(Skip::Terminal(0))
+                        Some(Skip::Terminal)
                     ),
-                    ("post_blur", Effect::AfterTerminal, Some(Skip::Terminal(0))),
+                    ("post_blur", Effect::AfterTerminal, Some(Skip::Terminal)),
                 ]
             );
         }
@@ -2670,7 +2651,7 @@ country_specific_nsfw_content_gating:
                 base.authored(),
                 "filter_all/drop/unspecified | audience=NonAuthors \
                  | when=all[followed=viewer_follows_author & tweet_has_label(SPAM)] \
-                 | Drop(Legacy(UnspecifiedReason))"
+                 | Drop(UnspecifiedReason)"
             );
             let changes = [
                 (

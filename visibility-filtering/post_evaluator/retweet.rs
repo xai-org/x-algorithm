@@ -2,14 +2,13 @@ use super::{HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObser
 use crate::hydration::Hydrators;
 use crate::metrics::families::RETWEET_SOURCES;
 use crate::metrics::RequestMetrics;
-use crate::models::{
-    Decided, Evaluation, EvaluationKey, PlacedCandidate, RetweetMerge, TweetId, Verdict,
-    Withholding,
-};
+use crate::models::{Evaluation, EvaluationKey, RetweetMerge, TweetId, Verdict};
+use crate::rules::engine::AdmittedPost;
 use crate::rules::PolicyTrace;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum MergeSelection {
     RequestedOnly,
     RequestedIncomplete,
@@ -27,10 +26,11 @@ pub(crate) struct Traced {
 }
 
 impl PostObserver for Traced {
-    const TOTAL: bool = true;
-
-    fn record(&mut self, key: EvaluationKey, trace: PolicyTrace) {
+    fn judge(&mut self, key: EvaluationKey, post: &AdmittedPost<'_>) -> Evaluation {
+        let trace = post.trace();
+        let evaluation = trace.evaluation.clone();
         self.policies.insert(key, trace);
+        evaluation
     }
 
     fn select(&mut self, key: EvaluationKey, selection: MergeSelection) {
@@ -45,11 +45,11 @@ pub(crate) async fn hydrate_and_trace(
 ) -> (HydratedRequest, Vec<PostEvaluation>, Traced) {
     let retweet_merge = request.retweet_merge;
     let mut traced = Traced::default();
-    let (hydrated, outcomes) = post_evaluator.run(request, metrics, &mut traced).await;
+    let (hydrated, evaluations) = post_evaluator.run(request, metrics, &mut traced).await;
     if retweet_merge == RetweetMerge::Merged {
         trace_unmerged_sources(post_evaluator, &hydrated, &mut traced);
     }
-    (hydrated, outcomes, traced)
+    (hydrated, evaluations, traced)
 }
 
 fn trace_unmerged_sources(
@@ -58,7 +58,7 @@ fn trace_unmerged_sources(
     traced: &mut Traced,
 ) {
     let hydration = hydrated.hydration();
-    let unmerged: Vec<EvaluationKey> = hydrated
+    let unmerged: HashSet<EvaluationKey> = hydrated
         .requested_ids()
         .filter_map(|tweet_id| hydration.tweet(tweet_id)?.source_tweet_id())
         .filter(|&source_id| {
@@ -69,8 +69,14 @@ fn trace_unmerged_sources(
         .map(EvaluationKey::retweet_source)
         .filter(|key| !traced.policies.contains_key(key))
         .collect();
-    if !unmerged.is_empty() {
-        post_evaluator.trace(hydrated, unmerged, &mut traced.policies);
+    if unmerged.is_empty() {
+        return;
+    }
+    let admitted = post_evaluator
+        .rule_engine
+        .admit(hydrated.safety_level, hydration);
+    for key in unmerged {
+        PostEvaluator::evaluate_post(hydrated, admitted.as_ref(), key, traced);
     }
 }
 
@@ -79,53 +85,48 @@ pub(super) fn merge_sources<O: PostObserver>(
     hydrated: &HydratedRequest,
     observer: &mut O,
 ) -> Vec<PostEvaluation> {
-    let (in_batch, fetched) = source_ids(hydrated);
-    if in_batch.is_empty() && fetched.is_empty() {
-        let outcomes = post_evaluator.evaluate_in_request_order(hydrated, observer);
-        for outcome in &outcomes {
-            observer.select(outcome.key(), requested_selection(&outcome.evaluation));
-        }
-        return outcomes;
-    }
-    let metrics = hydrated.metrics();
-    metrics.count(&RETWEET_SOURCES, ["in_batch"], in_batch.len() as u64);
-    metrics.count(&RETWEET_SOURCES, ["fetched"], fetched.len() as u64);
-    let source_ids = || in_batch.iter().chain(&fetched).copied();
-    let keys = hydrated
-        .candidates()
-        .map(PlacedCandidate::key)
-        .chain(source_ids().map(EvaluationKey::retweet_source));
-    let mut outcomes = post_evaluator.evaluate(hydrated, keys, observer);
-    let sources: HashMap<TweetId, Evaluation> = source_ids()
-        .filter_map(|source_id| {
-            let source = outcomes.remove(&EvaluationKey::retweet_source(source_id))?;
-            Some((source_id, source.evaluation))
-        })
+    let hydration = hydrated.hydration();
+    let source_ids: HashSet<TweetId> = hydrated
+        .requested_ids()
+        .filter_map(|tweet_id| hydration.tweet(tweet_id)?.source_to_merge())
         .collect();
-    let mut merged: Vec<PostEvaluation> = Vec::with_capacity(hydrated.candidates().len());
-    for candidate in hydrated.candidates() {
-        let key = candidate.key();
-        let selected = match outcomes.remove(&key) {
-            Some(outcome) => {
-                let (selected, selection) = merge_source(outcome, &sources);
-                observer.select(key, selection);
-                selected
-            }
-            None => match merged.iter().rfind(|prior| prior.key() == key) {
-                Some(prior) => prior.clone(),
-                None => continue,
-            },
-        };
-        merged.push(selected);
+    if source_ids.is_empty() {
+        let (evaluations, _) = post_evaluator.evaluate(hydrated, [], false, observer);
+        for evaluated in &evaluations {
+            observer.select(evaluated.key(), requested_selection(&evaluated.evaluation));
+        }
+        return evaluations;
     }
-    merged
+    let requested: HashSet<TweetId> = hydrated.requested_ids().collect();
+    let in_batch = source_ids
+        .iter()
+        .filter(|id| requested.contains(id))
+        .count();
+    let metrics = &hydrated.metrics;
+    metrics.count(&RETWEET_SOURCES, ["in_batch"], in_batch as u64);
+    metrics.count(
+        &RETWEET_SOURCES,
+        ["fetched"],
+        (source_ids.len() - in_batch) as u64,
+    );
+    let repeats = requested.len() < hydrated.candidates.len();
+    let (evaluations, sources) = post_evaluator.evaluate(hydrated, source_ids, repeats, observer);
+    evaluations
+        .into_iter()
+        .map(|evaluated| {
+            let key = evaluated.key();
+            let (merged, selection) = merge_source(evaluated, &sources);
+            observer.select(key, selection);
+            merged
+        })
+        .collect()
 }
 
 fn merge_source(
-    outcome: PostEvaluation,
+    evaluated: PostEvaluation,
     sources: &HashMap<TweetId, Evaluation>,
 ) -> (PostEvaluation, MergeSelection) {
-    let (evaluation, selection) = match (outcome.evaluation, outcome.source_tweet_id) {
+    let (evaluation, selection) = match (evaluated.evaluation, evaluated.source_tweet_id) {
         (
             Evaluation::Complete {
                 verdict,
@@ -140,17 +141,7 @@ fn merge_source(
                 Some(Evaluation::Complete {
                     verdict: source, ..
                 }) => {
-                    let selection = merge_selection(&verdict, source);
-                    let verdict = match selection {
-                        MergeSelection::SourceWithheld | MergeSelection::SourceRestrictions => {
-                            source.clone()
-                        }
-                        MergeSelection::RequestedOnly
-                        | MergeSelection::RequestedIncomplete
-                        | MergeSelection::SourceIncomplete
-                        | MergeSelection::RequestedWithheld
-                        | MergeSelection::RequestedRestrictions => verdict,
-                    };
+                    let (verdict, selection) = merge_verdicts(verdict, source);
                     (
                         Evaluation::Complete {
                             verdict,
@@ -182,7 +173,7 @@ fn merge_source(
     (
         PostEvaluation {
             evaluation,
-            ..outcome
+            ..evaluated
         },
         selection,
     )
@@ -198,35 +189,15 @@ fn requested_selection(evaluation: &Evaluation) -> MergeSelection {
     }
 }
 
-fn source_ids(hydrated: &HydratedRequest) -> (HashSet<TweetId>, HashSet<TweetId>) {
-    let hydration = hydrated.hydration();
-    let sources: HashSet<TweetId> = hydrated
-        .requested_ids()
-        .filter_map(|tweet_id| hydration.tweet(tweet_id)?.source_to_merge())
-        .collect();
-    if sources.is_empty() {
-        return Default::default();
-    }
-    let requested: HashSet<TweetId> = hydrated.requested_ids().collect();
-    sources
-        .into_iter()
-        .partition(|source_id| requested.contains(source_id))
-}
-
-fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
-    match (retweet, source) {
-        (
-            Verdict::Withheld(Decided {
-                value: Withholding::Drop(_),
-                ..
-            }),
-            Verdict::Withheld(Decided {
-                value: Withholding::Tombstone(_),
-                ..
-            }),
-        ) => MergeSelection::RequestedWithheld,
-        (_, Verdict::Withheld(_)) => MergeSelection::SourceWithheld,
-        (Verdict::Withheld(_), _) => MergeSelection::RequestedWithheld,
+fn merge_verdicts(retweet: Verdict, source: &Verdict) -> (Verdict, MergeSelection) {
+    match (&retweet, source) {
+        (Verdict::Withheld(own), Verdict::Withheld(theirs))
+            if own.value.kind().severity() > theirs.value.kind().severity() =>
+        {
+            (retweet, MergeSelection::RequestedWithheld)
+        }
+        (_, Verdict::Withheld(_)) => (source.clone(), MergeSelection::SourceWithheld),
+        (Verdict::Withheld(_), _) => (retweet, MergeSelection::RequestedWithheld),
         (
             Verdict::Shown {
                 label_interstitial: None,
@@ -234,8 +205,8 @@ fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
                 engagement: None,
             },
             _,
-        ) => MergeSelection::SourceRestrictions,
-        _ => MergeSelection::RequestedRestrictions,
+        ) => (source.clone(), MergeSelection::SourceRestrictions),
+        _ => (retweet, MergeSelection::RequestedRestrictions),
     }
 }
 
@@ -247,12 +218,12 @@ mod tests {
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup, Relation};
     use crate::models::{
-        ClientCapability, ClientSwitch, Deletion, DropReason, LimitedEngagementReason,
+        ClientCapability, ClientSwitch, Decided, Deletion, DropReason, LimitedEngagementReason,
         MediaFeature, NsfwFeature, Placement, RawCandidate, SafetyLabelType, TombstoneReason,
-        TweetFeatures,
+        TweetFeatures, Withholding,
     };
     use crate::rules::fixtures::{allow, blurred, fosnr, legacy_interstitial, limited};
-    use crate::rules::{RuleId, SafetyLevel};
+    use crate::rules::{RuleEngine, RuleId, SafetyLevel};
     use crate::scenario::{raw, Scenario};
     use std::time::Duration;
     use xai_core_entities::entities::{ConversationControlArm, PureCoreData};
@@ -1025,6 +996,53 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
                 [vec![1, 2, 3, 4], vec![5, 6]]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_retweet_or_source_is_answered_as_it_is_once_in_request_order() {
+        let judged = |tweet_ids: &'static [u64]| async move {
+            evaluate_tweets(retweet_world(true))
+                .evaluate(&requested(tweet_ids))
+                .await
+                .evaluations()
+        };
+        let once = judged(&[1, 5]).await;
+        assert_eq!(
+            judged(&[1, 5, 1, 5, 1]).await,
+            [0, 1, 0, 1, 0].map(|i| once[i].clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_retweet_or_source_is_folded_once() {
+        #[derive(Default)]
+        struct Folds(HashMap<EvaluationKey, usize>);
+        impl PostObserver for Folds {
+            fn judge(&mut self, key: EvaluationKey, post: &AdmittedPost<'_>) -> Evaluation {
+                *self.0.entry(key).or_default() += 1;
+                post.evaluate()
+            }
+        }
+        let mut folds = Folds::default();
+        evaluate_tweets(retweet_world(true))
+            .evaluate_observed(
+                RuleEngine::for_tests(),
+                &requested(&[1, 5, 1, 5, 1]),
+                &mut folds,
+            )
+            .await;
+        let standalone = |tweet_id| EvaluationKey {
+            tweet_id: TweetId(tweet_id),
+            placement: Placement::Standalone,
+        };
+        assert_eq!(
+            folds.0,
+            HashMap::from([
+                (standalone(1), 1),
+                (standalone(5), 1),
+                (EvaluationKey::retweet_source(TweetId(5)), 1),
+            ])
+        );
     }
 
     #[tokio::test]

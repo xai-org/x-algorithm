@@ -2,6 +2,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use super::dragonfly::{
     DragonflySource, EntryRead, Fill, FillJob, FillLabels, LabelCacheSwitches, ReadContext,
 };
 use super::metrics::{
-    self, BatchStage, CacheResult, CacheTier, LabelMetrics, ManhattanResult, OutageResult,
+    self, BatchStage, CacheKeyCounts, CacheTier, LabelMetrics, ManhattanResult, OutageResult,
     SourceOutcome,
 };
 use super::mh_client::ManhattanLabelFetcher;
@@ -52,14 +53,6 @@ pub enum FailureKind {
         LabelCacheUnavailable,
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum TwemcacheOutcome {
-    Hit(vf_pb::SafetyLabelMap),
-    NotFound,
-    Miss,
-    FallThrough(FallbackReason),
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{kind:?}: {message}")]
 pub struct LookupError {
@@ -78,6 +71,8 @@ impl LookupError {
 
 pub(crate) type LookupResults = FxHashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;
 
+pub(crate) type StaleEntries = FxHashMap<u64, Arc<vf_pb::SafetyLabelMap>>;
+
 fn label_cache_unavailable() -> LookupError {
     LookupError::new(
         FailureKind::LabelCacheUnavailable,
@@ -87,7 +82,7 @@ fn label_cache_unavailable() -> LookupError {
 
 #[async_trait]
 pub(crate) trait RemoteLabels: Send + Sync {
-                async fn get(&self, ids: &[u64], stale: &FxHashSet<u64>) -> LookupResults;
+                async fn get(&self, ids: &[u64], stale: &StaleEntries) -> LookupResults;
 
     fn set_switches(&self, switches: LabelCacheSwitches);
 }
@@ -137,9 +132,8 @@ enum ReplayOutcome {
 }
 
 pub(crate) struct RemoteSource {
-    twemcache: TwemcacheSource,
+        twemcache: Option<TwemcacheSource>,
     manhattan: ManhattanSource,
-    warmer: Option<Arc<CacheWarmer>>,
     dragonfly: Option<Arc<DragonflySource>>,
     switches: ArcSwap<LabelCacheSwitches>,
     now_ms: NowMs,
@@ -147,31 +141,27 @@ pub(crate) struct RemoteSource {
 }
 
 impl RemoteSource {
-    pub(crate) fn new(
-        cache: Arc<dyn CacheRead>,
+        pub(crate) fn new(
+        twemcache: Option<Arc<dyn CacheRead>>,
+        warmer: Option<Arc<CacheWarmer>>,
         fetcher: Arc<dyn ManhattanLabelFetcher>,
         metrics: LabelMetrics,
     ) -> Self {
         Self {
-            twemcache: TwemcacheSource {
+            twemcache: twemcache.map(|cache| TwemcacheSource {
                 cache,
+                warmer,
                 metrics: metrics.clone(),
-            },
+            }),
             manhattan: ManhattanSource {
                 fetcher,
                 metrics: metrics.clone(),
             },
-            warmer: None,
             dragonfly: None,
             switches: ArcSwap::from_pointee(LabelCacheSwitches::default()),
             now_ms: Arc::new(|| system_unix_ms().cast_unsigned()),
             metrics,
         }
-    }
-
-    pub(crate) fn with_warmer(mut self, warmer: Arc<CacheWarmer>) -> Self {
-        self.warmer = Some(warmer);
-        self
     }
 
     pub(crate) fn with_dragonfly(mut self, cache: Arc<dyn CacheWrite>) -> Self {
@@ -202,7 +192,7 @@ impl RemoteSource {
 
 #[async_trait]
 impl RemoteLabels for RemoteSource {
-    async fn get(&self, ids: &[u64], stale: &FxHashSet<u64>) -> LookupResults {
+    async fn get(&self, ids: &[u64], stale: &StaleEntries) -> LookupResults {
         let context = ReadContext {
             now_ms: (self.now_ms)(),
             switches: **self.switches.load(),
@@ -228,61 +218,22 @@ impl RemoteLabels for RemoteSource {
                 _ => Vec::new(),
             }
         };
-        let (mut twemcache_results, served_reads) =
-            tokio::join!(self.twemcache.get(&unserved), served_reads);
+        let twemcache_reads = async {
+            match &self.twemcache {
+                Some(twemcache) => twemcache.get(&unserved).await,
+                None => unserved.iter().map(|&id| (id, None)).collect(),
+            }
+        };
+        let (twemcache_reads, served_reads) = tokio::join!(twemcache_reads, served_reads);
         let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         let mut fallback_ids = Vec::new();
-        let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();
-        let mut warm_ids = Vec::new();
-
-        for &tweet_id in unserved.iter() {
-            if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {
-                continue;
+        for (tweet_id, labels) in twemcache_reads {
+            match labels {
+                Some(labels) => {
+                    results.insert(tweet_id, Ok(labels));
+                }
+                None => fallback_ids.push(tweet_id),
             }
-            match twemcache_results.remove(&tweet_id) {
-                Some(TwemcacheOutcome::Hit(label_map)) => {
-                    results.insert(tweet_id, Ok(label_map));
-                }
-                Some(TwemcacheOutcome::NotFound) => {
-                    results.insert(
-                        tweet_id,
-                        Ok(vf_pb::SafetyLabelMap {
-                            labels: HashMap::new(),
-                        }),
-                    );
-                }
-                Some(TwemcacheOutcome::Miss) => {
-                    fallback_ids.push(tweet_id);
-                    if self.warmer.is_some() {
-                        warm_ids.push(tweet_id);
-                    }
-                }
-                Some(TwemcacheOutcome::FallThrough(reason)) => {
-                    fallback_ids.push(tweet_id);
-                    *fallback_counts.entry(reason).or_insert(0) += 1;
-                }
-                None => {
-                    fallback_ids.push(tweet_id);
-                    *fallback_counts
-                        .entry(FallbackReason::MissingResponse)
-                        .or_insert(0) += 1;
-                }
-            }
-        }
-
-        for (reason, count) in fallback_counts {
-            metrics::record_cache_fallback_keys(
-                &self.metrics,
-                LabelSource::Twemcache,
-                reason,
-                count,
-            );
-        }
-
-        if let Some(warmer) = &self.warmer
-            && !warm_ids.is_empty()
-        {
-            warmer.warm(warm_ids);
         }
 
         let mut fills = Vec::new();
@@ -294,15 +245,7 @@ impl RemoteLabels for RemoteSource {
             }
             match read {
                 EntryRead::Hit { envelope, refresh } => {
-                    if let Some(fill) = refresh {
-                        fills.push(FillJob {
-                            tweet_id,
-                            fill,
-                            labels: FillLabels::Refresh {
-                                entry: envelope.clone(),
-                            },
-                        });
-                    }
+                    fills.extend(refresh);
                     results.insert(tweet_id, Ok(envelope.into_labels()));
                 }
                 EntryRead::Miss => {
@@ -310,7 +253,7 @@ impl RemoteLabels for RemoteSource {
                     fallback_ids.push(tweet_id);
                 }
                 EntryRead::Failed => {
-                    let admitted = !stale.contains(&tweet_id)
+                    let admitted = !stale.contains_key(&tweet_id)
                         && dragonfly.is_some_and(|dragonfly| dragonfly.admit_outage_read());
                     if admitted {
                         outage_reads += 1;
@@ -323,6 +266,8 @@ impl RemoteLabels for RemoteSource {
         }
         metrics::record_outage_keys(&self.metrics, OutageResult::Manhattan, outage_reads);
 
+        fallback_ids.sort_unstable();
+        fallback_ids.dedup();
         metrics::record_batch_size(
             &self.metrics,
             BatchStage::ManhattanFallback,
@@ -352,25 +297,18 @@ impl RemoteLabels for RemoteSource {
         if let Some(dragonfly) = &self.dragonfly
             && context.switches.shadow_buckets > context.switches.serve_buckets
         {
-            let mut shadowed: Vec<u64> = unserved
+            let mut shadowed: Vec<(u64, &vf_pb::SafetyLabelMap)> = unserved
                 .iter()
-                .copied()
-                .filter(|&id| context.switches.shadows(id))
-                .filter(|id| matches!(results.get(id), Some(Ok(_))))
+                .filter(|&&id| context.switches.shadows(id))
+                .filter_map(|&id| match results.get(&id) {
+                    Some(Ok(labels)) => Some((id, labels)),
+                    _ => None,
+                })
                 .collect();
-            shadowed.sort_unstable();
-            shadowed.dedup();
-            if !shadowed.is_empty()
-                && let Some(permit) = dragonfly.shadow_permit(shadowed.len())
-            {
-                let answers = shadowed
-                    .into_iter()
-                    .filter_map(|id| match results.get(&id) {
-                        Some(Ok(labels)) => Some((id, labels.clone())),
-                        _ => None,
-                    })
-                    .collect();
-                dragonfly.shadow(permit, answers, context);
+            shadowed.sort_unstable_by_key(|&(id, _)| id);
+            shadowed.dedup_by_key(|&mut (id, _)| id);
+            if !shadowed.is_empty() {
+                dragonfly.shadow(shadowed, context);
             }
         }
 
@@ -403,12 +341,19 @@ fn log_replay(ids: &[u64], context: &ReadContext, results: &LookupResults) {
     }
 }
 
-pub(crate) fn cache_key(id: u64) -> Result<Key, KVCacheError> {
-    Key::new(format!("{KEY_PREFIX}{id}").into_bytes())
+pub(crate) fn cache_key(id: u64) -> Key {
+    prefixed_key(KEY_PREFIX, id)
+}
+
+pub(crate) fn prefixed_key(prefix: &str, id: u64) -> Key {
+    let mut key = String::with_capacity(prefix.len() + 20);
+    write!(key, "{prefix}{id}").ok();
+    Key::from_bytes(key.into_bytes())
 }
 
 struct TwemcacheSource {
     cache: Arc<dyn CacheRead>,
+    warmer: Option<Arc<CacheWarmer>>,
     metrics: LabelMetrics,
 }
 
@@ -416,7 +361,7 @@ struct TwemcacheSource {
     clippy::wildcard_enum_match_arm,
     reason = "KVCacheError belongs to the shared xai-cache client; only its timeout and backpressure errors get their own FallbackReason, and every other error counts as Other, including any the client adds"
 )]
-pub(crate) fn fallback_reason(e: &KVCacheError) -> FallbackReason {
+fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     match e {
         KVCacheError::Timeout(_) => FallbackReason::Timeout,
         KVCacheError::Backpressure => FallbackReason::Backpressure,
@@ -424,94 +369,76 @@ pub(crate) fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     }
 }
 
-#[derive(Default)]
-struct ItemCounts {
-    hit: usize,
-    not_found: usize,
-    miss: usize,
+pub(crate) fn cache_reply(
+    reply: Option<&CacheOpResult<Option<Value>>>,
+) -> Result<Option<&Value>, FallbackReason> {
+    match reply {
+        Some(Ok(value)) => Ok(value.as_ref()),
+        Some(Err(e)) => Err(fallback_reason(e)),
+        None => Err(FallbackReason::MissingResponse),
+    }
 }
 
-impl ItemCounts {
-    fn count(&mut self, outcome: &TwemcacheOutcome) {
-        match outcome {
-            TwemcacheOutcome::Hit(_) => self.hit += 1,
-            TwemcacheOutcome::NotFound => self.not_found += 1,
-            TwemcacheOutcome::Miss => self.miss += 1,
-            TwemcacheOutcome::FallThrough(_) => {}
-        }
-    }
-
-    fn record_metrics(&self, metrics: &LabelMetrics) {
-        metrics::record_cache_keys(metrics, CacheTier::Twemcache, CacheResult::Hit, self.hit);
-        metrics::record_cache_keys(
-            metrics,
-            CacheTier::Twemcache,
-            CacheResult::NotFound,
-            self.not_found,
-        );
-        metrics::record_cache_keys(metrics, CacheTier::Twemcache, CacheResult::Miss, self.miss);
+fn twemcache_read(
+    reply: Option<&CacheOpResult<Option<Value>>>,
+) -> Result<CachedLabels, FallbackReason> {
+    match cache_reply(reply)? {
+        Some(bytes) => decode::cached_value(bytes).ok_or(FallbackReason::Decode),
+        None => Ok(CachedLabels::Miss),
     }
 }
 
 impl TwemcacheSource {
-    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
-        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
+            async fn get(&self, ids: &[u64]) -> Vec<(u64, Option<vf_pb::SafetyLabelMap>)> {
         if ids.is_empty() {
-            return results;
+            return Vec::new();
         }
-
         let start = Instant::now();
-
-        let keys: Vec<Key> = match ids
-            .iter()
-            .map(|&id| cache_key(id))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(keys) => keys,
-            Err(_) => {
-                for &tweet_id in ids {
-                    results.insert(
-                        tweet_id,
-                        TwemcacheOutcome::FallThrough(FallbackReason::Other),
-                    );
-                }
-                metrics::record_source_request(
-                    &self.metrics,
-                    LabelSource::Twemcache,
-                    SourceOutcome::Failure,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-                return results;
-            }
-        };
-
-        let mut counts = ItemCounts::default();
-
-        let map = self.cache.multi_get(&keys).await;
+        let keys: Vec<Key> = ids.iter().map(|&id| cache_key(id)).collect();
+        let replies = self.cache.multi_get(&keys).await;
+        let mut counts = CacheKeyCounts::default();
+        let mut fallbacks: BTreeMap<FallbackReason, usize> = BTreeMap::new();
+        let mut warm_ids = Vec::new();
+        let mut reads = Vec::with_capacity(ids.len());
         for (&tweet_id, key) in ids.iter().zip(&keys) {
-            let outcome = match map.get(key) {
-                Some(Ok(Some(bytes))) => match decode::cached_value(bytes) {
-                    Some(CachedLabels::Found(label_map)) => TwemcacheOutcome::Hit(label_map),
-                    Some(CachedLabels::NotFound) => TwemcacheOutcome::NotFound,
-                    Some(CachedLabels::Miss) => TwemcacheOutcome::Miss,
-                    None => TwemcacheOutcome::FallThrough(FallbackReason::Decode),
-                },
-                Some(Ok(None)) => TwemcacheOutcome::Miss,
-                Some(Err(e)) => TwemcacheOutcome::FallThrough(fallback_reason(e)),
-                None => TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse),
+            let labels = match twemcache_read(replies.get(key)) {
+                Ok(CachedLabels::Found(labels)) => {
+                    counts.hit += 1;
+                    Some(labels)
+                }
+                Ok(CachedLabels::NotFound) => {
+                    counts.not_found += 1;
+                    Some(vf_pb::SafetyLabelMap::default())
+                }
+                Ok(CachedLabels::Miss) => {
+                    counts.miss += 1;
+                    if self.warmer.is_some() {
+                        warm_ids.push(tweet_id);
+                    }
+                    None
+                }
+                Err(reason) => {
+                    *fallbacks.entry(reason).or_default() += 1;
+                    None
+                }
             };
-            counts.count(&outcome);
-            results.insert(tweet_id, outcome);
+            reads.push((tweet_id, labels));
         }
+        let m = &self.metrics;
         metrics::record_source_request(
-            &self.metrics,
+            m,
             LabelSource::Twemcache,
             SourceOutcome::Success,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-        counts.record_metrics(&self.metrics);
-
-        results
+        metrics::record_cache_keys(m, CacheTier::Twemcache, &counts);
+        metrics::record_cache_fallback_keys(m, LabelSource::Twemcache, fallbacks);
+        if let Some(warmer) = &self.warmer
+            && !warm_ids.is_empty()
+        {
+            warmer.warm(warm_ids);
+        }
+        reads
     }
 }
 
@@ -534,55 +461,34 @@ impl ManhattanSource {
         }
 
         let start = Instant::now();
-        let i64_ids: Vec<i64> = ids.iter().map(|&id| id.cast_signed()).collect();
         let mut successes = 0usize;
-        let mut failures = 0usize;
-
-        let request_outcome = match self.fetcher.fetch_labels(&i64_ids).await {
+        let request_outcome = match self.fetcher.fetch_labels(ids).await {
             Ok(fetch_results) => {
                 let mut fetch_results = fetch_results.into_iter();
                 for &tweet_id in ids {
-                    match fetch_results.next() {
+                    let result = match fetch_results.next() {
                         Some(Ok(items)) => match decode::raw_labels(&items) {
-                            Some(labels) => {
-                                successes += 1;
-                                results.insert(tweet_id, Ok(Scan { items, labels }));
-                            }
-                            None => {
-                                failures += 1;
-                                results.insert(
-                                    tweet_id,
-                                    Err(LookupError::new(
-                                        FailureKind::ManhattanDecode,
-                                        "decode panic",
-                                    )),
-                                );
-                            }
+                            Some(labels) => Ok(Scan { items, labels }),
+                            None => Err(LookupError::new(
+                                FailureKind::ManhattanDecode,
+                                "decode panic",
+                            )),
                         },
                         Some(Err(e)) => {
-                            failures += 1;
-                            results.insert(
-                                tweet_id,
-                                Err(LookupError::new(FailureKind::ManhattanFetch, e.to_string())),
-                            );
+                            Err(LookupError::new(FailureKind::ManhattanFetch, e.to_string()))
                         }
-                        None => {
-                            failures += 1;
-                            results.insert(
-                                tweet_id,
-                                Err(LookupError::new(
-                                    FailureKind::ManhattanFetch,
-                                    "missing from MH response",
-                                )),
-                            );
-                        }
-                    }
+                        None => Err(LookupError::new(
+                            FailureKind::ManhattanFetch,
+                            "missing from MH response",
+                        )),
+                    };
+                    successes += usize::from(result.is_ok());
+                    results.insert(tweet_id, result);
                 }
                 SourceOutcome::Success
             }
             Err(e) => {
                 for &tweet_id in ids {
-                    failures += 1;
                     results.insert(
                         tweet_id,
                         Err(LookupError::new(FailureKind::ManhattanFetch, e.to_string())),
@@ -591,7 +497,6 @@ impl ManhattanSource {
                 SourceOutcome::Failure
             }
         };
-
         metrics::record_source_request(
             &self.metrics,
             LabelSource::Manhattan,
@@ -599,7 +504,11 @@ impl ManhattanSource {
             start.elapsed().as_secs_f64() * 1000.0,
         );
         metrics::record_manhattan_keys(&self.metrics, ManhattanResult::Success, successes);
-        metrics::record_manhattan_keys(&self.metrics, ManhattanResult::Failed, failures);
+        metrics::record_manhattan_keys(
+            &self.metrics,
+            ManhattanResult::Failed,
+            ids.len() - successes,
+        );
 
         results
     }
@@ -627,7 +536,7 @@ mod tests {
             Arc::new(Self {
                 results: entries
                     .into_iter()
-                    .map(|(id, result)| (cache_key(id).unwrap(), result))
+                    .map(|(id, result)| (cache_key(id), result))
                     .collect(),
             })
         }
@@ -644,15 +553,15 @@ mod tests {
 
     #[derive(Default)]
     struct FakeLabelFetcher {
-        items: HashMap<i64, Vec<RawSafetyLabel>>,
-        per_key_errors: HashMap<i64, String>,
+        items: HashMap<u64, Vec<RawSafetyLabel>>,
+        per_key_errors: HashMap<u64, String>,
         batch_error: Option<String>,
         truncate_to: Option<usize>,
-        calls: Mutex<Vec<Vec<i64>>>,
+        calls: Mutex<Vec<Vec<u64>>>,
     }
 
     impl FakeLabelFetcher {
-        fn with_label(mut self, tweet_id: i64, lt: SafetyLabelType, score: Option<f64>) -> Self {
+        fn with_label(mut self, tweet_id: u64, lt: SafetyLabelType, score: Option<f64>) -> Self {
             let mval = score.map_or_else(minimal_mval, mval_with_score);
             self.items
                 .entry(tweet_id)
@@ -661,7 +570,7 @@ mod tests {
             self
         }
 
-        fn calls(&self) -> Vec<Vec<i64>> {
+        fn calls(&self) -> Vec<Vec<u64>> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -670,7 +579,7 @@ mod tests {
     impl ManhattanLabelFetcher for FakeLabelFetcher {
         async fn fetch_labels(
             &self,
-            tweet_ids: &[i64],
+            tweet_ids: &[u64],
         ) -> Result<Vec<FetchResult>, ManhattanError> {
             self.calls.lock().unwrap().push(tweet_ids.to_vec());
             if let Some(msg) = &self.batch_error {
@@ -694,12 +603,13 @@ mod tests {
     async fn duplicate_ids_resolve_once_without_a_phantom_miss() {
         let fetcher = Arc::new(FakeLabelFetcher::default());
         let source = RemoteSource::new(
-            FakeCache::new([(42, Ok(None))]),
+            Some(FakeCache::new([(42, Ok(None))]) as _),
+            None,
             Arc::<FakeLabelFetcher>::clone(&fetcher),
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42, 42], &FxHashSet::default()).await;
+        let results = source.get(&[42, 42], &StaleEntries::default()).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);
@@ -716,13 +626,13 @@ mod tests {
         let fetcher = Arc::new(FakeLabelFetcher::default());
         let (warmer, mut published) = CacheWarmer::without_drain_task(2);
         let source = RemoteSource::new(
-            cache,
+            Some(cache as _),
+            Some(Arc::new(warmer)),
             Arc::<FakeLabelFetcher>::clone(&fetcher),
             LabelMetrics::default(),
-        )
-        .with_warmer(Arc::new(warmer));
+        );
 
-        let results = source.get(&[1, 2, 3, 4, 5], &FxHashSet::default()).await;
+        let results = source.get(&[1, 2, 3, 4, 5], &StaleEntries::default()).await;
 
         assert_eq!(results.len(), 5);
         assert!(results.values().all(Result::is_ok));
@@ -746,12 +656,13 @@ mod tests {
             ..Default::default()
         });
         let source = RemoteSource::new(
-            FakeCache::new([(42, Ok(None))]),
+            Some(FakeCache::new([(42, Ok(None))]) as _),
+            None,
             Arc::<FakeLabelFetcher>::clone(&fetcher),
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42], &FxHashSet::default()).await;
+        let results = source.get(&[42], &StaleEntries::default()).await;
 
         assert!(matches!(
             results.get(&42),
@@ -768,13 +679,13 @@ mod tests {
 
         let fetcher = Arc::new(FakeLabelFetcher::default());
         let source = RemoteSource::new(
-            FakeCache::new([(42, Ok(None))]),
+            Some(FakeCache::new([(42, Ok(None))]) as _),
+            Some(warmer),
             Arc::<FakeLabelFetcher>::clone(&fetcher),
             LabelMetrics::default(),
-        )
-        .with_warmer(warmer);
+        );
 
-        let results = source.get(&[42], &FxHashSet::default()).await;
+        let results = source.get(&[42], &StaleEntries::default()).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);
@@ -783,33 +694,25 @@ mod tests {
     #[tokio::test]
     async fn cache_transport_results_select_lookup_outcome() {
         let cases = [
-            (FakeCache::new([(42, Ok(None))]), TwemcacheOutcome::Miss),
+            (FakeCache::new([(42, Ok(None))]), Ok(CachedLabels::Miss)),
             (
                 FakeCache::new([(42, Err(KVCacheError::Io("conn refused".into())))]),
-                TwemcacheOutcome::FallThrough(FallbackReason::Other),
+                Err(FallbackReason::Other),
             ),
             (
                 FakeCache::new([(42, Err(KVCacheError::Timeout("get".into())))]),
-                TwemcacheOutcome::FallThrough(FallbackReason::Timeout),
+                Err(FallbackReason::Timeout),
             ),
             (
                 FakeCache::new([(42, Err(KVCacheError::Backpressure))]),
-                TwemcacheOutcome::FallThrough(FallbackReason::Backpressure),
+                Err(FallbackReason::Backpressure),
             ),
-            (
-                FakeCache::new([]),
-                TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse),
-            ),
+            (FakeCache::new([]), Err(FallbackReason::MissingResponse)),
         ];
 
         for (cache, expected) in cases {
-            let results = TwemcacheSource {
-                cache,
-                metrics: LabelMetrics::default(),
-            }
-            .get(&[42])
-            .await;
-            assert_eq!(results.get(&42), Some(&expected));
+            let replies = cache.multi_get(&[cache_key(42)]).await;
+            assert_eq!(twemcache_read(replies.get(&cache_key(42))), expected);
         }
     }
 

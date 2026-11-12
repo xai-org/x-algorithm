@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-10T16:00:31Z
+// mirrored from config feature-switch defaults; last sync 2026-11-11T16:00:37Z
 use xai_feature_switches::param;
 
 param!(
@@ -93,6 +93,7 @@ param!(
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
     vec![
+        "Experiment12Fou:0".to_string(),
         "Experiment18Fou:0.3".to_string(),
         "Experiment19Fou:0.3".to_string(),
         "Experiment22Fou:0.3".to_string(),
@@ -101,7 +102,8 @@ param!(
         "Experiment25Fou:0.3".to_string(),
         "Experiment26Fou:0.3".to_string(),
         "Experiment27Fou:0.3".to_string(),
-        "Experiment28Fou:0.3".to_string()
+        "Experiment28Fou:0.3".to_string(),
+        "Experiment29Fou:0.3".to_string()
     ]
 );
 param!(
@@ -187,12 +189,6 @@ param!(
     EnablePhoenixMOESource,
     bool,
     "rust_home_mixer_enable_phoenix_moe_source",
-    false
-);
-param!(
-    EnableShuffledHistoryRetrieval,
-    bool,
-    "rust_home_mixer_enable_shuffled_history_retrieval",
     false
 );
 param!(

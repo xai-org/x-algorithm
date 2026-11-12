@@ -5,7 +5,6 @@ use crate::models::{
 };
 use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::params::LimitedActionsPolicies;
-use crate::quote::Rerendered;
 use crate::rules::{RerenderReason, SafetyLevel};
 use xai_visibility_filtering::graphql_results::translate;
 use xai_visibility_filtering::links;
@@ -28,28 +27,46 @@ use xai_x_thrift::tweet_service::{
     TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
 };
 
-fn thrift_action(
+pub(crate) fn thrift_result_state(
     verdict: &Verdict,
     level: SafetyLevel,
     policies: &LimitedActionsPolicies,
-) -> Action {
+) -> TweetFieldsResultState {
+    let safety_result = |reason: Option<SafetyResultReason>, action: Action| {
+        ThriftFilteredReason::SafetyResult(ThriftSafetyResult::new(reason, action))
+    };
+    let found = |reason| TweetFieldsResultState::Found(TweetFieldsResultFound::new(reason));
+    let shown = |reason, action| found(Some(safety_result(reason, action)));
+    let filtered =
+        |reason| TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason));
     match verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(reason),
             ..
-        }) => Action::Drop(action::Drop::new(drop_reason(reason, level), None)),
+        }) => filtered(legacy_drop_reason(reason.legacy()).unwrap_or_else(|| {
+            safety_result(
+                None,
+                Action::Drop(action::Drop::new(drop_reason(reason, level), None)),
+            )
+        })),
         Verdict::Withheld(Decided {
             value: Withholding::Tombstone(reason),
             ..
-        }) => Action::Tombstone(Tombstone::new(Some(tombstone_reason(*reason)), None)),
+        }) => filtered(safety_result(
+            None,
+            Action::Tombstone(Tombstone::new(Some(tombstone_reason(*reason)), None)),
+        )),
         Verdict::Fosnr(Decided {
             value: Notice::SoftIntervention(reason),
             ..
-        }) => Action::TweetInterstitial(TweetInterstitial {
-            soft_intervention: Some(soft_intervention(reason)),
-            avoid: Some(normal_avoid()),
-            ..TweetInterstitial::default()
-        }),
+        }) => shown(
+            None,
+            Action::TweetInterstitial(TweetInterstitial {
+                soft_intervention: Some(soft_intervention(reason)),
+                avoid: Some(normal_avoid()),
+                ..TweetInterstitial::default()
+            }),
+        ),
         Verdict::Fosnr(Decided {
             value:
                 Notice::Appealable {
@@ -57,12 +74,15 @@ fn thrift_action(
                     limited_actions,
                 },
             ..
-        }) => Action::TweetInterstitial(TweetInterstitial {
-            limited_engagements: Some(fosnr_limited_engagements(reason, limited_actions)),
-            avoid: Some(normal_avoid()),
-            appealable: Some(Appealable::new(appealable_reason(reason), None)),
-            ..TweetInterstitial::default()
-        }),
+        }) => shown(
+            Some(fosnr_safety_result_reason(reason)),
+            Action::TweetInterstitial(TweetInterstitial {
+                limited_engagements: Some(fosnr_limited_engagements(reason, limited_actions)),
+                avoid: Some(normal_avoid()),
+                appealable: Some(Appealable::new(appealable_reason(reason), None)),
+                ..TweetInterstitial::default()
+            }),
+        ),
         Verdict::Shown {
             label_interstitial:
                 Some(Decided {
@@ -70,16 +90,12 @@ fn thrift_action(
                     ..
                 }),
             media,
-            engagement: _,
+            engagement,
         } => {
-            let mut reasons = verdict.limited_engagement_reasons();
-            let limit = reasons.next().map(|first| {
-                let mut limit = LimitedEngagement::new(first);
-                for reason in reasons {
-                    limit.add(reason);
-                }
-                limit
-            });
+            let mut limit = LimitedEngagement::new(interstitial.limited_engagement_reason());
+            for reason in engagement.iter().flat_map(|held| held.value.reasons()) {
+                limit.add(reason);
+            }
             let (media_action, all_media_visibility_results) = match media {
                 Some(Decided {
                     value: MediaRestriction::MediaInterstitial(blur),
@@ -91,33 +107,46 @@ fn thrift_action(
                 }) => (Some(MediaAction::Interstitial(nsfw_interstitial())), None),
                 None => (None, None),
             };
-            Action::TweetInterstitial(TweetInterstitial {
-                interstitial: Some(any_interstitial(interstitial, policies.language())),
-                limited_engagements: limit.map(|limit| limited_engagements(&limit, policies)),
-                media_action,
-                all_media_visibility_results,
-                ..TweetInterstitial::default()
-            })
+            let reason = match interstitial {
+                LabelInterstitial::PublicInterest(public_interest) => Some(public_interest.reason),
+                LabelInterstitial::EmergencyDynamic(_) => None,
+            };
+            shown(
+                reason,
+                Action::TweetInterstitial(TweetInterstitial {
+                    interstitial: Some(any_interstitial(interstitial, policies.language())),
+                    limited_engagements: Some(limited_engagements(&limit, policies)),
+                    media_action,
+                    all_media_visibility_results,
+                    ..TweetInterstitial::default()
+                }),
+            )
         }
         Verdict::Shown {
             label_interstitial: None,
             media: None,
             engagement: None,
-        } => Action::Allow(action::Allow::new()),
+        } => found(None),
         Verdict::Shown {
             label_interstitial: None,
             media: None,
             engagement: Some(Decided { value, .. }),
-        } => Action::LimitedEngagements(limited_engagements(value, policies)),
+        } => shown(
+            None,
+            Action::LimitedEngagements(limited_engagements(value, policies)),
+        ),
         Verdict::Shown {
             label_interstitial: None,
             media: Some(Decided { value, .. }),
             engagement: None,
         } => match value {
-            MediaRestriction::MediaInterstitial(blur) => {
-                Action::ComposedMediaVisibilityResults(blurred_media(blur))
+            MediaRestriction::MediaInterstitial(blur) => shown(
+                None,
+                Action::ComposedMediaVisibilityResults(blurred_media(blur)),
+            ),
+            MediaRestriction::NsfwInterstitial => {
+                found(Some(ThriftFilteredReason::ContainNsfwMedia(true)))
             }
-            MediaRestriction::NsfwInterstitial => Action::Interstitial(nsfw_interstitial()),
         },
         Verdict::Shown {
             label_interstitial: None,
@@ -131,19 +160,22 @@ fn thrift_action(
                     None,
                 ),
             };
-            Action::TweetInterstitial(TweetInterstitial {
-                interstitial,
-                limited_engagements: Some(limited_engagements(&limit.value, policies)),
-                all_media_visibility_results,
-                ..TweetInterstitial::default()
-            })
+            shown(
+                None,
+                Action::TweetInterstitial(TweetInterstitial {
+                    interstitial,
+                    limited_engagements: Some(limited_engagements(&limit.value, policies)),
+                    all_media_visibility_results,
+                    ..TweetInterstitial::default()
+                }),
+            )
         }
     }
 }
 
-pub(crate) fn rerendered_state(rerendered: &Rerendered) -> TweetFieldsResultState {
+pub(crate) fn rerendered_state(reason: RerenderReason) -> TweetFieldsResultState {
     use ThriftFilteredReason as T;
-    let reason = match rerendered.reason {
+    let reason = match reason {
         RerenderReason::AuthorDeactivated => T::AuthorIsDeactivated(true),
         RerenderReason::AuthorInactive => T::AuthorAccountIsInactive(true),
         RerenderReason::AuthorSuspended => T::AuthorIsSuspended(true),
@@ -152,59 +184,6 @@ pub(crate) fn rerendered_state(rerendered: &Rerendered) -> TweetFieldsResultStat
         RerenderReason::Unspecified => T::UnspecifiedReason(true),
     };
     TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason))
-}
-
-pub(crate) fn thrift_result_state(
-    verdict: &Verdict,
-    level: SafetyLevel,
-    policies: &LimitedActionsPolicies,
-) -> TweetFieldsResultState {
-    let reason = match verdict {
-        Verdict::Fosnr(Decided {
-            value: Notice::Appealable { reason, .. },
-            ..
-        }) => Some(fosnr_safety_result_reason(reason)),
-        Verdict::Shown {
-            label_interstitial:
-                Some(Decided {
-                    value: LabelInterstitial::PublicInterest(interstitial),
-                    ..
-                }),
-            ..
-        } => Some(interstitial.reason),
-        Verdict::Withheld(_) | Verdict::Fosnr(_) | Verdict::Shown { .. } => None,
-    };
-    let safety_result = || {
-        ThriftFilteredReason::SafetyResult(ThriftSafetyResult::new(
-            reason,
-            thrift_action(verdict, level, policies),
-        ))
-    };
-    let found = |reason| TweetFieldsResultState::Found(TweetFieldsResultFound::new(reason));
-    let filtered =
-        |reason| TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason));
-    match verdict {
-        Verdict::Withheld(Decided {
-            value: Withholding::Drop(DropReason::Legacy(reason)),
-            ..
-        }) => filtered(legacy_drop_reason(reason).unwrap_or_else(safety_result)),
-        Verdict::Withheld(_) => filtered(safety_result()),
-        Verdict::Shown {
-            label_interstitial: None,
-            media: None,
-            engagement: None,
-        } => found(None),
-        Verdict::Shown {
-            label_interstitial: None,
-            media:
-                Some(Decided {
-                    value: MediaRestriction::NsfwInterstitial,
-                    ..
-                }),
-            engagement: None,
-        } => found(Some(ThriftFilteredReason::ContainNsfwMedia(true))),
-        Verdict::Fosnr(_) | Verdict::Shown { .. } => found(Some(safety_result())),
-    }
 }
 
 fn legacy_drop_reason(reason: &FilteredReason) -> Option<ThriftFilteredReason> {
@@ -292,7 +271,7 @@ fn any_interstitial(interstitial: &LabelInterstitial, language: &str) -> AnyInte
             AnyInterstitial::InterstitialLimitedEngagements(InterstitialLimitedEngagements::new(
                 limit.map(limited_engagement_reason),
                 localized_message(
-                    &translate(resname, language)
+                    translate(resname, language)
                         .unwrap_or_default()
                         .replace("%{", "{"),
                     Some(link),
@@ -310,13 +289,13 @@ fn any_interstitial(interstitial: &LabelInterstitial, language: &str) -> AnyInte
             AnyInterstitial::EmergencyDynamicInterstitial(EmergencyDynamicInterstitial::new(
                 copy.clone(),
                 link.clone(),
-                Box::new(localized_message(&message, link.as_deref(), language)),
+                Box::new(localized_message(message, link.as_deref(), language)),
             ))
         }
     }
 }
 
-fn localized_message(text: &str, link: Option<&str>, language: &str) -> LocalizedMessage {
+fn localized_message(text: String, link: Option<&str>, language: &str) -> LocalizedMessage {
     let links: Vec<MessageLink> = link
         .into_iter()
         .map(|url| {
@@ -329,7 +308,7 @@ fn localized_message(text: &str, link: Option<&str>, language: &str) -> Localize
             )
         })
         .collect();
-    LocalizedMessage::new(text.to_string(), language.to_string(), links)
+    LocalizedMessage::new(text, language.to_string(), links)
 }
 
 fn public_interest_copy(reason: SafetyResultReason) -> (&'static str, &'static str) {

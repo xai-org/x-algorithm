@@ -9,7 +9,7 @@ use crate::models::{
     ViewerFeatures,
 };
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator, PostObserver};
 use crate::quote::{QuotePassMode, QuotePassRunner};
 use crate::rules::{NoTrace, RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
@@ -173,11 +173,20 @@ impl<S: Sources + 'static> Scenario<S> {
         rule_engine: RuleEngine,
         raw: &[RawCandidate],
     ) -> Evaluated {
+        self.evaluate_observed(rule_engine, raw, &mut NoTrace).await
+    }
+
+    pub(crate) async fn evaluate_observed<O: PostObserver>(
+        &self,
+        rule_engine: RuleEngine,
+        raw: &[RawCandidate],
+        observer: &mut O,
+    ) -> Evaluated {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
         let post_evaluator = PostEvaluator::new(sources, rule_engine, caches, self.metrics.clone());
         let (hydrated, outcomes) = post_evaluator
-            .run(self.request(raw), &self.request_metrics(), &mut NoTrace)
+            .run(self.request(raw), &self.request_metrics(), observer)
             .await;
         Evaluated {
             outcomes,

@@ -1,11 +1,12 @@
-use crate::clients::strato::{self, decode_only, EncodeOnlyCodec, ToThrift};
+use crate::clients::strato::{self, EncodeOnlyCodec, ToThrift};
 use crate::thrift_read::read_fields;
 use std::collections::HashSet;
 use thrift::protocol::{
-    TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TSetIdentifier,
+    TFieldIdentifier, TInputProtocol, TListIdentifier, TOutputProtocol, TSetIdentifier,
     TStructIdentifier, TType,
 };
-use xai_strato::{encode, MValCodec, StratoGrpc};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
+use xai_strato::{encode, StratoGrpc};
 
 const USER_LOCATION_COLUMN: &str = "geo/service/userLocation";
 
@@ -20,19 +21,9 @@ const GEODUCK_IDL_DEFAULT_FLAGS: [(&str, i16, bool); 3] = [
 const FOUND: i16 = 1;
 const PLACE_MAP: i16 = 5;
 
-pub struct UserLocationClient {
-    grpc: StratoGrpc,
-}
-
-impl UserLocationClient {
-    pub fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
-
-    pub async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>> {
-        let bytes = strato::fetch(&self.grpc, USER_LOCATION_COLUMN, key(user_id)).await?;
-        decode_places(&bytes, user_id)
-    }
+pub async fn places(grpc: &StratoGrpc, user_id: u64) -> anyhow::Result<HashSet<u64>> {
+    let bytes = strato::fetch(grpc, USER_LOCATION_COLUMN, key(user_id)).await?;
+    decode_places(&bytes, user_id)
 }
 
 pub(crate) fn key(user_id: u64) -> Vec<u8> {
@@ -43,7 +34,7 @@ pub(crate) fn key(user_id: u64) -> Vec<u8> {
 }
 
 fn decode_places(bytes: &[u8], user_id: u64) -> anyhow::Result<HashSet<u64>> {
-    Ok(strato::decode::<UserLocationResponse>(bytes)?
+    Ok(strato::row(strato_decode::<UserLocationResponse>(bytes)?)?
         .and_then(|response| {
             response
                 .found
@@ -70,7 +61,11 @@ impl ToThrift for UserLocationRequest {
         proto
             .write_field_begin(&TFieldIdentifier::new("userIds", TType::List, 1))
             .unwrap();
-        vec![self.user_id].to_thrift(proto);
+        proto
+            .write_list_begin(&TListIdentifier::new(TType::I64, 1))
+            .unwrap();
+        proto.write_i64(self.user_id).unwrap();
+        proto.write_list_end().unwrap();
         proto.write_field_end().unwrap();
         proto
             .write_field_begin(&TFieldIdentifier::new("place_query", TType::Struct, 2))
@@ -109,8 +104,8 @@ struct UserLocationResponse {
     found: Vec<(u64, HashSet<u64>)>,
 }
 
-impl TSerializable for UserLocationResponse {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+impl StratoRead for UserLocationResponse {
+    fn read(i_prot: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let mut found = Vec::new();
         read_fields(i_prot, |i_prot, field| {
             if field.id != Some(FOUND) || field.field_type != TType::Map {
@@ -126,13 +121,9 @@ impl TSerializable for UserLocationResponse {
         })?;
         Ok(Self { found })
     }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(decode_only("UserLocationResponse"))
-    }
 }
 
-fn read_place_ids(i_prot: &mut dyn TInputProtocol) -> thrift::Result<HashSet<u64>> {
+fn read_place_ids(i_prot: &mut MValProtocol<'_>) -> thrift::Result<HashSet<u64>> {
     let mut places = HashSet::new();
     read_fields(i_prot, |i_prot, field| {
         if field.id != Some(PLACE_MAP) || field.field_type != TType::Map {

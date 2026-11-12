@@ -21,8 +21,8 @@ pub use verdict::{
     Withholding,
 };
 pub use viewer::{
-    ClientCapability, ClientSwitch, ClientSwitchSet, NotificationFilters, VerifyBlurSupport,
-    Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
+    ClientCapability, ClientSwitch, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge,
+    ViewerFeatures, ViewerProfile,
 };
 pub(crate) use viewer::{RequestFacts, RequestViewer};
 

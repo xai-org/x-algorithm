@@ -5,7 +5,7 @@ use crate::evaluated::EvaluationResult;
 use crate::metrics::{ClientRpc, RequestMetrics};
 use crate::models::{Action, DropReason, FilteredReason, SafetyResult};
 use crate::tweet_safety_label::{proto_to_safety_label_map, SafetyLabelFailure};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -24,11 +24,10 @@ use xai_strato::{
 use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
-use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
 
 pub const FILTER_TWEETS_LATENCY_VM_METRIC: &str = "vf_client_filter_tweets_latency_ms_vm";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Hash, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Hash, Eq, strum::FromRepr)]
 #[serde(rename_all = "camelCase")]
 pub enum SafetyLevel {
     #[default]
@@ -47,20 +46,7 @@ pub enum SafetyLevel {
 
 impl SafetyLevel {
     pub fn from_tag(tag: i32) -> Option<Self> {
-        match tag {
-            0 => Some(Self::FilterNone),
-            6 => Some(Self::SearchTop),
-            7 => Some(Self::SearchLatest),
-            8 => Some(Self::TimelineHome),
-            61 => Some(Self::TimelineHomeRecommendations),
-            93 => Some(Self::SearchPhoto),
-            94 => Some(Self::SearchVideo),
-            165 => Some(Self::SearchTopQig),
-            227 => Some(Self::SearchTopSafeSearchEnabled),
-            236 => Some(Self::ExploreNsfwRecommendations),
-            247 => Some(Self::ImmersiveExpandedRecommendations),
-            _ => None,
-        }
+        usize::try_from(tag).ok().and_then(Self::from_repr)
     }
 }
 
@@ -121,20 +107,14 @@ pub struct TweetVisibility {
 
 impl TweetVisibility {
     pub fn to_visibility_reason(&self) -> Option<FilteredReason> {
-        if matches!(self.reason, Some(FilteredReason::SafetyResult(_))) {
-            return self.reason.clone();
-        }
-        match self.action {
-            Action::Allow => None,
-            Action::Interstitial => Some(FilteredReason::SafetyResult(SafetyResult {
+        match (&self.reason, &self.action) {
+            (Some(reason @ FilteredReason::SafetyResult(_)), _) => Some(reason.clone()),
+            (_, Action::Allow) => None,
+            (_, Action::Interstitial) => Some(FilteredReason::SafetyResult(SafetyResult {
                 reason: None,
                 action: Action::Interstitial,
             })),
-            _ => Some(
-                self.reason
-                    .clone()
-                    .unwrap_or(FilteredReason::UnspecifiedReason),
-            ),
+            (reason, _) => Some(reason.clone().unwrap_or(FilteredReason::UnspecifiedReason)),
         }
     }
 }
@@ -219,12 +199,12 @@ impl VfClient for StratoVfClient {
             })
             .collect::<Vec<(String, String, Vec<Vec<u8>>)>>();
         let result_batch = client.batch_call(calls, context.as_ref()).await;
-        let mut result_map: HashMap<u64, Result<TweetVisibility>> = HashMap::new();
-        for (tweet_id, bytes_result) in tweet_ids.iter().zip(result_batch) {
-            let item_result = match bytes_result {
-                Ok(bytes) => {
-                    let decoded: StratoResult<StratoValue<FilteredReason>> = decode(&bytes);
-                    match decoded {
+        tweet_ids
+            .iter()
+            .zip(result_batch)
+            .map(|(tweet_id, bytes_result)| {
+                let item_result = bytes_result.and_then(|bytes| {
+                    match decode::<StratoResult<StratoValue<FilteredReason>>>(&bytes) {
                         StratoResult::Ok(strato_value) => {
                             let reason = strato_value.v;
                             Ok(TweetVisibility {
@@ -237,51 +217,20 @@ impl VfClient for StratoVfClient {
                             Err(anyhow!("Strato error code {}: {}", err.code, err.message))
                         }
                     }
-                }
-                Err(err) => Err(err),
-            };
-            result_map.insert(*tweet_id, item_result);
-        }
-        result_map
+                });
+                (*tweet_id, item_result)
+            })
+            .collect()
     }
 }
 
 pub(crate) const XAI_VF_DEFAULT_TIMEOUT_MS: u64 = 400;
 const XAI_VF_MAX_BATCH_SIZE: usize = 50;
-const XAI_VF_APERTURE_SIZE: usize = 16;
 const VF_FILTER_TWEETS_DISCOVERY_ENV: &str = "VF_FILTER_TWEETS_DISCOVERY";
 
 pub struct XaiVfClient {
-    client: FilterTweetsServiceClient,
+    client: VisibilityFilteringServiceClient<VfChannel>,
     timeout: Duration,
-}
-
-#[derive(Clone)]
-enum FilterTweetsServiceClient {
-    Wily(VisibilityFilteringServiceClient<Channel>),
-    Xds(VisibilityFilteringServiceClient<LoadBalancedChannel>),
-}
-
-impl FilterTweetsServiceClient {
-    async fn evaluate_tweets(
-        &mut self,
-        request: tonic::Request<vf_pb::EvaluateTweetsRequest>,
-    ) -> Result<tonic::Response<vf_pb::EvaluateTweetsResponse>, tonic::Status> {
-        match self {
-            Self::Wily(c) => c.evaluate_tweets(request).await,
-            Self::Xds(c) => c.evaluate_tweets(request).await,
-        }
-    }
-
-    async fn filter_tweets(
-        &mut self,
-        request: tonic::Request<vf_pb::VisibilityFilterRequest>,
-    ) -> Result<tonic::Response<vf_pb::VisibilityFilterResponse>, tonic::Status> {
-        match self {
-            Self::Wily(c) => c.filter_tweets(request).await,
-            Self::Xds(c) => c.filter_tweets(request).await,
-        }
-    }
 }
 
 pub(crate) fn xds_channel_params<'a>(name: &'a str, dc: &'a str) -> VfChannelParams<'a> {
@@ -290,9 +239,6 @@ pub(crate) fn xds_channel_params<'a>(name: &'a str, dc: &'a str) -> VfChannelPar
         dc,
         discovery: VfDiscovery::Xds,
         xds: XdsTarget::vf(dc),
-        aperture_size: XAI_VF_APERTURE_SIZE,
-        deterministic_aperture: std::env::var("APP_ENV").as_deref() == Ok("prod"),
-        xds_lb_policy: LbPolicy::least_request(),
     }
 }
 
@@ -303,19 +249,16 @@ fn filter_tweets_channel_params(dc: &str) -> VfChannelParams<'_> {
     }
 }
 
-pub(crate) fn channel_error_to_anyhow(e: VfChannelError) -> anyhow::Error {
-    match e {
+pub(crate) async fn connect_vf_client(
+    params: &VfChannelParams<'_>,
+) -> Result<VisibilityFilteringServiceClient<VfChannel>> {
+    let channel = build_vf_channel(params).await.map_err(|e| match e {
         VfChannelError::Config(e) | VfChannelError::Connect(e) => e,
-    }
+    })?;
+    Ok(make_vf_client(channel))
 }
 
-pub(crate) fn make_vf_client<T>(channel: T) -> VisibilityFilteringServiceClient<T>
-where
-    T: tonic::client::GrpcService<tonic::body::Body>,
-    T::Error: Into<tonic::codegen::StdError>,
-    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
-    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
-{
+pub(crate) fn make_vf_client(channel: VfChannel) -> VisibilityFilteringServiceClient<VfChannel> {
     VisibilityFilteringServiceClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd)
@@ -327,7 +270,7 @@ impl XaiVfClient {
         request: vf_pb::EvaluateTweetsRequest,
         metadata: &tonic::metadata::MetadataMap,
     ) -> Result<Vec<EvaluationResult>> {
-        let request_metrics = RequestMetrics::start(ClientRpc::EvaluateTweets);
+        let request_metrics = RequestMetrics::start(&ClientRpc::EVALUATE_TWEETS);
         self.evaluate_tweets_recording(request, metadata, request_metrics)
             .await
     }
@@ -359,10 +302,7 @@ impl XaiVfClient {
                         .evaluate_tweets(rpc)
                         .await
                         .map_err(timeout_as_deadline_exceeded);
-                    request_metrics.batch(
-                        batch_start.elapsed(),
-                        response.as_ref().err().map(tonic::Status::code),
-                    );
+                    request_metrics.batch(batch_start.elapsed(), response.as_ref().err());
                     decode_response(chunk.len(), response?.into_inner())
                 }
             })
@@ -379,31 +319,22 @@ impl XaiVfClient {
                 ordered[i].get_or_insert(result);
             }
         }
-        Ok(ordered
+        ordered
             .into_iter()
-            .map(|result| result.expect("the plan covers every request index"))
-            .collect())
+            .collect::<Option<Vec<_>>>()
+            .context("VF evaluation plan missed a request index")
     }
 
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            client: FilterTweetsServiceClient::Wily(make_vf_client(channel)),
+            client: make_vf_client(VfChannel::Wily(channel)),
             timeout: Duration::from_millis(XAI_VF_DEFAULT_TIMEOUT_MS),
         }
     }
 
     pub async fn connect(datacenter: &str) -> Result<Self> {
-        let params = filter_tweets_channel_params(datacenter);
-        let client = match build_vf_channel(&params)
-            .await
-            .map_err(channel_error_to_anyhow)?
-        {
-            VfChannel::Wily(ch) => FilterTweetsServiceClient::Wily(make_vf_client(ch)),
-            VfChannel::Xds(ch) => FilterTweetsServiceClient::Xds(make_vf_client(ch)),
-        };
-
         Ok(Self {
-            client,
+            client: connect_vf_client(&filter_tweets_channel_params(datacenter)).await?,
             timeout: Duration::from_millis(XAI_VF_DEFAULT_TIMEOUT_MS),
         })
     }
@@ -420,81 +351,82 @@ impl XaiVfClient {
 
 const EVALUATION_DEADLINE_EXCEEDED: &str = "VF evaluation deadline exceeded";
 
-pub(crate) async fn within_deadline<T>(
+pub(crate) async fn within_deadline<T, E: From<tonic::Status>>(
     timeout: Duration,
-    call: impl Future<Output = Result<T>>,
-) -> Result<T> {
+    call: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
     tokio::time::timeout(timeout, call)
         .await
-        .map_err(|_| tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED))?
+        .unwrap_or_else(|_| {
+            Err(tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED).into())
+        })
 }
 
 pub(crate) fn timeout_as_deadline_exceeded(status: tonic::Status) -> tonic::Status {
-    let mut source = std::error::Error::source(&status);
+    if grpc_timeout_expired(&status) {
+        tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED)
+    } else {
+        status
+    }
+}
+
+pub(crate) fn grpc_timeout_expired(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
     while let Some(err) = source {
         if err.is::<tonic::TimeoutExpired>() {
-            return tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED);
+            return true;
         }
         source = err.source();
     }
-    status
+    false
 }
 
 fn plan_evaluate_chunks(tweets: &[vf_pb::TweetData]) -> Vec<Vec<usize>> {
     if tweets.iter().all(|tweet| tweet.quote_context.is_none()) {
         return (0..tweets.len())
-            .collect::<Vec<_>>()
-            .chunks(XAI_VF_MAX_BATCH_SIZE)
-            .map(<[usize]>::to_vec)
+            .step_by(XAI_VF_MAX_BATCH_SIZE)
+            .map(|start| (start..tweets.len().min(start + XAI_VF_MAX_BATCH_SIZE)).collect())
             .collect();
     }
-    let mut standalone: HashMap<u64, usize> = HashMap::new();
+    let mut outers: HashMap<u64, (usize, Option<usize>)> = HashMap::new();
     for (i, tweet) in tweets.iter().enumerate() {
         if tweet.quote_context.is_none() {
-            standalone.entry(tweet.tweet_id).or_insert(i);
+            outers.entry(tweet.tweet_id).or_insert((i, None));
         }
     }
-    let quoted: HashSet<u64> = tweets
-        .iter()
-        .filter_map(|tweet| tweet.quote_context.map(|quote| quote.outer_tweet_id))
-        .filter(|outer| standalone.contains_key(outer))
-        .collect();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut group_of_outer: HashMap<u64, usize> = HashMap::new();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for (i, tweet) in tweets.iter().enumerate() {
         let outer = match tweet.quote_context {
-            Some(quote) => Some(quote.outer_tweet_id).filter(|outer| quoted.contains(outer)),
-            None => Some(tweet.tweet_id).filter(|id| quoted.contains(id) && standalone[id] == i),
+            Some(quote) => outers.get_mut(&quote.outer_tweet_id),
+            None => outers
+                .get_mut(&tweet.tweet_id)
+                .filter(|(index, _)| *index == i),
         };
-        let Some(outer) = outer else {
-            groups.push(vec![i]);
+        let Some((outer, group)) = outer else {
+            groups.push((i, Vec::new()));
             continue;
         };
-        let outer_index = standalone[&outer];
-        let group = *group_of_outer.entry(outer).or_insert_with(|| {
-            groups.push(vec![outer_index]);
+        let group = *group.get_or_insert_with(|| {
+            groups.push((*outer, Vec::new()));
             groups.len() - 1
         });
-        if i != outer_index {
-            groups[group].push(i);
+        if i != *outer {
+            groups[group].1.push(i);
         }
     }
     let mut chunks: Vec<Vec<usize>> = Vec::new();
-    for group in groups {
-        if group.len() > XAI_VF_MAX_BATCH_SIZE {
-            let (outer, quotes) = group.split_first().expect("a group holds its outer");
+    for (outer, quotes) in groups {
+        if quotes.len() >= XAI_VF_MAX_BATCH_SIZE {
             for part in quotes.chunks(XAI_VF_MAX_BATCH_SIZE - 1) {
-                chunks.push(
-                    std::iter::once(*outer)
-                        .chain(part.iter().copied())
-                        .collect(),
-                );
+                chunks.push(std::iter::once(outer).chain(part.iter().copied()).collect());
             }
             continue;
         }
+        let size = 1 + quotes.len();
+        let group = std::iter::once(outer).chain(quotes);
         match chunks.last_mut() {
-            Some(last) if last.len() + group.len() <= XAI_VF_MAX_BATCH_SIZE => last.extend(group),
-            _ => chunks.push(group),
+            Some(last) if last.len() + size <= XAI_VF_MAX_BATCH_SIZE => last.extend(group),
+            _ => chunks.push(group.collect()),
         }
     }
     chunks
@@ -535,7 +467,7 @@ fn to_proto_safety_level(level: SafetyLevel) -> vf_pb::SafetyLevel {
 fn result_to_visibility(result: vf_pb::TweetVisibilityResult) -> TweetVisibility {
     let safety_labels = result
         .safety_labels
-        .map(|m| proto_to_safety_label_map(&m))
+        .map(proto_to_safety_label_map)
         .ok_or(SafetyLabelFailure::LookupFailed);
     TweetVisibility {
         action: result.action.map(Action::from).unwrap_or_default(),
@@ -544,38 +476,38 @@ fn result_to_visibility(result: vf_pb::TweetVisibilityResult) -> TweetVisibility
     }
 }
 
-fn results_to_map(
+fn chunk_results(
     requested_tweet_ids: &[u64],
     results: Vec<vf_pb::TweetVisibilityResult>,
-) -> HashMap<u64, Result<TweetVisibility>> {
-    let mut map: HashMap<u64, Result<TweetVisibility>> = results
+) -> Vec<(u64, TweetVisibility)> {
+    let answered_in_order = results.len() == requested_tweet_ids.len()
+        && results
+            .iter()
+            .zip(requested_tweet_ids)
+            .all(|(r, &tweet_id)| r.tweet_id == tweet_id);
+    let missing: Vec<u64> = if answered_in_order {
+        Vec::new()
+    } else {
+        let answered: HashSet<u64> = results.iter().map(|r| r.tweet_id).collect();
+        requested_tweet_ids
+            .iter()
+            .copied()
+            .filter(|tweet_id| !answered.contains(tweet_id))
+            .collect()
+    };
+    results
         .into_iter()
-        .map(|r| (r.tweet_id, Ok(result_to_visibility(r))))
-        .collect();
-    for &tweet_id in requested_tweet_ids {
-        map.entry(tweet_id).or_insert_with(|| {
-            Ok(TweetVisibility {
-                action: Action::NotEvaluated,
-                reason: Some(FilteredReason::UnspecifiedReason),
-                safety_labels: Err(SafetyLabelFailure::LookupFailed),
-            })
-        });
-    }
-    map
-}
-
-fn rpc_error_map(
-    tweet_ids: &[u64],
-    status: &tonic::Status,
-) -> HashMap<u64, Result<TweetVisibility>> {
-    tweet_ids
-        .iter()
-        .map(|&tweet_id| {
+        .map(|r| (r.tweet_id, result_to_visibility(r)))
+        .chain(missing.into_iter().map(|tweet_id| {
             (
                 tweet_id,
-                Err(anyhow!("Rust VF filter_tweets error: {status}")),
+                TweetVisibility {
+                    action: Action::NotEvaluated,
+                    reason: Some(FilteredReason::UnspecifiedReason),
+                    safety_labels: Err(SafetyLabelFailure::LookupFailed),
+                },
             )
-        })
+        }))
         .collect()
 }
 
@@ -592,61 +524,58 @@ impl VfClient for XaiVfClient {
             return HashMap::new();
         }
 
-        let mut request_metrics = RequestMetrics::start(ClientRpc::FilterTweets);
+        let mut request_metrics = RequestMetrics::start(&ClientRpc::FILTER_TWEETS);
         let country_code = context
             .map(|v| v.request_country_code)
             .filter(|c| !c.is_empty());
         let safety_level_proto = to_proto_safety_level(safety_level) as i32;
 
-        let chunk_futures: Vec<_> = tweet_ids
-            .chunks(XAI_VF_MAX_BATCH_SIZE)
-            .map(|chunk| {
-                let chunk_ids = chunk.to_vec();
-                let country_code = country_code.clone();
-                let timeout = self.timeout;
-                let mut client = self.client.clone();
-                async move {
-                    let tweets = chunk_ids
-                        .iter()
-                        .map(|&tweet_id| vf_pb::TweetInput {
-                            tweet_id,
-                            author_id: None,
-                        })
-                        .collect();
+        let chunks = tweet_ids.chunks(XAI_VF_MAX_BATCH_SIZE);
+        let responses = futures::future::join_all(chunks.clone().map(|chunk| {
+            let country_code = country_code.clone();
+            let mut client = self.client.clone();
+            async move {
+                let tweets = chunk
+                    .iter()
+                    .map(|&tweet_id| vf_pb::TweetInput {
+                        tweet_id,
+                        author_id: None,
+                    })
+                    .collect();
 
-                    let mut request = tonic::Request::new(vf_pb::VisibilityFilterRequest {
-                        safety_level: safety_level_proto,
-                        tweets,
-                        viewer_id: Some(for_user_id),
-                        country_code,
-                    });
-                    request.set_timeout(timeout);
+                let mut request = tonic::Request::new(vf_pb::VisibilityFilterRequest {
+                    safety_level: safety_level_proto,
+                    tweets,
+                    viewer_id: Some(for_user_id),
+                    country_code,
+                });
+                request.set_timeout(self.timeout);
 
-                    let batch_start = Instant::now();
-                    let response = client.filter_tweets(request).await;
-                    let elapsed = batch_start.elapsed();
-                    match response {
-                        Ok(response) => (
-                            results_to_map(&chunk_ids, response.into_inner().results),
-                            elapsed,
-                            None,
-                        ),
-                        Err(status) => (
-                            rpc_error_map(&chunk_ids, &status),
-                            elapsed,
-                            Some((status.code(), chunk_ids.len())),
-                        ),
-                    }
-                }
-            })
-            .collect();
+                let batch_start = Instant::now();
+                let response = within_deadline(self.timeout, client.filter_tweets(request)).await;
+                let elapsed = batch_start.elapsed();
+                let answered = response.map(|r| chunk_results(chunk, r.into_inner().results));
+                (answered, elapsed)
+            }
+        }))
+        .await;
 
         let mut out = HashMap::with_capacity(tweet_ids.len());
         let mut failed_ids = 0;
-        for (chunk_map, elapsed, error) in futures::future::join_all(chunk_futures).await {
-            request_metrics.batch(elapsed, error.map(|(code, _)| code));
-            failed_ids += error.map_or(0, |(_, ids)| ids);
-            out.extend(chunk_map);
+        for (chunk, (answered, elapsed)) in chunks.zip(responses) {
+            request_metrics.batch(elapsed, answered.as_ref().err());
+            match answered {
+                Ok(chunk_map) => out.extend(chunk_map.into_iter().map(|(id, v)| (id, Ok(v)))),
+                Err(status) => {
+                    failed_ids += chunk.len();
+                    out.extend(chunk.iter().map(|&tweet_id| {
+                        (
+                            tweet_id,
+                            Err(anyhow!("Rust VF filter_tweets error: {status}")),
+                        )
+                    }));
+                }
+            }
         }
 
         request_metrics.answered(failed_ids);
@@ -673,23 +602,17 @@ impl VfClient for MockVfClient {
 #[cfg(target_os = "macos")]
 mod tests {
     use crate::models::{Action, FilteredReason};
-    use lazy_static::lazy_static;
 
-    lazy_static! {
-        pub static ref SAMPLE_VF_RESPONSE: Vec<Vec<u8>> = vec![vec![
-            12, 0, 4, 12, 9, 252, 12, 0, 118, 12, 105, 20, 12, 0, 11, 12, 0, 2, 12, 0, 15, 8, 0, 2,
-            0, 0, 0, 1, 0, 0, 0, 0, 0, 8, 193, 236, 255, 255, 255, 255, 0, 0, 0
-        ]];
-    }
+    const SAMPLE_VF_RESPONSE: &[u8] = &[
+        12, 0, 4, 12, 9, 252, 12, 0, 118, 12, 105, 20, 12, 0, 11, 12, 0, 2, 12, 0, 15, 8, 0, 2, 0,
+        0, 0, 1, 0, 0, 0, 0, 0, 8, 193, 236, 255, 255, 255, 255, 0, 0, 0,
+    ];
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_decode_simple() {
         use xai_strato::{decode, StratoResult, StratoValue};
 
-        let bytes_batch = &SAMPLE_VF_RESPONSE;
-        let bytes = &bytes_batch[0];
-
-        let result: StratoResult<StratoValue<FilteredReason>> = decode(bytes);
+        let result: StratoResult<StratoValue<FilteredReason>> = decode(SAMPLE_VF_RESPONSE);
         match result {
             StratoResult::Ok(strato_value) => {
                 assert!(strato_value.v.is_some());
@@ -713,7 +636,6 @@ mod rust_vf_tests {
     use super::*;
     use crate::models::Action;
     use crate::test_support::RecordingReceiver;
-    use std::net::SocketAddr;
     use tokio::sync::Mutex;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
@@ -721,6 +643,18 @@ mod rust_vf_tests {
     use xai_visibility_filtering_proto::visibility_filtering_service_server::{
         VisibilityFilteringService, VisibilityFilteringServiceServer,
     };
+
+    #[test]
+    fn safety_level_from_tag_reads_the_thrift_tags() {
+        let tags = [0, 6, 7, 8, 61, 93, 94, 165, 227, 236, 247];
+        for tag in tags {
+            let level = SafetyLevel::from_tag(tag).expect("a known tag");
+            assert_eq!(level as i32, tag);
+        }
+        for tag in [-1, 1, 62, 248, i32::MAX] {
+            assert_eq!(SafetyLevel::from_tag(tag), None, "{tag}");
+        }
+    }
 
     #[test]
     fn decode_response_requires_one_decodable_outcome_per_requested_tweet() {
@@ -760,8 +694,10 @@ mod rust_vf_tests {
         }
     }
 
+    #[derive(Default)]
     struct EvaluateStub {
         requests: Arc<std::sync::Mutex<Vec<tonic::metadata::MetadataMap>>>,
+        rpcs: Arc<std::sync::Mutex<Vec<Vec<vf_pb::TweetData>>>>,
         fail_chunks_smaller_than: usize,
         hang: bool,
     }
@@ -780,48 +716,32 @@ mod rust_vf_tests {
                 std::future::pending::<()>().await;
             }
             let tweets = request.into_inner().tweets;
+            self.rpcs.lock().unwrap().push(tweets.clone());
             if tweets.len() < self.fail_chunks_smaller_than {
                 return Err(Status::unavailable("stub failure"));
             }
             Ok(Response::new(vf_pb::EvaluateTweetsResponse {
                 results: tweets
-                    .into_iter()
+                    .iter()
                     .map(|tweet| vf_pb::TweetEvaluation {
-                        outcome: Some(if tweet.tweet_id % 100 < 50 {
-                            vf_pb::tweet_evaluation::Outcome::NotEvaluated(vf_pb::NotEvaluated {})
-                        } else {
-                            vf_pb::tweet_evaluation::Outcome::Failed(vf_pb::Failed {})
-                        }),
+                        outcome: Some(outcome_for(tweet.tweet_id)),
                     })
                     .collect(),
             }))
         }
-        async fn filter_tweets(
-            &self,
-            _: Request<vf_pb::VisibilityFilterRequest>,
-        ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
-        async fn get_safety_labels(
-            &self,
-            _: Request<vf_pb::GetSafetyLabelsRequest>,
-        ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
     }
 
-    async fn evaluate_against(
-        stub: EvaluateStub,
-        client_timeout_ms: u64,
-        tweet_count: usize,
-    ) -> (Result<Vec<EvaluationResult>>, Arc<RecordingReceiver>) {
+    async fn serve_stub<S: VisibilityFilteringService>(
+        stub: S,
+    ) -> (Channel, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             Server::builder()
                 .add_service(
                     VisibilityFilteringServiceServer::new(stub)
-                        .accept_compressed(CompressionEncoding::Zstd),
+                        .accept_compressed(CompressionEncoding::Zstd)
+                        .send_compressed(CompressionEncoding::Zstd),
                 )
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
@@ -832,12 +752,21 @@ mod rust_vf_tests {
             .connect()
             .await
             .unwrap();
+        (channel, handle)
+    }
+
+    async fn evaluate_against(
+        stub: EvaluateStub,
+        client_timeout_ms: u64,
+        tweet_count: usize,
+    ) -> (Result<Vec<EvaluationResult>>, Arc<RecordingReceiver>) {
+        let (channel, handle) = serve_stub(stub).await;
         let client = XaiVfClient::from_channel(channel).with_timeout_ms(client_timeout_ms);
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert("twittercontext", "ctx".parse().unwrap());
         let sr = Arc::new(RecordingReceiver::default());
         let request_metrics =
-            RequestMetrics::with_receiver(ClientRpc::EvaluateTweets, Some(sr.clone()));
+            RequestMetrics::with_receiver(&ClientRpc::EVALUATE_TWEETS, Some(sr.clone()));
         let result = tokio::spawn(async move {
             client
                 .evaluate_tweets_recording(
@@ -869,8 +798,7 @@ mod rust_vf_tests {
         let (results, sr) = evaluate_against(
             EvaluateStub {
                 requests: requests.clone(),
-                fail_chunks_smaller_than: 0,
-                hang: false,
+                ..Default::default()
             },
             1_000,
             XAI_VF_MAX_BATCH_SIZE + 1,
@@ -898,7 +826,7 @@ mod rust_vf_tests {
             EvaluateStub {
                 requests: requests.clone(),
                 fail_chunks_smaller_than: 2,
-                hang: false,
+                ..Default::default()
             },
             1_000,
             XAI_VF_MAX_BATCH_SIZE + 1,
@@ -913,8 +841,8 @@ mod rust_vf_tests {
         let (deadline, sr) = evaluate_against(
             EvaluateStub {
                 requests,
-                fail_chunks_smaller_than: 0,
                 hang: true,
+                ..Default::default()
             },
             50,
             XAI_VF_MAX_BATCH_SIZE + 1,
@@ -933,8 +861,27 @@ mod rust_vf_tests {
             .contains(&"observe_vm vf_client_evaluate_tweets_latency_ms_vm".to_string()));
     }
 
-    struct CapturingStub {
-        rpcs: Arc<std::sync::Mutex<Vec<Vec<vf_pb::TweetData>>>>,
+    #[tokio::test]
+    async fn a_batch_past_its_grpc_timeout_counts_as_deadline_exceeded() {
+        let (channel, handle) = serve_stub(EvaluateStub {
+            hang: true,
+            ..Default::default()
+        })
+        .await;
+        let mut rpc = tonic::Request::new(vf_pb::EvaluateTweetsRequest::default());
+        rpc.set_timeout(Duration::from_millis(50));
+        let status = make_vf_client(VfChannel::Wily(channel))
+            .evaluate_tweets(rpc)
+            .await
+            .unwrap_err();
+        handle.abort();
+        let sr = Arc::new(RecordingReceiver::default());
+        RequestMetrics::with_receiver(&ClientRpc::EVALUATE_TWEETS, Some(sr.clone()))
+            .batch(Duration::ZERO, Some(&status));
+        assert_eq!(
+            sr.counter("vf_client_evaluate_tweets_batch_error|code=deadline_exceeded"),
+            1
+        );
     }
 
     fn outcome_for(tweet_id: u64) -> vf_pb::tweet_evaluation::Outcome {
@@ -953,56 +900,15 @@ mod rust_vf_tests {
         }
     }
 
-    #[tonic::async_trait]
-    impl VisibilityFilteringService for CapturingStub {
-        async fn evaluate_tweets(
-            &self,
-            request: Request<vf_pb::EvaluateTweetsRequest>,
-        ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-            let tweets = request.into_inner().tweets;
-            self.rpcs.lock().unwrap().push(tweets.clone());
-            Ok(Response::new(vf_pb::EvaluateTweetsResponse {
-                results: tweets
-                    .iter()
-                    .map(|tweet| vf_pb::TweetEvaluation {
-                        outcome: Some(outcome_for(tweet.tweet_id)),
-                    })
-                    .collect(),
-            }))
-        }
-        async fn filter_tweets(
-            &self,
-            _: Request<vf_pb::VisibilityFilterRequest>,
-        ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
-        async fn get_safety_labels(
-            &self,
-            _: Request<vf_pb::GetSafetyLabelsRequest>,
-        ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
-    }
-
     async fn evaluate_capturing(
         tweets: Vec<vf_pb::TweetData>,
     ) -> (Vec<EvaluationResult>, Vec<Vec<vf_pb::TweetData>>) {
         let rpcs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(
-            Server::builder()
-                .add_service(
-                    VisibilityFilteringServiceServer::new(CapturingStub { rpcs: rpcs.clone() })
-                        .accept_compressed(CompressionEncoding::Zstd),
-                )
-                .serve_with_incoming(TcpListenerStream::new(listener)),
-        );
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
+        let (channel, handle) = serve_stub(EvaluateStub {
+            rpcs: rpcs.clone(),
+            ..Default::default()
+        })
+        .await;
         let results = XaiVfClient::from_channel(channel)
             .with_timeout_ms(10_000)
             .evaluate_tweets(
@@ -1124,7 +1030,7 @@ mod rust_vf_tests {
     }
 
     #[test]
-    fn results_to_map_converts_actions_and_fails_closed() {
+    fn chunk_results_converts_actions_and_fails_closed() {
         let results = vec![
             vf_pb::TweetVisibilityResult {
                 tweet_id: 1,
@@ -1170,7 +1076,10 @@ mod rust_vf_tests {
             },
         ];
 
-        let map = results_to_map(&[1, 2, 3, 4, 7], results);
+        let map: HashMap<u64, Result<TweetVisibility>> = chunk_results(&[1, 2, 3, 4, 7], results)
+            .into_iter()
+            .map(|(id, v)| (id, Ok(v)))
+            .collect();
 
         assert!(matches!(
             map.get(&1),
@@ -1261,7 +1170,7 @@ mod rust_vf_tests {
     }
 
     #[test]
-    fn results_to_map_converts_labels_and_fails_closed() {
+    fn chunk_results_converts_labels_and_fails_closed() {
         use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
         let results = vec![
@@ -1291,7 +1200,10 @@ mod rust_vf_tests {
             },
         ];
 
-        let map = results_to_map(&[1, 2, 3], results);
+        let map: HashMap<u64, Result<TweetVisibility>> = chunk_results(&[1, 2, 3], results)
+            .into_iter()
+            .map(|(id, v)| (id, Ok(v)))
+            .collect();
 
         match map.get(&1) {
             Some(Ok(r)) => {
@@ -1320,6 +1232,37 @@ mod rust_vf_tests {
         }
     }
 
+    #[test]
+    fn chunk_results_marks_only_unanswered_ids_not_evaluated() {
+        let allowed = |tweet_id| vf_pb::TweetVisibilityResult {
+            tweet_id,
+            action: Some(vf_pb::Action {
+                kind: Some(vf_pb::action::Kind::Allow(true)),
+            }),
+            filtered_reason: None,
+            safety_labels: None,
+        };
+        let actions = |results| -> Vec<(u64, Action)> {
+            chunk_results(&[1, 2, 2], results)
+                .into_iter()
+                .map(|(id, v)| (id, v.action))
+                .collect()
+        };
+
+        assert_eq!(
+            actions(vec![allowed(1), allowed(2), allowed(2)]),
+            vec![(1, Action::Allow), (2, Action::Allow), (2, Action::Allow)]
+        );
+        assert_eq!(
+            actions(vec![allowed(2), allowed(1)]),
+            vec![(2, Action::Allow), (1, Action::Allow)]
+        );
+        assert_eq!(
+            actions(vec![allowed(2)]),
+            vec![(2, Action::Allow), (1, Action::NotEvaluated)]
+        );
+    }
+
     #[derive(Clone, Default)]
     struct StubVfService {
         requests: Arc<Mutex<Vec<vf_pb::VisibilityFilterRequest>>>,
@@ -1327,13 +1270,6 @@ mod rust_vf_tests {
 
     #[tonic::async_trait]
     impl VisibilityFilteringService for StubVfService {
-        async fn evaluate_tweets(
-            &self,
-            _: Request<vf_pb::EvaluateTweetsRequest>,
-        ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
-
         async fn filter_tweets(
             &self,
             request: Request<vf_pb::VisibilityFilterRequest>,
@@ -1362,48 +1298,22 @@ mod rust_vf_tests {
                 .collect();
             Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
         }
-
-        async fn get_safety_labels(
-            &self,
-            _request: Request<vf_pb::GetSafetyLabelsRequest>,
-        ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-            unimplemented!()
-        }
     }
 
     async fn start_stub_server() -> (
-        SocketAddr,
+        XaiVfClient,
         tokio::task::JoinHandle<()>,
         Arc<Mutex<Vec<vf_pb::VisibilityFilterRequest>>>,
     ) {
         let service = StubVfService::default();
         let requests = service.requests.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let incoming = TcpListenerStream::new(listener);
-        let handle = tokio::spawn(async move {
-            Server::builder()
-                .add_service(
-                    VisibilityFilteringServiceServer::new(service)
-                        .accept_compressed(CompressionEncoding::Zstd)
-                        .send_compressed(CompressionEncoding::Zstd),
-                )
-                .serve_with_incoming(incoming)
-                .await
-                .unwrap();
-        });
-        (addr, handle, requests)
+        let (channel, handle) = serve_stub(service).await;
+        (XaiVfClient::from_channel(channel), handle, requests)
     }
 
     #[tokio::test]
     async fn get_result_keeps_block_directions_distinct() {
-        let (addr, handle, _requests) = start_stub_server().await;
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let client = XaiVfClient::from_channel(channel);
+        let (client, handle, _requests) = start_stub_server().await;
 
         let result = client
             .get_result(vec![10, 20], SafetyLevel::TimelineHome, 99, None)
@@ -1431,13 +1341,7 @@ mod rust_vf_tests {
 
     #[tokio::test]
     async fn get_result_forwards_country_code() {
-        let (addr, handle, requests) = start_stub_server().await;
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let client = XaiVfClient::from_channel(channel);
+        let (client, handle, requests) = start_stub_server().await;
 
         let with_country = TwitterContextViewer {
             request_country_code: "DE".to_string(),
@@ -1469,13 +1373,7 @@ mod rust_vf_tests {
 
     #[tokio::test]
     async fn get_result_chunks_large_batches() {
-        let (addr, handle, requests) = start_stub_server().await;
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let client = XaiVfClient::from_channel(channel);
+        let (client, handle, requests) = start_stub_server().await;
 
         let tweet_ids: Vec<u64> = (1..=(XAI_VF_MAX_BATCH_SIZE as u64 + 1)).collect();
         let result = client
@@ -1491,19 +1389,31 @@ mod rust_vf_tests {
     }
 
     #[tokio::test]
+    async fn a_chunk_waiting_for_an_endpoint_fails_at_the_client_deadline() {
+        let (channel, _endpoints) = Channel::balance_channel::<u8>(1);
+        let client = XaiVfClient::from_channel(channel).with_timeout_ms(50);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_result(vec![1, 2], SafetyLevel::TimelineHome, 99, None),
+        )
+        .await
+        .expect("the client deadline bounds a chunk");
+
+        assert_eq!(result.len(), 2);
+        for id in [1, 2] {
+            let err = result[&id].as_ref().unwrap_err().to_string();
+            assert!(err.contains(EVALUATION_DEADLINE_EXCEEDED), "{err}");
+        }
+    }
+
+    #[tokio::test]
     async fn get_result_partial_success_fills_missing_ids() {
         #[derive(Clone, Default)]
         struct PartialVfService;
 
         #[tonic::async_trait]
         impl VisibilityFilteringService for PartialVfService {
-            async fn evaluate_tweets(
-                &self,
-                _: Request<vf_pb::EvaluateTweetsRequest>,
-            ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-                Err(Status::unimplemented("unused"))
-            }
-
             async fn filter_tweets(
                 &self,
                 request: Request<vf_pb::VisibilityFilterRequest>,
@@ -1523,34 +1433,9 @@ mod rust_vf_tests {
                     }],
                 }))
             }
-
-            async fn get_safety_labels(
-                &self,
-                _request: Request<vf_pb::GetSafetyLabelsRequest>,
-            ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-                unimplemented!()
-            }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let incoming = TcpListenerStream::new(listener);
-        let handle = tokio::spawn(async move {
-            Server::builder()
-                .add_service(
-                    VisibilityFilteringServiceServer::new(PartialVfService)
-                        .accept_compressed(CompressionEncoding::Zstd)
-                        .send_compressed(CompressionEncoding::Zstd),
-                )
-                .serve_with_incoming(incoming)
-                .await
-                .unwrap();
-        });
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
+        let (channel, handle) = serve_stub(PartialVfService).await;
         let client = XaiVfClient::from_channel(channel);
 
         let result = client
@@ -1582,13 +1467,6 @@ mod rust_vf_tests {
 
         #[tonic::async_trait]
         impl VisibilityFilteringService for FailSecondChunkService {
-            async fn evaluate_tweets(
-                &self,
-                _: Request<vf_pb::EvaluateTweetsRequest>,
-            ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-                Err(Status::unimplemented("unused"))
-            }
-
             async fn filter_tweets(
                 &self,
                 request: Request<vf_pb::VisibilityFilterRequest>,
@@ -1615,34 +1493,9 @@ mod rust_vf_tests {
                     .collect();
                 Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
             }
-
-            async fn get_safety_labels(
-                &self,
-                _request: Request<vf_pb::GetSafetyLabelsRequest>,
-            ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-                unimplemented!()
-            }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let incoming = TcpListenerStream::new(listener);
-        let handle = tokio::spawn(async move {
-            Server::builder()
-                .add_service(
-                    VisibilityFilteringServiceServer::new(FailSecondChunkService)
-                        .accept_compressed(CompressionEncoding::Zstd)
-                        .send_compressed(CompressionEncoding::Zstd),
-                )
-                .serve_with_incoming(incoming)
-                .await
-                .unwrap();
-        });
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
+        let (channel, handle) = serve_stub(FailSecondChunkService).await;
         let client = XaiVfClient::from_channel(channel);
 
         let tweet_ids: Vec<u64> = (1..=(XAI_VF_MAX_BATCH_SIZE as u64 + 1)).collect();

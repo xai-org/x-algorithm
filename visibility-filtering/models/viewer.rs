@@ -304,6 +304,7 @@ impl ClientCapability {
         self.switches_on.contains(switch)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn with(self, switch: ClientSwitch) -> Self {
         Self {
@@ -329,9 +330,19 @@ impl Default for ClientCapability {
 }
 
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Client {
     #[default]
     Web,

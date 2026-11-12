@@ -65,6 +65,10 @@ impl<C: Candidate> Reads<C> for AuthorSafety {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "each variant is a leaf name the rule files and policy catalog spell"
+)]
 pub enum AuthorSafetyLeaf {
     AuthorIsSuspended,
     AuthorIsDeactivated,

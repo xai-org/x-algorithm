@@ -265,6 +265,7 @@ impl Fixture {
             prediction_id: 77,
             request_id: 88,
             request_time_ms: self.timestamp_ms,
+            is_debug_request: true,
             scoring_sequence: Some(Default::default()),
             retrieval_sequence: Some(Default::default()),
             seen_ids: (0..30).map(|i| self.base + i).collect(),

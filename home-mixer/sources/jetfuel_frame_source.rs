@@ -132,13 +132,16 @@ mod tests {
 
     #[test]
     fn frames_fetched_directly_from_jetfuel_are_left_to_their_own_source() {
-        let q = query_with(
-            &[(
-                "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled",
-                true,
-            )],
-            vec![],
-        );
+        let q = ScoredPostsQuery {
+            frame_dismissals: Some(std::collections::HashMap::new()),
+            ..query_with(
+                &[(
+                    "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled",
+                    true,
+                )],
+                vec![],
+            )
+        };
         assert!(frames::eligible(&q).next().is_some());
         assert!(!source(None).enable(&q));
     }

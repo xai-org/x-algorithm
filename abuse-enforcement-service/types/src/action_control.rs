@@ -226,7 +226,12 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-pub const PAGE_POST_LABELS: &[&str] = &["NsfwHighPrecision", "SoftNsfw"];
+pub const PAGE_POST_LABELS: &[&str] = &[
+    "NsfaHighPrecision",
+    "NsfaLimitedInventory",
+    "NsfwHighPrecision",
+    "SoftNsfw",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PostLabelName(&'static str);
@@ -1430,9 +1435,18 @@ mod tests {
         let a: PageAction = serde_json::from_str(soft).unwrap();
         assert_eq!(a.kind(), "SoftNsfw");
         assert_eq!(serde_json::to_string(&a).unwrap(), soft);
+        for nsfa in ["NsfaHighPrecision", "NsfaLimitedInventory"] {
+            let json = format!(r#"{{"kind":"post_label","label":"{nsfa}","lifetime":"7d"}}"#);
+            let a: PageAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(a.kind(), nsfa);
+            assert_eq!(a.entity(), ControlEntity::Post);
+            assert_eq!(serde_json::to_string(&a).unwrap(), json);
+        }
         for bad in [
             r#"{"kind":"post_label","label":"softnsfw","lifetime":"permanent"}"#,
             r#"{"kind":"post_label","label":"NsfwHighRecall","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfaHighRecall","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"nsfahighprecision","lifetime":"permanent"}"#,
             r#"{"kind":"post_label","label":"nsfwhighprecision","lifetime":"permanent"}"#,
             r#"{"kind":"post_label","label":"NsfwHighPrecision"}"#,
             r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"90d"}"#,

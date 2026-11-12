@@ -1,13 +1,9 @@
-use crate::ingress::{
-    self, NotificationPost, NotificationRequest, NotificationUser, Notifications,
-};
+use crate::ingress::{self, NotificationRequest};
 use crate::metrics::{self, Endpoint, RequestLevel, RequestMetrics};
-use crate::models::{AuthorId, Evaluation, NotificationKind, TweetId};
+use crate::models::{Evaluation, NotificationKind};
 use crate::params::ClientSwitches;
 use crate::post_evaluator::PostEvaluator;
-use crate::rules::SafetyLevel;
 use crate::treatment;
-use std::collections::HashMap;
 use std::sync::Arc;
 use strum::VariantArray;
 use tonic::{Request, Response, Status};
@@ -47,25 +43,31 @@ impl FilterNotificationsEndpoint {
                 )?;
                 let response = match notifications {
                     NotificationRequest::Users(users) => {
-                        let (by_actor, by_post) = context
-                            .scope(async {
-                                tokio::join!(
-                                    self.users(level, &users, &request_metrics),
-                                    self.recipient_posts(level, &users, &request_metrics),
-                                )
-                            })
+                        let judged = context
+                            .scope(self.post_evaluator.evaluate_user_notifications(
+                                level,
+                                &users.facts,
+                                &users.rows,
+                                &request_metrics,
+                            ))
                             .await;
                         self.client_switches.log_exposures(&users.facts);
                         respond(
                             &request_metrics,
-                            users.rows.iter().map(|&(kind, user)| {
-                                (kind, user_evaluation(user, &by_actor, &by_post))
-                            }),
+                            users
+                                .rows
+                                .iter()
+                                .map(|&(kind, user)| (kind, judged.evaluation(user))),
                         )
                     }
                     NotificationRequest::Posts(posts) => {
-                        let by_post = context
-                            .scope(self.posts(level, &posts, &request_metrics))
+                        let evaluations = context
+                            .scope(self.post_evaluator.evaluate_post_notifications(
+                                level,
+                                &posts.facts,
+                                &posts.rows,
+                                &request_metrics,
+                            ))
                             .await;
                         self.client_switches.log_exposures(&posts.facts);
                         respond(
@@ -73,12 +75,8 @@ impl FilterNotificationsEndpoint {
                             posts
                                 .rows
                                 .iter()
-                                .map(|&(kind, NotificationPost { post, actor })| {
-                                    (
-                                        kind,
-                                        by_post.get(&(post, kind, actor)).and_then(Option::as_ref),
-                                    )
-                                }),
+                                .zip(&evaluations)
+                                .map(|(&(kind, _), evaluation)| (kind, evaluation.as_ref())),
                         )
                     }
                 };
@@ -86,78 +84,6 @@ impl FilterNotificationsEndpoint {
             },
         )
         .await
-    }
-
-    async fn users(
-        &self,
-        level: SafetyLevel,
-        notifications: &Notifications<NotificationUser>,
-        metrics: &RequestMetrics,
-    ) -> HashMap<AuthorId, Option<Evaluation>> {
-        let mut actors: Vec<AuthorId> = notifications
-            .rows
-            .iter()
-            .map(|&(_, user)| user.actor)
-            .collect();
-        actors.sort_unstable_by_key(|actor| actor.0);
-        actors.dedup();
-        if actors.is_empty() {
-            return HashMap::new();
-        }
-        self.post_evaluator
-            .evaluate_users(level, notifications.facts.clone(), actors, metrics)
-            .await
-    }
-
-    async fn recipient_posts(
-        &self,
-        level: SafetyLevel,
-        notifications: &Notifications<NotificationUser>,
-        metrics: &RequestMetrics,
-    ) -> HashMap<TweetId, Result<(), Evaluation>> {
-        let mut posts: Vec<TweetId> = notifications
-            .rows
-            .iter()
-            .filter_map(|&(_, user)| user.recipient_post)
-            .collect();
-        posts.sort_unstable_by_key(|post| post.0);
-        posts.dedup();
-        if posts.is_empty() {
-            return HashMap::new();
-        }
-        self.post_evaluator
-            .resolve_recipient_posts(level, notifications.facts.clone(), posts, metrics)
-            .await
-    }
-
-    async fn posts(
-        &self,
-        level: SafetyLevel,
-        notifications: &Notifications<NotificationPost>,
-        metrics: &RequestMetrics,
-    ) -> HashMap<(TweetId, NotificationKind, AuthorId), Option<Evaluation>> {
-        let mut posts: Vec<_> = notifications
-            .rows
-            .iter()
-            .map(|&(kind, NotificationPost { post, actor })| (post, kind, actor))
-            .collect();
-        posts.sort_unstable_by_key(|&(post, kind, actor)| (post, kind, actor.0));
-        posts.dedup();
-        self.post_evaluator
-            .evaluate_post_notifications(level, notifications.facts.clone(), &posts, metrics)
-            .await
-    }
-}
-
-fn user_evaluation<'a>(
-    user: NotificationUser,
-    by_actor: &'a HashMap<AuthorId, Option<Evaluation>>,
-    by_post: &'a HashMap<TweetId, Result<(), Evaluation>>,
-) -> Option<&'a Evaluation> {
-    match user.recipient_post.map(|post| by_post.get(&post)) {
-        None | Some(Some(Ok(()))) => by_actor.get(&user.actor).and_then(Option::as_ref),
-        Some(Some(Err(evaluation))) => Some(evaluation),
-        Some(None) => None,
     }
 }
 

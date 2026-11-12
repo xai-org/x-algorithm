@@ -74,50 +74,36 @@ impl<E: Clone> FallbackCache<E> {
         batch: RawHydrationBatch<C::Value>,
     ) -> RawHydrationBatch<C::Value> {
         let mut counts = FallbackCacheCounts::default();
-        let resolved = batch
-            .into_hydrated()
-            .into_iter()
-            .map(|(key, hydrated)| {
-                let hydrated = match hydrated {
-                    Hydrated::Found(value) => {
-                        counts.resident += usize::from(self.set::<C>(key, &value));
-                        counts.fresh += 1;
-                        Hydrated::Found(value)
+        let mut resolved = batch.into_hydrated();
+        for (&key, hydrated) in &mut resolved {
+            match hydrated {
+                Hydrated::Found(value) => {
+                    counts.resident += usize::from(self.set::<C>(key, value));
+                    counts.fresh += 1;
+                }
+                Hydrated::NotFound => {
+                    counts.resident += usize::from(self.clear::<C>(key));
+                    counts.not_found += 1;
+                }
+                Hydrated::Partial(_) => match self.entries.get(&key).as_ref().and_then(C::get) {
+                    Some(cached) => {
+                        counts.resident += 1;
+                        counts.partial_stale += 1;
+                        *hydrated = Hydrated::Found(cached);
                     }
-                    Hydrated::NotFound => {
-                        counts.resident += usize::from(self.clear::<C>(key));
-                        counts.not_found += 1;
-                        Hydrated::NotFound
-                    }
-                    Hydrated::Partial(value) => {
-                        match self.entries.get(&key).as_ref().and_then(C::get) {
-                            Some(cached) => {
-                                counts.resident += 1;
-                                counts.partial_stale += 1;
-                                Hydrated::Found(cached)
-                            }
-                            None => {
-                                counts.partial += 1;
-                                Hydrated::Partial(value)
-                            }
+                    None => counts.partial += 1,
+                },
+                Hydrated::Failed | Hydrated::Unanswered => {
+                    match self.entries.get(&key).as_ref().and_then(C::get) {
+                        Some(value) => {
+                            counts.stale += 1;
+                            *hydrated = Hydrated::Found(value);
                         }
+                        None => counts.unavailable += 1,
                     }
-                    missed @ (Hydrated::Failed | Hydrated::Unanswered) => {
-                        match self.entries.get(&key).as_ref().and_then(C::get) {
-                            Some(value) => {
-                                counts.stale += 1;
-                                Hydrated::Found(value)
-                            }
-                            None => {
-                                counts.unavailable += 1;
-                                missed
-                            }
-                        }
-                    }
-                };
-                (key, hydrated)
-            })
-            .collect();
+                }
+            }
+        }
 
         counts.record(metrics, self.cache, C::NAME);
         if self

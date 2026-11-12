@@ -314,6 +314,7 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
             root_span,
         } = ctx;
         query.return_backbone_scores = true;
+        query.is_debug_request = true;
         let output = self.run_pipeline(query).instrument(root_span).await?;
 
         let debug_json = build_debug_json(&output.pipeline_result);

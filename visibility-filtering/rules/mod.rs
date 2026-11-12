@@ -5,7 +5,6 @@ mod catalog;
 mod context;
 mod defaults;
 pub mod engine;
-mod expansion;
 mod experiment;
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -23,23 +22,15 @@ use crate::models::{Placement, PostCandidate, ViewerFeatures};
 use crate::params::CountryLists;
 pub(crate) use action_kind::ActionKind;
 use context::RuleContext;
-pub use defaults::Effect;
 pub use engine::RuleEngine;
-pub(crate) use expansion::Expansion;
 #[cfg(test)]
 pub(crate) use experiment::Experiment;
 pub(crate) use experiment::{ExperimentSet, RequestExperiments};
 pub(crate) use rule_spec::RuleId;
 pub(crate) use rule_spec::observed::NoTrace;
-pub use rule_spec::observed::{NodeKind, NodeTrace, PolicyTrace, RowTrace, Skip, Witness};
-pub use rule_spec::{
-    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
-    CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,
-    PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf,
-    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
-    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
-};
-pub(crate) use safety_level::{LevelError, LevelSpec, QuoteEntries, RerenderReason, WireLevel};
+pub use rule_spec::observed::PolicyTrace;
+pub use rule_spec::{Predicate, RequestLeaf};
+pub(crate) use safety_level::{LevelError, QuoteEntries, RerenderReason, WireLevel};
 pub use safety_level::{Rpc, SafetyLevel};
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
@@ -69,7 +70,7 @@ pub(crate) enum CacheTier {
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum CacheResult {
+enum CacheResult {
     Hit,
     NotFound,
     Miss,
@@ -101,14 +102,24 @@ pub(crate) fn record_source_request(
     metrics.observe_vm(SOURCE_LATENCY_MS, &[source], elapsed_ms);
 }
 
-pub(crate) fn record_cache_keys(
-    metrics: &LabelMetrics,
-    tier: CacheTier,
-    result: CacheResult,
-    count: usize,
-) {
-    let labels = [("tier", tier.into()), ("result", result.into())];
-    metrics.incr(CACHE_KEYS, &labels, count);
+#[derive(Default)]
+pub(crate) struct CacheKeyCounts {
+    pub(crate) hit: usize,
+    pub(crate) not_found: usize,
+    pub(crate) miss: usize,
+    pub(crate) expired: usize,
+}
+
+pub(crate) fn record_cache_keys(metrics: &LabelMetrics, tier: CacheTier, counts: &CacheKeyCounts) {
+    for (result, count) in [
+        (CacheResult::Hit, counts.hit),
+        (CacheResult::NotFound, counts.not_found),
+        (CacheResult::Miss, counts.miss),
+        (CacheResult::Expired, counts.expired),
+    ] {
+        let labels = [("tier", tier.into()), ("result", result.into())];
+        metrics.incr(CACHE_KEYS, &labels, count);
+    }
 }
 
 pub(crate) fn record_manhattan_keys(metrics: &LabelMetrics, result: ManhattanResult, count: usize) {
@@ -118,11 +129,12 @@ pub(crate) fn record_manhattan_keys(metrics: &LabelMetrics, result: ManhattanRes
 pub(crate) fn record_cache_fallback_keys(
     metrics: &LabelMetrics,
     source: LabelSource,
-    reason: FallbackReason,
-    count: usize,
+    counts: BTreeMap<FallbackReason, usize>,
 ) {
-    let labels = [("source", source.into()), ("reason", reason.into())];
-    metrics.incr(CACHE_FALLBACK_KEYS, &labels, count);
+    for (reason, count) in counts {
+        let labels = [("source", source.into()), ("reason", reason.into())];
+        metrics.incr(CACHE_FALLBACK_KEYS, &labels, count);
+    }
 }
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]

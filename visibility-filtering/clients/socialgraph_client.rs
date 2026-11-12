@@ -83,12 +83,11 @@ pub trait SocialgraphClient: Send + Sync {
     ) -> Result<Vec<Option<HashSet<u64>>>, tonic::Status>;
 }
 
-fn decode_packed_ids(packed: &[u8]) -> HashSet<u64> {
+fn decode_packed_ids(packed: &[u8]) -> impl Iterator<Item = u64> + '_ {
     let (chunks, _remainder) = packed.as_chunks::<8>();
     chunks
         .iter()
         .map(|&arr| i64::from_le_bytes(arr).cast_unsigned())
-        .collect()
 }
 
 fn edge_membership_query(
@@ -250,10 +249,10 @@ mod tests {
             0x99, 0x88, 0x42, 0x24,
         ];
         assert_eq!(
-            decode_packed_ids(&packed),
-            HashSet::from([0x0102_0304_0506_0708, 0x8899_aabb_ccdd_eeff])
+            decode_packed_ids(&packed).collect::<Vec<_>>(),
+            [0x0102_0304_0506_0708, 0x8899_aabb_ccdd_eeff]
         );
-        assert!(decode_packed_ids(&[]).is_empty());
+        assert_eq!(decode_packed_ids(&[]).next(), None);
     }
 
     #[test]

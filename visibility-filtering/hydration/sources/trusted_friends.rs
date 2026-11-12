@@ -1,15 +1,12 @@
 use super::{source, Backends, Expired, Input, SourceFetch};
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
-use crate::hydration::hydrator::{Edge, EdgeKey};
-use std::collections::HashMap;
+use crate::clients::trusted_friends_client;
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
+use crate::hydration::hydrator::EdgeKey;
 #[cfg(test)]
 use {super::InMemoryCall, crate::hydration::hydrator::UserPair, std::collections::HashSet};
 
 impl SourceFetch for source::TrustedFriends {
-    const BACKEND_LABEL: &'static str = "trusted_friends";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = Some(Edge::TrustedFriends);
     type Key = EdgeKey;
     type Reply = RawHydrationBatch<bool>;
 
@@ -17,20 +14,16 @@ impl SourceFetch for source::TrustedFriends {
         let Some(viewer_id) = input.viewer_id else {
             return Ok(HydrationBatch::default());
         };
-        let answers = backends
-            .trusted_friends
-            .batch_is_member_or_owner(viewer_id, input.keys)
-            .await;
-        let answers: HashMap<_, _> = input
-            .keys
-            .iter()
-            .copied()
-            .zip(answers)
-            .map(|(list_id, answer)| (list_id, answer.map(Some)))
-            .collect();
-        Ok(HydrationBatch::from_results(
+        let answers = trusted_friends_client::batch_is_member_or_owner(
+            &backends.strato,
+            viewer_id,
+            input.keys,
+        )
+        .await;
+        Ok(HydrationBatch::from_results_with(
             input.keys.iter().copied(),
             answers,
+            |answer| Hydrated::from(answer.map(Some)),
         ))
     }
 

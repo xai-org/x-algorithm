@@ -1,4 +1,4 @@
-use xai_x_thrift::served_history::{EntityIdType, EntryWithItemIds, ServedHistory};
+use xai_x_thrift::served_history::{EntityIdType, ServedHistory};
 
 pub const FRAME_ENTITY_TYPE: EntityIdType = EntityIdType::ENTRY_POINT_PIVOT;
 
@@ -13,30 +13,6 @@ pub fn resume_index(history: &[ServedHistory], route: &str) -> Option<u32> {
         .filter(|(served_route, _)| *served_route == route)
         .map(|(_, index)| index)
         .max()
-}
-
-pub fn rested(history: &[ServedHistory], route: &str, fatigue_ms: i64, now_ms: i64) -> bool {
-    history
-        .iter()
-        .filter(|served| served.entries.iter().any(|entry| serves(entry, route)))
-        .filter_map(|served| served.served_time_ms)
-        .max()
-        .is_none_or(|last_served_ms| now_ms - last_served_ms >= fatigue_ms)
-}
-
-fn serves(entry: &EntryWithItemIds, route: &str) -> bool {
-    entry.entity_type == FRAME_ENTITY_TYPE
-        && entry
-            .item_ids
-            .iter()
-            .flatten()
-            .filter_map(|ids| ids.impression_id.as_deref())
-            .any(|fetch_route| {
-                fetch_route
-                    .split_once('?')
-                    .map_or(fetch_route, |(path, _)| path)
-                    == route
-            })
 }
 
 fn split_fetch_route(fetch_route: &str) -> Option<(&str, u32)> {

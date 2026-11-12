@@ -1,5 +1,5 @@
-use super::{CallRequest, FetcherMut, FetcherRef, Store};
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
+use super::{CallRequest, Store};
+use crate::hydration::batch::RawHydrationBatch;
 use crate::hydration::fetcher::{AnyFetcher, Fetcher};
 use crate::hydration::hydrator::{Edge, EdgeKey, UserPair};
 use crate::hydration::inventory::Answer;
@@ -8,16 +8,17 @@ use crate::hydration::Hydrator;
 
 impl Store {
     pub(super) fn claim_viewer_edge(&mut self, node: Hydrator, keys: Vec<u64>) -> Vec<u64> {
-        let edges: Vec<EdgeKey> = keys
-            .into_iter()
-            .filter_map(|key| self.viewer_edge(node, key))
-            .collect();
+        let (Some(source), Some(edge)) = (self.facts.viewer_id(), node.edge()) else {
+            return Vec::new();
+        };
         match self.edge_fetcher_mut(node) {
-            Some(fetcher) => fetcher
-                .claim(edges)
-                .into_iter()
-                .map(|edge| edge.pair.destination)
-                .collect(),
+            Some(fetcher) => fetcher.claim_by(keys, |&destination| EdgeKey {
+                edge,
+                pair: UserPair {
+                    source,
+                    destination,
+                },
+            }),
             None => Vec::new(),
         }
     }
@@ -31,10 +32,7 @@ impl Store {
     }
 
     pub(super) fn edge_fetcher(&self, node: Hydrator) -> Option<&Fetcher<bool, EdgeKey>> {
-        match self.fetchers.get(self.spec(node).fetcher()) {
-            FetcherRef::Edges(fetcher) => Some(fetcher),
-            FetcherRef::Keyed(_) => None,
-        }
+        self.fetchers.edges(self.spec(node).fetcher())
     }
 
     pub(super) fn edge_fetcher_mut(
@@ -42,10 +40,7 @@ impl Store {
         node: Hydrator,
     ) -> Option<&mut Fetcher<bool, EdgeKey>> {
         let fetcher = self.spec(node).fetcher();
-        match self.fetchers.get_mut(fetcher) {
-            FetcherMut::Edges(fetcher) => Some(fetcher),
-            FetcherMut::Keyed(_) => None,
-        }
+        self.fetchers.edges_mut(fetcher)
     }
 
     pub(super) fn answer(&self, node: Hydrator, key: u64) -> Option<Answer> {
@@ -55,7 +50,7 @@ impl Store {
                     .answer(self.viewer_edge(node, key)?),
             );
         }
-        Some(self.fetcher(node)?.answer(key))
+        self.keyed_answer(node, key)
     }
 
     pub(super) fn edge_holds(&self, node: Hydrator, key: u64) -> Option<bool> {
@@ -82,8 +77,8 @@ pub(in crate::hydration) trait Lands<K>: Batches {
 }
 
 impl<V: Send> Lands<u64> for RawHydrationBatch<V> {
-    fn land(self, fetcher: &mut Fetcher<V>, call: &CallRequest<'_>, _: Option<Edge>) {
-        fetcher.land(&call.keys, self);
+    fn land(self, fetcher: &mut Fetcher<V>, _: &CallRequest<'_>, _: Option<Edge>) {
+        fetcher.land(self);
     }
 }
 
@@ -118,18 +113,11 @@ fn land_edge(
     destinations: &[u64],
     answers: RawHydrationBatch<bool>,
 ) {
-    let key = |destination| EdgeKey {
+    fetcher.land_by(destinations, answers, |destination| EdgeKey {
         edge,
         pair: UserPair {
             source,
             destination,
         },
-    };
-    let claimed: Vec<EdgeKey> = destinations.iter().copied().map(key).collect();
-    let answers = answers
-        .into_hydrated()
-        .into_iter()
-        .map(|(destination, holds)| (key(destination), holds))
-        .collect();
-    fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));
+    });
 }

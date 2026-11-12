@@ -1,15 +1,13 @@
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tonic::async_trait;
 use tracing::{error, info, warn};
 use xai_cache::discovery::{WilyDiscovery, XdsDiscovery};
 use xai_cache::{
     CacheClient, ClientBuilder, ClientConfig, HashAlgorithm, KVCacheError, Key, Protocol, RingHash,
-    TlsConfig, Value,
+    TlsConfig,
 };
 use xai_manhattan::s2s::S2sConfig;
 use xai_stats_receiver::StatsReceiverExt;
@@ -17,7 +15,7 @@ use xai_stats_receiver::StatsReceiverExt;
 use crate::dragonfly::LabelCacheInvalidator;
 use crate::metrics::LabelMetrics;
 use crate::mh_client::{ManhattanLabelFetcher, MhLabelClient};
-use crate::remote::{CacheOpResult, CacheRead, RemoteSource};
+use crate::remote::{CacheRead, RemoteSource};
 use crate::source::SafetyLabelSource;
 use crate::warmer::{CacheWarmer, WarmFetcher};
 
@@ -135,15 +133,12 @@ impl LabelClients {
             cache_capacity,
             metrics,
         } = self;
-        let twemcache: Arc<dyn CacheRead> = match twemcache {
-            Some(twemcache) => twemcache,
-            None => Arc::new(NoTwemcache),
-        };
-        let mut remote = RemoteSource::new(twemcache, manhattan, metrics.clone());
-        if let Some(fetcher) = warm_fetcher {
-            info!("L2 cache warmer enabled");
-            remote = remote.with_warmer(CacheWarmer::spawn(fetcher, metrics.clone()));
-        }
+        let twemcache = twemcache.map(|twemcache| -> Arc<dyn CacheRead> { twemcache });
+        let warmer = warm_fetcher.map(|fetcher| {
+            info!("Twemcache warmer enabled");
+            CacheWarmer::spawn(fetcher, metrics.clone())
+        });
+        let mut remote = RemoteSource::new(twemcache, warmer, manhattan, metrics.clone());
         if let Some(dragonfly) = dragonfly {
             remote = remote.with_dragonfly(dragonfly);
         }
@@ -176,15 +171,6 @@ async fn connect_label_cache(
     .await?;
     warm_cache(&dragonfly).await;
     Ok(dragonfly)
-}
-
-struct NoTwemcache;
-
-#[async_trait]
-impl CacheRead for NoTwemcache {
-    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, CacheOpResult<Option<Value>>> {
-        keys.iter().map(|key| (key.clone(), Ok(None))).collect()
-    }
 }
 
 async fn retry<T, E, Fut>(
@@ -306,16 +292,10 @@ fn elapsed_ms(start: Instant) -> u64 {
     crate::dragonfly::millis(start.elapsed())
 }
 
-async fn warm_cache(twemcache: &CacheClient) {
+async fn warm_cache(cache: &CacheClient) {
     let start = Instant::now();
-    let key = match Key::new(b"slm_warmup".to_vec()) {
-        Ok(key) => key,
-        Err(e) => {
-            warn!(error = %e, "Cache warmup key construction failed (non-fatal)");
-            return;
-        }
-    };
-    match twemcache.multi_get(std::slice::from_ref(&key)).await {
+    let key = Key::from_bytes(b"slm_warmup".to_vec());
+    match cache.multi_get(std::slice::from_ref(&key)).await {
         Ok(map) => match map.get(&key) {
             Some(Ok(_)) => info!(latency_ms = elapsed_ms(start), "Cache warmup succeeded"),
             Some(Err(e)) => warn!(

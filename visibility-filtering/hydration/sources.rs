@@ -1,33 +1,28 @@
-use crate::clients::about_this_account_client::AboutThisAccountClient;
-use crate::clients::article_client::ArticleClient;
-use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::{EdgeQuery, SocialgraphClient};
-use crate::clients::trusted_friends_client::TrustedFriendsClient;
-use crate::clients::user_devices_client::UserDevicesClient;
-use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::WingmanClient;
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::community_source::{CommunityPost, CommunitySource};
 use crate::hydration::decode::author::{AuthorFallbackCache, AuthorNotFound};
 use crate::hydration::decode::tweet::TweetFallbackCache;
 use crate::hydration::execute::{send, InFlight, Timed};
-use crate::hydration::fetcher::{FetcherId, Fetchers};
-use crate::hydration::hydrator::Edge;
-use crate::hydration::store::{CallRequest, FetcherKey, FetcherMut, FetcherRef, Store};
+use crate::hydration::fetcher::{Fetcher, FetcherId, Fetchers};
+use crate::hydration::hydrator::{Edge, EdgeKey};
+use crate::hydration::inventory::Answer;
+use crate::hydration::store::{CallRequest, FetcherKey, Store};
 use crate::hydration::tweet_source::TweetSource;
 use crate::metrics::RequestMetrics;
-use crate::post_card::{PostCard, PostCards};
-use futures::future::{join, BoxFuture};
-use std::collections::{HashMap, HashSet};
+use futures::future::BoxFuture;
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
 use strum::VariantArray;
 use tonic::metadata::{MetadataMap, MetadataValue};
-use xai_core_entities::gizmoduck_client::QueryFields;
+use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
 use xai_core_entities::tweet_entity_service_client::TESClient;
 use xai_safety_label_source::SafetyLabelSource;
+use xai_strato::StratoGrpc;
 
 mod about_this_account;
 mod articles;
@@ -45,10 +40,7 @@ mod wingman;
 pub(crate) struct Expired;
 
 pub(crate) trait SourceFetch: 'static {
-    const BACKEND_LABEL: &'static str;
     const DECIDES_EXISTENCE: bool;
-    const NEEDS_VIEWER: bool;
-    const EDGE: Option<Edge>;
 
     type Key: Copy + Eq + Hash;
     type Reply: Batches;
@@ -125,6 +117,7 @@ pub(super) type Value<F> = <<F as SourceFetch>::Reply as Batches>::Value;
 
 pub(super) trait Registered: SourceFetch {
     const SOURCE: Source;
+    const EDGE: Option<Edge> = Edge::answered_from_the_viewer_by(Self::SOURCE);
 
     fn fetchers(all: &SourceFetchers) -> &Fetchers<Value<Self>, Self::Key>;
     fn fetchers_mut(all: &mut SourceFetchers) -> &mut Fetchers<Value<Self>, Self::Key>;
@@ -137,7 +130,7 @@ pub(crate) trait Held: SourceFetch {
 }
 
 macro_rules! sources {
-    ($($source:ident,)*) => {
+    ($($source:ident => $backend:literal,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
         pub(crate) enum Source {
             $($source,)*
@@ -154,16 +147,9 @@ macro_rules! sources {
                 }
             }
 
-            #[cfg(test)]
-            pub(super) const fn edge(self) -> Option<Edge> {
-                match self {
-                    $(Source::$source => <source::$source as SourceFetch>::EDGE,)*
-                }
-            }
-
             pub(super) const fn backend_label(self) -> &'static str {
                 match self {
-                    $(Source::$source => <source::$source as SourceFetch>::BACKEND_LABEL,)*
+                    $(Source::$source => $backend,)*
                 }
             }
 
@@ -173,7 +159,7 @@ macro_rules! sources {
                 sources: &'p dyn Sources,
                 context: CallContext<'p>,
                 timed: Timed<'p>,
-            ) -> Option<InFlight<'p>> {
+            ) -> InFlight<'p> {
                 match self {
                     $(Source::$source => send::<source::$source, dyn Sources>(
                         call, sources, context, timed, Reply::$source,
@@ -193,15 +179,27 @@ macro_rules! sources {
         }
 
         impl SourceFetchers {
-            pub(super) fn get(&self, id: FetcherId) -> FetcherRef<'_> {
+            pub(super) fn answer(&self, id: FetcherId, key: u64) -> Option<Answer> {
                 match id.source {
-                    $(Source::$source => FetcherKey::view(self.$source.of(id.owner)),)*
+                    $(Source::$source => FetcherKey::answer(self.$source.of(id.owner), key),)*
                 }
             }
 
-            pub(super) fn get_mut(&mut self, id: FetcherId) -> FetcherMut<'_> {
+            pub(super) fn claim(&mut self, id: FetcherId, keys: Vec<u64>) -> Vec<u64> {
                 match id.source {
-                    $(Source::$source => FetcherKey::view_mut(self.$source.of_mut(id.owner)),)*
+                    $(Source::$source => FetcherKey::claim(self.$source.of_mut(id.owner), keys),)*
+                }
+            }
+
+            pub(super) fn edges(&self, id: FetcherId) -> Option<&Fetcher<bool, EdgeKey>> {
+                match id.source {
+                    $(Source::$source => FetcherKey::edges(self.$source.of(id.owner)),)*
+                }
+            }
+
+            pub(super) fn edges_mut(&mut self, id: FetcherId) -> Option<&mut Fetcher<bool, EdgeKey>> {
+                match id.source {
+                    $(Source::$source => FetcherKey::edges_mut(self.$source.of_mut(id.owner)),)*
                 }
             }
         }
@@ -211,11 +209,9 @@ macro_rules! sources {
         }
 
         impl Reply {
-            pub(super) fn land(self, store: &mut Store, call: &CallRequest<'_>, elapsed: Duration) {
+            pub(super) fn land(self, store: &mut Store, call: &CallRequest<'_>) {
                 match self {
-                    $(Reply::$source(reply) => {
-                        store.land_reply::<source::$source>(call, reply, elapsed);
-                    })*
+                    $(Reply::$source(reply) => store.land_reply::<source::$source>(call, reply),)*
                 }
             }
         }
@@ -257,43 +253,39 @@ macro_rules! sources {
 }
 
 sources! {
-    TesPureCoreData,
-    TesTweetForVisibility,
-    TesConversationControl,
-    TesQuotedTweet,
-    TesTweetState,
-    SafetyLabels,
-    GizmoduckViewer,
-    GizmoduckAuthor,
-    Flock,
-    ViewerCountry,
-    Wingman,
-    CommunityModeration,
-    CommunityModerator,
-    CommunityViewerRemoved,
-    ArticleLifecycle,
-    ArticleMediaEntities,
-    ArticleCoverMedia,
-    TrustedFriends,
-    UserLocation,
-    GizmoduckActor,
-    ActorEmails,
-    ActorPhones,
+    TesPureCoreData => "tes",
+    TesTweetForVisibility => "tes",
+    TesConversationControl => "tes",
+    TesQuotedTweet => "tes",
+    TesTweetState => "tes",
+    SafetyLabels => "safety_labels",
+    GizmoduckViewer => "gizmoduck",
+    GizmoduckAuthor => "gizmoduck",
+    Flock => "socialgraph",
+    ViewerCountry => "about_this_account",
+    Wingman => "wingman",
+    CommunityModeration => "communities",
+    CommunityModerator => "communities",
+    CommunityViewerRemoved => "communities",
+    ArticleLifecycle => "articles",
+    ArticleMediaEntities => "articles",
+    ArticleCoverMedia => "articles",
+    TrustedFriends => "trusted_friends",
+    UserLocation => "geoduck",
+    GizmoduckActor => "gizmoduck",
+    ActorEmails => "notifinfra",
+    ActorPhones => "notifinfra",
 }
 
 pub(crate) struct Backends {
     pub(crate) tes: Arc<dyn TESClient + Send + Sync>,
     pub(crate) tweets: TweetSource,
-    pub(crate) gizmoduck: GizmoduckLookup,
+    pub(crate) gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
     pub(crate) socialgraph: Arc<dyn SocialgraphClient + Send + Sync>,
-    pub(crate) about_this_account: AboutThisAccountClient,
+    pub(crate) strato: StratoGrpc,
     pub(crate) wingman: Arc<dyn WingmanClient>,
-    pub(crate) articles: ArticleClient,
-    pub(crate) trusted_friends: TrustedFriendsClient,
-    pub(crate) user_location: UserLocationClient,
     pub(crate) safety_labels: Arc<SafetyLabelSource>,
     pub(crate) communities: CommunitySource,
-    pub(crate) user_devices: UserDevicesClient,
 }
 
 pub(crate) struct ProdSources {
@@ -320,50 +312,21 @@ pub fn test_users_metadata() -> MetadataMap {
     metadata
 }
 
-#[tonic::async_trait]
-impl PostCards for ProdSources {
-    async fn post_card(&self, tweet_id: u64) -> Option<PostCard> {
-        let (core, media) = join(
-            self.backends.tes.get_tweet_core_datas(vec![tweet_id]),
-            self.backends.tes.get_tweet_media_entities(vec![tweet_id]),
-        )
-        .await;
-        let core = only(core)?;
-        let author = only(
-            self.backends
-                .gizmoduck
-                .get_users(vec![core.author_id], &[QueryFields::PROFILE])
-                .await,
-        )
-        .and_then(|result| result.user);
-        Some(PostCard::new(
-            tweet_id,
-            core,
-            author.as_ref().map(|user| &user.profile),
-            &only(media).unwrap_or_default(),
-        ))
-    }
-}
-
 fn held_by(keys: &[u64], holders: Option<&HashSet<u64>>) -> RawHydrationBatch<bool> {
-    let answers: HashMap<u64, Result<Option<bool>, ()>> = keys
-        .iter()
-        .map(|&key| {
-            let held = holders
-                .map(|holders| Some(holders.contains(&key)))
-                .ok_or(());
-            (key, held)
-        })
-        .collect();
-    HydrationBatch::from_results(keys.iter().copied(), answers)
+    HydrationBatch::from_hydrated(
+        keys.iter()
+            .map(|&key| {
+                let held = holders.map_or(Hydrated::Failed, |holders| {
+                    Hydrated::Found(holders.contains(&key))
+                });
+                (key, held)
+            })
+            .collect(),
+    )
 }
 
 fn one_viewer_batch<V, E>(viewer_id: u64, answer: Result<Option<V>, E>) -> RawHydrationBatch<V> {
-    HydrationBatch::from_results([viewer_id], HashMap::from([(viewer_id, answer)]))
-}
-
-fn only<V, E>(answers: HashMap<u64, Result<Option<V>, E>>) -> Option<V> {
-    answers.into_values().next()?.ok().flatten()
+    HydrationBatch::from_hydrated(FxHashMap::from_iter([(viewer_id, Hydrated::from(answer))]))
 }
 
 #[cfg(test)]

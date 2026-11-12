@@ -11,13 +11,17 @@ pub(crate) enum Judged {
 
 pub(crate) const fn judged(kind: NotificationKind) -> Judged {
     match kind {
-        NotificationKind::Follow | NotificationKind::FollowRequestAccepted => Judged::Actor,
+        NotificationKind::Follow
+        | NotificationKind::FollowRequestAccepted
+        | NotificationKind::ContactJoined
+        | NotificationKind::AddedToList => Judged::Actor,
         NotificationKind::Like | NotificationKind::Repost => Judged::ActorOnRecipientPost,
         NotificationKind::Mention => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MENTION),
         NotificationKind::Reply => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_REPLY),
         NotificationKind::MediaTagged => {
             Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MEDIA_TAGGED)
         }
+        NotificationKind::Quote => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_QUOTE),
     }
 }
 

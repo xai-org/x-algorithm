@@ -929,14 +929,14 @@ pub(super) const SOFT_NSFW_NEW_USER_DROP_UNSPECIFIED: Rule = Rule {
 
 pub(super) const DO_NOT_AMPLIFY_DROP_UNDESIRABLE: Rule = Rule {
     id: RuleId::DoNotAmplify,
-    audience: NonAuthors,
+    audience: NonFollowers,
     when: all![TweetHasLabel(SafetyLabelType::DO_NOT_AMPLIFY)],
     action: drop_post(DropAs::PossiblyUndesirable),
 };
 
 pub(super) const MALICIOUS_URL_DROP_UNDESIRABLE: Rule = Rule {
     id: RuleId::MaliciousUrl,
-    audience: NonAuthors,
+    audience: NonFollowers,
     when: all![TweetHasLabel(SafetyLabelType::MALICIOUS_URL)],
     action: drop_post(DropAs::PossiblyUndesirable),
 };
@@ -1017,6 +1017,13 @@ pub(super) const DOWNRANK_SPAM_REPLY_UQF_DROP_UNSPECIFIED: Rule = Rule {
         ViewerHasUqfEnabled
     ],
     action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const SPAM_HIGH_RECALL_OON_DROP_UNDESIRABLE: Rule = Rule {
+    id: RuleId::SpamHighRecallOon,
+    audience: NonFollowers,
+    when: all![TweetHasLabel(SafetyLabelType::SPAM_HIGH_RECALL)],
+    action: drop_post(DropAs::PossiblyUndesirable),
 };
 
 pub(super) const RISKY_HIGH_VIZ_REPLY_OON_DROP_UNSPECIFIED: Rule = Rule {

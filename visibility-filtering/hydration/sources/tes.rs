@@ -1,12 +1,10 @@
 use super::{source, Backends, CallContext, Expired, Input, SourceFetch};
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::decode::tweet::{pure_core, PureCoreColumn, TweetRowColumn};
 use crate::hydration::execute::fall_back;
-use crate::hydration::hydrator::Edge;
 use crate::hydration::metrics::record_tweet_states;
 use crate::hydration::tweet_source::{decode_tweet, decode_tweet_state, TweetState};
 use crate::models::{PureCore, TweetFeatures};
-use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use xai_core_entities::entities::{ConversationControl, QuotedTweet};
 use xai_strato::Bytes;
@@ -14,17 +12,17 @@ use xai_strato::Bytes;
 use {super::InMemoryCall, xai_core_entities::entities::PureCoreData};
 
 impl SourceFetch for source::TesPureCoreData {
-    const BACKEND_LABEL: &'static str = "tes";
     const DECIDES_EXISTENCE: bool = true;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<PureCore>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
         let cores = backends.tes.get_tweet_core_datas(input.keys.to_vec()).await;
-        let cores = HydrationBatch::from_results(input.keys.iter().copied(), cores);
-        Ok(cores.map(|core| pure_core(&core)))
+        Ok(HydrationBatch::from_results_with(
+            input.keys.iter().copied(),
+            cores,
+            |core| Hydrated::from(core).map(|core| pure_core(&core)),
+        ))
     }
 
     fn fall_back(context: &CallContext<'_>, cores: Self::Reply) -> Self::Reply {
@@ -41,10 +39,7 @@ impl SourceFetch for source::TesPureCoreData {
 }
 
 impl SourceFetch for source::TesTweetForVisibility {
-    const BACKEND_LABEL: &'static str = "tes";
     const DECIDES_EXISTENCE: bool = true;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<TweetFeatures>;
 
@@ -67,10 +62,7 @@ impl SourceFetch for source::TesTweetForVisibility {
 }
 
 impl SourceFetch for source::TesConversationControl {
-    const BACKEND_LABEL: &'static str = "tes";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<ConversationControl>;
 
@@ -95,10 +87,7 @@ impl SourceFetch for source::TesConversationControl {
 }
 
 impl SourceFetch for source::TesQuotedTweet {
-    const BACKEND_LABEL: &'static str = "tes";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<QuotedTweet>;
 
@@ -120,10 +109,7 @@ impl SourceFetch for source::TesQuotedTweet {
 }
 
 impl SourceFetch for source::TesTweetState {
-    const BACKEND_LABEL: &'static str = "tes";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<TweetState>;
 
@@ -150,11 +136,9 @@ fn tweet_batch<V>(
     values: HashMap<u64, anyhow::Result<Bytes>>,
     decode: fn(&[u8]) -> anyhow::Result<Option<V>>,
 ) -> RawHydrationBatch<V> {
-    let tweets: FxHashMap<_, _> = values
-        .into_iter()
-        .map(|(id, value)| (id, value.and_then(|bytes| decode(&bytes))))
-        .collect();
-    HydrationBatch::from_results(tweet_ids.iter().copied(), tweets)
+    HydrationBatch::from_results_with(tweet_ids.iter().copied(), values, |value| {
+        Hydrated::from(value.and_then(|bytes| decode(&bytes)))
+    })
 }
 
 #[cfg(test)]

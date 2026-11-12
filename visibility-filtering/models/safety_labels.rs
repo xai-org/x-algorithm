@@ -1,12 +1,12 @@
 pub use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use xai_visibility_filtering_proto as vf_pb;
 
 #[derive(Clone, Debug, Default)]
 pub struct SafetyLabelMap {
-    types: HashSet<SafetyLabelType>,
-    by_agent: HashSet<SafetyLabelType>,
+    types: FxHashSet<SafetyLabelType>,
+    by_agent: FxHashSet<SafetyLabelType>,
     sources: Vec<(SafetyLabelType, String)>,
 }
 
@@ -22,10 +22,10 @@ impl SafetyLabelMap {
     ];
 
     #[cfg(test)]
-    pub fn new(label_types: HashSet<SafetyLabelType>) -> Self {
+    pub fn new(label_types: impl IntoIterator<Item = SafetyLabelType>) -> Self {
         Self {
-            types: label_types,
-            by_agent: HashSet::new(),
+            types: label_types.into_iter().collect(),
+            by_agent: FxHashSet::default(),
             sources: Vec::new(),
         }
     }

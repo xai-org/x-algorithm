@@ -65,6 +65,7 @@ mod tests {
         FrameDef {
             route,
             fetch: Fetch::Strato,
+            fatigue: None,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::Pinned { rank },
@@ -77,6 +78,7 @@ mod tests {
         FrameDef {
             route,
             fetch: Fetch::Strato,
+            fatigue: None,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::EveryNItems {

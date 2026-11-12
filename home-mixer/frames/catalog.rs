@@ -1,5 +1,4 @@
 use super::placement::Placement;
-use super::served::rested;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     EnableJetfuelFrameGrokbotSuggestedTasks, EnableJetfuelFrameMlbCarousel, EnableJetfuelFrameNfl,
@@ -30,9 +29,24 @@ pub enum Fetch {
     Jetfuel { height: i32 },
 }
 
+#[derive(Clone, Copy)]
+pub struct Fatigue {
+    pub served_key: &'static str,
+    pub dismissal_key: &'static str,
+    pub hours: fn(&ScoredPostsQuery) -> u32,
+}
+
+impl Fatigue {
+    pub fn window_ms(self, query: &ScoredPostsQuery) -> Option<i64> {
+        let hours = (self.hours)(query);
+        (hours > 0).then_some(i64::from(hours) * 3_600_000)
+    }
+}
+
 pub struct FrameDef {
     pub route: &'static str,
     pub fetch: Fetch,
+    pub fatigue: Option<Fatigue>,
     pub is_dismissible: bool,
     pub placement_id: i64,
     pub placement: Placement,
@@ -67,8 +81,10 @@ pub const MLB_TOPIC_ID: i64 = 1925951672561319936;
 pub const BASEBALL_TOPIC_ID: i64 = 1925950576740675584;
 
 pub const GROKBOT_SUGGESTED_TASKS_ROUTE: &str = "/grokbot/suggested_tasks";
+pub const GROKBOT_SUGGESTED_TASKS_SERVED_KEY: &str = "home.grokbot_suggested_tasks.served";
+pub const GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY: &str = "home.grokbot_suggested_tasks";
 const GROKBOT_SUGGESTED_TASKS_SLOT: usize = 3;
-const GROKBOT_SUGGESTED_TASKS_HEIGHT: i32 = 0;
+const GROKBOT_SUGGESTED_TASKS_HEIGHT: i32 = 433;
 
 const NFL_ROTATION_INTERVAL: usize = 7;
 
@@ -81,20 +97,18 @@ pub const TIMELINES: &[Timeline] = &[
             fetch: Fetch::Jetfuel {
                 height: GROKBOT_SUGGESTED_TASKS_HEIGHT,
             },
+            fatigue: Some(Fatigue {
+                served_key: GROKBOT_SUGGESTED_TASKS_SERVED_KEY,
+                dismissal_key: GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY,
+                hours: |q| q.params.get(JetfuelFrameGrokbotSuggestedTasksFatigueHours),
+            }),
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::AtSlot {
                 slot: GROKBOT_SUGGESTED_TASKS_SLOT,
             },
             cadence: Cadence::FirstResponseExceptPolling,
-            enabled: |q| {
-                rested(
-                    &q.served_history,
-                    GROKBOT_SUGGESTED_TASKS_ROUTE,
-                    q.params.get(JetfuelFrameGrokbotSuggestedTasksFatigueHours) as i64 * 3_600_000,
-                    q.request_time_ms,
-                )
-            },
+            enabled: |_| true,
         }],
     },
     Timeline {
@@ -103,6 +117,7 @@ pub const TIMELINES: &[Timeline] = &[
         frames: &[FrameDef {
             route: "/cards/soccer/timelineCarousel",
             fetch: Fetch::Strato,
+            fatigue: None,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::Pinned { rank: 0 },
@@ -117,6 +132,7 @@ pub const TIMELINES: &[Timeline] = &[
             FrameDef {
                 route: "/cards/nfl/timeline/pinned",
                 fetch: Fetch::Strato,
+                fatigue: None,
                 is_dismissible: false,
                 placement_id: 0,
                 placement: Placement::Pinned { rank: 0 },
@@ -126,6 +142,7 @@ pub const TIMELINES: &[Timeline] = &[
             FrameDef {
                 route: "/cards/nfl/timeline/card",
                 fetch: Fetch::Strato,
+                fatigue: None,
                 is_dismissible: false,
                 placement_id: 0,
                 placement: Placement::EveryNItems {
@@ -144,6 +161,7 @@ pub const TIMELINES: &[Timeline] = &[
         frames: &[FrameDef {
             route: "/cards/mlb/timelineCarousel",
             fetch: Fetch::Strato,
+            fatigue: None,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::Pinned { rank: 0 },
@@ -157,6 +175,7 @@ pub const TIMELINES: &[Timeline] = &[
         frames: &[FrameDef {
             route: "/cards/mlb/timelineCarousel",
             fetch: Fetch::Strato,
+            fatigue: None,
             is_dismissible: false,
             placement_id: 0,
             placement: Placement::Pinned { rank: 0 },
@@ -174,7 +193,33 @@ pub fn placement_for_route(route: &str) -> Option<Placement> {
     placement_in(TIMELINES, route)
 }
 
+pub fn fatigue_for_route(route: &str) -> Option<Fatigue> {
+    TIMELINES
+        .iter()
+        .flat_map(|timeline| timeline.frames.iter())
+        .find(|frame| frame.route == route)
+        .and_then(|frame| frame.fatigue)
+}
+
+pub fn fatigue_keys(query: &ScoredPostsQuery) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = candidates_in(TIMELINES, query)
+        .filter_map(|frame| frame.fatigue)
+        .filter(|fatigue| fatigue.window_ms(query).is_some())
+        .flat_map(|fatigue| [fatigue.served_key, fatigue.dismissal_key])
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 pub(super) fn eligible_in<'a>(
+    timelines: &'static [Timeline],
+    query: &'a ScoredPostsQuery,
+) -> impl Iterator<Item = &'static FrameDef> + 'a {
+    candidates_in(timelines, query).filter(move |frame| !fatigued(frame, query))
+}
+
+fn candidates_in<'a>(
     timelines: &'static [Timeline],
     query: &'a ScoredPostsQuery,
 ) -> impl Iterator<Item = &'static FrameDef> + 'a {
@@ -188,6 +233,21 @@ pub(super) fn eligible_in<'a>(
         .filter(move |frame| frame.cadence.should_emit(query) && (frame.enabled)(query))
 }
 
+fn fatigued(frame: &FrameDef, query: &ScoredPostsQuery) -> bool {
+    let Some(fatigue) = frame
+        .fatigue
+        .filter(|fatigue| fatigue.window_ms(query).is_some())
+    else {
+        return false;
+    };
+    query.frame_dismissals.as_ref().is_none_or(|dismissals| {
+        [fatigue.served_key, fatigue.dismissal_key]
+            .iter()
+            .filter_map(|key| dismissals.get(*key))
+            .any(|&expires_at_ms| expires_at_ms > query.request_time_ms)
+    })
+}
+
 pub(super) fn placement_in(timelines: &'static [Timeline], route: &str) -> Option<Placement> {
     timelines
         .iter()
@@ -199,11 +259,8 @@ pub(super) fn placement_in(timelines: &'static [Timeline], route: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::FRAME_ENTITY_TYPE;
+    use std::collections::HashMap;
     use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
-    use xai_x_thrift::served_history::{
-        EntryWithItemIds, ItemIds, RequestType as ServedRequestType, ServedHistory,
-    };
 
     const HOUR_MS: i64 = 3_600_000;
     const NOW_MS: i64 = 1_000 * HOUR_MS;
@@ -240,34 +297,8 @@ mod tests {
             user_id: 1,
             request_time_ms: NOW_MS,
             params: results.into(),
+            frame_dismissals: Some(HashMap::new()),
             ..Default::default()
-        }
-    }
-
-    fn served_frame(route: &str, served_time_ms: i64) -> ServedHistory {
-        ServedHistory {
-            request_type: ServedRequestType::INITIAL,
-            served_id: None,
-            served_time_ms: Some(served_time_ms),
-            entries: vec![EntryWithItemIds {
-                entity_type: FRAME_ENTITY_TYPE,
-                sort_index: None,
-                size: None,
-                item_ids: Some(vec![ItemIds {
-                    tweet_id: None,
-                    source_tweet_id: None,
-                    quote_tweet_id: None,
-                    source_author_id: None,
-                    quote_author_id: None,
-                    in_reply_to_tweet_id: None,
-                    in_reply_to_author_id: None,
-                    article_id: None,
-                    tweet_score: None,
-                    entry_id_to_replace: None,
-                    user_id: None,
-                    impression_id: Some(route.to_string()),
-                }]),
-            }],
         }
     }
 
@@ -313,19 +344,50 @@ mod tests {
     }
 
     #[test]
-    fn grokbot_suggested_tasks_frame_rests_for_its_fatigue_window() {
-        let served_at = |hours_ago: i64| ScoredPostsQuery {
-            served_history: vec![
-                served_frame("/cards/nfl/timeline/card?i=3", NOW_MS),
-                served_frame(GROKBOT_SUGGESTED_TASKS_ROUTE, NOW_MS - hours_ago * HOUR_MS),
-            ],
-            ..home_query(true, 24)
+    fn grokbot_suggested_tasks_frame_stays_hidden_while_its_served_or_dismissed_time_runs() {
+        for key in [
+            GROKBOT_SUGGESTED_TASKS_SERVED_KEY,
+            GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY,
+        ] {
+            let hidden_until = |expires_at_ms: i64| ScoredPostsQuery {
+                frame_dismissals: Some(HashMap::from([(key.to_string(), expires_at_ms)])),
+                ..home_query(true, 6)
+            };
+            assert!(eligible_routes(&hidden_until(NOW_MS + 1)).is_empty());
+            assert_eq!(
+                eligible_routes(&hidden_until(NOW_MS)),
+                vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
+            );
+        }
+    }
+
+    #[test]
+    fn grokbot_suggested_tasks_frame_is_hidden_when_its_dismissal_could_not_be_read() {
+        let unread = ScoredPostsQuery {
+            frame_dismissals: None,
+            ..home_query(true, 6)
         };
-        assert!(eligible_routes(&served_at(23)).is_empty());
+        assert!(eligible_routes(&unread).is_empty());
         assert_eq!(
-            eligible_routes(&served_at(24)),
+            fatigue_keys(&unread),
+            vec![
+                GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY,
+                GROKBOT_SUGGESTED_TASKS_SERVED_KEY
+            ]
+        );
+    }
+
+    #[test]
+    fn grokbot_suggested_tasks_frame_never_fatigues_when_its_fatigue_is_zero() {
+        let never_fatigued = ScoredPostsQuery {
+            frame_dismissals: None,
+            ..home_query(true, 0)
+        };
+        assert_eq!(
+            eligible_routes(&never_fatigued),
             vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
         );
+        assert!(fatigue_keys(&never_fatigued).is_empty());
     }
 
     #[test]

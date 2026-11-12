@@ -78,8 +78,8 @@ pub(super) fn catalog() -> String {
          ## Precedence\n\n\
          A level folds its user list, then its post list. Each list folds in this order of\n\
          action and keeps its listed order within one action, so every user rule comes before\n\
-         every post rule. The first withholding decides; the slots fill as `GLOSSARY.md` (Slot)\n\
-         says.\n\n\
+         every post rule. The first withholding or FOSNR notice that applies decides; the slots\n\
+         fill as `GLOSSARY.md` (Slot) says.\n\n\
          | Action | Slot |\n|---|---|\n",
     );
     let mut kinds: Vec<(&str, &str)> = rules.iter().map(|(entry, _)| entry.kind_and_slot).collect();
@@ -178,7 +178,7 @@ mod tests {
             .filter(|rule| {
                 matches!(
                     rule.action.spec(),
-                    ActionSpec::Drop(DropReason::NsfwViewer(_))
+                    ActionSpec::Drop(reason) if matches!(reason.reason(), DropReason::NsfwViewer(_))
                 )
             })
             .map(|rule| rule_name(rule.id, &rule.action))

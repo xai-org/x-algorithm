@@ -72,6 +72,13 @@ message ClientContext {
   string client_version = 20;
   string time_zone = 21;
   string device_network_type = 23;
+  DeviceOrientation device_orientation = 24;
+}
+
+enum DeviceOrientation {
+  DEVICE_ORIENTATION_UNSPECIFIED = 0;
+  DEVICE_ORIENTATION_PORTRAIT = 1;
+  DEVICE_ORIENTATION_LANDSCAPE = 2;
 }
 
 message UserContext {
@@ -1982,6 +1989,7 @@ enum UserActionAggregationType {
   IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
   DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
   DENSE_WITH_RECENT_IMPRESSIONS = 34;
+  IMMERSIVE_LONG_DWELL_GALLERY_3S = 36;
   reserved 33, 35;
 }
 

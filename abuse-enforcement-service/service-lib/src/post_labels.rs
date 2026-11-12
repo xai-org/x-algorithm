@@ -207,6 +207,8 @@ mod tests {
         let by_name: HashMap<&str, i32> = names.iter().map(|(v, n)| (n.as_str(), *v)).collect();
         assert_eq!(by_name.get("NsfwHighPrecision"), Some(&3));
         assert_eq!(by_name.get("SoftNsfw"), Some(&193));
+        assert_eq!(by_name.get("NsfaHighPrecision"), Some(&155));
+        assert_eq!(by_name.get("NsfaLimitedInventory"), Some(&182));
         for label in xai_abuse_enforcement_types::action_control::PAGE_POST_LABELS
             .iter()
             .chain(&["SpamHighRecall", "RiskyHighVizReply"])

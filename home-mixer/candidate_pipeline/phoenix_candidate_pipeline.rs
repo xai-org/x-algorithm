@@ -138,7 +138,6 @@ use crate::sources::phoenix_moe_source::PhoenixMOESource;
 use crate::sources::phoenix_source::PhoenixSource;
 use crate::sources::phoenix_topics_source::PhoenixTopicsSource;
 use crate::sources::popular_posts_source::PopularPostsSource;
-use crate::sources::shuffled_history_phoenix_source::ShuffledHistoryPhoenixSource;
 use crate::sources::sid_source::SidSource;
 use crate::sources::simclusters_source::SimclustersSource;
 use crate::sources::thunder_source::ThunderSource;
@@ -360,9 +359,6 @@ impl PhoenixCandidatePipeline {
         let phoenix_source = Box::new(PhoenixSource {
             phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
-        let shuffled_history_phoenix_source = Box::new(ShuffledHistoryPhoenixSource {
-            phoenix_retrieval_client: phoenix_retrieval_client.clone(),
-        });
         let phoenix_topics_source = Box::new(PhoenixTopicsSource {
             phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
@@ -392,7 +388,6 @@ impl PhoenixCandidatePipeline {
             tweet_mixer_source,
             simclusters_source,
             phoenix_source,
-            shuffled_history_phoenix_source,
             phoenix_topics_source,
             phoenix_moe_source,
             sid_source,
@@ -1160,6 +1155,10 @@ impl CandidatePipeline<ScoredPostsQuery, PostCandidate> for PhoenixCandidatePipe
     fn result_size(&self) -> usize {
         params::RESULT_SIZE
     }
+
+    fn retain_retrieved_candidates(&self, query: &ScoredPostsQuery) -> bool {
+        query.is_debug_request
+    }
 }
 
 #[cfg(test)]
@@ -1205,6 +1204,16 @@ mod tests {
             .last()
             .map(|filter| filter.name());
         assert_eq!(last, Some("VideoCarouselFilter"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn retrieved_candidates_are_retained_only_for_debug_requests() {
+        xai_init_utils::init().rustls();
+        let pipeline = PhoenixCandidatePipeline::mock().await;
+        let mut query = ScoredPostsQuery::default();
+        assert!(!pipeline.retain_retrieved_candidates(&query));
+        query.is_debug_request = true;
+        assert!(pipeline.retain_retrieved_candidates(&query));
     }
 
     #[test]

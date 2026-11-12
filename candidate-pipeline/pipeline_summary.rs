@@ -183,6 +183,12 @@ impl ComponentStats {
         self.record();
     }
 
+    pub fn finish_with_errors(mut self, input: usize, errors: usize) {
+        self.component.input_count = Some(input);
+        self.component.errors = Some(errors);
+        self.record();
+    }
+
     pub fn finish_filter(mut self, kept: usize, removed: usize) {
         self.component.input_count = Some(kept + removed);
         self.component.kept = Some(kept);

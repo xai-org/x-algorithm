@@ -133,6 +133,27 @@ pub(super) fn rows() -> Vec<Row> {
             at: vec![],
         },
         Row {
+            name: "misinfo_civic_label_naming_a_dynamic_product_ad_limit",
+            subject: Subject::Post(
+                candidate()
+                    .tweet_id(POSTED_2020)
+                    .with_label_source(SafetyLabelType::MISINFO_CIVIC, "dynamic_product_ad")
+                    .build(),
+            ),
+            expect: vec![(
+                Role::NonFollower,
+                label_interstitial(
+                    public_interest(
+                        SafetyResultReason::MISINFO_CIVIC,
+                        Some(LimitedEngagementReason::DynamicProductAd),
+                    ),
+                    "public_interest/label_interstitial",
+                    None,
+                ),
+            )],
+            at: vec![],
+        },
+        Row {
             name: "low_quality_label_before_public_interest_labels",
             subject: Subject::Post(
                 candidate()

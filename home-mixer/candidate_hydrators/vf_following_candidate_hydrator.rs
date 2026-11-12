@@ -6,8 +6,9 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::async_trait;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_twittercontext_proto::GetTwitterContextViewer;
+use xai_visibility_filtering::models::{Action, FilteredReason};
 use xai_visibility_filtering::vf_client::SafetyLevel::TimelineHome;
 use xai_visibility_filtering::vf_client::{TweetVisibility, VfClient};
 
@@ -28,13 +29,21 @@ impl VFFollowingCandidateHydrator {
     }
 }
 
+pub struct Visibility {
+    action: Option<Action>,
+    reason: Option<FilteredReason>,
+    drop_ancillary_posts: bool,
+}
+
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator {
-    async fn hydrate(
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator {
+    type Fetched = Vec<Option<Visibility>>;
+
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Vec<Option<Visibility>>, String> {
         let context = query.get_viewer();
         let client = if query.params.get(EnableXaiVfClient) {
             &self.xai_vf_client
@@ -64,28 +73,39 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
                 .await
         };
 
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let primary_result = all_results.get(&candidate.tweet_id);
-            let (visibility_action, visibility_reason) = visibility_fields(primary_result);
-
-            let drop_ancillary = should_drop_ancillary(candidate, &all_results);
-
-            let hydrated = match primary_result {
-                Some(Err(err)) => Err(err.to_string()),
-                _ => Ok(PostCandidate {
-                    visibility_action,
-                    visibility_reason,
-                    drop_ancillary_posts: Some(drop_ancillary),
-                    ..Default::default()
-                }),
-            };
-            hydrated_candidates.push(hydrated);
-        }
-        hydrated_candidates
+        Ok(candidates
+            .iter()
+            .map(|candidate| {
+                let primary_result = all_results.get(&candidate.tweet_id);
+                if let Some(Err(_)) = primary_result {
+                    return None;
+                }
+                let (action, reason) = visibility_fields(primary_result);
+                Some(Visibility {
+                    action,
+                    reason,
+                    drop_ancillary_posts: should_drop_ancillary(candidate, &all_results),
+                })
+            })
+            .collect())
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        visibility: Vec<Option<Visibility>>,
+    ) {
+        for (candidate, visibility) in candidates.iter_mut().zip(visibility) {
+            if let Some(visibility) = visibility {
+                candidate.visibility_action = visibility.action;
+                candidate.visibility_reason = visibility.reason;
+                candidate.drop_ancillary_posts = Some(visibility.drop_ancillary_posts);
+            }
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.visibility_action = hydrated.visibility_action;
         candidate.visibility_reason = hydrated.visibility_reason;
         candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;

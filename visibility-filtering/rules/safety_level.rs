@@ -16,7 +16,9 @@ pub enum Rpc {
     EvaluateTweets,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+)]
 #[strum(serialize_all = "snake_case")]
 pub enum SafetyLevel {
     FilterAll,
@@ -227,20 +229,11 @@ impl SafetyLevel {
             .ok_or(LevelError::NotServed)
     }
 
-    pub(crate) fn may_merge_retweets(self) -> bool {
-        match self.spec() {
-            LevelSpec::Posts(post) => post.evaluate_tweets.is_some(),
-            LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. } => false,
-        }
-    }
-
     pub(crate) fn is_carried_by(self, rpc: Rpc) -> bool {
         match (rpc, self.spec()) {
             (Rpc::FilterTweets, LevelSpec::Posts(post)) => post.proto.is_some(),
-            (Rpc::FilterTweets, LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. }) => {
-                false
-            }
-            (Rpc::EvaluateTweets, _) => self.may_merge_retweets(),
+            (Rpc::EvaluateTweets, LevelSpec::Posts(post)) => post.evaluate_tweets.is_some(),
+            (_, LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. }) => false,
         }
     }
 }

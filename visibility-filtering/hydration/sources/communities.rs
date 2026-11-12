@@ -1,15 +1,11 @@
 use super::{source, Backends, Expired, Input, SourceFetch};
 use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
-use crate::hydration::hydrator::Edge;
 use crate::models::CommunityModeration;
 #[cfg(test)]
 use {super::InMemoryCall, std::collections::HashMap, std::collections::HashSet};
 
 impl SourceFetch for source::CommunityModeration {
-    const BACKEND_LABEL: &'static str = "communities";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<CommunityModeration>;
 
@@ -39,10 +35,7 @@ impl SourceFetch for source::CommunityModeration {
 }
 
 impl SourceFetch for source::CommunityModerator {
-    const BACKEND_LABEL: &'static str = "communities";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<bool>;
 
@@ -67,10 +60,7 @@ impl SourceFetch for source::CommunityModerator {
 }
 
 impl SourceFetch for source::CommunityViewerRemoved {
-    const BACKEND_LABEL: &'static str = "communities";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<bool>;
 
@@ -105,6 +95,31 @@ mod tests {
     use crate::models::{ClientCapability, CommunityModeration};
     use crate::rules::SafetyLevel;
     use crate::scenario::{raw, InRequestOrder};
+
+    #[tokio::test]
+    async fn a_repeated_post_is_looked_up_for_its_first_occurrences_author() {
+        use crate::hydration::community_source::CommunityPost;
+        let posts = 1..=25;
+        let world = posts.clone().fold(InMemorySources::default(), |world, id| {
+            world.tweet(id, 10).community_post(id, 500)
+        });
+        let raw: Vec<_> = posts
+            .clone()
+            .rev()
+            .map(|id| raw(id, Some(100 + id)))
+            .chain(posts.clone().map(|id| raw(id, Some(200 + id))))
+            .collect();
+        let scenario = executor(world, SafetyLevel::TimelineHomeHydration, Some(VIEWER));
+        scenario.hydrate(&raw).await;
+        let first_authors: Vec<CommunityPost> = posts
+            .map(|tweet_id| CommunityPost {
+                tweet_id,
+                author_id: 100 + tweet_id,
+                community_id: 500,
+            })
+            .collect();
+        assert_eq!(scenario.sources().community_posts(), first_authors);
+    }
 
     #[tokio::test]
     async fn only_others_community_posts_are_looked_up_and_only_moderated_ones_ask_the_viewer() {

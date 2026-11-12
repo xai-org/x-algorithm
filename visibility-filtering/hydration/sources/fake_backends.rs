@@ -10,6 +10,7 @@ use crate::hydration::sources::Source;
 use crate::hydration::tweet_source::TweetState;
 use crate::models::NsfwFeature;
 use crate::models::{ArticleLifecycle, CommunityModeration, TweetFeatures};
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use thrift::protocol::TType;
@@ -293,14 +294,14 @@ struct Fake;
 
 #[tonic::async_trait]
 impl WingmanClient for Fake {
-    async fn batch_exists_intersect(&self, _: u64, ids: &[u64]) -> Option<Vec<Exists>> {
-        let exists = ids.iter().map(|&id| match id {
+    async fn batch_exists_intersect(&self, _: u64, ids: &[u64]) -> HashMap<u64, Exists> {
+        let exists = |id| match id {
             MISSING => Exists::NotFound,
             FAILED => Exists::ItemError,
             ABSENT => Exists::Incomplete,
             _ => Exists::Found,
-        });
-        Some(exists.collect())
+        };
+        ids.iter().map(|&id| (id, exists(id))).collect()
     }
 }
 
@@ -578,13 +579,10 @@ fn prod_sources() -> ProdSources {
         tweets: TweetSource {
             grpc_client: Arc::new(strato()),
         },
-        gizmoduck: GizmoduckLookup::new(Arc::new(Gizmoduck(gizmoduck))),
+        gizmoduck: Arc::new(Gizmoduck(gizmoduck)),
         socialgraph: Arc::clone(&fake) as _,
-        about_this_account: AboutThisAccountClient::new(strato()),
+        strato: strato(),
         wingman: fake,
-        articles: ArticleClient::new(strato()),
-        trusted_friends: TrustedFriendsClient::new(strato()),
-        user_location: UserLocationClient::new(strato()),
         safety_labels: Arc::new(
             FakeLabels::default()
                 .label(TWEET, SafetyLabelType::SPAM, label)
@@ -595,7 +593,6 @@ fn prod_sources() -> ProdSources {
         communities: CommunitySource {
             grpc_client: strato(),
         },
-        user_devices: UserDevicesClient::new(strato()),
     })
 }
 

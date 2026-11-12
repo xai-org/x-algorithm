@@ -199,23 +199,25 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
-pub(crate) fn take_videos_by_carousel_score(
-    candidates: &mut Vec<PostCandidate>,
+pub(crate) fn top_videos_by_carousel_score(
+    candidates: &[PostCandidate],
     count: usize,
     scoring: &CarouselScoring,
     seen: &HashSet<u64>,
 ) -> Vec<PostCandidate> {
-    let (mut videos, rest): (Vec<_>, Vec<_>) = std::mem::take(candidates)
-        .into_iter()
-        .partition(|candidate| is_carousel_video(candidate) && !was_seen(seen, candidate));
+    let mut videos: Vec<&PostCandidate> = candidates
+        .iter()
+        .filter(|candidate| is_carousel_video(candidate) && !was_seen(seen, candidate))
+        .collect();
     videos.sort_by(|a, b| scoring.rank(a, b));
-    let overflow = videos.split_off(count.min(videos.len()));
-    *candidates = rest;
-    candidates.extend(overflow);
-    for video in &mut videos {
-        video.video_carousel_extra = true;
-    }
     videos
+        .into_iter()
+        .take(count)
+        .map(|video| PostCandidate {
+            video_carousel_extra: true,
+            ..video.clone()
+        })
+        .collect()
 }
 
 pub(crate) fn is_carousel_video(candidate: &PostCandidate) -> bool {

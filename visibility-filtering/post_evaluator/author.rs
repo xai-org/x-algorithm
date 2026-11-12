@@ -1,17 +1,24 @@
 use super::{PostBatch, PostEvaluator};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::{
-    Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, Unresolved,
+    Cause, HydratedTweet, HydratedUser, Hydration, HydrationRequest, Hydrator, Hydrators, Lookup,
+    Unresolved,
 };
 use crate::metrics::RequestMetrics;
 use crate::models::{AuthorId, Evaluation, EvaluationKey, RequestFacts};
-use crate::rules::{LevelSpec, SafetyLevel};
+use crate::rules::SafetyLevel;
 use std::collections::HashMap;
-use tracing::warn;
 
-pub(super) const VIEWER_LOOKUPS: Hydrators = Hydrators::of(Hydrator::ViewerProfile)
+const VIEWER_LOOKUPS: Hydrators = Hydrators::of(Hydrator::ViewerProfile)
     .with(Hydrator::ViewerLabels)
     .with(Hydrator::ViewerNotificationFilters);
+
+pub(super) fn viewer_lookup_failed(hydration: &Hydration) -> bool {
+    !hydration
+        .viewer_failed()
+        .intersection(VIEWER_LOOKUPS)
+        .is_empty()
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AuthorJudgement {
@@ -59,24 +66,6 @@ impl PostEvaluator {
         metrics: &RequestMetrics,
     ) -> HashMap<EvaluationKey, AuthorJudgement> {
         let level = request.safety_level;
-        match level.spec() {
-            LevelSpec::QuotePass { .. } => {}
-            LevelSpec::Posts(_) | LevelSpec::Notifications { .. } => {
-                warn!(
-                    ?level,
-                    "authors evaluated outside the quote pass level; failing them"
-                );
-                let failed = AuthorJudgement::Unresolved(Unresolved {
-                    lookup: Lookup::Tweet,
-                    cause: Cause::Failed,
-                });
-                return request
-                    .candidates
-                    .iter()
-                    .map(|placed| (placed.key(), failed.clone()))
-                    .collect();
-            }
-        }
         let hydration = self
             .rule_engine
             .plan(level)
@@ -117,23 +106,17 @@ impl PostEvaluator {
             .collect()
     }
 
-    pub(crate) async fn evaluate_users(
+    pub(super) async fn evaluate_users(
         &self,
         level: SafetyLevel,
-        facts: RequestFacts,
+        facts: &RequestFacts,
         users: Vec<AuthorId>,
         metrics: &RequestMetrics,
     ) -> HashMap<AuthorId, Option<Evaluation>> {
-        match level.spec() {
-            LevelSpec::Notifications { .. } => {}
-            LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => {
-                warn!(
-                    ?level,
-                    "users evaluated outside a notification level; failing them"
-                );
-                return users.into_iter().map(|id| (id, None)).collect();
-            }
+        if users.is_empty() {
+            return HashMap::new();
         }
+        let facts = facts.clone();
         let hydration = self
             .rule_engine
             .plan(level)
@@ -142,10 +125,7 @@ impl PostEvaluator {
                 HydrationRequest::for_users(facts, users.clone(), &self.fallback_caches, metrics),
             )
             .await;
-        let viewer_failed = !hydration
-            .viewer_failed()
-            .intersection(VIEWER_LOOKUPS)
-            .is_empty();
+        let viewer_failed = viewer_lookup_failed(&hydration);
         let admitted = self.rule_engine.admit(level, &hydration);
         users
             .into_iter()

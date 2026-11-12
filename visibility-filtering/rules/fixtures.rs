@@ -1,11 +1,12 @@
 use crate::hydration::{Hydrator, Hydrators};
+use crate::models::viewer::ClientSwitchSet;
 use crate::models::{
-    AuthorFeatures, AuthorLabel, ClientCapability, ClientSwitch, ClientSwitchSet,
-    ConversationControlFeatures, Decided, DropReason, EdgeSet, FosnrReason, LabelInterstitial,
-    LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, PublicInterest,
-    RequestFacts, SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity,
-    Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
+    AuthorFeatures, AuthorLabel, ClientCapability, ClientSwitch, ConversationControlFeatures,
+    Decided, DropReason, EdgeSet, FosnrReason, LabelInterstitial, LimitedActionType,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice,
+    NsfwViewerDropReason, PostCandidate, PostEntity, PublicInterest, RequestFacts, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
+    Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::rules::RuleId;
 use std::collections::HashSet;
@@ -285,11 +286,7 @@ fn media_blurred(
     Verdict::Shown {
         label_interstitial: None,
         media: Some(Decided {
-            value: MediaRestriction::MediaInterstitial(MediaInterstitial {
-                legacy: FilteredReason::ContainNsfwMedia,
-                reason,
-                prompt,
-            }),
+            value: MediaRestriction::MediaInterstitial(MediaInterstitial { reason, prompt }),
             id: id_of(by),
             by,
         }),
@@ -682,7 +679,7 @@ impl CandidateBuilder {
 
     pub(crate) fn with_reacted_to_post_labels(mut self, labels: &[SafetyLabelType]) -> Self {
         self.candidate.post.reacted_to_post_safety_labels =
-            SafetyLabelMap::new(labels.iter().copied().collect());
+            SafetyLabelMap::new(labels.iter().copied());
         self
     }
 

@@ -380,6 +380,10 @@ def reusedAiVideoIndexNames(postId: Long, tweet: Tweet): Seq[String] = {
   }.getOrElse(Seq.empty[String])
 }
 
+def aiVideoLabel(postId: Long): Option[Boolean] =
+  #<content_understanding/internal/manhattan/aiGeneratedVideoAnnotationsMh>.fetch(postId, ()).v
+    .flatMap { annotation => annotation.isAiGenerated }
+
 def emitAiVideoIndex(candidate: PhoenixRankAllCandidate, indexName: String, stats: Stats.StatsReceiver): Unit = {
   val object = {
     postId = candidate.postId,
@@ -401,6 +405,17 @@ def buildAiVideoIndexes(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRe
             emitAiVideoIndex(candidate, indexName, stats)
           }
           stats.counter("ai_video_reuse_indexing_event_created").incr(emitted.foldLeft(0) { (acc, x) => acc + 1 })
+      }
+    case _ => ()
+  }
+}
+
+def buildAiVideoModelIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+  candidate.tweetMedadata match {
+    case Some(tweet) if eventProcessing.hasValidImmersiveVideo(tweet) =>
+      aiVideoLabel(candidate.postId) match {
+        case Some(true) => emitAiVideoIndex(candidate, "ai_video_model", stats)
+        case _ => ()
       }
     case _ => ()
   }
@@ -568,6 +583,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                     build1FavVideoIndex(candidate, receiverStats)
                     buildImagineIndex(candidate, receiverStats)
                     buildAiVideoIndexes(candidate, receiverStats)
+                    buildAiVideoModelIndex(candidate, receiverStats)
                   }
                   buildMetadataDump(candidate, receiverStats, isReply)
                   buildMMEmbMetadataDump(candidate, receiverStats)

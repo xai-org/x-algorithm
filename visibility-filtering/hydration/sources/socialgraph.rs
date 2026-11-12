@@ -1,7 +1,7 @@
 use super::{source, Backends, CallContext, Expired, Input, SourceFetch};
 use crate::clients::socialgraph_client::EdgeQuery;
 use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
-use crate::hydration::hydrator::{Edge, EdgeKey};
+use crate::hydration::hydrator::EdgeKey;
 use crate::hydration::metrics::record_flock_missing_keys;
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
@@ -13,10 +13,7 @@ use {
 };
 
 impl SourceFetch for source::Flock {
-    const BACKEND_LABEL: &'static str = "socialgraph";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = EdgeKey;
     type Reply = Vec<RawHydrationBatch<bool>>;
 

@@ -76,19 +76,15 @@ impl AuthorNotFound {
     ) -> RawHydrationBatch<DecodedAuthor> {
         match self {
             AuthorNotFound::Unresolves => authors,
-            AuthorNotFound::ReadsErased => HydrationBatch::from_hydrated(
-                authors
-                    .into_hydrated()
-                    .into_iter()
-                    .map(|(author, decoded)| match decoded {
-                        Hydrated::NotFound => (author, Hydrated::Found(erased_author())),
-                        decoded @ (Hydrated::Found(_)
-                        | Hydrated::Partial(_)
-                        | Hydrated::Failed
-                        | Hydrated::Unanswered) => (author, decoded),
-                    })
-                    .collect(),
-            ),
+            AuthorNotFound::ReadsErased => {
+                let mut authors = authors.into_hydrated();
+                for decoded in authors.values_mut() {
+                    if let Hydrated::NotFound = decoded {
+                        *decoded = Hydrated::Found(erased_author());
+                    }
+                }
+                HydrationBatch::from_hydrated(authors)
+            }
         }
     }
 }
@@ -103,57 +99,25 @@ fn erased_author() -> DecodedAuthor {
     }
 }
 
-pub(crate) fn author_batch(
-    users: RawHydrationBatch<GizmoduckUserResult>,
-) -> RawHydrationBatch<DecodedAuthor> {
-    let authors = users
-        .into_hydrated()
-        .into_iter()
-        .map(|(author, user)| {
-            let decoded = match user {
-                Hydrated::Found(result) | Hydrated::Partial(result) => {
-                    evaluable_author_features(result)
-                }
-                Hydrated::NotFound => Hydrated::NotFound,
-                Hydrated::Failed => Hydrated::Failed,
-                Hydrated::Unanswered => Hydrated::Unanswered,
-            };
-            (author, decoded)
-        })
-        .collect();
-    HydrationBatch::from_hydrated(authors)
+pub(crate) fn decoded_author(user: Hydrated<GizmoduckUserResult>) -> Hydrated<DecodedAuthor> {
+    match user {
+        Hydrated::Found(result) | Hydrated::Partial(result) => evaluable_author_features(result),
+        Hydrated::NotFound => Hydrated::NotFound,
+        Hydrated::Failed => Hydrated::Failed,
+        Hydrated::Unanswered => Hydrated::Unanswered,
+    }
 }
 
-pub(crate) fn actor_batch(
-    users: RawHydrationBatch<GizmoduckUserResult>,
-) -> RawHydrationBatch<DecodedActor> {
-    let actors = users
-        .into_hydrated()
-        .into_iter()
-        .map(|(actor, user)| {
-            let decoded = match user {
-                Hydrated::Found(result) | Hydrated::Partial(result) => {
-                    let profile = result.user.as_ref().map(author_profile).unwrap_or_default();
-                    match evaluable_author_features(result) {
-                        Hydrated::Found(author) => {
-                            Hydrated::Found(DecodedActor { author, profile })
-                        }
-                        Hydrated::Partial(author) => {
-                            Hydrated::Partial(DecodedActor { author, profile })
-                        }
-                        Hydrated::NotFound => Hydrated::NotFound,
-                        Hydrated::Failed => Hydrated::Failed,
-                        Hydrated::Unanswered => Hydrated::Unanswered,
-                    }
-                }
-                Hydrated::NotFound => Hydrated::NotFound,
-                Hydrated::Failed => Hydrated::Failed,
-                Hydrated::Unanswered => Hydrated::Unanswered,
-            };
-            (actor, decoded)
-        })
-        .collect();
-    HydrationBatch::from_hydrated(actors)
+pub(crate) fn decoded_actor(user: Hydrated<GizmoduckUserResult>) -> Hydrated<DecodedActor> {
+    match user {
+        Hydrated::Found(result) | Hydrated::Partial(result) => {
+            let profile = result.user.as_ref().map(author_profile).unwrap_or_default();
+            evaluable_author_features(result).map(|author| DecodedActor { author, profile })
+        }
+        Hydrated::NotFound => Hydrated::NotFound,
+        Hydrated::Failed => Hydrated::Failed,
+        Hydrated::Unanswered => Hydrated::Unanswered,
+    }
 }
 
 const NEW_AUTHOR_AGE: Duration = Duration::from_secs(72 * 60 * 60);

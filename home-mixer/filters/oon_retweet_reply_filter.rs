@@ -80,7 +80,7 @@ mod tests {
     async fn integrates_with_in_network_hydrator() {
         use crate::candidate_hydrators::in_network_candidate_hydrator::InNetworkCandidateHydrator;
         use crate::models::user_features::UserFeatures;
-        use xai_candidate_pipeline::hydrator::Hydrator;
+        use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 
         let query = ScoredPostsQuery {
             user_id: 1,
@@ -115,10 +115,8 @@ mod tests {
         ];
 
         let hydrator = InNetworkCandidateHydrator;
-        let hydrated = hydrator.hydrate(&query, &candidates).await;
-        for (c, h) in candidates.iter_mut().zip(hydrated) {
-            hydrator.update(c, h.expect("hydrate ok"));
-        }
+        let fetched = hydrator.fetch(&query, &candidates).await.expect("fetch ok");
+        hydrator.apply(&query, &mut candidates, fetched);
         assert_eq!(candidates[0].in_network, Some(false));
         assert_eq!(candidates[1].in_network, Some(false));
         assert_eq!(candidates[2].in_network, Some(true));

@@ -156,17 +156,14 @@ pub(super) fn send<'p, F: SourceFetch, S: Fetches<F> + ?Sized>(
     context: CallContext<'p>,
     timed: Timed<'p>,
     reply: fn(F::Reply) -> Reply,
-) -> Option<InFlight<'p>> {
-    if F::NEEDS_VIEWER && call.viewer_id.is_none() {
-        return None;
-    }
-    Some(Box::pin(async move {
+) -> InFlight<'p> {
+    Box::pin(async move {
         let input = call.input();
         let fetched = async { Ok(F::count_missing(&context, sources.fetch(&input).await?)) };
         let fetched = timed.run(fetched, call.queries().len()).await;
         let fetched = F::count(&context, &input, F::fall_back(&context, fetched));
         (call, reply(fetched))
-    }))
+    })
 }
 
 impl HydrationPlan {
@@ -187,16 +184,17 @@ impl HydrationPlan {
             &request.raw_candidates,
             request.retweet_merge,
         )
-        .with_quotes(&request.quotes)
+        .with_quotes(request.quotes)
         .with_users(&request.users);
         let mut running: FuturesUnordered<InFlight<'_>> = FuturesUnordered::new();
         let inputless = || self.groups().filter(|g| g.input.is_none());
         let mut ready: Vec<&Group> = inputless().collect();
+        let (mut core_landed, mut tweets_landed) = (None, None);
         loop {
             while let Some(group) = ready.pop() {
                 if let Some(call) = store.offer(group) {
                     let call_deadline = self.call_deadline(group, call.claimed_edges());
-                    running.extend(self.send(
+                    running.push(self.send(
                         call,
                         call_deadline,
                         sources,
@@ -209,7 +207,13 @@ impl HydrationPlan {
                 break;
             };
             let group = call.group;
-            if store.land(&call, reply, started.elapsed()) == Landing::KeysJoined {
+            if call.is_first && group.nodes.contains(Hydrator::PureCore) {
+                core_landed = Some(started.elapsed());
+            }
+            if call.is_first && group.nodes.contains(Hydrator::Tweet) {
+                tweets_landed = Some(started.elapsed());
+            }
+            if store.land(&call, reply) == Landing::KeysJoined {
                 ready.extend(inputless());
             }
             ready.extend(self.readers(group));
@@ -218,14 +222,13 @@ impl HydrationPlan {
         if store.is_country_lookup_skipped() {
             record_viewer_country(metrics, ViewerCountry::NoAllowedList.into());
         }
-        let tes_joined = store
-            .tweets_elapsed
-            .map_or(store.core_elapsed, |tweets| tweets.max(store.core_elapsed));
-        metrics.plain().observe(
-            &HYDRATOR_LATENCY_MS,
-            ["tes", "join"],
-            tes_joined.as_secs_f64() * 1000.0,
-        );
+        if let Some(tes_joined) = core_landed.max(tweets_landed) {
+            metrics.plain().observe(
+                &HYDRATOR_LATENCY_MS,
+                ["tes", "join"],
+                tes_joined.as_secs_f64() * 1000.0,
+            );
+        }
         let hydration = store.assemble(metrics);
         record_viewer(metrics, self, &hydration);
         hydration
@@ -238,7 +241,7 @@ impl HydrationPlan {
         sources: &'p dyn Sources,
         fallback_caches: &'p FallbackCaches,
         metrics: &'p RequestMetrics,
-    ) -> Option<InFlight<'p>> {
+    ) -> InFlight<'p> {
         let plain = metrics.plain();
         let group = call.group;
         let (backend, call_name) = group.label();

@@ -1,6 +1,10 @@
+use crate::models::Evaluation;
+use crate::params::LimitedActionsPolicies;
 use crate::quote::QuoteRendering;
+use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::fmt::Debug;
+use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::action::Action;
 use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
 use xai_x_thrift::safety_result::FilteredReason;
@@ -109,10 +113,31 @@ pub(crate) fn quote_label(rendering: QuoteRendering<'_>, served: Label) -> Label
     match rendering {
         QuoteRendering::Served => served,
         QuoteRendering::Rerendered(rerendered) => {
-            state_label(&treatment::rerendered_state(rerendered))
+            state_label(&treatment::rerendered_state(rerendered.reason))
         }
         QuoteRendering::Omitted => label(Class::Missing, NONE),
     }
+}
+
+pub(crate) fn filter_label(result: &vf_pb::TweetVisibilityResult) -> Label {
+    let kind = result.action.and_then(|action| action.kind);
+    let reason = result
+        .filtered_reason
+        .as_ref()
+        .and_then(|r| r.reason.as_ref());
+    (
+        kind.map_or_else(|| NONE.to_string(), |kind| debug_label(&kind).0),
+        reason.map_or_else(|| NONE.to_string(), |reason| debug_label(reason).0),
+    )
+}
+
+pub(crate) fn evaluate_tweets_label(
+    evaluation: &Evaluation,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> Label {
+    treatment::evaluate_tweets_state(evaluation, level, policies)
+        .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
 }
 
 pub(crate) fn state_label(state: &TweetFieldsResultState) -> Label {

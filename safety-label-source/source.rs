@@ -1,14 +1,14 @@
 use quanta::Clock;
 use quick_cache::sync::Cache;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
 use super::dragonfly::LabelCacheSwitches;
-use super::metrics::{self, BatchStage, CacheResult, CacheTier, LabelMetrics, OutageResult};
-use super::remote::{FailureKind, LookupError, LookupResults, RemoteLabels};
+use super::metrics::{self, BatchStage, CacheKeyCounts, CacheTier, LabelMetrics, OutageResult};
+use super::remote::{FailureKind, LookupError, LookupResults, RemoteLabels, StaleEntries};
 
 const TTL: Duration = Duration::from_secs(10);
 
@@ -73,25 +73,11 @@ impl SafetyLabelSource {
         cache_capacity: Option<usize>,
         metrics: LabelMetrics,
     ) -> Self {
-        Self::with_clock(remote, cache_capacity, Clock::new(), metrics)
+        let now_ms = Arc::new(system_unix_ms);
+        Self::with_clocks(remote, cache_capacity, Clock::new(), now_ms, metrics)
     }
 
-    pub(crate) fn with_clock(
-        remote: Arc<dyn RemoteLabels>,
-        cache_capacity: Option<usize>,
-        clock: Clock,
-        metrics: LabelMetrics,
-    ) -> Self {
-        Self::with_clocks(
-            remote,
-            cache_capacity,
-            clock,
-            Arc::new(system_unix_ms),
-            metrics,
-        )
-    }
-
-    fn with_clocks(
+        pub(crate) fn with_clocks(
         remote: Arc<dyn RemoteLabels>,
         cache_capacity: Option<usize>,
         clock: Clock,
@@ -101,7 +87,7 @@ impl SafetyLabelSource {
         info!(
             cache_capacity = cache_capacity.unwrap_or(0),
             ttl_secs = TTL.as_secs(),
-            "Local safety-label cache initialized (single pool, per-entry TTL)"
+            "Hot-key cache initialized (single pool, per-entry TTL)"
         );
         Self {
             cache: cache_capacity.map(|capacity| {
@@ -130,7 +116,7 @@ impl SafetyLabelSource {
         let remote_results = self.remote.get(&local_misses, &stale).await;
         let unavailable = self.backfill_local(remote_results, &mut results);
         if !unavailable.is_empty() {
-            self.serve_outage(unavailable, &mut results);
+            self.serve_outage(unavailable, stale, &mut results);
         }
 
         self.emit_stats(total - batch_size, batch_size, expired);
@@ -161,44 +147,51 @@ impl SafetyLabelSource {
             fn serve_outage(
         &self,
         unavailable: Vec<u64>,
+        mut stale: StaleEntries,
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) {
         let total = unavailable.len();
-        let mut stale = 0;
+        let mut answered = 0;
         for tweet_id in unavailable {
-            if let Some(entry) = self.cache.as_ref().and_then(|cache| cache.peek(&tweet_id)) {
-                results.insert(tweet_id, Ok(entry.labels));
-                stale += 1;
+            let labels = self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.peek(&tweet_id))
+                .map(|entry| entry.labels)
+                .or_else(|| stale.remove(&tweet_id));
+            if let Some(labels) = labels {
+                results.insert(tweet_id, Ok(labels));
+                answered += 1;
             }
         }
-        metrics::record_outage_keys(&self.metrics, OutageResult::Stale, stale);
-        metrics::record_outage_keys(&self.metrics, OutageResult::Failed, total - stale);
+        metrics::record_outage_keys(&self.metrics, OutageResult::Stale, answered);
+        metrics::record_outage_keys(&self.metrics, OutageResult::Failed, total - answered);
     }
 
     fn get_local(
         &self,
         ids: &[u64],
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-    ) -> (Vec<u64>, FxHashSet<u64>) {
+    ) -> (Vec<u64>, StaleEntries) {
         let Some(cache) = &self.cache else {
-            return (ids.to_vec(), FxHashSet::default());
+            return (ids.to_vec(), StaleEntries::default());
         };
         let mut misses = Vec::with_capacity(ids.len());
-        let mut expired = FxHashSet::default();
+        let mut stale = StaleEntries::default();
+        let now = self.clock.now();
         for &tweet_id in ids {
-            let now = self.clock.now();
             match cache.get(&tweet_id) {
                 Some(entry) if now < entry.expires_at => {
                     results.insert(tweet_id, Ok(entry.labels));
                 }
-                Some(_) => {
-                    expired.insert(tweet_id);
+                Some(entry) => {
+                    stale.insert(tweet_id, entry.labels);
                     misses.push(tweet_id);
                 }
                 None => misses.push(tweet_id),
             }
         }
-        (misses, expired)
+        (misses, stale)
     }
 
         fn backfill_local(
@@ -207,6 +200,7 @@ impl SafetyLabelSource {
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) -> Vec<u64> {
         let wall_now = SystemTime::now();
+        let mut expires_at = None;
         let mut unavailable = Vec::new();
         for (id, result) in remote_results {
             if let Err(failure) = &result
@@ -223,7 +217,7 @@ impl SafetyLabelSource {
                     id,
                     Entry {
                         labels: Arc::clone(label_map),
-                        expires_at: self.clock.now() + TTL,
+                        expires_at: *expires_at.get_or_insert_with(|| self.clock.now() + TTL),
                     },
                 );
             }
@@ -233,16 +227,14 @@ impl SafetyLabelSource {
     }
 
     fn emit_stats(&self, hits: usize, batch_size: usize, expired: usize) {
-        let metrics = &self.metrics;
-        metrics::record_cache_keys(metrics, CacheTier::Local, CacheResult::Hit, hits);
-        metrics::record_cache_keys(
-            metrics,
-            CacheTier::Local,
-            CacheResult::Miss,
-            batch_size - expired,
-        );
-        metrics::record_cache_keys(metrics, CacheTier::Local, CacheResult::Expired, expired);
-        metrics::record_batch_size(metrics, BatchStage::LocalMiss, batch_size);
+        let counts = CacheKeyCounts {
+            hit: hits,
+            miss: batch_size - expired,
+            expired,
+            ..CacheKeyCounts::default()
+        };
+        metrics::record_cache_keys(&self.metrics, CacheTier::Local, &counts);
+        metrics::record_batch_size(&self.metrics, BatchStage::LocalMiss, batch_size);
     }
 }
 
@@ -275,7 +267,7 @@ mod tests {
 
     #[async_trait]
     impl RemoteLabels for FakeRemote {
-        async fn get(&self, ids: &[u64], _stale: &FxHashSet<u64>) -> LookupResults {
+        async fn get(&self, ids: &[u64], _stale: &StaleEntries) -> LookupResults {
             self.fetched_keys.fetch_add(ids.len(), Ordering::SeqCst);
             ids.iter()
                 .filter_map(|id| self.results.get(id).map(|result| (*id, result.clone())))
@@ -393,10 +385,11 @@ mod tests {
         let (clock, mock) = Clock::mock();
         let tweet_id = tweet_id_created_at(SystemTime::now() - Duration::from_secs(60));
         let remote = found(tweet_id);
-        let source = SafetyLabelSource::with_clock(
+        let source = SafetyLabelSource::with_clocks(
             Arc::<FakeRemote>::clone(&remote),
             Some(1024),
             clock,
+            Arc::new(system_unix_ms),
             LabelMetrics::default(),
         );
 
@@ -409,6 +402,42 @@ mod tests {
 
         assert_eq!(remote.fetched_keys(), 2);
         assert!(restamped > first_expiry);
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_evicted_by_the_batchs_backfill_still_answers_the_outage() {
+        let (clock, _mock) = Clock::mock();
+        let remote = FakeRemote::new(
+            (2..66)
+                .map(|id| (id, Ok(vf_pb::SafetyLabelMap::default())))
+                .chain([(
+                    1,
+                    Err(LookupError::new(FailureKind::LabelCacheUnavailable, "down")),
+                )])
+                .collect(),
+        );
+        let source = SafetyLabelSource::with_clocks(
+            remote,
+            Some(1),
+            clock,
+            Arc::new(system_unix_ms),
+            LabelMetrics::default(),
+        );
+        let stale = Arc::new(vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(1, proto_label(None))]),
+        });
+        source.cache.as_ref().unwrap().insert(
+            1,
+            Entry {
+                labels: Arc::clone(&stale),
+                expires_at: source.clock.now(),
+            },
+        );
+
+        let ids: Vec<u64> = (1..66).collect();
+        let results = source.get(&ids).await;
+
+        assert_eq!(results.get(&1).unwrap().as_deref().ok(), Some(&*stale));
     }
 
     fn label_ids(map: &vf_pb::SafetyLabelMap) -> Vec<i32> {

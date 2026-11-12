@@ -41,15 +41,15 @@ fn cached_value_inner(bytes: &[u8]) -> Option<CachedLabels> {
 }
 
 pub(crate) fn raw_labels(items: &[RawSafetyLabel]) -> Option<vf_pb::SafetyLabelMap> {
-    contain_decode_panic(|| raw_labels_inner(items)).map(label_map_to_proto)
+    contain_decode_panic(|| raw_labels_inner(items))
 }
 
 fn contain_decode_panic<T>(decode: impl FnOnce() -> T) -> Option<T> {
     catch_unwind(AssertUnwindSafe(decode)).ok()
 }
 
-fn raw_labels_inner(items: &[RawSafetyLabel]) -> SafetyLabelMap {
-    let mut map = HashMap::with_capacity(items.len());
+fn raw_labels_inner(items: &[RawSafetyLabel]) -> vf_pb::SafetyLabelMap {
+    let mut labels = HashMap::with_capacity(items.len());
     for item in items {
         let label_type = decode_lkey_bytes(item.lkey);
         let label = match xai_x_thrift::deserialize_mval(&item.mval) {
@@ -59,9 +59,9 @@ fn raw_labels_inner(items: &[RawSafetyLabel]) -> SafetyLabelMap {
                 SafetyLabel::default()
             }
         };
-        map.insert(label_type, label);
+        labels.insert(i32::from(label_type), label_to_proto(label));
     }
-    map
+    vf_pb::SafetyLabelMap { labels }
 }
 
 fn label_to_proto(label: SafetyLabel) -> vf_pb::SafetyLabel {

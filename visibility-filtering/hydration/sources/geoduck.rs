@@ -1,16 +1,13 @@
 use super::{source, Backends, Expired, Input, SourceFetch};
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
-use crate::hydration::hydrator::{Edge, EdgeKey};
-use std::collections::HashMap;
+use crate::clients::user_location_client;
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
+use crate::hydration::hydrator::EdgeKey;
 use tracing::warn;
 #[cfg(test)]
 use {super::InMemoryCall, std::collections::HashSet};
 
 impl SourceFetch for source::UserLocation {
-    const BACKEND_LABEL: &'static str = "geoduck";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = Some(Edge::OutsidePlace);
     type Key = EdgeKey;
     type Reply = RawHydrationBatch<bool>;
 
@@ -18,22 +15,18 @@ impl SourceFetch for source::UserLocation {
         let Some(viewer_id) = input.viewer_id else {
             return Ok(HydrationBatch::default());
         };
-        let places = backends
-            .user_location
-            .places(viewer_id)
+        let places = user_location_client::places(&backends.strato, viewer_id)
             .await
             .inspect_err(|error| warn!(%error, "Geoduck userLocation lookup failed"));
-        let answers: HashMap<_, _> = input
-            .keys
-            .iter()
-            .map(|&place| {
-                let outside = places.as_ref().map(|places| Some(!places.contains(&place)));
-                (place, outside)
-            })
-            .collect();
-        Ok(HydrationBatch::from_results(
-            input.keys.iter().copied(),
-            answers,
+        Ok(HydrationBatch::from_hydrated(
+            input
+                .keys
+                .iter()
+                .map(|&place| {
+                    let outside = places.as_ref().map(|places| Some(!places.contains(&place)));
+                    (place, Hydrated::from(outside))
+                })
+                .collect(),
         ))
     }
 

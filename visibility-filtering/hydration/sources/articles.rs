@@ -1,25 +1,23 @@
 use super::{source, Backends, Expired, Input, SourceFetch};
+use crate::clients::article_client;
 use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::decode::article::decode_lifecycle;
-use crate::hydration::hydrator::Edge;
 use crate::models::ArticleLifecycle;
 #[cfg(test)]
 use {super::InMemoryCall, std::collections::HashMap};
 
 impl SourceFetch for source::ArticleLifecycle {
-    const BACKEND_LABEL: &'static str = "articles";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<ArticleLifecycle>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
-        let rows = backends.articles.lifecycles(input.keys).await;
-        Ok(lifecycle_batch(HydrationBatch::from_results(
+        let rows = article_client::lifecycles(&backends.strato, input.keys).await;
+        Ok(HydrationBatch::from_results_with(
             input.keys.iter().copied(),
             rows,
-        )))
+            |row| decoded_lifecycle(&row.into()),
+        ))
     }
 
     #[cfg(test)]
@@ -32,18 +30,13 @@ impl SourceFetch for source::ArticleLifecycle {
 }
 
 impl SourceFetch for source::ArticleMediaEntities {
-    const BACKEND_LABEL: &'static str = "articles";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<bool>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
-        let rows = backends
-            .articles
-            .media_entities(input.viewer_id, input.keys)
-            .await;
+        let rows =
+            article_client::media_entities(&backends.strato, input.viewer_id, input.keys).await;
         Ok(HydrationBatch::from_results(
             input.keys.iter().copied(),
             rows,
@@ -60,18 +53,12 @@ impl SourceFetch for source::ArticleMediaEntities {
 }
 
 impl SourceFetch for source::ArticleCoverMedia {
-    const BACKEND_LABEL: &'static str = "articles";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<bool>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
-        let rows = backends
-            .articles
-            .cover_media(input.viewer_id, input.keys)
-            .await;
+        let rows = article_client::cover_media(&backends.strato, input.viewer_id, input.keys).await;
         Ok(HydrationBatch::from_results(
             input.keys.iter().copied(),
             rows,
@@ -87,22 +74,16 @@ impl SourceFetch for source::ArticleCoverMedia {
     }
 }
 
-fn lifecycle_batch(rows: RawHydrationBatch<i32>) -> RawHydrationBatch<ArticleLifecycle> {
-    let decoded = rows.into_hydrated().into_iter().map(|(id, row)| {
-        let lifecycle = match row {
-            Hydrated::Found(value) => {
-                decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Found)
-            }
-            Hydrated::Partial(value) => {
-                decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Partial)
-            }
-            Hydrated::NotFound => Hydrated::NotFound,
-            Hydrated::Failed => Hydrated::Failed,
-            Hydrated::Unanswered => Hydrated::Unanswered,
-        };
-        (id, lifecycle)
-    });
-    HydrationBatch::from_hydrated(decoded.collect())
+fn decoded_lifecycle(row: &Hydrated<i32>) -> Hydrated<ArticleLifecycle> {
+    match *row {
+        Hydrated::Found(value) => decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Found),
+        Hydrated::Partial(value) => {
+            decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Partial)
+        }
+        Hydrated::NotFound => Hydrated::NotFound,
+        Hydrated::Failed => Hydrated::Failed,
+        Hydrated::Unanswered => Hydrated::Unanswered,
+    }
 }
 
 #[cfg(test)]

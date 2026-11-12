@@ -3,8 +3,10 @@ use crate::discovery::{
     VfChannelParams, VfDiscovery, XdsTarget,
 };
 use crate::metrics::{ClientRpc, RequestMetrics};
+use crate::vf_client::{make_vf_client, within_deadline};
 use anyhow::anyhow;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 use tonic::codec::CompressionEncoding;
 use tonic::{async_trait, Status};
@@ -13,14 +15,13 @@ use xai_safety_label_store::types::SafetyLabelMap;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::safety_label_store_service_client::SafetyLabelStoreServiceClient;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
-use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
 use xai_x_thrift::tweet_safety_label::{
     AgentTool, BotMakerAction, GrokAnnotationAction, GrokAnnotationSource, SafetyLabel,
     SafetyLabelSource, SafetyLabelType, ToolAction,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 200;
-const DEFAULT_MAX_BATCH_SIZE: usize = 50;
+const DEFAULT_MAX_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(50).unwrap();
 
 pub const LATENCY_VM_METRIC: &str = "vf_client_get_safety_labels_latency_ms_vm";
 pub const BATCH_LATENCY_VM_METRIC: &str = "vf_client_get_safety_labels_batch_latency_ms_vm";
@@ -43,8 +44,8 @@ pub trait TweetSafetyLabelClient: Send + Sync {
 }
 
 pub struct ProdTweetSafetyLabelClient {
-    client: ServiceClient,
-    max_batch_size: usize,
+    client: SafetyLabelsRpc,
+    max_batch_size: NonZeroUsize,
     timeout: Duration,
 }
 
@@ -55,25 +56,15 @@ enum SafetyLabelsBackend {
 }
 
 #[derive(Clone)]
-enum SafetyLabelsRpc<T> {
-    Vf(VisibilityFilteringServiceClient<T>),
-    Store(SafetyLabelStoreServiceClient<T>),
+enum SafetyLabelsRpc {
+    Vf(VisibilityFilteringServiceClient<VfChannel>),
+    Store(SafetyLabelStoreServiceClient<VfChannel>),
 }
 
-impl<T> SafetyLabelsRpc<T>
-where
-    T: tonic::client::GrpcService<tonic::body::Body>,
-    T::Error: Into<tonic::codegen::StdError>,
-    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
-    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
-{
-    fn new(backend: SafetyLabelsBackend, channel: T) -> Self {
+impl SafetyLabelsRpc {
+    fn new(backend: SafetyLabelsBackend, channel: VfChannel) -> Self {
         match backend {
-            SafetyLabelsBackend::Vf => Self::Vf(
-                VisibilityFilteringServiceClient::new(channel)
-                    .send_compressed(CompressionEncoding::Zstd)
-                    .accept_compressed(CompressionEncoding::Zstd),
-            ),
+            SafetyLabelsBackend::Vf => Self::Vf(make_vf_client(channel)),
             SafetyLabelsBackend::Store => Self::Store(
                 SafetyLabelStoreServiceClient::new(channel)
                     .send_compressed(CompressionEncoding::Zstd)
@@ -93,27 +84,8 @@ where
     }
 }
 
-#[derive(Clone)]
-enum ServiceClient {
-    Wily(SafetyLabelsRpc<tonic::transport::Channel>),
-    Xds(SafetyLabelsRpc<LoadBalancedChannel>),
-}
-
-impl ServiceClient {
-    async fn get_safety_labels(
-        &mut self,
-        request: tonic::Request<vf_pb::GetSafetyLabelsRequest>,
-    ) -> Result<tonic::Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-        match self {
-            Self::Wily(c) => c.get_safety_labels(request).await,
-            Self::Xds(c) => c.get_safety_labels(request).await,
-        }
-    }
-}
-
 const VF_SAFETY_LABELS_BACKEND_ENV: &str = "VF_SAFETY_LABELS_BACKEND";
 const VF_SAFETY_LABELS_DISCOVERY_ENV: &str = "VF_SAFETY_LABELS_DISCOVERY";
-const VF_SAFETY_LABELS_APERTURE_SIZE: usize = 16;
 const STORE_XDS_LISTENER_ENV: &str = "SAFETY_LABEL_STORE_CLIENT_XDS_LISTENER";
 const STORE_TLS_NAME_ENV: &str = "SAFETY_LABEL_STORE_CLIENT_TLS_NAME";
 const DEFAULT_STORE_XDS_LISTENER: &str = "xai-safety-label-store.prod.visibility:grpc";
@@ -134,18 +106,22 @@ fn channel_params(
             )));
         }
     };
-    let discovery = VfDiscovery::parse(
-        VF_SAFETY_LABELS_DISCOVERY_ENV,
-        env(VF_SAFETY_LABELS_DISCOVERY_ENV).as_deref(),
-        match backend {
-            SafetyLabelsBackend::Vf => VfDiscovery::Wily,
-            SafetyLabelsBackend::Store => VfDiscovery::Xds,
-        },
-    );
-    let (name, xds) = match backend {
-        SafetyLabelsBackend::Vf => ("vf-safety-labels", XdsTarget::vf(dc)),
+    let discovery_env = env(VF_SAFETY_LABELS_DISCOVERY_ENV);
+    let discovery_or = |default| {
+        VfDiscovery::parse(
+            VF_SAFETY_LABELS_DISCOVERY_ENV,
+            discovery_env.as_deref(),
+            default,
+        )
+    };
+    let (name, discovery, xds) = match backend {
+        SafetyLabelsBackend::Vf => (
+            "vf-safety-labels",
+            discovery_or(VfDiscovery::Wily),
+            XdsTarget::vf(dc),
+        ),
         SafetyLabelsBackend::Store => {
-            if discovery == VfDiscovery::Wily {
+            if discovery_or(VfDiscovery::Xds) == VfDiscovery::Wily {
                 return Err(VfChannelError::Config(anyhow!(
                     "{VF_SAFETY_LABELS_BACKEND_ENV}=store is reached only over xDS; \
                      unset {VF_SAFETY_LABELS_DISCOVERY_ENV} or set it to xds"
@@ -161,7 +137,7 @@ fn channel_params(
                     visibility_tls_domain("xai-safety-label-store", dc),
                 ),
             };
-            ("safety-label-store", store)
+            ("safety-label-store", VfDiscovery::Xds, store)
         }
     };
     let params = VfChannelParams {
@@ -169,9 +145,6 @@ fn channel_params(
         dc,
         discovery,
         xds,
-        aperture_size: VF_SAFETY_LABELS_APERTURE_SIZE,
-        deterministic_aperture: env("APP_ENV").as_deref() == Some("prod"),
-        xds_lb_policy: LbPolicy::least_request(),
     };
     Ok((backend, params))
 }
@@ -187,16 +160,11 @@ impl ProdTweetSafetyLabelClient {
     pub async fn new(dc: &str) -> Result<Self, Status> {
         let (backend, params) =
             channel_params(dc, |name| std::env::var(name).ok()).map_err(channel_error_to_status)?;
-        let client = match build_vf_channel(&params)
+        let channel = build_vf_channel(&params)
             .await
-            .map_err(channel_error_to_status)?
-        {
-            VfChannel::Wily(ch) => ServiceClient::Wily(SafetyLabelsRpc::new(backend, ch)),
-            VfChannel::Xds(ch) => ServiceClient::Xds(SafetyLabelsRpc::new(backend, ch)),
-        };
-
+            .map_err(channel_error_to_status)?;
         Ok(Self {
-            client,
+            client: SafetyLabelsRpc::new(backend, channel),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         })
@@ -212,16 +180,12 @@ impl ProdTweetSafetyLabelClient {
     }
 
     pub fn with_max_batch_size(mut self, size: usize) -> Self {
-        self.max_batch_size = if size == 0 {
-            DEFAULT_MAX_BATCH_SIZE
-        } else {
-            size
-        };
+        self.max_batch_size = NonZeroUsize::new(size).unwrap_or(DEFAULT_MAX_BATCH_SIZE);
         self
     }
 }
 
-fn proto_to_safety_label(label: &vf_pb::SafetyLabel) -> SafetyLabel {
+fn proto_to_safety_label(label: vf_pb::SafetyLabel) -> SafetyLabel {
     use xai_x_thrift::tweet_safety_label::PerspectivalUser;
     SafetyLabel {
         score: label.score.map(thrift::OrderedFloat::from),
@@ -231,19 +195,19 @@ fn proto_to_safety_label(label: &vf_pb::SafetyLabel) -> SafetyLabel {
             Some(
                 label
                     .applicable_users
-                    .iter()
-                    .map(|&uid| PerspectivalUser::new(uid))
+                    .into_iter()
+                    .map(PerspectivalUser::new)
                     .collect(),
             )
         },
         holdback_experiment: label.holdback_experiment,
-        source: label.source.clone(),
-        safety_label_source: label.safety_label_source.as_ref().map(|src| match src {
+        source: label.source,
+        safety_label_source: label.safety_label_source.map(|src| match src {
             vf_pb::safety_label::SafetyLabelSource::BotmakerAction(a) => {
                 SafetyLabelSource::BotMakerAction(BotMakerAction::new(a.rule_id))
             }
             vf_pb::safety_label::SafetyLabelSource::ToolAction(a) => SafetyLabelSource::ToolAction(
-                ToolAction::new(AgentTool::from(a.agent_tool), a.actor_ldap.clone()),
+                ToolAction::new(AgentTool::from(a.agent_tool), a.actor_ldap),
             ),
             vf_pb::safety_label::SafetyLabelSource::GrokAnnotationAction(a) => {
                 SafetyLabelSource::GrokAnnotationAction(GrokAnnotationAction::new(
@@ -256,16 +220,16 @@ fn proto_to_safety_label(label: &vf_pb::SafetyLabel) -> SafetyLabel {
         applicable_countries: if label.applicable_countries.is_empty() {
             None
         } else {
-            Some(label.applicable_countries.clone())
+            Some(label.applicable_countries)
         },
     }
 }
 
-pub(crate) fn proto_to_safety_label_map(proto: &vf_pb::SafetyLabelMap) -> SafetyLabelMap {
+pub(crate) fn proto_to_safety_label_map(proto: vf_pb::SafetyLabelMap) -> SafetyLabelMap {
     proto
         .labels
-        .iter()
-        .map(|(&type_id, label)| (SafetyLabelType::from(type_id), proto_to_safety_label(label)))
+        .into_iter()
+        .map(|(type_id, label)| (SafetyLabelType::from(type_id), proto_to_safety_label(label)))
         .collect()
 }
 
@@ -273,69 +237,59 @@ pub(crate) fn proto_to_safety_label_map(proto: &vf_pb::SafetyLabelMap) -> Safety
 impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
     async fn get_safety_labels(&self, tweet_ids: Vec<u64>) -> Result<SafetyLabelsBatch, Status> {
         if tweet_ids.is_empty() {
-            return Ok(SafetyLabelsBatch {
-                labels: HashMap::new(),
-                failures: HashMap::new(),
-            });
+            return Ok(SafetyLabelsBatch::default());
         }
 
         let timeout = self.timeout;
-        let mut request_metrics = RequestMetrics::start(ClientRpc::GetSafetyLabels);
-
-        let futures: Vec<_> = tweet_ids
-            .chunks(self.max_batch_size)
-            .map(|batch| {
-                let batch_ids = batch.to_vec();
-                let mut client = self.client.clone();
-                async move {
-                    let batch_start = Instant::now();
-                    let mut request = tonic::Request::new(vf_pb::GetSafetyLabelsRequest {
-                        tweet_ids: batch_ids.clone(),
-                    });
-                    request.set_timeout(timeout);
-                    let result = client.get_safety_labels(request).await.map(|response| {
-                        let response = response.into_inner();
-                        let labels = response
-                            .results
-                            .iter()
-                            .map(|(&id, proto)| (id, proto_to_safety_label_map(proto)))
-                            .collect::<HashMap<u64, SafetyLabelMap>>();
-                        let failures = response
-                            .failed_ids
-                            .into_iter()
-                            .map(|id| (id, SafetyLabelFailure::LookupFailed))
-                            .collect::<HashMap<u64, SafetyLabelFailure>>();
-
-                        SafetyLabelsBatch { labels, failures }
-                    });
-                    (result, batch_start.elapsed())
-                }
-            })
-            .collect();
-
-        let responses = futures::future::join_all(futures).await;
+        let mut request_metrics = RequestMetrics::start(&ClientRpc::GET_SAFETY_LABELS);
+        let batches = tweet_ids.chunks(self.max_batch_size.get());
+        let responses = futures::future::join_all(batches.clone().map(|batch| {
+            let mut client = self.client.clone();
+            async move {
+                let batch_start = Instant::now();
+                let mut request = tonic::Request::new(vf_pb::GetSafetyLabelsRequest {
+                    tweet_ids: batch.to_vec(),
+                });
+                request.set_timeout(timeout);
+                let response = within_deadline(timeout, client.get_safety_labels(request)).await;
+                let result = response.map(|response| {
+                    let response = response.into_inner();
+                    let labels = response
+                        .results
+                        .into_iter()
+                        .map(|(id, proto)| (id, proto_to_safety_label_map(proto)))
+                        .collect::<Vec<(u64, SafetyLabelMap)>>();
+                    (labels, response.failed_ids)
+                });
+                (result, batch_start.elapsed())
+            }
+        }))
+        .await;
 
         let mut labels = HashMap::with_capacity(tweet_ids.len());
         let mut failures = HashMap::new();
-
-        for (i, (response, batch_elapsed)) in responses.into_iter().enumerate() {
+        for (i, (batch, (response, batch_elapsed))) in batches.zip(responses).enumerate() {
+            request_metrics.batch(batch_elapsed, response.as_ref().err());
             match response {
-                Ok(batch) => {
-                    labels.extend(batch.labels);
-                    failures.extend(batch.failures);
-                    request_metrics.batch(batch_elapsed, None);
+                Ok((answered, failed_ids)) => {
+                    labels.extend(answered);
+                    failures.extend(
+                        failed_ids
+                            .into_iter()
+                            .map(|id| (id, SafetyLabelFailure::LookupFailed)),
+                    );
                 }
                 Err(status) => {
                     warn!(batch = i, %status, "get_safety_labels batch failed");
-                    request_metrics.batch(batch_elapsed, Some(status.code()));
-                    let start = i * self.max_batch_size;
-                    let end = usize::min(start + self.max_batch_size, tweet_ids.len());
-                    for id in &tweet_ids[start..end] {
-                        failures.insert(*id, SafetyLabelFailure::BatchFailed);
-                    }
+                    failures.extend(
+                        batch
+                            .iter()
+                            .map(|&id| (id, SafetyLabelFailure::BatchFailed)),
+                    );
                 }
             }
         }
+        failures.retain(|id, _| !labels.contains_key(id));
 
         request_metrics.answered(failures.len());
         Ok(SafetyLabelsBatch { labels, failures })
@@ -375,37 +329,14 @@ mod tests {
         VisibilityFilteringService, VisibilityFilteringServiceServer,
     };
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct TestVisibilityFilteringService {
         requests: Arc<Mutex<Vec<Vec<u64>>>>,
         responses: Arc<Mutex<Vec<Result<vf_pb::GetSafetyLabelsResponse, Status>>>>,
     }
 
-    impl Default for TestVisibilityFilteringService {
-        fn default() -> Self {
-            Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                responses: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
     #[tonic::async_trait]
     impl VisibilityFilteringService for TestVisibilityFilteringService {
-        async fn evaluate_tweets(
-            &self,
-            _: Request<vf_pb::EvaluateTweetsRequest>,
-        ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-            Err(Status::unimplemented("unused"))
-        }
-
-        async fn filter_tweets(
-            &self,
-            _request: Request<vf_pb::VisibilityFilterRequest>,
-        ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
-            unimplemented!()
-        }
-
         async fn get_safety_labels(
             &self,
             request: Request<vf_pb::GetSafetyLabelsRequest>,
@@ -429,26 +360,13 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct TestSafetyLabelStore {
-        requests: Arc<Mutex<Vec<Vec<u64>>>>,
-    }
-
     #[tonic::async_trait]
-    impl SafetyLabelStoreService for TestSafetyLabelStore {
+    impl SafetyLabelStoreService for TestVisibilityFilteringService {
         async fn get_safety_labels(
             &self,
             request: Request<vf_pb::GetSafetyLabelsRequest>,
         ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-            let tweet_ids = request.into_inner().tweet_ids;
-            self.requests.lock().await.push(tweet_ids.clone());
-            Ok(Response::new(vf_pb::GetSafetyLabelsResponse {
-                results: tweet_ids
-                    .into_iter()
-                    .map(|id| (id, vf_pb::SafetyLabelMap::default()))
-                    .collect(),
-                failed_ids: Vec::new(),
-            }))
+            VisibilityFilteringService::get_safety_labels(self, request).await
         }
     }
 
@@ -487,8 +405,15 @@ mod tests {
             .connect()
             .await
             .unwrap();
+        client_over(backend, channel)
+    }
+
+    fn client_over(
+        backend: SafetyLabelsBackend,
+        channel: tonic::transport::Channel,
+    ) -> ProdTweetSafetyLabelClient {
         ProdTweetSafetyLabelClient {
-            client: ServiceClient::Wily(SafetyLabelsRpc::new(backend, channel)),
+            client: SafetyLabelsRpc::new(backend, VfChannel::Wily(channel)),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         }
@@ -592,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_backend_calls_safety_label_store_service() {
-        let store = TestSafetyLabelStore::default();
+        let store = TestVisibilityFilteringService::default();
         let requests = store.requests.clone();
         let (addr, handle) = serve(Routes::new(
             SafetyLabelStoreServiceServer::new(store)
@@ -618,7 +543,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let label = proto_to_safety_label(&proto);
+        let label = proto_to_safety_label(proto);
         assert_eq!(
             label.safety_label_source,
             Some(SafetyLabelSource::BotMakerAction(BotMakerAction::new(42)))
@@ -636,7 +561,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let label = proto_to_safety_label(&proto);
+        let label = proto_to_safety_label(proto);
         assert_eq!(
             label.safety_label_source,
             Some(SafetyLabelSource::ToolAction(ToolAction::new(
@@ -656,7 +581,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let label = proto_to_safety_label(&proto);
+        let label = proto_to_safety_label(proto);
         assert_eq!(
             label.safety_label_source,
             Some(SafetyLabelSource::GrokAnnotationAction(
@@ -668,8 +593,59 @@ mod tests {
     #[test]
     fn proto_no_source_to_thrift() {
         let proto = vf_pb::SafetyLabel::default();
-        let label = proto_to_safety_label(&proto);
+        let label = proto_to_safety_label(proto);
         assert_eq!(label.safety_label_source, None);
+    }
+
+    #[test]
+    fn proto_label_map_converts_every_field() {
+        use xai_x_thrift::tweet_safety_label::PerspectivalUser;
+        let full = vf_pb::SafetyLabel {
+            score: Some(0.75),
+            applicable_users: vec![7, 8],
+            holdback_experiment: Some(true),
+            source: Some("model".to_string()),
+            created_at_msec: Some(100),
+            expires_at_msec: Some(200),
+            applicable_countries: vec!["us".to_string(), "de".to_string()],
+            safety_label_source: Some(vf_pb::safety_label::SafetyLabelSource::ToolAction(
+                vf_pb::ToolAction {
+                    agent_tool: 15,
+                    actor_ldap: "someone".to_string(),
+                },
+            )),
+        };
+        let proto = vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(1, full), (2, vf_pb::SafetyLabel::default())]),
+        };
+
+        let map = proto_to_safety_label_map(proto);
+
+        assert_eq!(
+            map,
+            SafetyLabelMap::from([
+                (
+                    SafetyLabelType::from(1),
+                    SafetyLabel {
+                        score: Some(thrift::OrderedFloat::from(0.75)),
+                        applicable_users: Some(vec![
+                            PerspectivalUser::new(7),
+                            PerspectivalUser::new(8),
+                        ]),
+                        holdback_experiment: Some(true),
+                        source: Some("model".to_string()),
+                        safety_label_source: Some(SafetyLabelSource::ToolAction(ToolAction::new(
+                            AgentTool::BME,
+                            "someone".to_string(),
+                        ))),
+                        created_at_msec: Some(100),
+                        expires_at_msec: Some(200),
+                        applicable_countries: Some(vec!["us".to_string(), "de".to_string()]),
+                    }
+                ),
+                (SafetyLabelType::from(2), SafetyLabel::default()),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -720,14 +696,14 @@ mod tests {
         let (addr, handle) = start_test_server(service).await;
         let client = test_client(addr).await.with_max_batch_size(0);
 
-        let tweet_ids: Vec<u64> = (1..=(DEFAULT_MAX_BATCH_SIZE as u64 + 1)).collect();
+        let tweet_ids: Vec<u64> = (1..=(DEFAULT_MAX_BATCH_SIZE.get() as u64 + 1)).collect();
         let result = client.get_safety_labels(tweet_ids.clone()).await.unwrap();
 
         let requests = requests.lock().await.clone();
         let request_sets: HashSet<Vec<u64>> = requests.into_iter().collect();
         let expected_sets: HashSet<Vec<u64>> = [
-            (1..=DEFAULT_MAX_BATCH_SIZE as u64).collect(),
-            vec![DEFAULT_MAX_BATCH_SIZE as u64 + 1],
+            (1..=DEFAULT_MAX_BATCH_SIZE.get() as u64).collect(),
+            vec![DEFAULT_MAX_BATCH_SIZE.get() as u64 + 1],
         ]
         .into_iter()
         .collect();
@@ -760,6 +736,43 @@ mod tests {
                 (2, SafetyLabelFailure::BatchFailed),
             ])
         );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_batch_waiting_for_an_endpoint_fails_at_the_client_deadline() {
+        let (channel, _endpoints) = tonic::transport::Channel::balance_channel::<u8>(1);
+        let client = client_over(SafetyLabelsBackend::Vf, channel).with_timeout_ms(50);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), client.get_safety_labels(vec![1, 2]))
+                .await
+                .expect("the client deadline bounds a batch")
+                .unwrap();
+
+        assert!(result.labels.is_empty());
+        assert_eq!(
+            result.failures,
+            HashMap::from([
+                (1, SafetyLabelFailure::BatchFailed),
+                (2, SafetyLabelFailure::BatchFailed),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_labelled_by_one_batch_is_not_failed_by_another() {
+        let service = TestVisibilityFilteringService {
+            responses: Arc::new(Mutex::new(vec![Err(Status::unavailable("vf down"))])),
+            ..Default::default()
+        };
+        let (addr, handle) = start_test_server(service).await;
+        let client = test_client(addr).await.with_max_batch_size(1);
+
+        let result = client.get_safety_labels(vec![1, 1]).await.unwrap();
+
+        assert!(result.labels.contains_key(&1));
+        assert!(result.failures.is_empty());
         handle.abort();
     }
 

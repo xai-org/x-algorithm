@@ -13,6 +13,7 @@ use inputs::Interpreter;
 use rule::{NamedCond, RuleCond};
 use std::fmt::{self, Debug, Formatter};
 use std::ops::Not;
+#[cfg(test)]
 use xai_safety_label_store::types::label_meta;
 use xai_visibility_filtering::models::{FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
@@ -111,6 +112,7 @@ pub(crate) enum RuleId {
     AbusiveUqf,
     UntrustedUrlUqf,
     DownrankSpamReplyUqf,
+    SpamHighRecallOon,
     RiskyHighVizReplyOon,
 
     NsfwHighRecallUserLabel,
@@ -158,12 +160,9 @@ mod predicates;
 pub(super) mod rule;
 
 pub(in crate::rules) use features::leaves;
-pub use features::{
-    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
-    CommunityViewerRemovedLeaf, CompoundLeaf, EdgeLeaf, PostFactsLeaf, PostModerationLeaf,
-    ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf, RelationshipLeaf, ReplyControlLeaf,
-    RequestLeaf, SourceTweetIdLeaf, TweetLeaf, TweetSafetyLabelsLeaf, ViewerAccountLeaf,
-};
+#[cfg(test)]
+pub(in crate::rules) use features::AuthorFactsLeaf;
+pub use features::RequestLeaf;
 pub use predicates::Predicate;
 pub(in crate::rules) use predicates::*;
 
@@ -177,34 +176,7 @@ impl RuleId {
 pub(super) fn rule_name<E: Engine>(id: RuleId, action: &RuleAction<E>) -> String {
     let id: &str = id.into();
     let (kind, reason, prompt) = match action.spec() {
-        ActionSpec::Drop(DropReason::Legacy(reason)) => {
-            let reason = match reason {
-                FilteredReason::UnspecifiedReason => "unspecified".to_owned(),
-                FilteredReason::PossiblyUndesirable => "undesirable".to_owned(),
-                FilteredReason::ContainNsfwMedia => "nsfw_media".to_owned(),
-                FilteredReason::AuthorAccountIsInactive => "inactive".to_owned(),
-                reason @ (FilteredReason::AuthorBlockViewer
-                | FilteredReason::AuthorIsProtected
-                | FilteredReason::AuthorIsUnsafe
-                | FilteredReason::ReportedTweet
-                | FilteredReason::TweetMatchesViewerMutedKeyword(_)
-                | FilteredReason::TweetIsBounced
-                | FilteredReason::SafetyResult(_)
-                | FilteredReason::AuthorIsDeactivated
-                | FilteredReason::AuthorIsSuspended
-                | FilteredReason::ViewerMutesAuthor
-                | FilteredReason::TweetIsNullcast
-                | FilteredReason::ExclusiveTweet
-                | FilteredReason::ViewerBlocksAuthor) => snake(reason),
-            };
-            ("drop", Some(reason), None)
-        }
-        ActionSpec::Drop(DropReason::NsfwViewer(reason)) => {
-            ("drop", Some(<&str>::from(reason).to_owned()), None)
-        }
-        ActionSpec::Tombstone(TombstoneReason::SensitiveViewerAgeVerification) => {
-            ("tombstone", Some("age_verification".to_owned()), None)
-        }
+        ActionSpec::Drop(reason) => ("drop", Some(<&str>::from(reason).to_owned()), None),
         ActionSpec::Tombstone(reason) => ("tombstone", Some(<&str>::from(reason).to_owned()), None),
         ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(blur)) => {
             #[expect(
@@ -241,15 +213,7 @@ pub(super) fn rule_name<E: Engine>(id: RuleId, action: &RuleAction<E>) -> String
     };
     let keeps_reason = matches!(action.spec(), ActionSpec::SoftIntervention(_));
     let squashed = |name: &str| name.replace('_', "");
-    let reason = reason
-        .map(|reason| {
-            ["author_is_", "tweet_is_", "is_", "has_"]
-                .iter()
-                .find_map(|prefix| reason.strip_prefix(prefix))
-                .unwrap_or(&reason)
-                .to_owned()
-        })
-        .filter(|reason| keeps_reason || !squashed(id).contains(&squashed(reason)));
+    let reason = reason.filter(|reason| keeps_reason || !squashed(id).contains(&squashed(reason)));
     let mut name = format!("{id}/{kind}");
     for part in [reason, prompt].into_iter().flatten() {
         name.push('/');
@@ -305,7 +269,7 @@ impl LabelInterstitialSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum ActionSpec<E: Engine = PostEngine> {
-    Drop(DropReason),
+    Drop(DropAs),
     Tombstone(TombstoneReason),
     MediaRestriction(MediaRestriction),
     SoftIntervention(E::PostOnly<FosnrNotice>),
@@ -326,7 +290,7 @@ impl<E: Engine> RuleAction<E> {
 
     pub(super) fn lift(&self) -> RuleAction {
         let spec = match &self.spec {
-            ActionSpec::Drop(reason) => ActionSpec::Drop(reason.clone()),
+            ActionSpec::Drop(reason) => ActionSpec::Drop(*reason),
             ActionSpec::Tombstone(reason) => ActionSpec::Tombstone(*reason),
             ActionSpec::MediaRestriction(restriction) => {
                 ActionSpec::MediaRestriction(restriction.clone())
@@ -355,29 +319,43 @@ impl<E: Engine> From<ActionSpec<E>> for RuleAction<E> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum DropAs {
+    #[strum(serialize = "unspecified")]
     UnspecifiedReason,
+    #[strum(serialize = "undesirable")]
     PossiblyUndesirable,
+    #[strum(serialize = "nsfw_media")]
     ContainNsfwMedia,
+    #[strum(serialize = "inactive")]
     AuthorAccountIsInactive,
+    #[strum(serialize = "suspended")]
     AuthorIsSuspended,
+    #[strum(serialize = "deactivated")]
     AuthorIsDeactivated,
+    #[strum(serialize = "protected")]
     AuthorIsProtected,
     AuthorBlockViewer,
     ViewerBlocksAuthor,
     ViewerMutesAuthor,
+    #[strum(serialize = "bounced")]
     TweetIsBounced,
+    #[strum(serialize = "nullcast")]
     TweetIsNullcast,
     ExclusiveTweet,
+    #[strum(serialize = "safety_result")]
     NsfwHighPrecisionSafetyResult,
+    #[strum(serialize = "logged_out")]
     NsfwViewerLoggedOut,
+    #[strum(serialize = "underage")]
     NsfwViewerIsUnderage,
+    #[strum(serialize = "no_stated_age")]
     NsfwViewerHasNoStatedAge,
 }
 
 impl DropAs {
-    const fn reason(self) -> DropReason {
+    pub(in crate::rules) const fn reason(self) -> DropReason {
         let legacy = match self {
             DropAs::UnspecifiedReason => FilteredReason::UnspecifiedReason,
             DropAs::PossiblyUndesirable => FilteredReason::PossiblyUndesirable,
@@ -414,7 +392,7 @@ impl DropAs {
 
 pub(super) const fn drop_post<E: Engine>(reason: DropAs) -> RuleAction<E> {
     RuleAction {
-        spec: ActionSpec::Drop(reason.reason()),
+        spec: ActionSpec::Drop(reason),
     }
 }
 
@@ -470,11 +448,7 @@ const fn media_interstitial<E: Engine>(
 ) -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(
-            MediaInterstitial {
-                legacy: FilteredReason::ContainNsfwMedia,
-                reason,
-                prompt,
-            },
+            MediaInterstitial { reason, prompt },
         )),
     }
 }
@@ -489,7 +463,7 @@ pub(super) const fn legacy_nsfw_interstitial<E: Engine>() -> RuleAction<E> {
 impl<E: Engine> ActionSpec<E> {
     pub(super) fn spelled(&self) -> String {
         match self {
-            ActionSpec::Drop(reason) => format!("{reason:?}"),
+            ActionSpec::Drop(reason) => format!("{:?}", reason.reason()),
             ActionSpec::Tombstone(reason) => format!("{reason:?}"),
             ActionSpec::MediaRestriction(restriction) => format!("{restriction:?}"),
             ActionSpec::SoftIntervention(notice) => {
@@ -539,8 +513,11 @@ impl<E: Fold> ActionSpec<E> {
         interpreter: &I,
     ) -> I::Output<Option<Contribution>> {
         match self {
-            Self::Drop(reason) => interpreter
-                .run(|()| Some(Contribution::Withholding(Withholding::Drop(reason.clone())))),
+            Self::Drop(reason) => interpreter.run(|()| {
+                Some(Contribution::Withholding(Withholding::Drop(
+                    reason.reason(),
+                )))
+            }),
             Self::Tombstone(reason) => interpreter
                 .run(|()| Some(Contribution::Withholding(Withholding::Tombstone(*reason)))),
             Self::MediaRestriction(restriction) => {

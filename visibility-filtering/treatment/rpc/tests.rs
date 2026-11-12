@@ -1,4 +1,5 @@
 use super::*;
+use crate::result_label::{label, state_label, Class, NONE};
 use crate::rules::fixtures::{allow, dropped};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;
@@ -74,13 +75,10 @@ fn each_evaluation_sends_and_labels_as_vf_counts_it() {
     let policies = LimitedActionsPolicies::default();
     let level = SafetyLevel::TimelineHomeHydration;
     for (evaluation, sent, (class, reason)) in &cases {
+        let state = evaluate_tweets_state(evaluation, level, &policies);
+        assert_eq!(state.as_ref(), *sent, "{evaluation:?}");
         assert_eq!(
-            evaluate_tweets_state(evaluation, level, &policies).as_ref(),
-            *sent,
-            "{evaluation:?}"
-        );
-        assert_eq!(
-            evaluate_tweets_label(evaluation, level, &policies),
+            state.map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state)),
             ((*class).to_owned(), (*reason).to_owned()),
             "{evaluation:?}"
         );

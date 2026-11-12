@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_recsys_proto::grok_topics::{topic_index, PARENT_TOPIC_IDS};
 
 const TOP_TOPIC_COUNT: usize = 2;
@@ -103,76 +103,86 @@ impl TopicFeedbackContextHydrator {
     }
 }
 
+#[derive(Default)]
+pub struct TopicFeedbackContext {
+    feedback_topics: HashMap<usize, (String, String)>,
+    grok_topics: HashMap<usize, Vec<String>>,
+}
+
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator {
+    type Fetched = TopicFeedbackContext;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.params.get(EnableTopicFeedbackContext)
             && !query.is_topic_request()
             && !query.in_network_only
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         _query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<TopicFeedbackContext, String> {
         let eligible: Vec<(usize, u64)> = candidates
             .iter()
             .enumerate()
             .filter(|(_, c)| Self::is_eligible_original_post(c))
             .map(|(i, c)| (i, c.tweet_id))
             .collect();
+        if eligible.is_empty() {
+            return Ok(TopicFeedbackContext::default());
+        }
 
-        let mut grok_topics_by_idx: HashMap<usize, Vec<String>> = HashMap::new();
-        let selected = if eligible.is_empty() {
-            HashMap::new()
-        } else {
-            let tweet_ids: Vec<u64> = eligible.iter().map(|(_, id)| *id).collect();
-            let results = self
-                .strato_client
-                .batch_get_unified_post_annotations(&tweet_ids)
-                .await;
+        let tweet_ids: Vec<u64> = eligible.iter().map(|(_, id)| *id).collect();
+        let results = self
+            .strato_client
+            .batch_get_unified_post_annotations(&tweet_ids)
+            .await;
 
-            let mut candidate_topics: Vec<(usize, Vec<TopicAnnotation>)> = Vec::new();
-            for ((idx, _), result) in eligible.into_iter().zip(results) {
-                match result {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        let (annotations, topic_names) = Self::decode_topics(&bytes);
-                        if !topic_names.is_empty() {
-                            grok_topics_by_idx.insert(idx, topic_names);
-                        }
-                        if !annotations.is_empty() {
-                            candidate_topics.push((idx, annotations));
-                        }
+        let mut grok_topics: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut candidate_topics: Vec<(usize, Vec<TopicAnnotation>)> = Vec::new();
+        for ((idx, _), result) in eligible.into_iter().zip(results) {
+            match result {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let (annotations, topic_names) = Self::decode_topics(&bytes);
+                    if !topic_names.is_empty() {
+                        grok_topics.insert(idx, topic_names);
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("TopicFeedbackContextHydrator: strato fetch error: {}", e);
+                    if !annotations.is_empty() {
+                        candidate_topics.push((idx, annotations));
                     }
                 }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("TopicFeedbackContextHydrator: strato fetch error: {}", e);
+                }
             }
-            Self::select_feedback_targets(&candidate_topics)
-        };
-
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let (topic, topic_id) = match selected.get(&i) {
-                    Some((t, id)) => (Some(t.clone()), Some(id.clone())),
-                    None => (None, None),
-                };
-                Ok(PostCandidate {
-                    topic_feedback_topic: topic,
-                    topic_feedback_topic_id: topic_id,
-                    grok_topics: grok_topics_by_idx.get(&i).cloned(),
-                    ..Default::default()
-                })
-            })
-            .collect()
+        }
+        Ok(TopicFeedbackContext {
+            feedback_topics: Self::select_feedback_targets(&candidate_topics),
+            grok_topics,
+        })
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        mut context: TopicFeedbackContext,
+    ) {
+        for (i, candidate) in candidates.iter_mut().enumerate() {
+            let (topic, topic_id) = context
+                .feedback_topics
+                .remove(&i)
+                .map_or((None, None), |(topic, id)| (Some(topic), Some(id)));
+            candidate.topic_feedback_topic = topic;
+            candidate.topic_feedback_topic_id = topic_id;
+            candidate.grok_topics = context.grok_topics.remove(&i);
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.topic_feedback_topic = hydrated.topic_feedback_topic;
         candidate.topic_feedback_topic_id = hydrated.topic_feedback_topic_id;
         candidate.grok_topics = hydrated.grok_topics;

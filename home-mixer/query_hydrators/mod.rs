@@ -4,6 +4,7 @@ pub mod explicit_engagement_signals_query_hydrator;
 pub mod followed_grok_topics_query_hydrator;
 pub mod followed_starter_packs_query_hydrator;
 pub mod followed_user_ids_query_hydrator;
+pub mod frame_dismissal_query_hydrator;
 pub mod immersive_scoring_sequence_query_hydrator;
 pub mod implicit_engagement_signals_query_hydrator;
 pub mod impressed_posts_query_hydrator;

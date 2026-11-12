@@ -14,12 +14,14 @@ use crate::filters::ad_adjacent_served_filter::AdAdjacentServedFilter;
 use crate::filters::push_to_home_dedup_filter::PushToHomeDedupFilter;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
+use crate::query_hydrators::frame_dismissal_query_hydrator::FrameDismissalQueryHydrator;
 use crate::query_hydrators::past_request_timestamps_query_hydrator::PastRequestTimestampsQueryHydrator;
 use crate::query_hydrators::served_history_query_hydrator::ServedHistoryQueryHydrator;
 use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
+use crate::side_effects::frame_dismissal_side_effect::FrameDismissalSideEffect;
 use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
 use crate::side_effects::phoenix_request_cache_side_effect::ServedSlateCacheSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
@@ -218,6 +220,9 @@ impl ForYouCandidatePipeline {
             Box::new(PastRequestTimestampsQueryHydrator::new(Arc::clone(
                 &past_request_timestamps_client,
             ))),
+            Box::new(FrameDismissalQueryHydrator {
+                strato_client: Arc::clone(&strato_client),
+            }),
         ];
 
         let sources: Vec<Box<dyn Source<ScoredPostsQuery, FeedItem>>> = vec![
@@ -233,7 +238,9 @@ impl ForYouCandidatePipeline {
                 tes_client,
                 reply_mixer_client,
             }),
-            Box::new(JetfuelFrameSource { strato_client }),
+            Box::new(JetfuelFrameSource {
+                strato_client: Arc::clone(&strato_client),
+            }),
             Box::new(JetfuelDirectFrameSource { jetfuel_client }),
             Box::new(FeedSurveySource),
         ];
@@ -262,6 +269,7 @@ impl ForYouCandidatePipeline {
                 ))),
                 Box::new(TruncateServedHistorySideEffect::new(served_history_client)),
                 Box::new(served_slate_cache),
+                Box::new(FrameDismissalSideEffect { strato_client }),
             ]);
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>> =

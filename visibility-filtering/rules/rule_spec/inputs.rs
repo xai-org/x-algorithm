@@ -69,19 +69,3 @@ impl<'a, A: Inputs<'a>, B: Inputs<'a>, C: Inputs<'a>> Inputs<'a> for (A, B, C) {
         )
     }
 }
-
-impl<'a, A: Inputs<'a>, B: Inputs<'a>, C: Inputs<'a>, D: Inputs<'a>> Inputs<'a> for (A, B, C, D) {
-    const REQUIRED: Hydrators = A::REQUIRED
-        .union(B::REQUIRED)
-        .union(C::REQUIRED)
-        .union(D::REQUIRED);
-    #[inline]
-    fn acquire(context: &RuleContext<'a>) -> Self {
-        (
-            A::acquire(context),
-            B::acquire(context),
-            C::acquire(context),
-            D::acquire(context),
-        )
-    }
-}

@@ -19,13 +19,13 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(labeled(SafetyLabelType::MALICIOUS_URL)),
             expect: vec![
                 (
-                    Role::each([Role::NonFollower, Role::Follower]),
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "malicious_url/drop/undesirable",
                     ),
                 ),
-                (Role::Author, allow()),
+                (Role::each([Role::Follower, Role::Author]), allow()),
             ],
             at: vec![(TimelineHome, Role::NonFollower, allow())],
         },
@@ -49,13 +49,13 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(labeled(SafetyLabelType::DO_NOT_AMPLIFY)),
             expect: vec![
                 (
-                    Role::each([Role::NonFollower, Role::Follower]),
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "do_not_amplify/drop/undesirable",
                     ),
                 ),
-                (Role::Author, allow()),
+                (Role::each([Role::Follower, Role::Author]), allow()),
             ],
             at: vec![],
         },

@@ -2,6 +2,8 @@ use crate::hydration::batch::{Hydrated, HydrationBatch};
 use crate::hydration::inventory::Answer;
 use crate::hydration::relation::Relation;
 use crate::hydration::sources::Source;
+#[cfg(test)]
+use crate::hydration::Hydrator;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
@@ -9,21 +11,7 @@ use std::hash::Hash;
 use strum::VariantArray;
 
 pub(super) struct Fetcher<V, K = u64> {
-    states: FxHashMap<K, State<V>>,
-}
-
-enum State<V> {
-    Pending,
-    Landed(Hydrated<V>),
-}
-
-impl<V> State<V> {
-    fn is_complete(&self) -> bool {
-        match self {
-            State::Landed(answer) => answer.is_complete(),
-            State::Pending => false,
-        }
-    }
+    states: FxHashMap<K, Hydrated<V>>,
 }
 
 impl<V, K> Default for Fetcher<V, K> {
@@ -35,26 +23,49 @@ impl<V, K> Default for Fetcher<V, K> {
 }
 
 impl<V, K: Copy + Eq + Hash> Fetcher<V, K> {
-    pub(super) fn land(&mut self, claimed: &[K], batch: HydrationBatch<K, V>) {
-        let mut answers = batch.into_hydrated();
-        for &key in claimed {
-            let answer = answers.remove(&key).unwrap_or(Hydrated::Unanswered);
-            self.states.insert(key, State::Landed(answer));
+    pub(super) fn land(&mut self, batch: HydrationBatch<K, V>) {
+        for (key, answer) in batch.into_hydrated() {
+            if let Some(state) = self.states.get_mut(&key) {
+                debug_assert!(
+                    matches!(state, Hydrated::Unanswered),
+                    "a batch answers only its call's keys"
+                );
+                *state = answer;
+            }
         }
+    }
+
+    pub(super) fn land_by<S: Copy + Eq + Hash>(
+        &mut self,
+        claimed: &[S],
+        batch: HydrationBatch<S, V>,
+        key: impl Fn(S) -> K,
+    ) {
+        let mut answers = batch.into_hydrated();
+        for &claimed in claimed {
+            let answer = answers.remove(&claimed).unwrap_or(Hydrated::Unanswered);
+            self.states.insert(key(claimed), answer);
+        }
+    }
+
+    pub(super) fn claim_by<S>(&mut self, mut keys: Vec<S>, key: impl Fn(&S) -> K) -> Vec<S> {
+        self.states.reserve(keys.len());
+        keys.retain(|claimed| match self.states.entry(key(claimed)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(Hydrated::Unanswered);
+                true
+            }
+        });
+        keys
     }
 
     pub(super) fn get(&self, key: K) -> Option<&V> {
-        match self.states.get(&key)? {
-            State::Landed(answer) => answer.value(),
-            State::Pending => None,
-        }
+        self.states.get(&key)?.value()
     }
 
     pub(super) fn take(&mut self, key: K) -> Option<V> {
-        match self.states.remove(&key)? {
-            State::Landed(answer) => answer.into_value(),
-            State::Pending => None,
-        }
+        self.states.remove(&key)?.into_value()
     }
 }
 
@@ -79,15 +90,21 @@ pub(crate) struct FetcherId {
 impl FetcherId {
     #[cfg(test)]
     pub(crate) fn all() -> impl Iterator<Item = Self> {
-        Source::VARIANTS.iter().flat_map(|&source| {
-            let owners = Relation::VARIANTS
-                .iter()
-                .filter(move |relation| relation.owns(source))
-                .map(|&relation| Owner::Related(relation));
-            std::iter::once(Owner::Request)
-                .chain(owners)
-                .map(move |owner| Self { source, owner })
-        })
+        let related = Hydrator::VARIANTS
+            .iter()
+            .map(|node| node.spec().fetcher())
+            .filter(|fetcher| fetcher.owner != Owner::Request);
+        let mut all: Vec<Self> = Vec::new();
+        for fetcher in Source::VARIANTS
+            .iter()
+            .map(|&source| Self::from(source))
+            .chain(related)
+        {
+            if !all.contains(&fetcher) {
+                all.push(fetcher);
+            }
+        }
+        all.into_iter()
     }
 
     pub(super) const fn asked_fields(self) -> AskedFields {
@@ -174,45 +191,32 @@ impl<V, K> Fetchers<V, K> {
 pub(super) trait AnyFetcher<K = u64> {
     fn claim(&mut self, keys: Vec<K>) -> Vec<K>;
     fn has_claimed(&self) -> bool;
-    fn is_claimed(&self, key: K) -> bool;
     fn is_incomplete(&self, key: K) -> bool;
     fn answer(&self, key: K) -> Answer;
 }
 
 impl<V, K: Copy + Eq + Hash> AnyFetcher<K> for Fetcher<V, K> {
-    fn claim(&mut self, mut keys: Vec<K>) -> Vec<K> {
-        self.states.reserve(keys.len());
-        keys.retain(|&key| match self.states.entry(key) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(entry) => {
-                entry.insert(State::Pending);
-                true
-            }
-        });
-        keys
+    fn claim(&mut self, keys: Vec<K>) -> Vec<K> {
+        self.claim_by(keys, |&key| key)
     }
 
     fn has_claimed(&self) -> bool {
         !self.states.is_empty()
     }
 
-    fn is_claimed(&self, key: K) -> bool {
-        self.states.contains_key(&key)
-    }
-
     fn is_incomplete(&self, key: K) -> bool {
         self.states
             .get(&key)
-            .is_some_and(|state| !state.is_complete())
+            .is_some_and(|answer| !answer.is_complete())
     }
 
     fn answer(&self, key: K) -> Answer {
         match self.states.get(&key) {
-            Some(State::Landed(Hydrated::Found(_))) => Answer::Found,
-            Some(State::Landed(Hydrated::Partial(_))) => Answer::Partial,
-            Some(State::Landed(Hydrated::NotFound)) => Answer::NotFound,
-            Some(State::Landed(Hydrated::Failed)) => Answer::Failed,
-            Some(State::Landed(Hydrated::Unanswered) | State::Pending) => Answer::Unanswered,
+            Some(Hydrated::Found(_)) => Answer::Found,
+            Some(Hydrated::Partial(_)) => Answer::Partial,
+            Some(Hydrated::NotFound) => Answer::NotFound,
+            Some(Hydrated::Failed) => Answer::Failed,
+            Some(Hydrated::Unanswered) => Answer::Unanswered,
             None => Answer::Unclaimed,
         }
     }
@@ -226,15 +230,12 @@ mod tests {
     fn only_found_and_not_found_keys_are_complete() {
         let mut fetcher = Fetcher::default();
         let keys = fetcher.claim(vec![1, 2, 3, 4, 5]);
-        fetcher.land(
-            &keys[..4],
-            HydrationBatch::from_hydrated(FxHashMap::from_iter([
-                (1, Hydrated::Found(7)),
-                (2, Hydrated::NotFound),
-                (3, Hydrated::Partial(7)),
-                (4, Hydrated::Failed),
-            ])),
-        );
+        fetcher.land(HydrationBatch::from_hydrated(FxHashMap::from_iter([
+            (1, Hydrated::Found(7)),
+            (2, Hydrated::NotFound),
+            (3, Hydrated::Partial(7)),
+            (4, Hydrated::Failed),
+        ])));
 
         let incomplete: Vec<u64> = keys
             .into_iter()
@@ -247,11 +248,11 @@ mod tests {
     #[test]
     fn a_claimed_key_the_answer_leaves_out_lands_unanswered() {
         let mut fetcher = Fetcher::default();
-        let keys = fetcher.claim(vec![1, 2]);
-        fetcher.land(
-            &keys,
-            HydrationBatch::from_hydrated(FxHashMap::from_iter([(1, Hydrated::Found(7))])),
-        );
+        assert_eq!(fetcher.claim(vec![1, 2]), [1, 2]);
+        fetcher.land(HydrationBatch::from_hydrated(FxHashMap::from_iter([(
+            1,
+            Hydrated::Found(7),
+        )])));
 
         assert!(fetcher.is_incomplete(2));
         assert_eq!(fetcher.answer(2), Answer::Unanswered);

@@ -27,6 +27,7 @@ struct Case {
     recipient: ViewerFeatures,
     post: PostCandidate,
     mention_and_reply: Verdict,
+    media_tagged: Verdict,
 }
 
 fn shown(
@@ -41,6 +42,7 @@ fn shown(
         recipient,
         post,
         mention_and_reply: allow(),
+        media_tagged: allow(),
     }
 }
 
@@ -325,6 +327,16 @@ fn post_cases() -> Vec<Case> {
                 .with_label(SafetyLabelType::LOW_QUALITY)
                 .build(),
         ),
+        Case {
+            mention_and_reply: undesirable("spam_high_recall/drop/undesirable"),
+            media_tagged: undesirable("spam_high_recall_oon/drop/undesirable"),
+            ..shown(
+                "spam_high_recall_label",
+                "non_follower",
+                default_recipient(),
+                labeled(SafetyLabelType::SPAM_HIGH_RECALL),
+            )
+        },
         dropped_at_79(
             "spam_high_recall_label",
             "follower",
@@ -351,6 +363,7 @@ fn post_cases() -> Vec<Case> {
         ),
         Case {
             mention_and_reply: unspecified("risky_high_viz_reply_oon/drop/unspecified"),
+            media_tagged: unspecified("risky_high_viz_reply_oon/drop/unspecified"),
             ..shown(
                 "risky_high_viz_reply_label",
                 "non_follower",
@@ -417,14 +430,17 @@ fn post_cases() -> Vec<Case> {
     cases
 }
 
-fn post_case_verdict(kind: NotificationKind, with_level_79_drops: Verdict) -> Verdict {
+fn post_case_verdict(kind: NotificationKind, case: &Case) -> Verdict {
     match kind {
-        NotificationKind::Mention | NotificationKind::Reply => with_level_79_drops,
-        NotificationKind::MediaTagged => allow(),
+        NotificationKind::Mention | NotificationKind::Reply => case.mention_and_reply.clone(),
+        NotificationKind::MediaTagged => case.media_tagged.clone(),
+        NotificationKind::Quote => allow(),
         NotificationKind::Follow
         | NotificationKind::FollowRequestAccepted
         | NotificationKind::Like
-        | NotificationKind::Repost => {
+        | NotificationKind::Repost
+        | NotificationKind::ContactJoined
+        | NotificationKind::AddedToList => {
             unreachable!("{kind:?} is no post kind")
         }
     }
@@ -435,14 +451,17 @@ pub(super) fn cases() -> Vec<CorpusCase> {
         .iter()
         .flat_map(|&level| level.post_kinds().map(move |(kind, _)| (level, kind)))
         .flat_map(|(level, kind)| {
-            let posts = post_cases().into_iter().map(move |case| CorpusCase {
-                name: format!("{}/{level:?}/{kind:?}/{}", case.name, case.role),
-                level,
-                kind: Some(kind),
-                viewer: case.recipient,
-                subject: Subject::Post(case.post),
-                placement: Placement::Standalone,
-                expected: post_case_verdict(kind, case.mention_and_reply),
+            let posts = post_cases().into_iter().map(move |case| {
+                let expected = post_case_verdict(kind, &case);
+                CorpusCase {
+                    name: format!("{}/{level:?}/{kind:?}/{}", case.name, case.role),
+                    level,
+                    kind: Some(kind),
+                    viewer: case.recipient,
+                    subject: Subject::Post(case.post),
+                    placement: Placement::Standalone,
+                    expected,
+                }
             });
             post_kind_cases(level, kind).into_iter().chain(posts)
         })

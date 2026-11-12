@@ -11,7 +11,8 @@ use crate::params::LimitedActionsPolicies;
 use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
 use crate::result_label::{
-    Class, Failure, Label, NONE, failed, label, quote_label, renders_alike, state_label,
+    Class, Failure, Label, NONE, evaluate_tweets_label, failed, label, quote_label, renders_alike,
+    state_label,
 };
 use crate::rules::SafetyLevel;
 use crate::server_deps::init_client_with_retry;
@@ -454,7 +455,7 @@ fn vf_status(evaluation: &Evaluation) -> &'static str {
 }
 
 fn vf_label(outcome: &PostEvaluation, level: SafetyLevel) -> Label {
-    treatment::evaluate_tweets_label(
+    evaluate_tweets_label(
         &outcome.evaluation,
         level,
         &LimitedActionsPolicies::default(),

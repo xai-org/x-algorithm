@@ -7,25 +7,27 @@ use arc_swap::ArcSwapOption;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use prost::Message;
 use rustc_hash::FxHashSet;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
-use xai_cache::{KVCacheError, Key};
+use xai_cache::Key;
 use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
 use xai_safety_label_store::types::safety_label_metas;
 use xai_visibility_filtering_proto as vf_pb;
 
 use super::decode::{self, RawSafetyLabel};
 use super::metrics::{
-    self, CacheResult, CacheTier, DeleteAttempt, DeleteResult, FillKeyResult, LabelMetrics,
+    self, CacheKeyCounts, CacheTier, DeleteAttempt, DeleteResult, FillKeyResult, LabelMetrics,
     MhCheckClass, MhCheckSample, MhCheckView, RefreshResult, ShadowResult, SourceOutcome,
 };
-use super::remote::{CacheWrite, FallbackReason, LabelSource, ManhattanSource, fallback_reason};
+use super::remote::{
+    CacheWrite, FallbackReason, LabelSource, ManhattanSource, Scan, cache_reply, prefixed_key,
+};
 use super::source::{drop_expired_labels, tweet_timestamp_ms};
 
 const KEY_PREFIX: &str = "sls:";
 const VALUE_VERSION: u8 = 2;
-const REFRESH_STEPS: [Duration; 1] = [Duration::from_secs(60)];
+const REFRESH_AFTER: Duration = Duration::from_secs(60);
 const REPEAT_AFTER: Duration = Duration::from_secs(30);
 const REPEAT_QUEUE: usize = 500_000;
 const DELETE_PERMITS: u32 = 256;
@@ -83,6 +85,9 @@ impl LabelCacheSwitches {
                 .get_i64_no_impression(key)
                 .and_then(|value| u64::try_from(value).ok())
         };
+        let per_sec = |key, default| {
+            value(key).map_or(default, |keys| u32::try_from(keys).unwrap_or(u32::MAX))
+        };
         let default = Self::default();
         Self {
             shadow_buckets: value("rust_vf_safety_label_cache_shadow_buckets")
@@ -96,16 +101,14 @@ impl LabelCacheSwitches {
             refresh_cutoff_ms: value("rust_vf_safety_label_cache_refresh_cutoff_ms")
                 .unwrap_or(default.refresh_cutoff_ms),
             replay_bucket: value("rust_vf_safety_label_cache_replay_bucket"),
-            shadow_mh_check_keys_per_sec: value(
+            shadow_mh_check_keys_per_sec: per_sec(
                 "rust_vf_safety_label_cache_shadow_mh_check_keys_per_sec",
-            )
-            .map_or(default.shadow_mh_check_keys_per_sec, |keys| {
-                u32::try_from(keys).unwrap_or(u32::MAX)
-            }),
-            shadow_fill_keys_per_sec: value("rust_vf_safety_label_cache_shadow_fill_keys_per_sec")
-                .map_or(default.shadow_fill_keys_per_sec, |keys| {
-                    u32::try_from(keys).unwrap_or(u32::MAX)
-                }),
+                default.shadow_mh_check_keys_per_sec,
+            ),
+            shadow_fill_keys_per_sec: per_sec(
+                "rust_vf_safety_label_cache_shadow_fill_keys_per_sec",
+                default.shadow_fill_keys_per_sec,
+            ),
         }
     }
 
@@ -160,14 +163,9 @@ impl Fill {
             return Some(Self::new(context.now_ms));
         }
         let age_ms = context.now_ms.saturating_sub(self.filled_at_ms);
-        let due = REFRESH_STEPS
-            .iter()
-            .take_while(|&&after| age_ms >= millis(after))
-            .count();
-        let step = u8::try_from(due).ok()?;
-        (step > self.step).then_some(Self {
+        (self.step == 0 && age_ms >= millis(REFRESH_AFTER)).then_some(Self {
             filled_at_ms: self.filled_at_ms,
-            step,
+            step: 1,
         })
     }
 }
@@ -255,7 +253,7 @@ impl Envelope {
         context.now_ms.saturating_sub(self.fill.filled_at_ms) < millis(ttl.max(MIN_TTL))
     }
 
-    fn filtered(&self, now_ms: i64) -> Self {
+    fn filtered(&self, now_ms: u64) -> Self {
         let status = match &self.status {
             Status::Found(labels) => Status::Found(filtered_labels(labels, now_ms)),
             Status::NotFound => Status::NotFound,
@@ -283,7 +281,8 @@ impl Envelope {
     }
 }
 
-fn filtered_labels(labels: &vf_pb::SafetyLabelMap, now_ms: i64) -> vf_pb::SafetyLabelMap {
+fn filtered_labels(labels: &vf_pb::SafetyLabelMap, now_ms: u64) -> vf_pb::SafetyLabelMap {
+    let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
     twemcache_types_only(drop_expired_labels(labels, now_ms))
 }
 
@@ -428,8 +427,8 @@ fn differing_fields(a: &vf_pb::SafetyLabel, b: &vf_pb::SafetyLabel) -> Vec<&'sta
     .collect()
 }
 
-fn cache_key(tweet_id: u64) -> Result<Key, KVCacheError> {
-    Key::new(format!("{KEY_PREFIX}{tweet_id}").into_bytes())
+fn cache_key(tweet_id: u64) -> Key {
+    prefixed_key(KEY_PREFIX, tweet_id)
 }
 
 pub struct LabelCacheInvalidator {
@@ -531,10 +530,7 @@ impl LabelCacheInvalidator {
 }
 
 async fn delete(cache: &dyn CacheWrite, tweet_id: u64) -> DeleteResult {
-    let Ok(key) = cache_key(tweet_id) else {
-        return DeleteResult::Failed;
-    };
-    match cache.delete(&key).await {
+    match cache.delete(&cache_key(tweet_id)).await {
         Ok(()) => DeleteResult::Deleted,
         Err(_) => DeleteResult::Failed,
     }
@@ -564,7 +560,7 @@ async fn repeat(
 pub(crate) enum EntryRead {
     Hit {
         envelope: Envelope,
-        refresh: Option<Fill>,
+        refresh: Option<FillJob>,
     },
     Miss,
     Failed,
@@ -582,15 +578,7 @@ pub(crate) enum FillLabels {
         read_at: tokio::time::Instant,
     },
         Reread,
-        Refresh { entry: Envelope },
-}
-
-#[derive(Default)]
-struct ReadCounts {
-    hit: usize,
-    not_found: usize,
-    miss: usize,
-    expired: usize,
+            Refresh { entry: Envelope, served_at_ms: u64 },
 }
 
 pub(crate) struct DragonflySource {
@@ -671,26 +659,29 @@ impl DragonflySource {
         tier: CacheTier,
     ) -> Vec<(u64, EntryRead)> {
         let start = Instant::now();
-        let keys: Vec<Option<Key>> = ids.iter().map(|&id| cache_key(id).ok()).collect();
-        let present: Vec<Key> = keys.iter().flatten().cloned().collect();
-        let replies = self.cache.multi_get(&present).await;
+        let keys: Vec<Key> = ids.iter().map(|&id| cache_key(id)).collect();
+        let replies = self.cache.multi_get(&keys).await;
 
-        let mut counts = ReadCounts::default();
+        let mut counts = CacheKeyCounts::default();
         let mut failures: BTreeMap<FallbackReason, usize> = BTreeMap::new();
         let mut reads = Vec::with_capacity(ids.len());
         for (&id, key) in ids.iter().zip(&keys) {
-            let reply = key.as_ref().map(|key| replies.get(key));
-            let read = match reply {
-                Some(Some(Ok(Some(bytes)))) => match Envelope::decode(bytes) {
+            let read = match cache_reply(replies.get(key)) {
+                Ok(Some(bytes)) => match Envelope::decode(bytes) {
                     Some(envelope) if envelope.is_live(context) => {
                         match envelope.status {
                             Status::Found(_) => counts.hit += 1,
                             Status::NotFound => counts.not_found += 1,
                         }
-                        EntryRead::Hit {
-                            refresh: envelope.fill.due_refresh(context),
-                            envelope,
-                        }
+                        let refresh = envelope.fill.due_refresh(context).map(|fill| FillJob {
+                            tweet_id: id,
+                            fill,
+                            labels: FillLabels::Refresh {
+                                entry: envelope.clone(),
+                                served_at_ms: context.now_ms,
+                            },
+                        });
+                        EntryRead::Hit { envelope, refresh }
                     }
                     Some(_) => {
                         counts.expired += 1;
@@ -701,20 +692,12 @@ impl DragonflySource {
                         EntryRead::Miss
                     }
                 },
-                Some(Some(Ok(None))) => {
+                Ok(None) => {
                     counts.miss += 1;
                     EntryRead::Miss
                 }
-                Some(Some(Err(e))) => {
-                    *failures.entry(fallback_reason(e)).or_default() += 1;
-                    EntryRead::Failed
-                }
-                Some(None) => {
-                    *failures.entry(FallbackReason::MissingResponse).or_default() += 1;
-                    EntryRead::Failed
-                }
-                None => {
-                    *failures.entry(FallbackReason::Other).or_default() += 1;
+                Err(reason) => {
+                    *failures.entry(reason).or_default() += 1;
                     EntryRead::Failed
                 }
             };
@@ -728,13 +711,8 @@ impl DragonflySource {
             SourceOutcome::Success,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-        metrics::record_cache_keys(m, tier, CacheResult::Hit, counts.hit);
-        metrics::record_cache_keys(m, tier, CacheResult::NotFound, counts.not_found);
-        metrics::record_cache_keys(m, tier, CacheResult::Miss, counts.miss);
-        metrics::record_cache_keys(m, tier, CacheResult::Expired, counts.expired);
-        for (reason, count) in failures {
-            metrics::record_cache_fallback_keys(m, LabelSource::Dragonfly, reason, count);
-        }
+        metrics::record_cache_keys(m, tier, &counts);
+        metrics::record_cache_fallback_keys(m, LabelSource::Dragonfly, failures);
         reads
     }
 
@@ -784,20 +762,18 @@ impl DragonflySource {
         self.outage_budget.check().is_ok()
     }
 
-            pub(crate) fn shadow_permit(&self, keys: usize) -> Option<OwnedSemaphorePermit> {
-        let permit = Arc::clone(&self.shadow_tasks).try_acquire_owned().ok();
-        if permit.is_none() {
-            record_shed(&self.metrics, keys);
-        }
-        permit
-    }
-
-    pub(crate) fn shadow(
+        pub(crate) fn shadow(
         self: &Arc<Self>,
-        permit: OwnedSemaphorePermit,
-        answers: Vec<(u64, vf_pb::SafetyLabelMap)>,
+        answers: Vec<(u64, &vf_pb::SafetyLabelMap)>,
         context: ReadContext,
     ) {
+        let Ok(permit) = Arc::clone(&self.shadow_tasks).try_acquire_owned() else {
+            return record_shed(&self.metrics, answers.len());
+        };
+        let answers: Vec<(u64, vf_pb::SafetyLabelMap)> = answers
+            .into_iter()
+            .map(|(id, labels)| (id, labels.clone()))
+            .collect();
         let source = Arc::clone(self);
         tokio::spawn(async move {
             let _permit = permit;
@@ -826,7 +802,6 @@ impl DragonflySource {
             &self.shadow_fill_budget,
             context.switches.shadow_fill_keys_per_sec,
         );
-        let served_at_ms = i64::try_from(context.now_ms).unwrap_or(i64::MAX);
         let (mut matched, mut mismatched, mut failed) = (0, 0, 0);
         let mut would_read = 0;
         let mut fills = Vec::new();
@@ -834,56 +809,48 @@ impl DragonflySource {
         for ((tweet_id, read), (_, answer)) in reads.into_iter().zip(answers) {
             let job = match read {
                 EntryRead::Hit { envelope, refresh } => {
-                    let filtered_entry = envelope.filtered(served_at_ms);
-                    let sample = if filtered_entry.answers(&filtered_labels(&answer, served_at_ms))
-                    {
-                        matched += 1;
-                        MhCheckSample::Match
-                    } else {
-                        mismatched += 1;
-                        if self.mismatch_logs.check().is_ok() {
-                            log_mismatch(tweet_id, &envelope, &answer, context.now_ms);
-                        }
-                        MhCheckSample::Mismatch
-                    };
+                    let filtered_entry = envelope.filtered(context.now_ms);
+                    let sample =
+                        if filtered_entry.answers(&filtered_labels(&answer, context.now_ms)) {
+                            matched += 1;
+                            MhCheckSample::Match
+                        } else {
+                            mismatched += 1;
+                            if self.mismatch_logs.check().is_ok() {
+                                log_mismatch(tweet_id, &envelope, &answer, context.now_ms);
+                            }
+                            MhCheckSample::Mismatch
+                        };
                     if refresh.is_some() {
                         would_read += 1;
                     }
-                    let job = refresh.map(|fill| {
-                        let labels = FillLabels::Refresh {
-                            entry: envelope.clone(),
-                        };
-                        (fill, labels)
-                    });
                     if budget.is_some() {
                         hits.push(ShadowHit {
                             tweet_id,
                             sample,
                             entry: envelope,
-                            answer: answer.clone(),
+                            answer,
                         });
                     }
-                    job
+                    refresh
                 }
                 EntryRead::Miss => {
                     would_read += 1;
                     fill_budget
                         .as_ref()
                         .is_some_and(|budget| budget.limiter.check().is_ok())
-                        .then(|| (Fill::new(context.now_ms), FillLabels::Reread))
+                        .then(|| FillJob {
+                            tweet_id,
+                            fill: Fill::new(context.now_ms),
+                            labels: FillLabels::Reread,
+                        })
                 }
                 EntryRead::Failed => {
                     failed += 1;
                     None
                 }
             };
-            if let Some((fill, labels)) = job {
-                fills.push(FillJob {
-                    tweet_id,
-                    fill,
-                    labels,
-                });
-            }
+            fills.extend(job);
         }
         let m = &self.metrics;
         metrics::record_shadow_keys(m, ShadowResult::Match, matched);
@@ -903,50 +870,31 @@ impl DragonflySource {
         now_ms: u64,
         deadline: tokio::time::Instant,
     ) {
-        if hits.is_empty() {
-            return;
-        }
         let ids: Vec<u64> = hits.iter().map(|hit| hit.tweet_id).collect();
         let read_at = tokio::time::Instant::now();
         let mut manhattan = tokio::time::timeout_at(deadline, self.manhattan.scan(&ids))
             .await
             .unwrap_or_default();
-        let served_at_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let mut counts: BTreeMap<(MhCheckClass, MhCheckSample, MhCheckView), usize> =
             BTreeMap::new();
         let mut repairs = Vec::new();
         for hit in hits {
-            let (items, labels) = match manhattan.remove(&hit.tweet_id).and_then(Result::ok) {
-                Some(scan) => (Some(scan.items), Some(scan.labels)),
-                None => (None, None),
-            };
-            let raw_class = mh_check_class(&hit.entry, &hit.answer, labels.as_ref());
+            let scan = manhattan.remove(&hit.tweet_id).and_then(Result::ok);
+            let labels = scan.as_ref().map(|scan| &scan.labels);
+            let raw_class = mh_check_class(&hit.entry, &hit.answer, labels);
             *counts
                 .entry((raw_class, hit.sample, MhCheckView::Raw))
                 .or_default() += 1;
-            let filtered = labels
-                .as_ref()
-                .map(|labels| filtered_labels(labels, served_at_ms));
+            let filtered = labels.map(|labels| filtered_labels(labels, now_ms));
             let class = mh_check_class(
-                &hit.entry.filtered(served_at_ms),
-                &filtered_labels(&hit.answer, served_at_ms),
+                &hit.entry.filtered(now_ms),
+                &filtered_labels(&hit.answer, now_ms),
                 filtered.as_ref(),
             );
             *counts
                 .entry((class, hit.sample, MhCheckView::Filtered))
                 .or_default() += 1;
-            if let Some(labels) = &labels
-                && matches!(
-                    class,
-                    MhCheckClass::DragonflyDiffers
-                        | MhCheckClass::AllDiffer
-                        | MhCheckClass::ManhattanDiffers
-                )
-                && self.mh_mismatch_logs.check().is_ok()
-            {
-                log_mh_mismatch(&hit, labels, class, now_ms);
-            }
-            if let Some(items) = items
+            if let Some(scan) = scan
                 && matches!(
                     class,
                     MhCheckClass::DragonflyDiffers
@@ -954,10 +902,16 @@ impl DragonflySource {
                         | MhCheckClass::ManhattanDiffers
                 )
             {
+                if self.mh_mismatch_logs.check().is_ok() {
+                    log_mh_mismatch(&hit, &scan.labels, class, now_ms);
+                }
                 repairs.push(FillJob {
                     tweet_id: hit.tweet_id,
                     fill: Fill::new(now_ms),
-                    labels: FillLabels::Scanned { items, read_at },
+                    labels: FillLabels::Scanned {
+                        items: scan.items,
+                        read_at,
+                    },
                 });
             }
         }
@@ -1079,15 +1033,6 @@ struct Writer {
     metrics: LabelMetrics,
 }
 
-fn refresh_result(entry: &Envelope, items: &[RawSafetyLabel]) -> Option<RefreshResult> {
-    let reread = if items.is_empty() {
-        vf_pb::SafetyLabelMap::default()
-    } else {
-        twemcache_types_only(decode::raw_labels(items)?)
-    };
-    Some(LabelDiff::new(entry, &reread).refresh_result())
-}
-
 impl Writer {
             async fn write(&self, jobs: Vec<FillJob>) {
         let ids: Vec<u64> = jobs.iter().map(|job| job.tweet_id).collect();
@@ -1108,14 +1053,18 @@ impl Writer {
                     FillLabels::Reread => {
                         (reread_results.remove(&job.tweet_id)?.ok()?.items, reread_at)
                     }
-                    FillLabels::Refresh { entry } => {
-                        let items = reread_results.remove(&job.tweet_id)?.ok()?.items;
-                        if let Some(result) = refresh_result(&entry, &items) {
-                            let status = <&'static str>::from(&entry.status);
-                            *refreshes
-                                .entry((entry.fill.step, status, result))
-                                .or_default() += 1;
-                        }
+                    FillLabels::Refresh {
+                        entry,
+                        served_at_ms,
+                    } => {
+                        let Scan { items, labels } = reread_results.remove(&job.tweet_id)?.ok()?;
+                        let reread = filtered_labels(&labels, served_at_ms);
+                        let result =
+                            LabelDiff::new(&entry.filtered(served_at_ms), &reread).refresh_result();
+                        let status = <&'static str>::from(&entry.status);
+                        *refreshes
+                            .entry((entry.fill.step, status, result))
+                            .or_default() += 1;
                         (items, reread_at)
                     }
                 };
@@ -1123,7 +1072,7 @@ impl Writer {
                     old_reads += 1;
                     return None;
                 }
-                let key = cache_key(job.tweet_id).ok()?;
+                let key = cache_key(job.tweet_id);
                 let value = encode_entry(job.fill, items);
                 Some(async move { self.cache.set(&key, value, WRITE_TTL_SECS).await.is_ok() })
             })
@@ -1169,7 +1118,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tonic::async_trait;
-    use xai_cache::Value;
+    use xai_cache::{KVCacheError, Value};
     use xai_manhattan::ManhattanError;
     use xai_safety_label_store::types::encode_lkey;
     use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
@@ -1212,15 +1161,12 @@ mod tests {
         }
 
         fn fail(&self, id: u64) {
-            self.failing_keys
-                .lock()
-                .unwrap()
-                .insert(cache_key(id).unwrap());
+            self.failing_keys.lock().unwrap().insert(cache_key(id));
         }
 
         fn entry(&self, id: u64) -> Option<(Envelope, u32)> {
             let entries = self.entries.lock().unwrap();
-            let (bytes, ttl) = entries.get(&cache_key(id).unwrap())?;
+            let (bytes, ttl) = entries.get(&cache_key(id))?;
             Some((Envelope::decode(bytes).unwrap(), *ttl))
         }
 
@@ -1228,7 +1174,7 @@ mod tests {
             self.entries
                 .lock()
                 .unwrap()
-                .insert(cache_key(id).unwrap(), (bytes, DAY_SECS));
+                .insert(cache_key(id), (bytes, DAY_SECS));
         }
 
         fn put(&self, id: u64, status: Status, fill: Fill) {
@@ -1237,7 +1183,7 @@ mod tests {
 
         fn stored_items(&self, id: u64) -> Vec<StoredItem> {
             let entries = self.entries.lock().unwrap();
-            let (bytes, _) = entries.get(&cache_key(id).unwrap()).unwrap();
+            let (bytes, _) = entries.get(&cache_key(id)).unwrap();
             StoredEntry::decode(&bytes[1..]).unwrap().items
         }
     }
@@ -1305,7 +1251,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|&id| remote::cache_key(id).unwrap())
+                .map(|&id| remote::cache_key(id))
                 .collect();
             keys.iter()
                 .map(|key| {
@@ -1318,17 +1264,17 @@ mod tests {
 
     #[derive(Default)]
     struct FakeManhattan {
-        scores: Mutex<HashMap<i64, f64>>,
-        others: Mutex<HashMap<i64, Vec<SafetyLabelType>>>,
-        calls: Mutex<Vec<Vec<i64>>>,
+        scores: Mutex<HashMap<u64, f64>>,
+        others: Mutex<HashMap<u64, Vec<SafetyLabelType>>>,
+        calls: Mutex<Vec<Vec<u64>>>,
     }
 
     impl FakeManhattan {
-        fn set_spam(&self, id: i64, score: f64) {
+        fn set_spam(&self, id: u64, score: f64) {
             self.scores.lock().unwrap().insert(id, score);
         }
 
-        fn add_label(&self, id: i64, label_type: SafetyLabelType) {
+        fn add_label(&self, id: u64, label_type: SafetyLabelType) {
             self.others
                 .lock()
                 .unwrap()
@@ -1337,14 +1283,14 @@ mod tests {
                 .push(label_type);
         }
 
-        fn calls(&self) -> Vec<Vec<i64>> {
+        fn calls(&self) -> Vec<Vec<u64>> {
             self.calls.lock().unwrap().clone()
         }
     }
 
     #[async_trait]
     impl ManhattanLabelFetcher for FakeManhattan {
-        async fn fetch_labels(&self, ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError> {
+        async fn fetch_labels(&self, ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError> {
             self.calls.lock().unwrap().push(ids.to_vec());
             let scores = self.scores.lock().unwrap();
             let others = self.others.lock().unwrap();
@@ -1398,7 +1344,8 @@ mod tests {
         let stats = Arc::new(RecordedStats::default());
         let metrics = LabelMetrics::new(Some(Arc::<RecordedStats>::clone(&stats) as _));
         let remote = RemoteSource::new(
-            Arc::<FakeTwemcache>::clone(&twemcache),
+            Some(Arc::<FakeTwemcache>::clone(&twemcache) as _),
+            None,
             Arc::<FakeManhattan>::clone(&manhattan),
             metrics.clone(),
         );
@@ -1422,7 +1369,13 @@ mod tests {
         remote.set_switches(switches);
         let remote = Arc::new(remote);
         let source = match hot_keys {
-            Some(clock) => SafetyLabelSource::with_clock(remote, Some(4096), clock, metrics),
+            Some(clock) => SafetyLabelSource::with_clocks(
+                remote,
+                Some(4096),
+                clock,
+                Arc::new(crate::source::system_unix_ms),
+                metrics,
+            ),
             None => SafetyLabelSource::new(remote, None, metrics),
         };
         Built {
@@ -2044,6 +1997,18 @@ rust_vf:
         );
     }
 
+    #[test]
+    fn cache_keys_are_the_prefix_and_the_decimal_id() {
+        let key = |text: String| Key::from_bytes(text.into_bytes());
+        assert_eq!(cache_key(0), key("sls:0".to_owned()));
+        assert_eq!(cache_key(u64::MAX), key(format!("sls:{}", u64::MAX)));
+        assert_eq!(remote::cache_key(42), key("slm_42".to_owned()));
+        assert_eq!(
+            remote::cache_key(u64::MAX),
+            key(format!("slm_{}", u64::MAX))
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn with_both_switches_at_zero_the_label_cache_is_neither_read_nor_written() {
         let w = world(LabelCacheSwitches::default());
@@ -2253,11 +2218,21 @@ rust_vf:
         w.dragonfly.put(2, Status::Found(spam(0.5)), due);
         w.dragonfly.put(3, Status::NotFound, due);
         w.dragonfly.put(4, Status::Found(spam(0.5)), due);
+        let mut with_expired = spam(0.5);
+        with_expired.labels.insert(
+            i32::from(SafetyLabelType::NSFA_HIGH_PRECISION),
+            vf_pb::SafetyLabel {
+                expires_at_msec: Some((BASE_MS - 1).cast_signed()),
+                ..vf_pb::SafetyLabel::default()
+            },
+        );
+        w.dragonfly.put(5, Status::Found(with_expired), due);
         w.manhattan.set_spam(1, 0.5);
         w.manhattan.set_spam(2, 0.9);
         w.manhattan.set_spam(3, 0.7);
+        w.manhattan.set_spam(5, 0.5);
 
-        w.source.get(&[1, 2, 3, 4]).await;
+        w.source.get(&[1, 2, 3, 4, 5]).await;
         settle().await;
 
         let refreshes = |step, status, result| {
@@ -2266,7 +2241,7 @@ rust_vf:
                 &[("step", step), ("status", status), ("result", result)],
             )
         };
-        assert_eq!(refreshes("0", "found", "unchanged"), 1);
+        assert_eq!(refreshes("0", "found", "unchanged"), 2);
         assert_eq!(refreshes("0", "found", "changed"), 1);
         assert_eq!(refreshes("0", "not_found", "added"), 1);
         assert_eq!(refreshes("0", "found", "removed"), 1);
@@ -2608,7 +2583,7 @@ rust_vf:
             ..LabelCacheSwitches::default()
         });
         for id in [in_match_slice, differs, source_differs] {
-            w.manhattan.set_spam(id.cast_signed(), 0.5);
+            w.manhattan.set_spam(id, 0.5);
         }
         let mut with_source = spam(0.5);
         for label in with_source.labels.values_mut() {
@@ -2676,7 +2651,7 @@ rust_vf:
         );
         w.dragonfly
             .put(in_match_slice, Status::Found(entry), fill(BASE_MS, 2));
-        w.manhattan.set_spam(in_match_slice.cast_signed(), 0.5);
+        w.manhattan.set_spam(in_match_slice, 0.5);
         let mh_check = |class, view| {
             w.stats.count(
                 "safety_labels_shadow_mh_check_keys",
@@ -2802,7 +2777,7 @@ rust_vf:
     }
 
     fn keys(ids: &[u64]) -> Vec<Key> {
-        ids.iter().map(|&id| cache_key(id).unwrap()).collect()
+        ids.iter().map(|&id| cache_key(id)).collect()
     }
 
     #[tokio::test(start_paused = true)]

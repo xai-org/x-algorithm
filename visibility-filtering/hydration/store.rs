@@ -5,7 +5,7 @@ use crate::hydration::fetcher::{AnyFetcher, Fetcher, Owner};
 use crate::hydration::hydrator::{Edge, EdgeKey, NodeSpec, RequestRows};
 use crate::hydration::inventory::{Answer, Effect, Stake, claimed_answer_fails, classify};
 use crate::hydration::plan::Group;
-use crate::hydration::relation::{Related, Relation, Role, Trigger};
+use crate::hydration::relation::{Joins, Related, Relation, Trigger};
 use crate::hydration::sources::{Input, Registered, Reply, Source, SourceFetchers, Value, source};
 use crate::hydration::{
     Cause, HydratedTweet, HydratedUser, Hydration, HydrationPlan, Hydrator, Hydrators, QuoteEntry,
@@ -13,8 +13,8 @@ use crate::hydration::{
 use crate::metrics::RequestMetrics;
 use crate::metrics::families::HYDRATOR_UNASKED_KEYS;
 use crate::models::{
-    AuthorId, NotificationFilters, RawCandidate, RequestFacts, RetweetMerge, TweetId, Viewer,
-    ViewerFeatures,
+    AuthorId, EdgeSet, NotificationFilters, RawCandidate, RequestFacts, RetweetMerge, TweetId,
+    Viewer, ViewerFeatures,
 };
 pub(super) use edges::Lands;
 pub(super) use key_origin::{ControlArms, KeyOrigin, Names};
@@ -22,7 +22,6 @@ use quotes::Quotes;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::time::Duration;
 use strum::VariantArray;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 
@@ -107,38 +106,46 @@ fn claimed<'a>(keys: &'a [u64], queries: &'a [EdgeQuery]) -> impl Iterator<Item 
     keys.iter().chain(destinations).copied()
 }
 
-pub(super) enum FetcherRef<'a> {
-    Keyed(&'a dyn AnyFetcher),
-    Edges(&'a Fetcher<bool, EdgeKey>),
-}
-
-pub(super) enum FetcherMut<'a> {
-    Keyed(&'a mut dyn AnyFetcher),
-    Edges(&'a mut Fetcher<bool, EdgeKey>),
-}
-
 pub(super) trait FetcherKey<V>: Sized {
-    fn view(fetcher: &Fetcher<V, Self>) -> FetcherRef<'_>;
-    fn view_mut(fetcher: &mut Fetcher<V, Self>) -> FetcherMut<'_>;
+    fn answer(fetcher: &Fetcher<V, Self>, key: u64) -> Option<Answer>;
+    fn claim(fetcher: &mut Fetcher<V, Self>, keys: Vec<u64>) -> Vec<u64>;
+    fn edges(fetcher: &Fetcher<V, Self>) -> Option<&Fetcher<bool, EdgeKey>>;
+    fn edges_mut(fetcher: &mut Fetcher<V, Self>) -> Option<&mut Fetcher<bool, EdgeKey>>;
 }
 
 impl<V> FetcherKey<V> for u64 {
-    fn view(fetcher: &Fetcher<V, Self>) -> FetcherRef<'_> {
-        FetcherRef::Keyed(fetcher)
+    fn answer(fetcher: &Fetcher<V, Self>, key: u64) -> Option<Answer> {
+        Some(fetcher.answer(key))
     }
 
-    fn view_mut(fetcher: &mut Fetcher<V, Self>) -> FetcherMut<'_> {
-        FetcherMut::Keyed(fetcher)
+    fn claim(fetcher: &mut Fetcher<V, Self>, keys: Vec<u64>) -> Vec<u64> {
+        fetcher.claim(keys)
+    }
+
+    fn edges(_: &Fetcher<V, Self>) -> Option<&Fetcher<bool, EdgeKey>> {
+        None
+    }
+
+    fn edges_mut(_: &mut Fetcher<V, Self>) -> Option<&mut Fetcher<bool, EdgeKey>> {
+        None
     }
 }
 
 impl FetcherKey<bool> for EdgeKey {
-    fn view(fetcher: &Fetcher<bool, Self>) -> FetcherRef<'_> {
-        FetcherRef::Edges(fetcher)
+    fn answer(_: &Fetcher<bool, Self>, _: u64) -> Option<Answer> {
+        None
     }
 
-    fn view_mut(fetcher: &mut Fetcher<bool, Self>) -> FetcherMut<'_> {
-        FetcherMut::Edges(fetcher)
+    fn claim(_: &mut Fetcher<bool, Self>, _: Vec<u64>) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn edges(fetcher: &Fetcher<bool, Self>) -> Option<&Fetcher<bool, EdgeKey>> {
+        Some(fetcher)
+    }
+
+    fn edges_mut(fetcher: &mut Fetcher<bool, Self>) -> Option<&mut Fetcher<bool, EdgeKey>> {
+        Some(fetcher)
     }
 }
 
@@ -160,10 +167,9 @@ pub(super) struct Store {
     quotes: Quotes,
     retweet_merge: RetweetMerge,
     callable: Hydrators,
+    deciding_existence: Hydrators,
     fetchers: SourceFetchers,
     has_called: Vec<bool>,
-    pub(super) core_elapsed: Duration,
-    pub(super) tweets_elapsed: Option<Duration>,
 }
 
 impl Store {
@@ -173,8 +179,10 @@ impl Store {
         raw: &[RawCandidate],
         retweet_merge: RetweetMerge,
     ) -> Self {
+        let callable = plan.callable(facts.viewer_id());
         Self {
-            callable: plan.callable(facts.viewer_id()),
+            callable,
+            deciding_existence: plan.deciding_existence().intersection(callable),
             facts,
             retweet_merge,
             rows: raw
@@ -192,7 +200,7 @@ impl Store {
         }
     }
 
-    pub(super) fn with_quotes(mut self, quotes: &[QuoteEntry]) -> Self {
+    pub(super) fn with_quotes(mut self, quotes: Vec<QuoteEntry>) -> Self {
         self.quotes = Quotes::new(quotes);
         self
     }
@@ -217,26 +225,12 @@ impl Store {
             .take(key)
     }
 
-        pub(super) fn land_reply<S: Registered>(
-        &mut self,
-        call: &CallRequest<'_>,
-        reply: S::Reply,
-        elapsed: Duration,
-    ) where
+        pub(super) fn land_reply<S: Registered>(&mut self, call: &CallRequest<'_>, reply: S::Reply)
+    where
         S::Reply: Lands<S::Key>,
     {
         let fetcher = S::fetchers_mut(&mut self.fetchers).of_mut(call.group.fetcher.owner);
         reply.land(fetcher, call, S::EDGE);
-        let first = call.is_first;
-        if S::SOURCE == Source::TesPureCoreData
-            && first
-            && call.group.nodes.contains(Hydrator::PureCore)
-        {
-            self.core_elapsed = elapsed;
-        }
-        if S::SOURCE == Source::TesTweetForVisibility && first {
-            self.tweets_elapsed = Some(elapsed);
-        }
         if matches!(S::SOURCE, Source::TesPureCoreData | Source::TesQuotedTweet) {
             self.land_authors();
         }
@@ -251,7 +245,7 @@ impl Store {
     }
 
     pub(super) fn existence_miss(&self, node: Hydrator, key: u64) -> Option<Cause> {
-        match classify(self.stake(node), self.fetcher(node)?.answer(key)) {
+        match classify(self.stake(node), self.keyed_answer(node, key)?) {
             Effect::Unresolves(cause) => Some(cause),
             Effect::Value | Effect::Absent | Effect::Fails => None,
         }
@@ -284,7 +278,7 @@ impl Store {
     }
 
     fn named(&self, relation: Relation, parent: &RequestRow) -> Option<Related> {
-        match relation.spec().trigger {
+        match relation.spec().trigger()? {
             Trigger::PureCore(named) => named(
                 self.request_fetcher::<source::TesPureCoreData>()
                     .get(parent.tweet_id()?.0)?,
@@ -297,7 +291,6 @@ impl Store {
                 tweet_id: TweetId(self.key(origin, parent)?),
                 author: None,
             }),
-            Trigger::QuoteEntry => None,
         }
     }
 
@@ -315,15 +308,28 @@ impl Store {
     }
 
     fn read_key(&self, node: Hydrator, parent: usize) -> Option<u64> {
-        let related = self.related_post(node.spec().relation?, parent)?;
+        let related = self.related_post(node.relation()?, parent)?;
         self.related_key(self.origin(node), related)
     }
 
     fn parent_key(&self, node: Hydrator, row: &RequestRow, position: usize) -> Option<u64> {
-        match node.spec().relation {
+        match node.relation() {
             None => self.key(self.origin(node), row),
             Some(_) => self.read_key(node, position),
         }
+    }
+
+    fn read<S: Registered<Key = u64>>(
+        &self,
+        node: Hydrator,
+        row: &RequestRow,
+        position: usize,
+    ) -> Option<&Value<S>> {
+        if !self.callable.contains(node) {
+            return None;
+        }
+        let key = self.parent_key(node, row, position)?;
+        self.fetcher_of::<S>(self.owner(node)).get(key)
     }
 
     fn controls(&self) -> impl Iterator<Item = &ConversationControl> {
@@ -358,14 +364,14 @@ impl Store {
         })
     }
 
-    fn community_posts(&self, tweet_ids: &[u64]) -> Vec<CommunityPost> {
+        fn community_posts(&self, tweet_ids: &[u64]) -> Vec<CommunityPost> {
         let mut posts: Vec<CommunityPost> = self
             .rows
             .iter()
             .filter_map(|row| self.community_post(row))
             .filter(|post| tweet_ids.binary_search(&post.tweet_id).is_ok())
             .collect();
-        posts.sort_unstable_by_key(|post| post.tweet_id);
+        posts.sort_by_key(|post| post.tweet_id);
         posts.dedup_by_key(|post| post.tweet_id);
         posts
     }
@@ -381,7 +387,7 @@ impl Store {
             {
                 continue;
             }
-            keys.extend(self.node_keys(node));
+            self.node_keys(node, |key| keys.push(key));
         }
         if nodes.contains(Hydrator::PureCore) {
             keys.extend(self.paired.iter().map(|&(_, tweet_id)| tweet_id.0));
@@ -399,33 +405,34 @@ impl Store {
         if node.is_edge() {
             return self.claim_viewer_edge(node, keys);
         }
-        match self.fetcher_mut(node) {
-            Some(fetcher) => fetcher.claim(keys),
-            None => Vec::new(),
-        }
+        let fetcher = self.spec(node).fetcher();
+        self.fetchers.claim(fetcher, keys)
     }
 
-    fn fetcher(&self, node: Hydrator) -> Option<&dyn AnyFetcher> {
-        match self.fetchers.get(self.spec(node).fetcher()) {
-            FetcherRef::Keyed(fetcher) => Some(fetcher),
-            FetcherRef::Edges(_) => None,
-        }
+    fn keyed_answer(&self, node: Hydrator, key: u64) -> Option<Answer> {
+        self.fetchers.answer(self.spec(node).fetcher(), key)
     }
 
-    fn fetcher_mut(&mut self, node: Hydrator) -> Option<&mut dyn AnyFetcher> {
-        match self.fetchers.get_mut(self.spec(node).fetcher()) {
-            FetcherMut::Keyed(fetcher) => Some(fetcher),
-            FetcherMut::Edges(_) => None,
-        }
-    }
-
-    fn candidate_count_by_key(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
-        let mut counts = self.candidate_count_by_pair(nodes);
-        let (viewer_nodes, row_nodes): (Vec<Hydrator>, Vec<Hydrator>) = nodes
-            .iter()
-            .partition(|&node| self.origin(node).names() == Names::Viewer);
-        for node in viewer_nodes {
-            counts.extend(self.node_keys(node).into_iter().map(|key| (key, 1)));
+    fn candidate_count_by_claimed_key(
+        &self,
+        nodes: Hydrators,
+        claimed: impl Iterator<Item = u64>,
+        key_count: usize,
+    ) -> FxHashMap<u64, usize> {
+        let mut counts = FxHashMap::with_capacity_and_hasher(key_count, Default::default());
+        counts.extend(claimed.map(|key| (key, 0)));
+        self.count_pair_candidates(nodes, &mut counts);
+        let mut row_nodes = Vec::new();
+        for node in nodes.iter() {
+            if self.origin(node).names() == Names::Viewer {
+                self.node_keys(node, |key| {
+                    if let Some(count) = counts.get_mut(&key) {
+                        *count = 1;
+                    }
+                });
+            } else {
+                row_nodes.push(node);
+            }
         }
         for (parent, row) in self.rows.iter().enumerate() {
             for (position, &node) in row_nodes.iter().enumerate() {
@@ -437,8 +444,11 @@ impl Store {
                     .iter()
                     .take(position)
                     .any(|&earlier| self.parent_key(earlier, row, parent) == Some(key));
-                if is_candidate && !counted {
-                    *counts.entry(key).or_default() += 1;
+                if is_candidate
+                    && !counted
+                    && let Some(count) = counts.get_mut(&key)
+                {
+                    *count += 1;
                 }
             }
         }
@@ -446,13 +456,15 @@ impl Store {
     }
 
     pub(super) fn offer<'p>(&mut self, group: &'p Group) -> Option<CallRequest<'p>> {
-        if self.facts.viewer_id().is_none() && group.nodes.iter().all(Hydrator::needs_viewer) {
+        let callable = group.nodes.intersection(self.callable);
+        if callable.is_empty() {
             return None;
         }
         let is_first = self.has_called.get(group.position) != Some(&true);
         let mut queries = Vec::new();
         let mut queried_edges = Vec::new();
         for &(edge, graph, direction, nodes) in group.edges() {
+            let nodes = nodes.intersection(callable);
             let query = |from, destination_ids| EdgeQuery {
                 graph,
                 direction,
@@ -470,7 +482,7 @@ impl Store {
             }
         }
         let keys = if queries.is_empty() {
-            self.claim(group.nodes)
+            self.claim(callable)
         } else {
             Vec::new()
         };
@@ -486,10 +498,8 @@ impl Store {
         if let Some(has_called) = self.has_called.get_mut(group.position) {
             *has_called = true;
         }
-        let candidate_count_by_key = self.candidate_count_by_key(group.nodes);
-        let candidate_count_by_claimed_key = claimed(&keys, &queries)
-            .map(|key| (key, candidate_count_by_key.get(&key).copied().unwrap_or(0)))
-            .collect();
+        let candidate_count_by_claimed_key =
+            self.candidate_count_by_claimed_key(callable, claimed(&keys, &queries), key_count);
         Some(CallRequest {
             group,
             is_first,
@@ -513,13 +523,8 @@ impl Store {
                 .any(|control| control.arm == ConversationControlArm::Co)
     }
 
-    pub(super) fn land(
-        &mut self,
-        call: &CallRequest<'_>,
-        reply: Reply,
-        elapsed: Duration,
-    ) -> Landing {
-        reply.land(self, call, elapsed);
+    pub(super) fn land(&mut self, call: &CallRequest<'_>, reply: Reply) -> Landing {
+        reply.land(self, call);
         if self.join(call.group.nodes) {
             Landing::KeysJoined
         } else {
@@ -545,13 +550,13 @@ impl Store {
     fn join(&mut self, landed: Hydrators) -> bool {
         let mut has_joined = false;
         for &relation in Relation::VARIANTS {
-            let spec = relation.spec();
-            if spec.trigger.reads().intersection(landed).is_empty() || !self.is_on(relation) {
+            let joins = relation.spec();
+            if joins.reads().intersection(landed).is_empty() || !self.is_on(relation) {
                 continue;
             }
-            let named: Vec<(usize, Related)> = match spec.trigger {
-                Trigger::QuoteEntry => self.quote_outers(),
-                Trigger::PureCore(_) | Trigger::Tweet(_) | Trigger::Key(_) => self
+            let named: Vec<(usize, Related)> = match joins {
+                Joins::Paired => self.quote_outers(),
+                Joins::Judged(_) | Joins::Read(_) => self
                     .rows
                     .iter()
                     .enumerate()
@@ -559,8 +564,8 @@ impl Store {
                     .collect(),
             };
             for (parent, related) in named {
-                match (spec.trigger, spec.role) {
-                    (Trigger::QuoteEntry, _) => {
+                match joins {
+                    Joins::Paired => {
                         let paired = (parent, related.tweet_id);
                         if self.paired.contains(&paired) {
                             continue;
@@ -572,7 +577,7 @@ impl Store {
                             continue;
                         }
                     }
-                    (_, Role::Judged) => {
+                    Joins::Judged(_) => {
                         if self.requested_tweet_ids.contains(&related.tweet_id)
                             || !self.joined_tweet_ids.insert(related.tweet_id)
                         {
@@ -584,7 +589,7 @@ impl Store {
                             author: related.author,
                         });
                     }
-                    (_, Role::Read) => match self.related.entry((relation, parent)) {
+                    Joins::Read(_) => match self.related.entry((relation, parent)) {
                         Entry::Vacant(entry) => {
                             entry.insert(related.tweet_id);
                         }
@@ -638,13 +643,34 @@ impl Store {
                 .count(&HYDRATOR_UNASKED_KEYS, [backend, call], keys as u64);
         }
         for (id, tweet) in &mut tweets {
+            let labels = self.take::<source::SafetyLabels>(id.0);
             match tweet {
-                HydratedTweet::Resolved { candidate, .. } => {
+                HydratedTweet::Resolved {
+                    candidate,
+                    safety_labels,
+                } => {
                     candidate.post.tweet_features = self
                         .take::<source::TesTweetForVisibility>(id.0)
                         .unwrap_or_default();
+                    *safety_labels = labels;
                 }
-                HydratedTweet::Unresolved { .. } => {}
+                HydratedTweet::Unresolved { safety_labels, .. } => *safety_labels = labels,
+            }
+        }
+        if self.is_on(Relation::RetweetSource) {
+            let copies: Vec<(TweetId, bool)> = tweets
+                .iter()
+                .filter_map(|(&id, tweet)| {
+                    let own = tweet.candidate()?.post.tweet_features.media.has_media;
+                    let source = tweets.get(&tweet.source_tweet_id()?)?.candidate()?;
+                    let has_media = source.post.tweet_features.media.has_uploaded_media;
+                    (has_media != own).then_some((id, has_media))
+                })
+                .collect();
+            for (id, has_media) in copies {
+                if let Some(HydratedTweet::Resolved { candidate, .. }) = tweets.get_mut(&id) {
+                    candidate.post.tweet_features.media.has_media = has_media;
+                }
             }
         }
         let (viewer, viewer_state) = match self.facts.viewer_id() {
@@ -677,7 +703,6 @@ impl Store {
             users,
             quotes,
             has_fetched_retweet_sources,
-            retweet_merge: self.retweet_merge,
         }
     }
 
@@ -695,18 +720,27 @@ impl Store {
             .fold(Hydrators::empty(), Hydrators::with)
     }
 
-    fn failed(
+    fn edges_and_failed(
         &self,
         row: &RequestRow,
         position: usize,
         unclaimed: &mut Vec<(Hydrator, u64)>,
-    ) -> Hydrators {
+    ) -> (EdgeSet, Hydrators) {
+        let root_author_block = self.root_author_block(row);
+        let unread = root_author_block.unread();
         let has_joined_retweet_sources = self.has_joined_retweet_sources();
+        let mut edges = EdgeSet::default();
         let mut answered_incompletely = Hydrators::empty();
         for node in self.callable.iter() {
             let Some(key) = self.parent_key(node, row, position) else {
                 continue;
             };
+            if node.is_viewer_edge()
+                && !unread.contains(node)
+                && self.edge_holds(node, key) == Some(true)
+            {
+                edges = edges.with(node);
+            }
             let Some(answer) = self.answer(node, key) else {
                 continue;
             };
@@ -720,13 +754,13 @@ impl Store {
                 answered_incompletely = answered_incompletely.with(node);
             }
         }
-        let root_author_block = self.root_author_block(row);
         answered_incompletely =
             answered_incompletely.union(root_author_block.failed().intersection(self.callable));
         if answered_incompletely.is_empty() {
-            return answered_incompletely;
+            return (edges, answered_incompletely);
         }
-        self.callable
+        let failed = self
+            .callable
             .iter()
             .fold(answered_incompletely, |failed, node| {
                 match node.input_at(self.request_rows) {
@@ -739,7 +773,8 @@ impl Store {
                     _ => failed,
                 }
             })
-            .difference(root_author_block.unread())
+            .difference(unread);
+        (edges, failed)
     }
 }
 
@@ -750,7 +785,7 @@ fn unclaimed_keys_by_label(
     unclaimed.dedup();
     let mut by_label = HashMap::new();
     for (node, _) in &unclaimed {
-        *by_label.entry(node.spec().label).or_default() += 1;
+        *by_label.entry(node.spec().label()).or_default() += 1;
     }
     by_label
 }
@@ -775,27 +810,6 @@ mod tests {
         UserResponseState,
     };
 
-        #[test]
-    fn each_edge_is_answered_by_one_source() {
-        let mut sources: HashMap<Edge, Source> = HashMap::new();
-        for &node in Hydrator::VARIANTS {
-            if let Some(edge) = node.edge() {
-                let source = node.spec().source;
-                assert_eq!(*sources.entry(edge).or_insert(source), source, "{edge:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn each_viewer_keyed_edge_node_reads_its_sources_edge() {
-        for &node in Hydrator::VARIANTS {
-            let source = node.spec().source;
-            if source.edge().is_some() || (node.is_viewer_edge() && source != Source::Flock) {
-                assert_eq!(source.edge(), node.edge(), "{node:?}");
-            }
-        }
-    }
-
     #[test]
     fn authors_prefer_the_request_author_and_leave_unresolved_tweets_without_one() {
         let core = |author| PureCore {
@@ -819,7 +833,7 @@ mod tests {
             [1, 2, 3, 4],
             HashMap::from([(2, Ok::<_, &str>(Some(core(20)))), (4, Ok(Some(core(40))))]),
         );
-        store.land(&call, Reply::TesPureCoreData(pure_cores), Duration::ZERO);
+        store.land(&call, Reply::TesPureCoreData(pure_cores));
         let resolved: Vec<(TweetId, u64)> = store
             .rows
             .iter()
@@ -842,7 +856,7 @@ mod tests {
             Hydrators::of(Hydrator::OuterAuthorFollowsAuthor),
         );
         let mut store = Store::new(&plan, RequestFacts::default(), &raw, RetweetMerge::Unmerged)
-            .with_quotes(&[QuoteEntry {
+            .with_quotes(vec![QuoteEntry {
                 inner: TweetId(1),
                 outer: TweetId(9),
             }]);
@@ -857,7 +871,7 @@ mod tests {
         let cores =
             HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(inner)))]));
         assert_eq!(
-            store.land(&call, Reply::TesPureCoreData(cores), Duration::ZERO),
+            store.land(&call, Reply::TesPureCoreData(cores)),
             Landing::KeysJoined
         );
         assert_eq!(store.offer(pure_core).unwrap().keys, [9]);
@@ -881,7 +895,7 @@ mod tests {
         let cores =
             HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(retweet)))]));
         assert_eq!(
-            store.land(&call, Reply::TesPureCoreData(cores), Duration::ZERO),
+            store.land(&call, Reply::TesPureCoreData(cores)),
             Landing::KeysJoined
         );
         let mut unclaimed = Vec::new();
@@ -892,7 +906,7 @@ mod tests {
         }
         assert_eq!(
             unclaimed_keys_by_label(unclaimed),
-            HashMap::from([(Hydrator::PureCore.spec().label, 1)])
+            HashMap::from([(Hydrator::PureCore.spec().label(), 1)])
         );
     }
 

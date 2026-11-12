@@ -2076,6 +2076,49 @@ async fn soft_nsfw_is_sent_skipped_and_deduped_like_any_listed_label() {
     assert!(b.dedup.slots.lock().unwrap().contains_key(&soft_key));
 }
 
+#[tokio::test]
+async fn nsfa_labels_are_sent_skipped_and_deduped_like_any_listed_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    for (name, other) in [
+        ("NsfaHighPrecision", "NsfaLimitedInventory"),
+        ("NsfaLimitedInventory", "NsfaHighPrecision"),
+    ] {
+        let b = bed(
+            labelling(vec![post_label(name, Lifetime::Permanent)]),
+            false,
+        )
+        .await;
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_hidden(&t);
+        assert!(sends_label(&t, name), "{name}: {:?}", t.ais);
+
+        let id = post_id(Account::Clean);
+        b.post_labels.carry(id, &[(name, None)]);
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, "already_post_labeled", "{name}: {:?}", t.outcomes);
+        assert!(t.ais.is_empty(), "{name}");
+
+        b.post_labels.carry(id, &[(other, None)]);
+        b.dedup.slots.lock().unwrap().clear();
+        let other_key =
+            dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&[other]));
+        b.dedup.hold_key(other_key, dedup_cache::CLASS_LABEL);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_hidden(&t);
+        assert!(sends_label(&t, name), "{name}: {:?}", t.ais);
+        assert!(!sends_label(&t, other), "{name}");
+        let own =
+            dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&[name]));
+        assert!(b.dedup.slots.lock().unwrap().contains_key(&own), "{name}");
+    }
+}
+
 fn with_skips(
     r: ActionControlRecord,
     follower_threshold: Option<u32>,

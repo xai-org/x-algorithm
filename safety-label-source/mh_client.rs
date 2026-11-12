@@ -16,7 +16,7 @@ pub(crate) type FetchResult = Result<Vec<RawSafetyLabel>, ManhattanError>;
 
 #[async_trait]
 pub(crate) trait ManhattanLabelFetcher: Send + Sync {
-    async fn fetch_labels(&self, tweet_ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError>;
+    async fn fetch_labels(&self, tweet_ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError>;
 }
 
 static TENANT: LazyLock<Tenant> = LazyLock::new(|| Tenant {
@@ -48,14 +48,14 @@ impl MhLabelClient {
 
 #[async_trait]
 impl ManhattanLabelFetcher for MhLabelClient {
-    async fn fetch_labels(&self, tweet_ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError> {
+    async fn fetch_labels(&self, tweet_ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError> {
         if tweet_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let pkeys: Vec<Key> = tweet_ids
             .iter()
-            .map(|&id| Key::from([&encode_pkey(id)[..]]))
+            .map(|&id| Key::from([&encode_pkey(id.cast_signed())[..]]))
             .collect();
         let selector = LkeySelector::Range {
             from: None,

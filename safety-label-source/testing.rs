@@ -55,7 +55,8 @@ impl FakeLabels {
     pub fn into_source(self) -> SafetyLabelSource {
         let backends = Arc::new(self);
         let remote = RemoteSource::new(
-            Arc::<Self>::clone(&backends),
+            Some(Arc::<Self>::clone(&backends) as _),
+            None,
             backends,
             LabelMetrics::default(),
         );
@@ -66,15 +67,11 @@ impl FakeLabels {
 #[async_trait]
 impl CacheRead for FakeLabels {
     async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, Result<Option<Value>, KVCacheError>> {
-        let not_found: Vec<Key> = self
-            .not_found
-            .iter()
-            .filter_map(|&id| cache_key(id).ok())
-            .collect();
+        let not_found: Vec<Key> = self.not_found.iter().map(|&id| cache_key(id)).collect();
         let cached: HashMap<Key, &Vec<u8>> = self
             .cached
             .iter()
-            .filter_map(|(&id, mval)| Some((cache_key(id).ok()?, mval)))
+            .map(|(&id, mval)| (cache_key(id), mval))
             .collect();
         let answer = |key: &Key| {
             let value = if not_found.contains(key) {
@@ -94,22 +91,19 @@ impl CacheRead for FakeLabels {
 
 #[async_trait]
 impl ManhattanLabelFetcher for FakeLabels {
-    async fn fetch_labels(&self, tweet_ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError> {
-        let fetch = |id: u64| {
-            if self.failing.contains(&id) || self.not_found.contains(&id) {
+    async fn fetch_labels(&self, tweet_ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError> {
+        let fetch = |id: &u64| {
+            if self.failing.contains(id) || self.not_found.contains(id) {
                 return Err(ManhattanError::NativeProtocol("fake failure".to_owned()));
             }
-            let labels = self.labels.get(&id).map_or(&[][..], Vec::as_slice);
+            let labels = self.labels.get(id).map_or(&[][..], Vec::as_slice);
             labels
                 .iter()
                 .map(|(label_type, label)| raw_label(*label_type, label))
                 .collect::<thrift::Result<_>>()
                 .map_err(|e| ManhattanError::NativeProtocol(e.to_string()))
         };
-        Ok(tweet_ids
-            .iter()
-            .map(|&id| fetch(id.cast_unsigned()))
-            .collect())
+        Ok(tweet_ids.iter().map(fetch).collect())
     }
 }
 

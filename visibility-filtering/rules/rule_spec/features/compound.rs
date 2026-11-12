@@ -11,9 +11,14 @@ use crate::rules::rule_spec::inputs::Interpreter;
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::Predicate;
 
+type MuteRetweets = EdgeFeature<{ Hydrator::MuteRetweets as u8 }>;
 type SuperFollowsExclusive = EdgeFeature<{ Hydrator::SuperFollowsExclusive as u8 }>;
 type RootFollowsViewer = EdgeFeature<{ Hydrator::RootFollowsViewer as u8 }>;
 type RootFollowsViewerSecondDegree = EdgeFeature<{ Hydrator::RootFollowsViewerSecondDegree as u8 }>;
+type ViewerFollowsRoot = EdgeFeature<{ Hydrator::ViewerFollowsRoot as u8 }>;
+type SuperFollowsRoot = EdgeFeature<{ Hydrator::SuperFollowsRoot as u8 }>;
+type TrustedFriends = EdgeFeature<{ Hydrator::TrustedFriends as u8 }>;
+type OutsideNarrowcastPlace = EdgeFeature<{ Hydrator::OutsideNarrowcastPlace as u8 }>;
 
 enum ConversationRootAuthorBlocksViewer {}
 
@@ -39,6 +44,12 @@ pub enum CompoundLeaf {
     ViewerIsInConversationRootAuthorNetwork,
     ViewerIsBlockedByConversationRootAuthor,
     ViewerIsInAllowedCountry,
+    ViewerMutesRetweetsFromAuthor,
+    ViewerIsFollowedByConversationRootAuthor,
+    ViewerFollowsConversationRootAuthor,
+    ViewerSuperFollowsConversationRootAuthor,
+    ViewerIsTrustedFriendsListMemberOrOwner,
+    ViewerIsOutsideNarrowcastPlace,
 }
 
 impl CompoundLeaf {
@@ -80,6 +91,22 @@ impl CompoundLeaf {
                     })
                 },
             ),
+            Self::ViewerMutesRetweetsFromAuthor => i.run(|In::<MuteRetweets>(mutes)| mutes),
+            Self::ViewerIsFollowedByConversationRootAuthor => {
+                i.run(|In::<RootFollowsViewer>(follows)| follows)
+            }
+            Self::ViewerFollowsConversationRootAuthor => {
+                i.run(|In::<ViewerFollowsRoot>(follows)| follows)
+            }
+            Self::ViewerSuperFollowsConversationRootAuthor => {
+                i.run(|In::<SuperFollowsRoot>(super_follows)| super_follows)
+            }
+            Self::ViewerIsTrustedFriendsListMemberOrOwner => {
+                i.run(|In::<TrustedFriends>(member)| member)
+            }
+            Self::ViewerIsOutsideNarrowcastPlace => {
+                i.run(|In::<OutsideNarrowcastPlace>(outside)| outside)
+            }
         }
     }
 

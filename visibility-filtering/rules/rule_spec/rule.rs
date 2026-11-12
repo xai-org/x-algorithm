@@ -117,11 +117,13 @@ impl Audience {
 
 impl<E: Fold> Rule<E> {
     pub(in crate::rules) fn requirements(&self) -> Hydrators {
-        self.audience
-            .condition::<E>()
-            .requirements()
-            .union(self.when.requirements())
-            .union(self.action.spec().requirements())
+        let mut leaves = Vec::new();
+        self.leaves(&mut leaves);
+        leaves
+            .into_iter()
+            .fold(self.action.spec().requirements(), |hydrators, leaf| {
+                hydrators.union(leaf.requirements())
+            })
     }
 
     pub(in crate::rules) fn leaves(&self, leaves: &mut Vec<Predicate>) {
@@ -137,7 +139,7 @@ impl<E: Engine> RuleCond<E> {
 
     pub(in crate::rules) fn leaves(self, leaves: &mut Vec<Predicate>) {
         match self {
-            Self::Leaf(leaf) => leaves.push(E::lift(leaf)),
+            Self::Leaf(leaf) => leaves.push(leaf.lift()),
             Self::All(children) | Self::Any(children) => {
                 for child in children {
                     child.leaves(leaves);
@@ -145,19 +147,6 @@ impl<E: Engine> RuleCond<E> {
             }
             Self::Not(child) => child.leaves(leaves),
             Self::Named(named) => named.condition.leaves(leaves),
-        }
-    }
-
-    pub(in crate::rules) fn requirements(self) -> Hydrators {
-        match self {
-            Self::Leaf(leaf) => leaf.requirements(),
-            Self::All(children) | Self::Any(children) => children
-                .iter()
-                .fold(Hydrators::empty(), |hydrators, child| {
-                    hydrators.union(child.requirements())
-                }),
-            Self::Not(child) => child.requirements(),
-            Self::Named(named) => named.condition.requirements(),
         }
     }
 
@@ -170,7 +159,7 @@ impl<E: Engine> RuleCond<E> {
                     .all(|(child, other)| child.same_as(*other))
         };
         match (self, other) {
-            (Self::Leaf(leaf), RuleCond::Leaf(other)) => E::lift(leaf) == F::lift(other),
+            (Self::Leaf(leaf), RuleCond::Leaf(other)) => leaf.lift() == other.lift(),
             (Self::All(children), RuleCond::All(others))
             | (Self::Any(children), RuleCond::Any(others)) => all_same(children, others),
             (Self::Not(child), RuleCond::Not(other)) => child.same_as(*other),
@@ -294,7 +283,7 @@ impl<E: Engine> RuleCond<E> {
 
     pub(in crate::rules) fn positive_tweet_labels(self) -> Vec<SafetyLabelType> {
         match self {
-            Self::Leaf(leaf) => label_of(E::lift(leaf)).into_iter().collect(),
+            Self::Leaf(leaf) => label_of(leaf.lift()).into_iter().collect(),
             Self::Not(_) => Vec::new(),
             Self::All(children) | Self::Any(children) => children
                 .iter()
@@ -305,7 +294,7 @@ impl<E: Engine> RuleCond<E> {
     }
 
     pub(in crate::rules) fn own_tweet_label(self) -> Option<String> {
-        let label = |leaf| label_of(E::lift(leaf)).map(spelled_label);
+        let label = |leaf: Predicate<E>| label_of(leaf.lift()).map(spelled_label);
         match self {
             Self::Leaf(leaf) => label(leaf),
             Self::Not(Self::Leaf(leaf)) => label(*leaf).map(|label| format!("not {label}")),
@@ -326,7 +315,7 @@ impl<E: Engine> RuleCond<E> {
                 .join(separator)
         };
         match self {
-            Self::Leaf(leaf) => E::lift(leaf).spelled(),
+            Self::Leaf(leaf) => leaf.lift().spelled(),
             Self::All(children) => format!("all[{}]", joined(children, " & ")),
             Self::Any(children) => format!("any[{}]", joined(children, " | ")),
             Self::Not(child) => format!("not({})", child.spelled_with(named)),

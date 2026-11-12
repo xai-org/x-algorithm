@@ -1,5 +1,7 @@
 use crate::models::viewer::Client;
-use crate::result_label::{debug_label, state_label, Label, NONE};
+use crate::models::NotificationKind;
+use crate::result_label::{filter_label, state_label, Label, NONE};
+use crate::treatment::notification_reason_label;
 use anyhow::{anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +50,13 @@ struct CaseSpec {
     quoted_in: Option<String>,
     expect: VerdictFields,
     #[serde(default)]
+    promoted: Option<VerdictFields>,
+    #[serde(default)]
     filter_tweets: BTreeMap<FilterLevel, VerdictFields>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    filter_notifications: BTreeMap<GateNotificationKind, VerdictFields>,
 }
 
 const US: &str = "us";
@@ -78,6 +86,42 @@ impl FilterLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum EvaluateLevel {
+    TimelineHomeHydration,
+    TimelineHomePromotedHydration,
+}
+
+impl EvaluateLevel {
+    fn thrift(self) -> SafetyLevel {
+        match self {
+            Self::TimelineHomeHydration => SafetyLevel::TIMELINE_HOME_HYDRATION,
+            Self::TimelineHomePromotedHydration => SafetyLevel::TIMELINE_HOME_PROMOTED_HYDRATION,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum GateNotificationKind {
+    Follow,
+    Mention,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Rpc {
+    EvaluateTweets(EvaluateLevel),
+    FilterTweets(FilterLevel),
+    FilterNotifications {
+        kind: GateNotificationKind,
+        recipient_id: u64,
+        actor_id: u64,
+    },
+    GetSafetyLabels,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerdictFields {
@@ -99,7 +143,7 @@ pub struct Case {
     country: String,
     client: Client,
     quoted_in: Option<u64>,
-    filter_tweets_at: Option<FilterLevel>,
+    rpc: Rpc,
     expect: Expect,
 }
 
@@ -129,7 +173,7 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
         if case.quoted_in.is_some() && !case.filter_tweets.is_empty() {
             bail!("{name}: FilterTweets carries no quote");
         }
-        let call = |name: String, filter_tweets_at, expect: &VerdictFields| {
+        let call = |name: String, rpc, expect: &VerdictFields| {
             anyhow::Ok(Case {
                 name,
                 viewer_id: case.viewer.as_deref().map(id).transpose()?,
@@ -137,14 +181,42 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
                 country: country.clone(),
                 client: case.client,
                 quoted_in: case.quoted_in.as_deref().map(id).transpose()?,
-                filter_tweets_at,
+                rpc,
                 expect: Expect::Verdict(expect.clone()),
             })
         };
-        calls.push(call(name.clone(), None, &case.expect)?);
+        let hydration = Rpc::EvaluateTweets(EvaluateLevel::TimelineHomeHydration);
+        calls.push(call(name.clone(), hydration, &case.expect)?);
+        if let Some(expect) = &case.promoted {
+            let level = EvaluateLevel::TimelineHomePromotedHydration;
+            let on = format!("{name} on evaluate_tweets/{}", <&str>::from(level));
+            calls.push(call(on, Rpc::EvaluateTweets(level), expect)?);
+        }
         for (level, expect) in &case.filter_tweets {
             let on = format!("{name} on filter_tweets/{}", <&str>::from(level));
-            calls.push(call(on, Some(*level), expect)?);
+            calls.push(call(on, Rpc::FilterTweets(*level), expect)?);
+        }
+        match (
+            &case.viewer,
+            &case.actor,
+            case.filter_notifications.is_empty(),
+        ) {
+            (_, None, true) => {}
+            (Some(viewer), Some(actor), false) if case.quoted_in.is_none() => {
+                for (&kind, expect) in &case.filter_notifications {
+                    let on = format!(
+                        "{name} on filter_notifications/{} from {actor}",
+                        <&str>::from(kind)
+                    );
+                    let rpc = Rpc::FilterNotifications {
+                        kind,
+                        recipient_id: id(viewer)?,
+                        actor_id: id(actor)?,
+                    };
+                    calls.push(call(on, rpc, expect)?);
+                }
+            }
+            _ => bail!("{name}: filter_notifications needs a viewer and an actor, and no quote"),
         }
     }
     for (post, labels) in &file.safety_labels {
@@ -158,7 +230,7 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
             country: us(),
             client: Client::Web,
             quoted_in: None,
-            filter_tweets_at: None,
+            rpc: Rpc::GetSafetyLabels,
             expect: Expect::SafetyLabels(labels.clone()),
         });
     }
@@ -168,6 +240,7 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
 pub enum Answer {
     EvaluateTweets(anyhow::Result<Vec<EvaluationResult>>),
     FilterTweets(anyhow::Result<vf_pb::VisibilityFilterResponse>),
+    FilterNotifications(anyhow::Result<vf_pb::FilterNotificationsResponse>),
     GetSafetyLabels(anyhow::Result<vf_pb::GetSafetyLabelsResponse>),
 }
 
@@ -189,8 +262,8 @@ pub struct CaseLine<'a> {
 
 impl Case {
     pub async fn ask(&self, channel: &Channel) -> Answer {
-        if let Expect::SafetyLabels(_) = self.expect {
-            return Answer::GetSafetyLabels(
+        match self.rpc {
+            Rpc::GetSafetyLabels => Answer::GetSafetyLabels(
                 async {
                     let mut request = tonic::Request::new(vf_pb::GetSafetyLabelsRequest {
                         tweet_ids: vec![self.post_id],
@@ -202,34 +275,51 @@ impl Case {
                     anyhow::Ok(response.into_inner())
                 }
                 .await,
-            );
-        }
-        let Some(level) = self.filter_tweets_at else {
-            return Answer::EvaluateTweets(
+            ),
+            Rpc::EvaluateTweets(level) => Answer::EvaluateTweets(
                 async {
                     XaiVfClient::from_channel(channel.clone())
                         .with_timeout_ms(CALL_TIMEOUT_MS)
-                        .evaluate_tweets(self.request(), &self.metadata()?)
+                        .evaluate_tweets(self.request(level), &self.metadata()?)
                         .await
                 }
                 .await,
-            );
-        };
-        Answer::FilterTweets(
-            async {
-                let mut request = tonic::Request::new(self.filter_request(level));
-                *request.metadata_mut() = self.metadata()?;
-                request.set_timeout(Duration::from_millis(CALL_TIMEOUT_MS));
-                let response = VisibilityFilteringServiceClient::new(channel.clone())
-                    .filter_tweets(request)
-                    .await?;
-                anyhow::Ok(response.into_inner())
-            }
-            .await,
-        )
+            ),
+            Rpc::FilterTweets(level) => Answer::FilterTweets(
+                async {
+                    let mut request = tonic::Request::new(self.filter_request(level));
+                    *request.metadata_mut() = self.metadata()?;
+                    request.set_timeout(Duration::from_millis(CALL_TIMEOUT_MS));
+                    let response = VisibilityFilteringServiceClient::new(channel.clone())
+                        .filter_tweets(request)
+                        .await?;
+                    anyhow::Ok(response.into_inner())
+                }
+                .await,
+            ),
+            Rpc::FilterNotifications {
+                kind,
+                recipient_id,
+                actor_id,
+            } => Answer::FilterNotifications(
+                async {
+                    let mut request = tonic::Request::new(self.notification_request(
+                        kind,
+                        recipient_id,
+                        actor_id,
+                    ));
+                    request.set_timeout(Duration::from_millis(CALL_TIMEOUT_MS));
+                    let response = VisibilityFilteringServiceClient::new(channel.clone())
+                        .filter_notifications(request)
+                        .await?;
+                    anyhow::Ok(response.into_inner())
+                }
+                .await,
+            ),
+        }
     }
 
-    fn request(&self) -> vf_pb::EvaluateTweetsRequest {
+    fn request(&self, level: EvaluateLevel) -> vf_pb::EvaluateTweetsRequest {
         let post = vf_pb::TweetData {
             tweet_id: self.post_id,
             quote_context: self
@@ -241,7 +331,7 @@ impl Case {
             quote_context: None,
         });
         vf_pb::EvaluateTweetsRequest {
-            safety_level: SafetyLevel::TIMELINE_HOME_HYDRATION.0,
+            safety_level: level.thrift().0,
             tweets: std::iter::once(post).chain(outer).collect(),
             viewer_id: self.viewer_id,
         }
@@ -259,6 +349,29 @@ impl Case {
         }
     }
 
+    fn notification_request(
+        &self,
+        kind: GateNotificationKind,
+        recipient_id: u64,
+        actor_id: u64,
+    ) -> vf_pb::FilterNotificationsRequest {
+        use vf_pb::notification::Kind;
+        let proto = match kind {
+            GateNotificationKind::Follow => Kind::Follow(vf_pb::Follow {}),
+            GateNotificationKind::Mention => Kind::Mention(vf_pb::Mention {
+                post_id: self.post_id,
+            }),
+        };
+        vf_pb::FilterNotificationsRequest {
+            safety_level: NotificationKind::of_proto(&proto).0.level().0,
+            recipient_id,
+            notifications: vec![vf_pb::Notification {
+                actor_id,
+                kind: Some(proto),
+            }],
+        }
+    }
+
     fn metadata(&self) -> anyhow::Result<MetadataMap> {
         let context = self.client.context(self.viewer_id, Some(&self.country));
         let mut metadata = MetadataMap::new();
@@ -271,7 +384,13 @@ impl Case {
 
     pub fn judge(&self, answer: &Answer) -> CaseLine<'_> {
         let judged = |got: Expect| {
-            if got == self.expect {
+            let pass = match (&self.expect, &got) {
+                (Expect::SafetyLabels(listed), Expect::SafetyLabels(types)) => {
+                    listed.is_subset(types)
+                }
+                _ => got == self.expect,
+            };
+            if pass {
                 CaseResult::Pass { got }
             } else {
                 CaseResult::Wrong { got }
@@ -297,6 +416,30 @@ impl Case {
                 Ok(None) => failed("no result".to_string()),
                 Err(err) => failed(format!("{err:#}")),
             },
+            Answer::FilterNotifications(answer) => {
+                use vf_pb::notification_visibility_result::Outcome;
+                let outcome = answer
+                    .as_ref()
+                    .map(|r| r.results.first().map(|result| result.outcome.as_ref()));
+                match outcome {
+                    Ok(Some(Some(Outcome::Allowed(_)))) => {
+                        verdict(("allowed".to_string(), NONE.to_string()))
+                    }
+                    Ok(Some(Some(Outcome::Dropped(dropped)))) => {
+                        let reason = vf_pb::NotificationDropReason::try_from(
+                            dropped.reason.unwrap_or_default(),
+                        )
+                        .unwrap_or_default();
+                        verdict((
+                            "dropped".to_string(),
+                            notification_reason_label(reason).to_string(),
+                        ))
+                    }
+                    Ok(Some(Some(Outcome::Failed(_)))) => failed("VF answered failed".to_string()),
+                    Ok(Some(None) | None) => failed("no result".to_string()),
+                    Err(err) => failed(format!("{err:#}")),
+                }
+            }
             Answer::GetSafetyLabels(answer) => match answer {
                 Ok(response) if response.failed_ids.contains(&self.post_id) => {
                     failed("VF answered failed".to_string())
@@ -366,18 +509,6 @@ fn offers_age_verification(state: &TweetFieldsResultState) -> bool {
         })
 }
 
-fn filter_label(result: &vf_pb::TweetVisibilityResult) -> Label {
-    let kind = result.action.and_then(|action| action.kind);
-    let reason = result
-        .filtered_reason
-        .as_ref()
-        .and_then(|r| r.reason.as_ref());
-    (
-        kind.map_or_else(|| NONE.to_string(), |kind| debug_label(&kind).0),
-        reason.map_or_else(|| NONE.to_string(), |reason| debug_label(reason).0),
-    )
-}
-
 fn label_types(labels: &vf_pb::SafetyLabelMap) -> BTreeSet<String> {
     labels
         .labels
@@ -429,7 +560,7 @@ mod tests {
             country: us(),
             client: Client::Web,
             quoted_in,
-            filter_tweets_at: None,
+            rpc: Rpc::EvaluateTweets(EvaluateLevel::TimelineHomeHydration),
             expect: fields("drop", "author_is_suspended"),
         }
     }
@@ -503,7 +634,9 @@ mod tests {
                 ),
             ]
         );
-        let request = calls[2].filter_request(calls[2].filter_tweets_at.unwrap());
+        let level = FilterLevel::TimelineHomeRecommendations;
+        assert_eq!(calls[2].rpc, Rpc::FilterTweets(level));
+        let request = calls[2].filter_request(level);
         assert_eq!(
             (
                 request.safety_level,
@@ -519,6 +652,39 @@ mod tests {
     }
 
     #[test]
+    fn a_promoted_verdict_adds_an_evaluate_tweets_call_at_level_124() {
+        let text = r#"{"fixtures": {"v": 1, "p": 2}, "cases": [{"viewer": "v", "post": "p",
+            "expect": {"class": "allow", "reason": "none"},
+            "promoted": {"class": "limited_engagements", "reason": "blocked_viewer"}}]}"#;
+        let sent: Vec<_> = parse_cases(text)
+            .unwrap()
+            .into_iter()
+            .map(|call| (call.rpc, call.name, call.expect))
+            .collect();
+        let promoted = EvaluateLevel::TimelineHomePromotedHydration;
+        assert_eq!(
+            sent,
+            [
+                (
+                    Rpc::EvaluateTweets(EvaluateLevel::TimelineHomeHydration),
+                    "v x p".to_string(),
+                    fields("allow", "none")
+                ),
+                (
+                    Rpc::EvaluateTweets(promoted),
+                    "v x p on evaluate_tweets/timeline_home_promoted_hydration".to_string(),
+                    fields("limited_engagements", "blocked_viewer")
+                ),
+            ]
+        );
+        let levels = [EvaluateLevel::TimelineHomeHydration, promoted];
+        assert_eq!(
+            levels.map(|level| case(None).request(level).safety_level),
+            [82, 124]
+        );
+    }
+
+    #[test]
     fn a_case_sends_its_country_and_client_and_no_viewer_when_it_names_none() {
         let text = r#"{"fixtures": {"v": 1, "p": 2}, "cases": [
             {"viewer": "v", "post": "p", "expect": {"class": "allow", "reason": "none"},
@@ -530,12 +696,15 @@ mod tests {
         let sent: Vec<_> = calls
             .iter()
             .map(|call| {
-                let filter_country = call
-                    .filter_tweets_at
-                    .and_then(|level| call.filter_request(level).country_code);
+                let filter_country = match call.rpc {
+                    Rpc::FilterTweets(level) => call.filter_request(level).country_code,
+                    Rpc::EvaluateTweets(_)
+                    | Rpc::FilterNotifications { .. }
+                    | Rpc::GetSafetyLabels => None,
+                };
                 (
                     call.name.as_str(),
-                    call.request().viewer_id,
+                    call.request(EvaluateLevel::TimelineHomeHydration).viewer_id,
                     filter_country,
                     (call.country.as_str(), call.client),
                 )
@@ -562,9 +731,128 @@ mod tests {
     }
 
     #[test]
-    fn request_sends_level_82_with_a_quote_s_outer_after_the_post() {
-        assert_eq!(case(None).request().safety_level, 82);
-        let tweets = case(Some(3)).request().tweets;
+    fn listed_notification_kinds_go_from_the_actor_at_the_level_each_kind_names() {
+        use vf_pb::notification::Kind;
+        let text = r#"{"fixtures": {"v": 1, "p": 2, "a": 3}, "cases": [{"viewer": "v", "post": "p",
+            "expect": {"class": "allow", "reason": "none"}, "actor": "a",
+            "filter_notifications": {"mention": {"class": "dropped", "reason": "actor_protected"},
+                                     "follow": {"class": "allowed", "reason": "none"}}}]}"#;
+        let sent: Vec<_> = parse_cases(text)
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|call| {
+                let Rpc::FilterNotifications {
+                    kind,
+                    recipient_id,
+                    actor_id,
+                } = call.rpc
+                else {
+                    panic!("{:?}", call.rpc);
+                };
+                let request = call.notification_request(kind, recipient_id, actor_id);
+                (call.name.clone(), request, call.expect.clone())
+            })
+            .collect();
+        let request = |safety_level, kind| vf_pb::FilterNotificationsRequest {
+            safety_level,
+            recipient_id: 1,
+            notifications: vec![vf_pb::Notification {
+                actor_id: 3,
+                kind: Some(kind),
+            }],
+        };
+        assert_eq!(
+            sent,
+            [
+                (
+                    "v x p on filter_notifications/follow from a".to_string(),
+                    request(246, Kind::Follow(vf_pb::Follow {})),
+                    fields("allowed", "none")
+                ),
+                (
+                    "v x p on filter_notifications/mention from a".to_string(),
+                    request(72, Kind::Mention(vf_pb::Mention { post_id: 2 })),
+                    fields("dropped", "actor_protected")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_refuses_notifications_without_a_viewer_or_an_actor_or_on_a_quote() {
+        let file = |case: &str| {
+            format!(
+                r#"{{"fixtures": {{"v": 1, "p": 2, "a": 3}}, "cases": [{{"post": "p",
+                "expect": {{"class": "allow", "reason": "none"}}, {case}}}]}}"#
+            )
+        };
+        let follow =
+            r#""filter_notifications": {"follow": {"class": "allowed", "reason": "none"}}"#;
+        for case in [
+            format!(r#""viewer": "v", {follow}"#),
+            format!(r#""actor": "a", {follow}"#),
+            format!(r#""viewer": "v", "actor": "a", "quoted_in": "p", {follow}"#),
+            r#""viewer": "v", "actor": "a""#.to_string(),
+        ] {
+            let Err(err) = parse_cases(&file(&case)) else {
+                panic!("parsed {case}");
+            };
+            let err = err.to_string();
+            assert!(
+                err.contains("filter_notifications needs a viewer and an actor"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn judge_labels_a_notification_outcome_and_its_drop_reason() {
+        use vf_pb::notification_visibility_result::Outcome;
+        let answer = |outcome| {
+            Answer::FilterNotifications(Ok(vf_pb::FilterNotificationsResponse {
+                results: vec![vf_pb::NotificationVisibilityResult { outcome }],
+            }))
+        };
+        let dropped = |reason| {
+            Some(Outcome::Dropped(vf_pb::Dropped {
+                reason: Some(reason),
+            }))
+        };
+        let got = |answer| match case(None).judge(&answer).result {
+            CaseResult::Wrong { got } | CaseResult::Pass { got } => got,
+            CaseResult::CallFailed { error } => panic!("{error}"),
+        };
+        assert_eq!(
+            got(answer(Some(Outcome::Allowed(vf_pb::Allowed {})))),
+            fields("allowed", "none")
+        );
+        assert_eq!(
+            got(answer(dropped(
+                vf_pb::NotificationDropReason::RecipientMutesActor.into()
+            ))),
+            fields("dropped", "recipient_mutes_actor")
+        );
+        assert_eq!(got(answer(dropped(99))), fields("dropped", "unspecified"));
+        for failed in [
+            answer(Some(Outcome::Failed(vf_pb::Failed {}))),
+            answer(None),
+            Answer::FilterNotifications(Ok(vf_pb::FilterNotificationsResponse { results: vec![] })),
+            Answer::FilterNotifications(Err(anyhow!("deadline exceeded"))),
+        ] {
+            let result = case(None).judge(&failed).result;
+            assert!(
+                matches!(result, CaseResult::CallFailed { .. }),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_sends_a_quote_s_outer_after_the_post() {
+        let tweets = case(Some(3))
+            .request(EvaluateLevel::TimelineHomeHydration)
+            .tweets;
         let sent: Vec<_> = tweets
             .iter()
             .map(|tweet| {
@@ -741,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn judge_compares_the_post_s_label_type_names() {
+    fn judge_checks_that_the_post_carries_the_listed_label_types() {
         let case = parse_cases(
             r#"{"fixtures": {"p": 2}, "cases": [], "safety_labels": {"p": ["BOUNCE", "NSFW_HIGH_PRECISION"]}}"#,
         )
@@ -769,6 +1057,12 @@ mod tests {
                 got: case.expect.clone()
             }
         );
+        let more = label_map(&[
+            SafetyLabelType::NSFW_HIGH_PRECISION,
+            SafetyLabelType::BOUNCE,
+            SafetyLabelType::LOW_QUALITY,
+        ]);
+        assert!(case.judge(&answer(vec![(2, more)], vec![])).passed());
         let unmapped = label_map(&[
             SafetyLabelType::BOUNCE,
             SafetyLabelType::DEPRECATED_LABEL_144,

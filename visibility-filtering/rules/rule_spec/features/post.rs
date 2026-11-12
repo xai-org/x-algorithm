@@ -3,7 +3,7 @@ use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{PostCandidate, SafetyLabelMap, SafetyLabelType};
 use crate::rules::context::{At, PostCoreFacts};
 use crate::rules::rule_spec::rule::RuleCond;
-use crate::rules::rule_spec::{spelled_label, Predicate, Truth};
+use crate::rules::rule_spec::Predicate;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 
 pub(in crate::rules) enum PostFacts {}
@@ -110,16 +110,6 @@ impl Leaf for TweetSafetyLabelsLeaf {
         match self {
             Self::TweetHasLabel(label) => m.run_with(label, |labels, _| labels.has_label(label)),
         }
-    }
-
-    fn sentence(self, truth: Truth) -> Option<String> {
-        let Self::TweetHasLabel(label) = self;
-        let label = spelled_label(label);
-        Some(match truth {
-            Truth::True => format!("The post has the {label} safety label."),
-            Truth::False => format!("The post does not have the {label} safety label."),
-            Truth::Unknown { .. } => format!("Whether the post has the {label} safety label."),
-        })
     }
 }
 

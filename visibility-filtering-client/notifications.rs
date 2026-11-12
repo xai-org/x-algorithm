@@ -4,14 +4,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Result};
 use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
-use xai_x_rpc::balanced_channel::LoadBalancedChannel;
 use xai_x_thrift::safety_level::SafetyLevel;
 
-use crate::discovery::build_vf_xds_channel;
+use crate::discovery::VfChannel;
 use crate::metrics::{ClientRpc, RequestMetrics};
 use crate::vf_client::{
-    channel_error_to_anyhow, make_vf_client, timeout_as_deadline_exceeded, within_deadline,
-    xds_channel_params, XAI_VF_DEFAULT_TIMEOUT_MS,
+    connect_vf_client, timeout_as_deadline_exceeded, within_deadline, xds_channel_params,
+    XAI_VF_DEFAULT_TIMEOUT_MS,
 };
 
 #[derive(
@@ -35,6 +34,9 @@ pub enum NotificationKind {
     MediaTagged,
     Like,
     Repost,
+    Quote,
+    ContactJoined,
+    AddedToList,
 }
 
 impl NotificationKind {
@@ -46,7 +48,10 @@ impl NotificationKind {
             | Self::Reply
             | Self::MediaTagged
             | Self::Like
-            | Self::Repost => SafetyLevel::NOTIFICATIONS_WRITER_V2,
+            | Self::Repost
+            | Self::Quote
+            | Self::ContactJoined
+            | Self::AddedToList => SafetyLevel::NOTIFICATIONS_WRITER_V2,
         }
     }
 
@@ -62,6 +67,9 @@ impl NotificationKind {
             }
             Kind::Like(vf_pb::Like { post_id }) => (Self::Like, Some(*post_id)),
             Kind::Repost(vf_pb::Repost { source_post_id }) => (Self::Repost, Some(*source_post_id)),
+            Kind::Quote(vf_pb::Quote { post_id }) => (Self::Quote, Some(*post_id)),
+            Kind::ContactJoined(_) => (Self::ContactJoined, None),
+            Kind::AddedToList(_) => (Self::AddedToList, None),
         }
     }
 }
@@ -82,36 +90,46 @@ pub enum Notification {
         actor_id: u64,
         source_post_id: NonZeroU64,
     },
+    ContactJoined {
+        actor_id: u64,
+    },
+    AddedToList {
+        actor_id: u64,
+    },
 }
 
 impl Notification {
     fn into_proto(self) -> vf_pb::Notification {
-        match self {
-            Self::Follow { actor_id } => vf_pb::Notification {
+        use vf_pb::notification::Kind;
+        let (actor_id, kind) = match self {
+            Self::Follow { actor_id } => (actor_id, Kind::Follow(vf_pb::Follow {})),
+            Self::FollowRequestAccepted { actor_id } => (
                 actor_id,
-                kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),
-            },
-            Self::FollowRequestAccepted { actor_id } => vf_pb::Notification {
+                Kind::FollowRequestAccepted(vf_pb::FollowRequestAccepted {}),
+            ),
+            Self::Like { actor_id, post_id } => (
                 actor_id,
-                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
-                    vf_pb::FollowRequestAccepted {},
-                )),
-            },
-            Self::Like { actor_id, post_id } => vf_pb::Notification {
-                actor_id,
-                kind: Some(vf_pb::notification::Kind::Like(vf_pb::Like {
+                Kind::Like(vf_pb::Like {
                     post_id: post_id.get(),
-                })),
-            },
+                }),
+            ),
             Self::Repost {
                 actor_id,
                 source_post_id,
-            } => vf_pb::Notification {
+            } => (
                 actor_id,
-                kind: Some(vf_pb::notification::Kind::Repost(vf_pb::Repost {
+                Kind::Repost(vf_pb::Repost {
                     source_post_id: source_post_id.get(),
-                })),
-            },
+                }),
+            ),
+            Self::ContactJoined { actor_id } => {
+                (actor_id, Kind::ContactJoined(vf_pb::ContactJoined {}))
+            }
+            Self::AddedToList { actor_id } => (actor_id, Kind::AddedToList(vf_pb::AddedToList {})),
+        };
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(kind),
         }
     }
 }
@@ -128,6 +146,7 @@ pub enum PostKind {
     Mention,
     Reply,
     MediaTagged,
+    Quote,
 }
 
 impl PostKind {
@@ -136,6 +155,7 @@ impl PostKind {
             Self::Mention => NotificationKind::Mention,
             Self::Reply => NotificationKind::Reply,
             Self::MediaTagged => NotificationKind::MediaTagged,
+            Self::Quote => NotificationKind::Quote,
         }
     }
 }
@@ -150,6 +170,7 @@ impl PostNotification {
                 PostKind::Mention => Kind::Mention(vf_pb::Mention { post_id }),
                 PostKind::Reply => Kind::Reply(vf_pb::Reply { post_id }),
                 PostKind::MediaTagged => Kind::MediaTagged(vf_pb::MediaTagged { post_id }),
+                PostKind::Quote => Kind::Quote(vf_pb::Quote { post_id }),
             }),
         }
     }
@@ -181,17 +202,14 @@ impl NotificationOutcome {
 }
 
 pub struct NotificationsClient {
-    client: VisibilityFilteringServiceClient<LoadBalancedChannel>,
+    client: VisibilityFilteringServiceClient<VfChannel>,
     timeout: Duration,
 }
 
 impl NotificationsClient {
     pub async fn connect(datacenter: &str) -> Result<Self> {
-        let channel = build_vf_xds_channel(&xds_channel_params("vf-notifications", datacenter))
-            .await
-            .map_err(channel_error_to_anyhow)?;
         Ok(Self {
-            client: make_vf_client(channel),
+            client: connect_vf_client(&xds_channel_params("vf-notifications", datacenter)).await?,
             timeout: Duration::from_millis(XAI_VF_DEFAULT_TIMEOUT_MS),
         })
     }
@@ -206,7 +224,7 @@ impl NotificationsClient {
             safety_level,
             recipient_id,
             notifications.iter().map(|n| n.into_proto()).collect(),
-            RequestMetrics::start(ClientRpc::FilterNotifications),
+            RequestMetrics::start(&ClientRpc::FILTER_NOTIFICATIONS),
         )
         .await
     }
@@ -223,7 +241,7 @@ impl NotificationsClient {
             first.kind.kind().level(),
             recipient_id,
             notifications.iter().map(|n| n.into_proto()).collect(),
-            RequestMetrics::start(ClientRpc::FilterNotifications),
+            RequestMetrics::start(&ClientRpc::FILTER_NOTIFICATIONS),
         )
         .await
     }
@@ -249,10 +267,7 @@ impl NotificationsClient {
                 .filter_notifications(rpc)
                 .await
                 .map_err(timeout_as_deadline_exceeded);
-            request_metrics.batch(
-                batch_start.elapsed(),
-                response.as_ref().err().map(tonic::Status::code),
-            );
+            request_metrics.batch(batch_start.elapsed(), response.as_ref().err());
             decode_response(sent, response?.into_inner())
         })
         .await;
@@ -283,6 +298,7 @@ fn decode_response(
 mod tests {
     use super::*;
     use crate::test_support::RecordingReceiver;
+    use crate::vf_client::make_vf_client;
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -293,7 +309,7 @@ mod tests {
     use vf_pb::visibility_filtering_service_server::{
         VisibilityFilteringService, VisibilityFilteringServiceServer,
     };
-    use xai_x_rpc::balanced_channel::LbPolicy;
+    use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
     use xai_x_rpc::endpoint_source::EndpointSource;
     use xai_x_rpc::endpoint_weights::{uniform_weights, EndpointWeights};
 
@@ -371,7 +387,7 @@ mod tests {
             .await
             .unwrap();
         let client = NotificationsClient {
-            client: make_vf_client(channel),
+            client: make_vf_client(VfChannel::Xds(channel)),
             timeout: Duration::from_millis(timeout_ms),
         };
         (client, server)
@@ -385,7 +401,7 @@ mod tests {
         let (client, server) = serve(stub, timeout_ms).await;
         let sr = Arc::new(RecordingReceiver::default());
         let request_metrics =
-            RequestMetrics::with_receiver(ClientRpc::FilterNotifications, Some(sr.clone()));
+            RequestMetrics::with_receiver(&ClientRpc::FILTER_NOTIFICATIONS, Some(sr.clone()));
         let result = client
             .filter_notifications_recording(
                 SafetyLevel::NOTIFICATIONS_FOLLOW,
@@ -443,6 +459,14 @@ mod tests {
                 },
                 Kind::Repost(vf_pb::Repost { source_post_id: 20 }),
             ),
+            (
+                Notification::ContactJoined { actor_id: 10 },
+                Kind::ContactJoined(vf_pb::ContactJoined {}),
+            ),
+            (
+                Notification::AddedToList { actor_id: 10 },
+                Kind::AddedToList(vf_pb::AddedToList {}),
+            ),
         ] {
             assert_eq!(
                 notification.into_proto(),
@@ -479,11 +503,12 @@ mod tests {
                     post(PostKind::Mention),
                     post(PostKind::Reply),
                     post(PostKind::MediaTagged),
+                    post(PostKind::Quote),
                 ],
             )
             .await;
         server.abort();
-        assert_eq!(outcomes.unwrap(), vec![NotificationOutcome::Allowed; 3]);
+        assert_eq!(outcomes.unwrap(), vec![NotificationOutcome::Allowed; 4]);
         let sent = |kind| vf_pb::Notification {
             actor_id: 10,
             kind: Some(kind),
@@ -497,6 +522,7 @@ mod tests {
                     sent(Kind::Mention(vf_pb::Mention { post_id: 20 })),
                     sent(Kind::Reply(vf_pb::Reply { post_id: 20 })),
                     sent(Kind::MediaTagged(vf_pb::MediaTagged { post_id: 20 })),
+                    sent(Kind::Quote(vf_pb::Quote { post_id: 20 })),
                 ],
             }]
         );

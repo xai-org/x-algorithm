@@ -1,24 +1,16 @@
-use crate::clients::strato::{self, decode_only};
+use crate::clients::strato;
 use crate::thrift_read::read_fields;
-use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
+use thrift::protocol::{TInputProtocol, TType};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
 use xai_strato::StratoGrpc;
 
 const TFE_TOP_COUNTRY_COLUMN: &str = "about_this_account/tfe_top_country.User";
 
-pub struct AboutThisAccountClient {
-    grpc: StratoGrpc,
-}
-
-impl AboutThisAccountClient {
-    pub fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
-
-    pub async fn tfe_top_country(&self, user_id: u64) -> anyhow::Result<Option<String>> {
-        let key = xai_strato::encode(&(user_id.cast_signed(), ()));
-        let bytes = strato::fetch(&self.grpc, TFE_TOP_COUNTRY_COLUMN, key).await?;
-        Ok(strato::decode::<UserTfeTopCountry>(&bytes)?.and_then(|row| row.weighted_top_country))
-    }
+pub async fn tfe_top_country(grpc: &StratoGrpc, user_id: u64) -> anyhow::Result<Option<String>> {
+    let key = xai_strato::encode(&(user_id.cast_signed(), ()));
+    let bytes = strato::fetch(grpc, TFE_TOP_COUNTRY_COLUMN, key).await?;
+    Ok(strato::row(strato_decode::<UserTfeTopCountry>(&bytes)?)?
+        .and_then(|row| row.weighted_top_country))
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -29,8 +21,8 @@ struct UserTfeTopCountry {
 const WEIGHTED_TOP_COUNTRY: i16 = 2;
 const COUNTRY_ID: i16 = 1;
 
-impl TSerializable for UserTfeTopCountry {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+impl StratoRead for UserTfeTopCountry {
+    fn read(i_prot: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let mut weighted_top_country = None;
         read_fields(i_prot, |i_prot, field| {
             if field.id != Some(WEIGHTED_TOP_COUNTRY) || field.field_type != TType::Struct {
@@ -49,17 +41,13 @@ impl TSerializable for UserTfeTopCountry {
             weighted_top_country,
         })
     }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(decode_only("UserTfeTopCountry"))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clients::strato::answer::Thrift::{Bool, Str, Struct, I64};
-    use thrift::protocol::TBinaryInputProtocol;
+    use std::io::Cursor;
 
     fn decode_row(details: &[(i16, &str)]) -> UserTfeTopCountry {
         let details = details.iter().map(|&(id, country_id)| {
@@ -71,8 +59,7 @@ mod tests {
             .chain(details)
             .chain([(5, I64(1))]);
         let bytes = Struct(fields.collect()).bytes();
-        let mut i_prot = TBinaryInputProtocol::new(&bytes[..], false);
-        UserTfeTopCountry::read_from_in_protocol(&mut i_prot).unwrap()
+        UserTfeTopCountry::read(&mut MValProtocol::new(Cursor::new(&bytes[..]), false)).unwrap()
     }
 
     #[test]

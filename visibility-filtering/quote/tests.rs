@@ -266,6 +266,16 @@ fn pass_cases() -> Vec<PassCase> {
             ),
         ),
         case(
+            "retweet outer whose share names no source author",
+            InMemorySources::default()
+                .tweet(INNER, QUOTED_AUTHOR)
+                .retweet(OUTER, QUOTING_AUTHOR, 3, None)
+                .tweet(3, 40)
+                .authors(&[QUOTED_AUTHOR, QUOTING_AUTHOR, 40])
+                .edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),
+            PassOutcome::FailedOpen,
+        ),
+        case(
             "outer withheld",
             world().user(QUOTING_AUTHOR, suspended()),
             PassOutcome::OuterWithheld,
@@ -531,6 +541,39 @@ async fn a_deleted_inner_drops_for_a_protected_author_a_live_quote_already_hydra
             .map(|pass| (pass.key.tweet_id.0, &pass.outcome))
             .collect::<Vec<_>>(),
         [(INNER, &protected_drop), (LIVE_INNER, &protected_drop)]
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_inner_resolves_by_any_outer_that_names_its_author() {
+    const NAMING_OUTER: u64 = 12;
+    let world = InMemorySources::default()
+        .tweet(OUTER, QUOTING_AUTHOR)
+        .tweet(NAMING_OUTER, QUOTING_AUTHOR)
+        .quote(NAMING_OUTER, INNER, QUOTED_AUTHOR)
+        .authors(&[QUOTING_AUTHOR])
+        .user(QUOTED_AUTHOR, protected());
+    let mut tweets = quote_with_outer();
+    tweets.extend([
+        tweet_data(NAMING_OUTER, None),
+        tweet_data(INNER, Some(NAMING_OUTER)),
+    ]);
+    let (_, passes) = serve(Arc::new(world), QuotePassMode::Shadow, Some(VIEWER), tweets).await;
+    let protected_drop = dropped(
+        "protected_quoted_author/drop",
+        RerenderReason::AuthorProtected,
+    );
+    assert_eq!(
+        passes
+            .iter()
+            .map(|pass| (pass.key.placement, &pass.outcome))
+            .collect::<Vec<_>>(),
+        [OUTER, NAMING_OUTER].map(|outer| (
+            Placement::InnerQuoted {
+                outer: TweetId(outer)
+            },
+            &protected_drop
+        ))
     );
 }
 

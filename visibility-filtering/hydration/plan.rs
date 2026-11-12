@@ -1,9 +1,10 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
 use crate::hydration::fetcher::{AskedFields, FetcherId};
 use crate::hydration::hydrator::{Edge, Part, RequestRows};
-use crate::hydration::relation::{Relation, Role};
+use crate::hydration::inventory::Stake;
+use crate::hydration::relation::{Joins, Relation};
 use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
-use crate::rules::{Expansion, Rpc, SafetyLevel};
+use crate::rules::{Rpc, SafetyLevel};
 use std::fmt;
 use std::iter;
 use std::time::Duration;
@@ -17,6 +18,7 @@ pub(crate) struct HydrationPlan {
     edge_ceilings: Vec<(FetcherId, Edge, Duration)>,
     nodes: Hydrators,
     logged_out_nodes: Hydrators,
+    deciding_existence: Hydrators,
 }
 
 pub(super) struct Group {
@@ -61,7 +63,7 @@ impl HydrationPlan {
                     fetcher: spec.fetcher(),
                     input,
                     nodes: Hydrators::of(node),
-                    label: spec.label,
+                    label: spec.label(),
                     edges: Vec::new(),
                     fields: Vec::new(),
                     readers: Vec::new(),
@@ -111,9 +113,10 @@ impl HydrationPlan {
             groups,
             edge_ceilings,
             nodes,
-            logged_out_nodes: nodes
+            logged_out_nodes: nodes.without_viewer(),
+            deciding_existence: nodes
                 .iter()
-                .filter(|node| !node.needs_viewer())
+                .filter(|node| node.spec_at(rows).stake() == Stake::Exists)
                 .fold(Hydrators::empty(), Hydrators::with),
         }
     }
@@ -153,6 +156,10 @@ impl HydrationPlan {
         }
     }
 
+    pub(super) fn deciding_existence(&self) -> Hydrators {
+        self.deciding_existence
+    }
+
     pub(super) fn groups(&self) -> impl Iterator<Item = &Group> {
         self.groups.iter()
     }
@@ -161,18 +168,12 @@ impl HydrationPlan {
         Relation::VARIANTS
             .iter()
             .copied()
-            .filter(|&relation| match relation.spec().role {
-                Role::Judged => {
-                    self.level.may_merge_retweets()
-                        && !self
-                            .nodes
-                            .intersection(relation.spec().trigger.reads())
-                            .is_empty()
+            .filter(|&relation| match relation.spec() {
+                joins @ Joins::Judged(_) => {
+                    self.level.is_carried_by(Rpc::EvaluateTweets)
+                        && !self.nodes.intersection(joins.reads()).is_empty()
                 }
-                Role::Read => self
-                    .nodes
-                    .iter()
-                    .any(|node| node.spec().relation == Some(relation)),
+                Joins::Read(_) | Joins::Paired => relation.is_read_by(self.nodes),
             })
     }
 
@@ -202,14 +203,10 @@ impl HydrationPlan {
 impl Group {
     pub(super) fn ceiling(&self) -> Duration {
         if self.nodes.has_must_have() {
-            return HYDRATION_TIMEOUT;
+            HYDRATION_TIMEOUT
+        } else {
+            BEST_EFFORT_HYDRATION_TIMEOUT
         }
-        self.nodes
-            .iter()
-            .find_map(|node| Expansion::of(node.relation()?))
-            .map_or(BEST_EFFORT_HYDRATION_TIMEOUT, |expansion| {
-                expansion.spec().deadline
-            })
     }
 
     pub(super) fn label(&self) -> (&'static str, &'static str) {
@@ -236,7 +233,7 @@ fn fields(fetcher: FetcherId, nodes: Hydrators, rows: RequestRows) -> Vec<QueryF
     };
     let mut fields = Vec::new();
     for node in nodes.iter() {
-        if let Part::Fields(node_fields) = node.spec().part {
+        if let Part::Fields(_, node_fields) = node.spec().part {
             for field in node_fields {
                 if !fields.contains(field) {
                     fields.push(*field);
@@ -374,7 +371,11 @@ mod tests {
             let plan = HydrationPlan::with_rows(SafetyLevel::FilterAll, rows, Hydrators::all());
             for group in plan.groups() {
                 for node in group.nodes.iter() {
-                    assert_eq!(node.spec_at(rows).label, group.label(), "{rows:?} {node:?}");
+                    assert_eq!(
+                        node.spec_at(rows).label(),
+                        group.label(),
+                        "{rows:?} {node:?}"
+                    );
                 }
             }
         }

@@ -93,7 +93,7 @@ pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
 #[derive(Default)]
 struct Tweet {
     core_data: Option<CoreData>,
-    media: Vec<Media>,
+    media: MediaFeature,
     takedown_reasons: Vec<TakedownReason>,
     community_id: Option<NonZeroU64>,
     exclusive_tweet_control: Option<ExclusiveTweetControl>,
@@ -140,7 +140,7 @@ impl Tweet {
             media: MediaFeature {
                 has_media: self.has_media_refs || self.has_card_reference,
                 has_uploaded_media: self.has_media_keys,
-                ..media_feature(self.media)
+                ..self.media
             },
             community_id: self.community_id,
             trusted_friends_list_id: self.trusted_friends_list_id,
@@ -163,18 +163,13 @@ fn latest_edit_tweet_id(control: &EditControl) -> Option<u64> {
     initial.edit_tweet_ids.last().copied()
 }
 
-fn media_feature(entities: Vec<Media>) -> MediaFeature {
-    let mut feature = MediaFeature::default();
-    for restrictions in entities
-        .into_iter()
-        .filter(|e| e.has_media_key)
-        .filter_map(|e| e.restrictions)
-    {
-        feature.has_dmca_media |= restrictions.is_dmca;
-        feature.geo_allow_list.extend(restrictions.geo_allow_list);
-        feature.geo_deny_list.extend(restrictions.geo_deny_list);
-    }
-    feature
+fn fold_media(feature: &mut MediaFeature, entity: Media) {
+    let Some(restrictions) = entity.restrictions.filter(|_| entity.has_media_key) else {
+        return;
+    };
+    feature.has_dmca_media |= restrictions.is_dmca;
+    feature.geo_allow_list.extend(restrictions.geo_allow_list);
+    feature.geo_deny_list.extend(restrictions.geo_deny_list);
 }
 
 impl StratoRead for Tweet {
@@ -185,9 +180,9 @@ impl StratoRead for Tweet {
                 Some(2) => tweet.core_data = Some(read_core_data(proto)?),
                 Some(7) => {
                     let list = proto.read_list_begin()?;
-                    let mut media = Vec::with_capacity(usize::try_from(list.size).unwrap_or(0));
+                    let mut media = MediaFeature::default();
                     for _ in 0..list.size {
-                        media.push(read_media(proto)?);
+                        fold_media(&mut media, read_media(proto)?);
                     }
                     proto.read_list_end()?;
                     tweet.media = media;

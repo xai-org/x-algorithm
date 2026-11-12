@@ -101,6 +101,9 @@ where
         self.result_size()
     }
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
+    fn retain_retrieved_candidates(&self, _query: &Q) -> bool {
+        true
+    }
 
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
         self.execute_traced(query).await.0
@@ -132,9 +135,14 @@ where
         let candidates = self.fetch_candidates(&hydrated_query).await;
 
         let hydrated_candidates = self.hydrate(&hydrated_query, candidates).await;
+        let retrieved_candidates = if self.retain_retrieved_candidates(&hydrated_query) {
+            hydrated_candidates.clone()
+        } else {
+            Vec::new()
+        };
 
         let (kept_candidates, mut filtered_candidates) =
-            self.filter(&hydrated_query, hydrated_candidates.clone());
+            self.filter(&hydrated_query, hydrated_candidates);
 
         let scored_candidates = self.score(&hydrated_query, kept_candidates).await;
 
@@ -171,7 +179,7 @@ where
         self.run_side_effects(input);
 
         PipelineResult {
-            retrieved_candidates: hydrated_candidates,
+            retrieved_candidates,
             filtered_candidates,
             selected_candidates: final_candidates,
             query: arc_hydrated_query,
@@ -344,10 +352,12 @@ where
         let stats = StageStats::begin(stage);
         let enabled: Vec<_> = hydrators.iter().filter(|h| h.enable(query)).collect();
         stats.record_components(hydrators.len(), enabled.len());
-        let hydrate_futures = enabled.iter().map(|h| h.run(query, &candidates, stage));
-        let results = join_all(hydrate_futures).await;
-        for (hydrator, result) in enabled.iter().zip(results) {
-            hydrator.update_all(&mut candidates, result);
+        let fetch_futures = enabled
+            .iter()
+            .map(|h| h.fetch_output(query, &candidates, stage));
+        let outputs = join_all(fetch_futures).await;
+        for (hydrator, output) in enabled.iter().zip(outputs) {
+            hydrator.apply_output(query, &mut candidates, output);
         }
         stats.finish_with_size(candidates.len());
         candidates

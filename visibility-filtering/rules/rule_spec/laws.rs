@@ -8,14 +8,12 @@ use super::features::{CompoundLeaf, ReplyControlLeaf, RequestLeaf};
 use super::rule::Audience::{self, Everyone, NonAuthors, NonFollowers, OnlyAuthor};
 use super::rule::{Rule, RuleCond};
 use super::*;
-use crate::hydration::inventory::Tier;
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Relation};
 use crate::models::{
     ClientCapability, ClientSwitch, PostCandidate, RequestFacts, SafetyLabelMap, SafetyLabelType,
     UserCandidate, VerifyBlurSupport, ViewerFeatures,
 };
 use crate::params::CountryLists;
-use crate::rules::expansion::Expansion;
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 use crate::rules::golden_corpus::{corpus, Subject};
 use crate::rules::levels::LevelLists;
@@ -162,6 +160,16 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         "the default drops the quote of a protected author the quoting author really follows",
     ),
     (
+        "do_not_amplify/drop/undesirable",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "malicious_url/drop/undesirable",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
         "fosnr_abuse_insults_non_follower/drop/undesirable",
         Hydrator::Follows,
         "the default drops the post for real followers",
@@ -262,6 +270,11 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         FAILS_THE_NOTIFICATION,
     ),
     (
+        "spam_high_recall_oon/drop/undesirable",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
         "risky_high_viz_reply_oon/drop/unspecified",
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
@@ -278,14 +291,10 @@ fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
     });
     let post = wired_rules().into_iter().map(|rule| {
         let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
-        let shown = rule.requirements().iter().filter(|node| {
-            node.relation()
-                .and_then(Expansion::of)
-                .is_some_and(|expansion| {
-                    let spec = expansion.spec();
-                    spec.on_failure.tier() == Tier::BestEffort && spec.rules.contains(&rule)
-                })
-        });
+        let shown = rule
+            .requirements()
+            .iter()
+            .filter(|node| node.relation() == Some(Relation::ReactedTo));
         let shown = shown.fold(Hydrators::empty(), Hydrators::with);
         (rule.name(), limits, rule.requirements(), shown)
     });
@@ -329,9 +338,9 @@ fn faithful<E: Fold>(
         if rule.requirements().intersection(failed) != failed {
             continue;
         }
-        let (truth, ()) = observed::evaluate_rule(rule, context, &mut observed::NoTrace, None);
+        let (truth, ()) = observed::evaluate_rule(rule, context, &mut observed::NoTrace, false);
         let (total, _) =
-            observed::evaluate_rule(rule, context, &mut observed::Total::default(), None);
+            observed::evaluate_rule(rule, context, &mut observed::Total::default(), false);
         assert_eq!(truth, total, "{} with {failed:?} failed", rule.name());
         assert_eq!(
             truth.resolves_true(),
@@ -397,7 +406,7 @@ fn reads_one_definition<E: Fold>(
     ) {
         match condition {
             condition if definitions.contains(&condition) => uses.push(negated),
-            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),
+            RuleCond::Leaf(leaf) => outside.push(leaf.lift()),
             RuleCond::All(children) | RuleCond::Any(children) => {
                 for &child in children {
                     walk(child, definitions, negated, outside, uses);
@@ -606,7 +615,6 @@ fn every_post_rule_reads_the_post() {
         | Predicate::CommunityViewerRemoved(_)
         | Predicate::ReactedToPostSafetyLabels(_)
         | Predicate::ReactedToAuthorSafety(_)
-        | Predicate::Edge(_)
         | Predicate::Compound(_) => true,
     };
     let reading_no_post: Vec<String> = wired_rules()

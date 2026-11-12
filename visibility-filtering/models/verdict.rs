@@ -165,18 +165,8 @@ pub enum MediaRestriction {
     NsfwInterstitial,
 }
 
-impl MediaRestriction {
-    pub fn legacy(&self) -> &FilteredReason {
-        match self {
-            Self::MediaInterstitial(blur) => &blur.legacy,
-            Self::NsfwInterstitial => &FilteredReason::ContainNsfwMedia,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaInterstitial {
-    pub legacy: FilteredReason,
     pub reason: InterstitialReason,
     pub prompt: Option<InterstitialAction>,
 }
@@ -216,6 +206,7 @@ impl LimitedEngagement {
 #[strum(serialize_all = "snake_case")]
 pub enum TombstoneReason {
     Bounced,
+    #[strum(serialize = "age_verification")]
     SensitiveViewerAgeVerification,
     UpdateAppIos,
     UpdateAppAndroid,
@@ -268,6 +259,7 @@ impl LimitedEngagementReason {
             Self::CommunityTweetHidden,
             Self::CommunityTweetMemberRemoved,
             Self::CommunityTweetViewerRemoved,
+            Self::DynamicProductAd,
             Self::StaleTweet,
             Self::LocalTweet,
             Self::ReadonlyViewer,
@@ -383,6 +375,7 @@ impl Evaluation {
         }
     }
 
+    #[cfg(test)]
     pub const fn complete(verdict: Verdict) -> Self {
         Self::Complete {
             verdict,

@@ -731,6 +731,105 @@ impl InputBuffer {
         }
         self.candidate_ad_side_ids = out;
     }
+
+    pub fn drop_recent_history(
+        &mut self,
+        model_config: &ModelConfig,
+        rate: f64,
+        window_secs: i64,
+        mut uniform: impl FnMut() -> f64,
+    ) -> usize {
+        let h = model_config.history_seq_len;
+        let n_item = model_config.hash_table.num_item_hashes().max(1);
+        let real = |hashes: &[i32], row: usize| hashes.get(row * n_item).is_some_and(|&x| x != 0);
+        let Some(request_sec) = (0..self.candidate_impr_ts.len())
+            .filter(|&c| real(&self.candidate_post_hashes, c) && self.candidate_impr_ts[c] > 0)
+            .map(|c| i64::from(self.candidate_impr_ts[c]))
+            .min()
+        else {
+            return 0;
+        };
+        if self.history_impr_ts.len() < h {
+            return 0;
+        }
+        let n_actions = self.history_actions.len() / h;
+        let negative = |row: usize| {
+            NEGATIVE_FEEDBACK_ACTIONS.iter().any(|&a| {
+                (a as usize) < n_actions && self.history_actions[row * n_actions + a as usize]
+            })
+        };
+        let keep: Vec<bool> = (0..h)
+            .map(|t| {
+                let recent = real(&self.history_post_hashes, t)
+                    && i64::from(self.history_impr_ts[t]) > request_sec - window_secs;
+                !(recent && !negative(t) && uniform() < rate)
+            })
+            .collect();
+        let removed = keep.iter().filter(|&&k| !k).count();
+        if removed == 0 {
+            return 0;
+        }
+        compact_rows(&mut self.history_post_hashes, &keep);
+        compact_rows(&mut self.history_auth_hashes, &keep);
+        compact_rows(&mut self.history_product_surfaces, &keep);
+        compact_rows(&mut self.history_actions, &keep);
+        compact_rows(&mut self.history_continuous_actions, &keep);
+        compact_rows(&mut self.history_categorical_features, &keep);
+        compact_rows(&mut self.history_bool_features, &keep);
+        compact_rows(&mut self.history_float_features, &keep);
+        compact_rows(&mut self.history_int64_features, &keep);
+        compact_rows(&mut self.history_impr_ts, &keep);
+        compact_rows(&mut self.history_post_creation_ts_sec, &keep);
+        compact_rows(&mut self.history_post_ids, &keep);
+        compact_rows(&mut self.history_semantic_ids, &keep);
+        let new_row: Vec<u32> = keep
+            .iter()
+            .scan(0u32, |next, &k| {
+                let row = *next;
+                *next += u32::from(k);
+                Some(row)
+            })
+            .collect();
+        self.history_web_conv_url_ids.retain_mut(|(row, _)| {
+            let r = *row as usize;
+            let kept = keep.get(r).copied().unwrap_or(false);
+            if kept {
+                *row = new_row[r];
+            }
+            kept
+        });
+        self.num_history = self.num_history.saturating_sub(removed);
+        removed
+    }
+}
+
+pub const NEGATIVE_FEEDBACK_ACTIONS: [pb::ActionName; 10] = [
+    pb::ActionName::ServerTweetReport,
+    pb::ActionName::ClientTweetReport,
+    pb::ActionName::ClientTweetNotInterestedIn,
+    pb::ActionName::ClientTweetSeeFewer,
+    pb::ActionName::ClientTweetUnfollowAuthor,
+    pb::ActionName::ClientTweetBlockAuthor,
+    pb::ActionName::ClientTweetMuteAuthor,
+    pb::ActionName::ClientTweetMuteConversation,
+    pb::ActionName::ClientTweetNotRelevant,
+    pb::ActionName::ClientNotificationSeeLessOften,
+];
+
+fn compact_rows<T: Copy + Default>(buf: &mut [T], keep: &[bool]) {
+    if buf.is_empty() {
+        return;
+    }
+    debug_assert_eq!(buf.len() % keep.len(), 0);
+    let width = buf.len() / keep.len();
+    let mut dst = 0;
+    for (row, _) in keep.iter().enumerate().filter(|&(_, &k)| k) {
+        if dst != row {
+            buf.copy_within(row * width..(row + 1) * width, dst * width);
+        }
+        dst += 1;
+    }
+    buf[dst * width..].fill(T::default());
 }
 
 struct CandidateData {
@@ -2130,6 +2229,53 @@ mod tests {
             num_categorical_features: 0,
             sid_num_levels: 0,
         }
+    }
+
+    #[test]
+    fn drop_recent_history_removes_window_rows_and_moves_kept_rows_up() {
+        let mc = test_model_config(0);
+        let mut buf = InputBuffer {
+            candidate_post_hashes: vec![7, 7, 7, 7, 0, 0],
+            candidate_impr_ts: vec![10_050, 10_000, 9_000],
+            history_post_hashes: vec![1, 1, 2, 2, 3, 3, 0, 0],
+            history_impr_ts: vec![9_500, 8_000, 9_900, 0],
+            history_actions: vec![true, false, false, true, true, true, false, false],
+            history_post_ids: vec![11, 12, 13, 0],
+            history_web_conv_url_ids: vec![(1, 42), (2, 43)],
+            num_history: 3,
+            ..Default::default()
+        };
+        let mut draws = [0.1, 0.9].into_iter();
+        assert_eq!(
+            buf.drop_recent_history(&mc, 0.5, 900, || draws.next().unwrap()),
+            1
+        );
+        assert_eq!(buf.history_post_hashes, vec![2, 2, 3, 3, 0, 0, 0, 0]);
+        assert_eq!(buf.history_impr_ts, vec![8_000, 9_900, 0, 0]);
+        assert_eq!(
+            buf.history_actions,
+            vec![false, true, true, true, false, false, false, false]
+        );
+        assert_eq!(buf.history_post_ids, vec![12, 13, 0, 0]);
+        assert_eq!(buf.history_web_conv_url_ids, vec![(0, 42), (1, 43)]);
+        assert_eq!(buf.num_history, 2);
+
+        let not_interested = pb::ActionName::ClientTweetNotInterestedIn as usize;
+        let mut history_actions = vec![false; 4 * 64];
+        history_actions[not_interested] = true;
+        let mut buf = InputBuffer {
+            candidate_post_hashes: vec![7, 7],
+            candidate_impr_ts: vec![10_000],
+            history_post_hashes: vec![1, 1, 2, 2, 0, 0, 0, 0],
+            history_impr_ts: vec![9_500, 9_900, 0, 0],
+            history_actions,
+            num_history: 2,
+            ..Default::default()
+        };
+        assert_eq!(buf.drop_recent_history(&mc, 1.0, 900, || 0.0), 1);
+        assert_eq!(buf.history_post_hashes, vec![1, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(buf.history_actions[not_interested]);
+        assert_eq!(buf.num_history, 1);
     }
 
     #[test]

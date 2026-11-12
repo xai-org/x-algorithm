@@ -1,11 +1,5 @@
-use crate::clients::about_this_account_client::AboutThisAccountClient;
-use crate::clients::article_client::ArticleClient;
-use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::label_warm_client::StratoWarmFetcher;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
-use crate::clients::trusted_friends_client::TrustedFriendsClient;
-use crate::clients::user_devices_client::UserDevicesClient;
-use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::filter_notifications::FilterNotificationsEndpoint;
@@ -406,9 +400,6 @@ pub(crate) async fn prod_sources(
     info!(deterministic_aperture, "Backend clients ready");
 
     let tes_client = Arc::new(tes);
-    let gizmoduck_client: Arc<
-        dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
-    > = Arc::new(gizmoduck);
     let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
         Arc::new(socialgraph);
     let wingman_client = Arc::new(wingman);
@@ -416,14 +407,8 @@ pub(crate) async fn prod_sources(
     let communities = CommunitySource {
         grpc_client: stratoserver.clone(),
     };
-    let about_this_account_client = AboutThisAccountClient::new(stratoserver.clone());
-    let trusted_friends_client = TrustedFriendsClient::new(stratoserver.clone());
-    let user_location_client = UserLocationClient::new(stratoserver.clone());
-    let article_client = ArticleClient::new(stratoserver.clone());
-    let user_devices_client = UserDevicesClient::new(stratoserver.clone());
-
     let safety_label_source =
-        Arc::new(labels.into_source(cache_warming.warmer(|| warm_fetcher(stratoserver))));
+        Arc::new(labels.into_source(cache_warming.warmer(|| warm_fetcher(stratoserver.clone()))));
 
     let tweet_source = TweetSource {
         grpc_client: Arc::clone(&tes_client.grpc_client),
@@ -431,23 +416,19 @@ pub(crate) async fn prod_sources(
     let sources = ProdSources::new(Backends {
         tes: tes_client,
         tweets: tweet_source,
-        gizmoduck: GizmoduckLookup::new(gizmoduck_client),
+        gizmoduck: Arc::new(gizmoduck),
         socialgraph: sg_client,
-        about_this_account: about_this_account_client,
+        strato: stratoserver,
         wingman: wingman_client,
-        articles: article_client,
-        trusted_friends: trusted_friends_client,
-        user_location: user_location_client,
         safety_labels: Arc::clone(&safety_label_source),
         communities,
-        user_devices: user_devices_client,
     });
     (sources, safety_label_source)
 }
 
 fn warm_fetcher(stratoserver: StratoGrpc) -> Option<Arc<dyn WarmFetcher>> {
     crate::config::cache_warm_enabled()
-        .then(|| Arc::new(StratoWarmFetcher::new(stratoserver)) as Arc<dyn WarmFetcher>)
+        .then(|| Arc::new(StratoWarmFetcher(stratoserver)) as Arc<dyn WarmFetcher>)
 }
 
 const STRATO_REQUEST_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;

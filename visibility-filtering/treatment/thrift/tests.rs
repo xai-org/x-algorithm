@@ -1,11 +1,12 @@
 use super::*;
+use crate::models::VerdictAction;
 use crate::rules::fixtures::{
     allow, appealed, blurred, blurred_and_limited, dropped, fosnr, label_interstitial,
     legacy_interstitial, limited, limited_for, tombstoned, verify_blurred, with_label_interstitial,
 };
 use crate::rules::RuleId;
 use crate::treatment::proto::proto_action;
-use crate::treatment::rpc::{decided_rows, verdict_action, BY_RULE_ACTIONS};
+use crate::treatment::rpc::{decided_rows, verdict_action};
 use vf_pb::action::Kind;
 use xai_visibility_filtering::graphql_results::{
     is_dropped_media_blur, resolve_blurred_image_interstitial,
@@ -72,12 +73,27 @@ fn blur(reason: InterstitialReason) -> Verdict {
     blurred(reason, "blur_rule")
 }
 
-fn thrift_drop(reason: Option<action::DropReason>) -> Action {
-    Action::Drop(action::Drop::new(reason, None))
+fn sent_action(
+    verdict: &Verdict,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> Option<Action> {
+    let (TweetFieldsResultState::Found(TweetFieldsResultFound {
+        suppress_reason: Some(reason),
+    })
+    | TweetFieldsResultState::Filtered(TweetFieldsResultFiltered { reason })) =
+        thrift_result_state(verdict, level, policies)
+    else {
+        return None;
+    };
+    let ThriftFilteredReason::SafetyResult(result) = reason else {
+        return None;
+    };
+    Some(result.action)
 }
 
 struct Projected {
-    thrift: Action,
+    thrift: Option<Action>,
     proto: Kind,
     reason: Option<FilteredReason>,
     label: &'static str,
@@ -91,10 +107,10 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             tombstoned(reason, "rule"),
             Projected {
-                thrift: Action::Tombstone(Tombstone::new(
+                thrift: Some(Action::Tombstone(Tombstone::new(
                     Some(action::TombstoneReason(code)),
                     None,
-                )),
+                ))),
                 proto: proto_drop,
                 reason: Some(FilteredReason::UnspecifiedReason),
                 label: "tombstone",
@@ -110,7 +126,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
                 by: "rule",
             }),
             Projected {
-                thrift: thrift_drop(Some(thrift)),
+                thrift: Some(Action::Drop(action::Drop::new(Some(thrift), None))),
                 proto: proto_drop,
                 reason: Some(FilteredReason::ContainNsfwMedia),
                 label: "drop",
@@ -122,7 +138,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             allow(),
             Projected {
-                thrift: Action::Allow(action::Allow::new()),
+                thrift: None,
                 proto: Kind::Allow(true),
                 reason: None,
                 label: "allow",
@@ -132,7 +148,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             dropped(FilteredReason::AuthorIsSuspended, "rule"),
             Projected {
-                thrift: thrift_drop(Some(action::DropReason::SuspendedAuthor(true))),
+                thrift: None,
                 proto: proto_drop,
                 reason: Some(FilteredReason::AuthorIsSuspended),
                 label: "drop",
@@ -159,7 +175,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             blur(InterstitialReason::Sensitive(true)),
             Projected {
-                thrift: thrift_blur(InterstitialReason::Sensitive(true)),
+                thrift: Some(thrift_blur(InterstitialReason::Sensitive(true))),
                 proto: Kind::Interstitial(true),
                 reason: Some(FilteredReason::ContainNsfwMedia),
                 label: "interstitial",
@@ -169,7 +185,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             limit(),
             Projected {
-                thrift: Action::LimitedEngagements(thrift_limit()),
+                thrift: Some(Action::LimitedEngagements(thrift_limit())),
                 proto: Kind::Allow(true),
                 reason: None,
                 label: "limited_engagement",
@@ -179,11 +195,11 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             limited_for(&[LimitedEngagementReason::StaleTweet], "limit_rule"),
             Projected {
-                thrift: thrift_limit_for(
+                thrift: Some(thrift_limit_for(
                     action::LimitedEngagementReason::StaleTweet(action::StaleTweet::new()),
                     None,
                     "stale_tweet",
-                ),
+                )),
                 proto: Kind::Allow(true),
                 reason: None,
                 label: "limited_engagement",
@@ -193,13 +209,13 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             blurred_and_limited(blur(InterstitialReason::Sensitive(true)), limit()),
             Projected {
-                thrift: Action::TweetInterstitial(TweetInterstitial {
+                thrift: Some(Action::TweetInterstitial(TweetInterstitial {
                     limited_engagements: Some(thrift_limit()),
                     all_media_visibility_results: Some(thrift_media(
                         InterstitialReason::Sensitive(true),
                     )),
                     ..TweetInterstitial::default()
-                }),
+                })),
                 proto: Kind::Interstitial(true),
                 reason: Some(FilteredReason::ContainNsfwMedia),
                 label: "tweet_interstitial",
@@ -212,10 +228,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             legacy_interstitial("fallback_rule"),
             Projected {
-                thrift: Action::Interstitial(Interstitial::new(
-                    InterstitialReason::ContainsNsfwMedia(true),
-                    None,
-                )),
+                thrift: None,
                 proto: Kind::Interstitial(true),
                 reason: Some(FilteredReason::ContainNsfwMedia),
                 label: "interstitial",
@@ -225,14 +238,14 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             blurred_and_limited(legacy_interstitial("fallback_rule"), limit()),
             Projected {
-                thrift: Action::TweetInterstitial(TweetInterstitial {
+                thrift: Some(Action::TweetInterstitial(TweetInterstitial {
                     interstitial: Some(AnyInterstitial::Interstitial(Interstitial::new(
                         InterstitialReason::ContainsNsfwMedia(true),
                         None,
                     ))),
                     limited_engagements: Some(thrift_limit()),
                     ..TweetInterstitial::default()
-                }),
+                })),
                 proto: Kind::Interstitial(true),
                 reason: Some(FilteredReason::ContainNsfwMedia),
                 label: "tweet_interstitial",
@@ -245,7 +258,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
         (
             fosnr(true, false, "fosnr_rule"),
             Projected {
-                thrift: Action::TweetInterstitial(TweetInterstitial {
+                thrift: Some(Action::TweetInterstitial(TweetInterstitial {
                     soft_intervention: Some(ThriftSoftIntervention {
                         soft_intervention_reason: Some(SoftInterventionReason::Fosnr(Box::new(
                             AppealableReason::new(
@@ -263,7 +276,7 @@ fn verdict_cases() -> [(Verdict, Projected); 19] {
                     }),
                     avoid: Some(Avoid::new(None, Some(BrandSafetyRiskLevel::NORMAL), None)),
                     ..TweetInterstitial::default()
-                }),
+                })),
                 proto: Kind::Allow(true),
                 reason: None,
                 label: "soft_intervention",
@@ -308,7 +321,7 @@ fn appeal(
     (
         appealed(policy, level, false, true, "fosnr_author"),
         Projected {
-            thrift: Action::TweetInterstitial(TweetInterstitial {
+            thrift: Some(Action::TweetInterstitial(TweetInterstitial {
                 limited_engagements: Some(LimitedEngagements::new(
                     action::LimitedEngagementReason::FosnrReason(reason.clone()),
                     LimitedActionsPolicy::new(limited),
@@ -317,7 +330,7 @@ fn appeal(
                 avoid: Some(Avoid::new(None, Some(BrandSafetyRiskLevel::NORMAL), None)),
                 appealable: Some(Appealable::new(reason, None)),
                 ..TweetInterstitial::default()
-            }),
+            })),
             proto: Kind::Allow(true),
             reason: None,
             label: "appealable",
@@ -331,7 +344,7 @@ fn every_verdict_case_projects_per_the_table() {
     for (verdict, expected) in verdict_cases() {
         let name = format!("{verdict:?}");
         assert_eq!(
-            thrift_action(&verdict, TimelineHome, &policies()),
+            sent_action(&verdict, TimelineHome, &policies()),
             expected.thrift,
             "{name}"
         );
@@ -348,7 +361,13 @@ fn every_verdict_case_projects_per_the_table() {
             "{name}"
         );
         for (rule, action) in decided_rows(&verdict) {
-            assert!(BY_RULE_ACTIONS.contains(&action), "{name}: {rule}");
+            assert!(
+                !matches!(
+                    action,
+                    VerdictAction::Allow | VerdictAction::TweetInterstitial
+                ),
+                "{name}: {rule}"
+            );
         }
         let (proto, reason) = proto_action(&verdict);
         assert_eq!(proto.kind, Some(expected.proto), "{name}");
@@ -370,8 +389,8 @@ fn a_limit_sends_its_first_reason_and_the_union_of_its_reasons_policies() {
     );
     let action = |action_type| LimitedAction::new(action_type, None);
     assert_eq!(
-        thrift_action(&verdict, TimelineHome, &policies),
-        thrift_limit_for(
+        sent_action(&verdict, TimelineHome, &policies),
+        Some(thrift_limit_for(
             action::LimitedEngagementReason::StaleTweet(action::StaleTweet::new()),
             Some(LimitedActionsPolicy::new(vec![
                 action(action::LimitedActionType::REPLY),
@@ -379,7 +398,7 @@ fn a_limit_sends_its_first_reason_and_the_union_of_its_reasons_policies() {
                 action(action::LimitedActionType::LIKE),
             ])),
             "stale_tweet",
-        )
+        ))
     );
     assert_eq!(<&str>::from(verdict_action(&verdict)), "limited_engagement");
     assert_eq!(
@@ -387,6 +406,41 @@ fn a_limit_sends_its_first_reason_and_the_union_of_its_reasons_policies() {
             .map(|(rule, action)| (rule, <&str>::from(action)))
             .collect::<Vec<_>>(),
         [("limit_rule", "limited_engagement")]
+    );
+}
+
+#[test]
+fn a_label_interstitials_limit_leads_and_its_repeat_in_the_engagement_slot_adds_no_action() {
+    use LimitedActionType::{Like, Reply, Retweet};
+    use LimitedEngagementReason::{BlockedViewer, ConversationControl};
+    let policies = LimitedActionsPolicies::for_tests(vec![
+        (BlockedViewer, vec![Retweet, Reply, Like]),
+        (ConversationControl, vec![Reply]),
+    ]);
+    let verdict = with_label_interstitial(
+        limited_for(&[BlockedViewer, ConversationControl], "limit_rule"),
+        LabelInterstitial::PublicInterest(PublicInterest {
+            reason: SafetyResultReason::ONE_OFF,
+            limit: Some(ConversationControl),
+        }),
+        "public_interest/label_interstitial",
+    );
+    let Some(Action::TweetInterstitial(composite)) = sent_action(&verdict, TimelineHome, &policies)
+    else {
+        panic!("a label interstitial sends a TweetInterstitial");
+    };
+    let action = |action_type| LimitedAction::new(action_type, None);
+    assert_eq!(
+        composite.limited_engagements,
+        Some(LimitedEngagements::new(
+            action::LimitedEngagementReason::ConversationControl(action::ConversationControl::new()),
+            Some(LimitedActionsPolicy::new(vec![
+                action(action::LimitedActionType::REPLY),
+                action(action::LimitedActionType::RETWEET),
+                action(action::LimitedActionType::LIKE),
+            ])),
+            ConversationControl.limited_actions_string().to_string(),
+        ))
     );
 }
 
@@ -462,12 +516,12 @@ fn each_limited_engagement_reason_sends_its_thrift_arm_and_legacy_string() {
         ),
     ] {
         assert_eq!(
-            thrift_action(
+            sent_action(
                 &limited_for(&[reason], "limit_rule"),
                 TimelineHome,
                 &LimitedActionsPolicies::default(),
             ),
-            thrift_limit_for(arm, None, legacy),
+            Some(thrift_limit_for(arm, None, legacy)),
             "{reason:?}"
         );
     }
@@ -478,10 +532,8 @@ fn entity_mixer_resolves_the_blur_and_its_prompt_from_both_media_arms() {
     let reason = InterstitialReason::Nudity(true);
     let verify = verify_blurred(reason.clone(), "blur_rule");
     for verdict in [verify.clone(), blurred_and_limited(verify, limit())] {
-        let rendered = resolve_blurred_image_interstitial(&ThriftSafetyResult::new(
-            None,
-            thrift_action(&verdict, TimelineHome, &policies()),
-        ));
+        let action = sent_action(&verdict, TimelineHome, &policies()).expect("a blur is sent");
+        let rendered = resolve_blurred_image_interstitial(&ThriftSafetyResult::new(None, action));
         assert_eq!(
             rendered,
             Some(BlurredImageInterstitial {
@@ -501,20 +553,18 @@ fn entity_mixer_resolves_the_blur_and_its_prompt_from_both_media_arms() {
 #[test]
 fn drop_reasons_without_a_canonical_form_drop_without_a_reason() {
     assert_eq!(
-        thrift_action(
-            &dropped(FilteredReason::AuthorIsProtected, "rule"),
-            TimelineHome,
-            &policies()
+        drop_reason(
+            &DropReason::Legacy(FilteredReason::AuthorIsProtected),
+            TimelineHome
         ),
-        thrift_drop(Some(action::DropReason::ProtectedAuthor(true)))
+        Some(action::DropReason::ProtectedAuthor(true))
     );
     assert_eq!(
-        thrift_action(
-            &dropped(FilteredReason::UnspecifiedReason, "rule"),
-            FilterAll,
-            &policies()
+        drop_reason(
+            &DropReason::Legacy(FilteredReason::UnspecifiedReason),
+            FilterAll
         ),
-        thrift_drop(Some(action::DropReason::Unspecified(true)))
+        Some(action::DropReason::Unspecified(true))
     );
     let lossy = [
         FilteredReason::UnspecifiedReason,
@@ -532,12 +582,8 @@ fn drop_reasons_without_a_canonical_form_drop_without_a_reason() {
         FilteredReason::TweetIsNullcast,
     ];
     for reason in lossy {
-        let verdict = dropped(reason, "rule");
-        assert_eq!(
-            thrift_action(&verdict, TimelineHome, &policies()),
-            thrift_drop(None),
-            "{verdict:?}"
-        );
+        let reason = DropReason::Legacy(reason);
+        assert_eq!(drop_reason(&reason, TimelineHome), None, "{reason:?}");
     }
 }
 
@@ -548,10 +594,8 @@ fn thrift_result_state_uses_a_legacy_arm_only_where_it_renders_differently() {
     let filtered =
         |reason| TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason));
     let safety_result_with = |reason, verdict: &Verdict| {
-        T::SafetyResult(ThriftSafetyResult::new(
-            reason,
-            thrift_action(verdict, TimelineHome, &policies()),
-        ))
+        let action = sent_action(verdict, TimelineHome, &policies()).expect("a SafetyResult");
+        T::SafetyResult(ThriftSafetyResult::new(reason, action))
     };
     let safety_result = |verdict: &Verdict| safety_result_with(None, verdict);
     let nsfw = legacy_interstitial("nsfw_rule");
@@ -714,7 +758,7 @@ fn an_emergency_post_carries_its_copy_and_a_later_limit() {
             "read_only_viewer/limited_engagement",
         )),
     );
-    let Action::TweetInterstitial(sent) = thrift_action(
+    let Some(Action::TweetInterstitial(sent)) = sent_action(
         &verdict,
         SafetyLevel::TimelineHomeHydration,
         &LimitedActionsPolicies::default(),
@@ -777,7 +821,7 @@ fn each_quote_rerender_sends_tweetypies_filtered_reason() {
             };
             rerenders
                 .iter()
-                .map(move |&(by, reason)| (level, by, rerendered_state(&Rerendered { by, reason })))
+                .map(move |&(by, reason)| (level, by, rerendered_state(reason)))
         })
         .collect();
     let expected: Vec<_> = [

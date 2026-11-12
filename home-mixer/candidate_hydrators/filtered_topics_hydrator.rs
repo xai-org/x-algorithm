@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_strato::{decode, Bytes, StratoResult, StratoValue};
 
 fn decode_topics_pair(
@@ -51,16 +51,18 @@ pub struct FilteredTopicsHydrator {
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
+    type Fetched = Vec<TopicIds>;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.is_topic_request() || query.has_excluded_topics()
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Vec<TopicIds>, String> {
         let experiment = if query.is_bulk_topic_request() || query.has_excluded_topics() {
             TopicFilteringExperiment::Unfiltered
         } else {
@@ -103,11 +105,11 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
             }
         }
 
-        candidates
+        Ok(candidates
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let (topics, unf_topics) = if let Some(rt_id) = c.retweeted_tweet_id {
+                let (filtered, unfiltered) = if let Some(rt_id) = c.retweeted_tweet_id {
                     (
                         retweet_topics.get(&rt_id).cloned(),
                         retweet_unfiltered.get(&rt_id).cloned(),
@@ -115,18 +117,33 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
                 } else {
                     decode_topics_pair(&all_results[i], experiment, need_unfiltered)
                 };
-
-                Ok(PostCandidate {
-                    filtered_topic_ids: topics,
-                    unfiltered_topic_ids: unf_topics,
-                    ..Default::default()
-                })
+                TopicIds {
+                    filtered,
+                    unfiltered,
+                }
             })
-            .collect()
+            .collect())
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        topic_ids: Vec<TopicIds>,
+    ) {
+        for (candidate, topic_ids) in candidates.iter_mut().zip(topic_ids) {
+            candidate.filtered_topic_ids = topic_ids.filtered;
+            candidate.unfiltered_topic_ids = topic_ids.unfiltered;
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.filtered_topic_ids = hydrated.filtered_topic_ids;
         candidate.unfiltered_topic_ids = hydrated.unfiltered_topic_ids;
     }
+}
+
+pub struct TopicIds {
+    filtered: Option<Vec<i64>>,
+    unfiltered: Option<Vec<i64>>,
 }

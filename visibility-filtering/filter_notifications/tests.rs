@@ -52,6 +52,24 @@ fn accepted(actor_id: u64) -> vf_pb::Notification {
     }
 }
 
+fn contact_joined(actor_id: u64) -> vf_pb::Notification {
+    vf_pb::Notification {
+        actor_id,
+        kind: Some(vf_pb::notification::Kind::ContactJoined(
+            vf_pb::ContactJoined {},
+        )),
+    }
+}
+
+fn added_to_list(actor_id: u64) -> vf_pb::Notification {
+    vf_pb::Notification {
+        actor_id,
+        kind: Some(vf_pb::notification::Kind::AddedToList(
+            vf_pb::AddedToList {},
+        )),
+    }
+}
+
 fn like(actor_id: u64, post_id: u64) -> vf_pb::Notification {
     vf_pb::Notification {
         actor_id,
@@ -90,6 +108,13 @@ fn media_tagged(actor_id: u64, post_id: u64) -> vf_pb::Notification {
         kind: Some(vf_pb::notification::Kind::MediaTagged(vf_pb::MediaTagged {
             post_id,
         })),
+    }
+}
+
+fn quote(actor_id: u64, post_id: u64) -> vf_pb::Notification {
+    vf_pb::Notification {
+        actor_id,
+        kind: Some(vf_pb::notification::Kind::Quote(vf_pb::Quote { post_id })),
     }
 }
 
@@ -231,6 +256,8 @@ async fn invalid_requests_are_refused_and_no_notifications_answer_empty() {
             vec![follow(ACTOR), accepted(OTHER_ACTOR)],
         ),
         (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![follow(ACTOR)]),
+        (FOLLOW, RECIPIENT, vec![contact_joined(ACTOR)]),
+        (FOLLOW, RECIPIENT, vec![added_to_list(ACTOR)]),
         (FOLLOW, RECIPIENT, vec![like(ACTOR, RECIPIENT_POST)]),
         (
             FOLLOW,
@@ -242,6 +269,13 @@ async fn invalid_requests_are_refused_and_no_notifications_answer_empty() {
         (FOLLOW, RECIPIENT, vec![mention(ACTOR, POST)]),
         (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![mention(ACTOR, 0)]),
         (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![reply(ACTOR, 0)]),
+        (FOLLOW, RECIPIENT, vec![quote(ACTOR, POST)]),
+        (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![quote(ACTOR, 0)]),
+        (
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![quote(ACTOR, POST), accepted(OTHER_ACTOR)],
+        ),
         (
             FOLLOW_REQUEST_ACCEPTED,
             RECIPIENT,
@@ -487,7 +521,7 @@ async fn only_an_accepted_follow_request_drops_a_protected_actor() {
 }
 
 #[tokio::test]
-async fn a_like_and_a_repost_get_an_accepted_follow_request_s_verdict_on_each_actor() {
+async fn each_level_72_user_kind_judges_its_actor_as_an_accepted_follow_request() {
     const PROTECTED_ACTOR: u64 = 5;
     const MUTED_ACTOR: u64 = 6;
     const READ_ONLY_ACTOR: u64 = 7;
@@ -521,6 +555,8 @@ async fn a_like_and_a_repost_get_an_accepted_follow_request_s_verdict_on_each_ac
     ];
     for (name, kind) in [
         ("accepted", accepted as fn(u64) -> vf_pb::Notification),
+        ("contact_joined", contact_joined),
+        ("added_to_list", added_to_list),
         ("like", |actor| like(actor, RECIPIENT_POST)),
         ("repost", |actor| repost(actor, RECIPIENT_POST)),
     ] {
@@ -551,8 +587,10 @@ async fn a_like_and_a_repost_get_an_accepted_follow_request_s_verdict_on_each_ac
 #[tokio::test]
 async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_s() {
     const FAILED_POST: u64 = 105;
+    const RECIPIENT_REPOST: u64 = 106;
     let sources = world()
         .tweet(POST, ACTOR)
+        .retweet(RECIPIENT_REPOST, RECIPIENT, POST, Some(ACTOR))
         .tweet(FAILED_POST, RECIPIENT)
         .fail_key(Source::TesPureCoreData, FAILED_POST);
     let (seen, sources) = filter(
@@ -568,6 +606,8 @@ async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_
             like(SUSPENDED_ACTOR, FAILED_POST),
             accepted(ACTOR),
             repost(OTHER_ACTOR, RECIPIENT_POST),
+            like(ACTOR, RECIPIENT_REPOST),
+            repost(SUSPENDED_ACTOR, RECIPIENT_REPOST),
         ],
     )
     .await;
@@ -582,11 +622,19 @@ async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_
             Seen::Failed,
             Seen::Allowed,
             Seen::Allowed,
+            Seen::Allowed,
+            Seen::Dropped(DropReason::ActorSuspended),
         ])
     );
     assert_eq!(
         sources.keys(Source::TesPureCoreData),
-        [vec![POST, RECIPIENT_POST, FAILED_POST, MISSING_POST]]
+        [vec![
+            POST,
+            RECIPIENT_POST,
+            FAILED_POST,
+            RECIPIENT_REPOST,
+            MISSING_POST
+        ]]
     );
     for unasked in [
         Source::TesTweetForVisibility,
@@ -610,6 +658,8 @@ async fn each_user_notification_counts_under_its_kind() {
             repost(SUSPENDED_ACTOR, RECIPIENT_POST),
             accepted(ACTOR),
             like(MISSING_ACTOR, RECIPIENT_POST),
+            contact_joined(ACTOR),
+            added_to_list(SUSPENDED_ACTOR),
         ],
     )
     .await;
@@ -617,6 +667,8 @@ async fn each_user_notification_counts_under_its_kind() {
     assert_eq!(
         notification_results(&recording),
         [
+            result_row("added_to_list", "dropped", "actor_suspended"),
+            result_row("contact_joined", "allowed", "none"),
             result_row("follow_request_accepted", "allowed", "none"),
             result_row("like", "allowed", "none"),
             result_row("like", "dropped", "actor_not_found"),
@@ -879,6 +931,10 @@ async fn each_post_notification_judges_its_post_author_in_order_on_one_post_look
             media_tagged(ACTOR, POST),
             mention(MISSING_ACTOR, ACTORLESS_POST),
             mention(ACTOR, POST),
+            quote(ACTOR, POST),
+            quote(OTHER_ACTOR, POST),
+            quote(SUSPENDED_ACTOR, SUSPENDED_POST),
+            quote(ACTOR, MISSING_POST),
         ],
     )
     .await;
@@ -894,6 +950,10 @@ async fn each_post_notification_judges_its_post_author_in_order_on_one_post_look
             Seen::Allowed,
             Seen::Dropped(DropReason::ActorNotFound),
             Seen::Allowed,
+            Seen::Allowed,
+            Seen::Dropped(DropReason::PostNotFound),
+            Seen::Dropped(DropReason::ActorSuspended),
+            Seen::Dropped(DropReason::PostNotFound),
         ])
     );
     assert_eq!(
@@ -1001,6 +1061,63 @@ async fn failed_lookups_fail_only_the_post_notifications_whose_verdict_read_them
 }
 
 #[tokio::test]
+async fn a_failed_viewer_lookup_still_drops_a_post_notification_whose_post_is_missing_or_another_actors(
+) {
+    let (metrics, recording) = Metrics::recording();
+    let (seen, _) = filter_with(
+        metrics,
+        posts_world().fault(Source::GizmoduckViewer, Fault::Fails),
+        FOLLOW_REQUEST_ACCEPTED,
+        RECIPIENT,
+        vec![
+            mention(ACTOR, POST),
+            mention(ACTOR, MISSING_POST),
+            reply(OTHER_ACTOR, POST),
+        ],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        Ok(vec![
+            Seen::Failed,
+            Seen::Dropped(DropReason::PostNotFound),
+            Seen::Dropped(DropReason::PostNotFound),
+        ])
+    );
+    assert_eq!(
+        notification_results(&recording),
+        [
+            result_row("mention", "dropped", "post_not_found"),
+            result_row("mention", "failed", "none"),
+            result_row("reply", "dropped", "post_not_found"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_post_notification_is_answered_as_it_is_alone() {
+    let rows = || {
+        [
+            mention(ACTOR, POST),
+            reply(OTHER_ACTOR, POST),
+            mention(ACTOR, POST),
+            mention(ACTOR, MISSING_POST),
+            reply(OTHER_ACTOR, POST),
+        ]
+    };
+    let seen = |rows: Vec<vf_pb::Notification>| async move {
+        filter(posts_world(), FOLLOW_REQUEST_ACCEPTED, RECIPIENT, rows)
+            .await
+            .0
+    };
+    let mut alone = Vec::new();
+    for row in rows() {
+        alone.extend(seen(vec![row]).await.into_iter().flatten());
+    }
+    assert_eq!(seen(rows().into()).await, Ok(alone));
+}
+
+#[tokio::test]
 async fn each_post_notification_counts_under_its_kind() {
     let (metrics, recording) = Metrics::recording();
     let (seen, _) = filter_with(
@@ -1013,6 +1130,7 @@ async fn each_post_notification_counts_under_its_kind() {
             reply(OTHER_ACTOR, POST),
             media_tagged(ACTOR, MISSING_POST),
             mention(SUSPENDED_ACTOR, SUSPENDED_POST),
+            quote(ACTOR, POST),
         ],
     )
     .await;
@@ -1023,6 +1141,7 @@ async fn each_post_notification_counts_under_its_kind() {
             result_row("media_tagged", "dropped", "post_not_found"),
             result_row("mention", "allowed", "none"),
             result_row("mention", "dropped", "actor_suspended"),
+            result_row("quote", "allowed", "none"),
             result_row("reply", "dropped", "post_not_found"),
         ]
     );
@@ -1081,16 +1200,33 @@ async fn a_country_takedown_spares_a_post_notification() {
 }
 
 #[tokio::test]
-async fn a_failed_label_read_fails_a_mention_and_spares_a_media_tag_of_the_same_post() {
-    let sources = posts_world().fail_key(Source::SafetyLabels, POST);
+async fn a_failed_label_read_fails_a_mention_and_spares_a_quote_and_only_a_followed_authors_media_tag(
+) {
+    let sources = posts_world()
+        .edge(Graph::Follows, RECIPIENT, ACTOR)
+        .fail_key(Source::SafetyLabels, POST)
+        .fail_key(Source::SafetyLabels, OTHER_POST);
     let (seen, _) = filter(
         sources,
         FOLLOW_REQUEST_ACCEPTED,
         RECIPIENT,
-        vec![mention(ACTOR, POST), media_tagged(ACTOR, POST)],
+        vec![
+            mention(ACTOR, POST),
+            media_tagged(ACTOR, POST),
+            media_tagged(OTHER_ACTOR, OTHER_POST),
+            quote(OTHER_ACTOR, OTHER_POST),
+        ],
     )
     .await;
-    assert_eq!(seen, Ok(vec![Seen::Failed, Seen::Allowed]));
+    assert_eq!(
+        seen,
+        Ok(vec![
+            Seen::Failed,
+            Seen::Allowed,
+            Seen::Failed,
+            Seen::Allowed
+        ])
+    );
 }
 
 #[tokio::test]
@@ -1111,12 +1247,16 @@ async fn only_people_i_follow_exempts_a_post_notification_in_a_community() {
             mention(ACTOR, COMMUNITY_POST),
             media_tagged(ACTOR, POST),
             media_tagged(ACTOR, COMMUNITY_POST),
+            quote(ACTOR, POST),
+            quote(ACTOR, COMMUNITY_POST),
         ],
     )
     .await;
     assert_eq!(
         seen,
         Ok(vec![
+            Seen::Dropped(DropReason::Unspecified),
+            Seen::Allowed,
             Seen::Dropped(DropReason::Unspecified),
             Seen::Allowed,
             Seen::Dropped(DropReason::Unspecified),

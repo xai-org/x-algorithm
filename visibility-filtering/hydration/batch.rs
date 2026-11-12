@@ -31,6 +31,16 @@ impl<V> Hydrated<V> {
     pub(crate) fn is_complete(&self) -> bool {
         matches!(self, Hydrated::Found(_) | Hydrated::NotFound)
     }
+
+    pub(crate) fn map<V2>(self, f: impl FnOnce(V) -> V2) -> Hydrated<V2> {
+        match self {
+            Hydrated::Found(value) => Hydrated::Found(f(value)),
+            Hydrated::Partial(value) => Hydrated::Partial(f(value)),
+            Hydrated::NotFound => Hydrated::NotFound,
+            Hydrated::Failed => Hydrated::Failed,
+            Hydrated::Unanswered => Hydrated::Unanswered,
+        }
+    }
 }
 
 impl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {
@@ -53,12 +63,20 @@ pub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;
 impl<K: Eq + Hash, V> HydrationBatch<K, V> {
     pub(crate) fn from_results<E, S: BuildHasher>(
         expected: impl IntoIterator<Item = K>,
-        mut results: HashMap<K, Result<Option<V>, E>, S>,
+        results: HashMap<K, Result<Option<V>, E>, S>,
+    ) -> Self {
+        Self::from_results_with(expected, results, Hydrated::from)
+    }
+
+    pub(crate) fn from_results_with<R, S: BuildHasher>(
+        expected: impl IntoIterator<Item = K>,
+        mut results: HashMap<K, R, S>,
+        mut decode: impl FnMut(R) -> Hydrated<V>,
     ) -> Self {
         Self::from_expected(expected, |key| {
             results
                 .remove(key)
-                .map_or(Hydrated::Unanswered, Hydrated::from)
+                .map_or(Hydrated::Unanswered, &mut decode)
         })
     }
 
@@ -70,7 +88,9 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         expected: impl IntoIterator<Item = K>,
         mut resolve: impl FnMut(&K) -> Hydrated<V>,
     ) -> Self {
-        let mut results = FxHashMap::default();
+        let expected = expected.into_iter();
+        let mut results =
+            FxHashMap::with_capacity_and_hasher(expected.size_hint().0, Default::default());
         for key in expected {
             if let Entry::Vacant(entry) = results.entry(key) {
                 let hydrated = resolve(entry.key());
@@ -102,21 +122,21 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         self.results.get(key).and_then(Hydrated::value)
     }
 
+    #[cfg(test)]
     pub(crate) fn map<V2>(self, mut f: impl FnMut(V) -> V2) -> HydrationBatch<K, V2> {
+        self.map_hydrated(|hydrated| hydrated.map(&mut f))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn map_hydrated<V2>(
+        self,
+        mut f: impl FnMut(Hydrated<V>) -> Hydrated<V2>,
+    ) -> HydrationBatch<K, V2> {
         HydrationBatch {
             results: self
                 .results
                 .into_iter()
-                .map(|(key, hydrated)| {
-                    let hydrated = match hydrated {
-                        Hydrated::Found(value) => Hydrated::Found(f(value)),
-                        Hydrated::Partial(value) => Hydrated::Partial(f(value)),
-                        Hydrated::NotFound => Hydrated::NotFound,
-                        Hydrated::Failed => Hydrated::Failed,
-                        Hydrated::Unanswered => Hydrated::Unanswered,
-                    };
-                    (key, hydrated)
-                })
+                .map(|(key, hydrated)| (key, f(hydrated)))
                 .collect(),
         }
     }

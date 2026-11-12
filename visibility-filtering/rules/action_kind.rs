@@ -131,7 +131,7 @@ impl ActionKind {
         }
     }
 
-    pub(super) const fn severity(self) -> u8 {
+    pub(crate) const fn severity(self) -> u8 {
         self.row().severity
     }
 
@@ -149,13 +149,6 @@ impl ActionKind {
             Lands::Withheld | Lands::Fosnr => false,
         };
         !own_slot_filled && self.kept_by(filled).is_none()
-    }
-
-    pub(super) const fn withholds(self) -> bool {
-        match self.row().lands {
-            Lands::Withheld => true,
-            Lands::Fosnr | Lands::Slot(_) => false,
-        }
     }
 
     pub(super) const fn bucket(self) -> Bucket {

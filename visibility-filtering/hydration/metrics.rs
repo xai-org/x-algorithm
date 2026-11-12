@@ -266,7 +266,6 @@ mod tests {
     use crate::rules::RuleEngine;
     use crate::rules::SafetyLevel;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     #[test]
     fn a_request_country_reads_its_listed_code_other_or_none() {
@@ -289,7 +288,7 @@ mod tests {
 
     #[test]
     fn partial_keys_make_a_partial_call_and_a_failed_one_key_call_is_an_error() {
-        use crate::hydration::decode::author::author_batch;
+        use crate::hydration::decode::author::decoded_author;
         use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
         let user = |state| {
             Ok::<_, ()>(Some(GizmoduckUserResult {
@@ -303,7 +302,7 @@ mod tests {
                 .map(|&(author, state)| (author, user(state)))
                 .collect::<HashMap<_, _>>();
             let expected: Vec<u64> = results.keys().copied().collect();
-            author_batch(HydrationBatch::from_results(expected, results))
+            HydrationBatch::from_results_with(expected, results, |user| decoded_author(user.into()))
         };
         let counts = FxHashMap::from_iter([(10, 1), (20, 2)]);
 
@@ -384,11 +383,7 @@ mod tests {
         };
         let landed =
             HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(circle)))]));
-        store.land(
-            &tweets,
-            Reply::TesTweetForVisibility(landed),
-            Duration::ZERO,
-        );
+        store.land(&tweets, Reply::TesTweetForVisibility(landed));
 
         let call = store.offer(group(Source::TrustedFriends)).unwrap();
         let failed: HydrationBatch<u64, bool> =

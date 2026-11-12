@@ -1,13 +1,15 @@
+use crate::SPAN_LEVEL;
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
 use crate::pipeline_summary::ComponentStats;
 use crate::util;
-use crate::SPAN_LEVEL;
-use std::any::{type_name_of_val, Any};
+use std::any::{Any, type_name_of_val};
 use std::borrow::Cow;
 use std::hash::Hash;
 use tonic::async_trait;
 use tracing::warn;
 use xai_stats_receiver::global_stats_receiver;
+
+pub struct HydratorOutput(Box<dyn Any + Send>);
 
 #[async_trait]
 pub trait Hydrator<Q, C>: Any + Send + Sync
@@ -15,11 +17,11 @@ where
     Q: PipelineQuery,
     C: PipelineCandidate,
 {
-    fn enable(&self, _query: &Q) -> bool {
+        fn enable(&self, _query: &Q) -> bool {
         true
     }
 
-    async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>>;
+                        async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>>;
 
     async fn hydrate_for_stage(
         &self,
@@ -39,30 +41,17 @@ where
         stage: PipelineStage,
     ) -> Vec<Result<C, String>> {
         let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
-        let hydrated = self.hydrate_for_stage(query, candidates, stage).await;
-        let expected_len = candidates.len();
-        let results = if hydrated.len() == expected_len {
-            hydrated
-        } else {
-            let message = format!(
-                "Hydrator length_mismatch expected={} got={}",
-                expected_len,
-                hydrated.len()
-            );
-            warn!(
-                "Skipped: length_mismatch expected={} got={}",
-                expected_len,
-                hydrated.len()
-            );
-            vec![Err(message); expected_len]
-        };
+        let results = checked_len(
+            self.hydrate_for_stage(query, candidates, stage).await,
+            candidates.len(),
+        );
         stats.finish_with_results(&results);
         results
     }
 
-    fn update(&self, candidate: &mut C, hydrated: C);
+            fn update(&self, candidate: &mut C, hydrated: C);
 
-    fn update_all(&self, candidates: &mut [C], hydrated: Vec<Result<C, String>>) {
+            fn update_all(&self, candidates: &mut [C], hydrated: Vec<Result<C, String>>) {
         for (candidate, hydrated) in candidates.iter_mut().zip(hydrated) {
             if let Ok(hydrated) = hydrated {
                 self.update(candidate, hydrated);
@@ -70,8 +59,148 @@ where
         }
     }
 
+    async fn fetch_output(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> HydratorOutput {
+        HydratorOutput(Box::new(self.run(query, candidates, stage).await))
+    }
+
+    fn apply_output(&self, _query: &Q, candidates: &mut [C], output: HydratorOutput) {
+        if let Ok(hydrated) = output.0.downcast::<Vec<Result<C, String>>>() {
+            self.update_all(candidates, *hydrated);
+        }
+    }
+
     fn name(&self) -> &'static str {
         util::short_type_name(type_name_of_val(self))
+    }
+}
+
+fn checked_len<C: Clone>(
+    hydrated: Vec<Result<C, String>>,
+    expected: usize,
+) -> Vec<Result<C, String>> {
+    if hydrated.len() == expected {
+        return hydrated;
+    }
+    let message = format!(
+        "Hydrator length_mismatch expected={} got={}",
+        expected,
+        hydrated.len()
+    );
+    warn!(
+        "Skipped: length_mismatch expected={} got={}",
+        expected,
+        hydrated.len()
+    );
+    vec![Err(message); expected]
+}
+
+#[async_trait]
+pub trait TwoPhaseHydrator<Q, C>: Any + Send + Sync
+where
+    Q: PipelineQuery,
+    C: PipelineCandidate,
+{
+    type Fetched: Send + 'static;
+
+    fn enable(&self, _query: &Q) -> bool {
+        true
+    }
+
+    async fn fetch(&self, query: &Q, candidates: &[C]) -> Result<Self::Fetched, String>;
+
+            fn apply(&self, query: &Q, candidates: &mut [C], fetched: Self::Fetched);
+
+            fn merge(&self, candidate: &mut C, hydrated: C);
+
+    #[xai_stats_macro::receive_stats(name = "run", latency = Bucket50To500)]
+    #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "hydrator", fields(name = self.name()))]
+    async fn run_fetch(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Result<Self::Fetched, String> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
+        let fetched = self.fetch(query, candidates).await;
+        let errors = if fetched.is_ok() { 0 } else { candidates.len() };
+        stats.finish_with_errors(candidates.len(), errors);
+        fetched
+    }
+
+        async fn legacy_hydrate(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        _stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        match self.fetch(query, candidates).await {
+            Ok(fetched) => {
+                let mut hydrated = candidates.to_vec();
+                self.apply(query, &mut hydrated, fetched);
+                hydrated.into_iter().map(Ok).collect()
+            }
+            Err(err) => vec![Err(err); candidates.len()],
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        util::short_type_name(type_name_of_val(self))
+    }
+}
+
+#[async_trait]
+impl<Q, C, T> Hydrator<Q, C> for T
+where
+    Q: PipelineQuery,
+    C: PipelineCandidate,
+    T: TwoPhaseHydrator<Q, C>,
+{
+    fn enable(&self, query: &Q) -> bool {
+        TwoPhaseHydrator::enable(self, query)
+    }
+
+    async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>> {
+        self.legacy_hydrate(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
+
+    async fn hydrate_for_stage(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        self.legacy_hydrate(query, candidates, stage).await
+    }
+
+    fn update(&self, candidate: &mut C, hydrated: C) {
+        TwoPhaseHydrator::merge(self, candidate, hydrated);
+    }
+
+    async fn fetch_output(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> HydratorOutput {
+        HydratorOutput(Box::new(self.run_fetch(query, candidates, stage).await))
+    }
+
+    fn apply_output(&self, query: &Q, candidates: &mut [C], output: HydratorOutput) {
+        if let Ok(fetched) = output.0.downcast::<Result<T::Fetched, String>>()
+            && let Ok(fetched) = *fetched
+        {
+            TwoPhaseHydrator::apply(self, query, candidates, fetched);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        TwoPhaseHydrator::name(self)
     }
 }
 
@@ -96,7 +225,7 @@ where
 
     fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue>;
     fn cache_key(&self, candidate: &C) -> Self::CacheKey;
-    fn cache_key_for(&self, _query: &Q, candidate: &C) -> Self::CacheKey {
+                    fn cache_key_for(&self, _query: &Q, candidate: &C) -> Self::CacheKey {
         self.cache_key(candidate)
     }
     fn cache_value(&self, hydrated: &C) -> Self::CacheValue;
@@ -114,44 +243,24 @@ where
         util::short_type_name(type_name_of_val(self))
     }
 
-    fn stat_cache(&self, cache_hits: usize, cache_misses: usize, stage: PipelineStage) {
-        if let Some(receiver) = global_stats_receiver() {
-            let metric_name = format!("{}.cache", self.name());
-            if cache_hits > 0 {
-                receiver.incr(
-                    metric_name.as_str(),
-                    &stage.stat_labels(self.name(), "cache_hit"),
-                    cache_hits as u64,
-                );
-            }
-            if cache_misses > 0 {
-                receiver.incr(
-                    metric_name.as_str(),
-                    &stage.stat_labels(self.name(), "cache_miss"),
-                    cache_misses as u64,
-                );
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl<Q, C, T> Hydrator<Q, C> for T
-where
-    Q: PipelineQuery,
-    C: PipelineCandidate,
-    T: CachedHydrator<Q, C> + ?Sized,
-{
-    fn enable(&self, query: &Q) -> bool {
-        CachedHydrator::enable(self, query)
+    #[xai_stats_macro::receive_stats(name = "run", latency = Bucket50To500, size = Bucket500To2500)]
+    #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "hydrator", fields(name = self.name()))]
+    async fn run_cached(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
+        let results = checked_len(
+            self.hydrate_cached(query, candidates, stage).await,
+            candidates.len(),
+        );
+        stats.finish_with_results(&results);
+        results
     }
 
-    async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>> {
-        self.hydrate_for_stage(query, candidates, PipelineStage::Hydrator)
-            .await
-    }
-
-    async fn hydrate_for_stage(
+    async fn hydrate_cached(
         &self,
         query: &Q,
         candidates: &[C],
@@ -243,7 +352,77 @@ where
             .collect()
     }
 
-    fn update(&self, candidate: &mut C, hydrated: C) {
+    fn stat_cache(&self, cache_hits: usize, cache_misses: usize, stage: PipelineStage) {
+        if let Some(receiver) = global_stats_receiver() {
+            let metric_name = format!("{}.cache", self.name());
+            if cache_hits > 0 {
+                receiver.incr(
+                    metric_name.as_str(),
+                    &stage.stat_labels(self.name(), "cache_hit"),
+                    cache_hits as u64,
+                );
+            }
+            if cache_misses > 0 {
+                receiver.incr(
+                    metric_name.as_str(),
+                    &stage.stat_labels(self.name(), "cache_miss"),
+                    cache_misses as u64,
+                );
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<Q, C, T> TwoPhaseHydrator<Q, C> for T
+where
+    Q: PipelineQuery,
+    C: PipelineCandidate,
+    T: CachedHydrator<Q, C>,
+{
+    type Fetched = Vec<Result<C, String>>;
+
+    fn enable(&self, query: &Q) -> bool {
+        CachedHydrator::enable(self, query)
+    }
+
+    async fn fetch(&self, query: &Q, candidates: &[C]) -> Result<Self::Fetched, String> {
+        Ok(self
+            .hydrate_cached(query, candidates, PipelineStage::Hydrator)
+            .await)
+    }
+
+    fn apply(&self, _query: &Q, candidates: &mut [C], fetched: Self::Fetched) {
+        for (candidate, hydrated) in candidates.iter_mut().zip(fetched) {
+            if let Ok(hydrated) = hydrated {
+                CachedHydrator::update(self, candidate, hydrated);
+            }
+        }
+    }
+
+    async fn run_fetch(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Result<Self::Fetched, String> {
+        Ok(self.run_cached(query, candidates, stage).await)
+    }
+
+    async fn legacy_hydrate(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        self.hydrate_cached(query, candidates, stage).await
+    }
+
+    fn merge(&self, candidate: &mut C, hydrated: C) {
         CachedHydrator::update(self, candidate, hydrated);
+    }
+
+    fn name(&self) -> &'static str {
+        CachedHydrator::name(self)
     }
 }

@@ -1,7 +1,7 @@
 use super::{one_viewer_batch, source, Backends, CallContext, Expired, Input, SourceFetch};
+use crate::clients::about_this_account_client;
 use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::execute::ViewerCountry;
-use crate::hydration::hydrator::Edge;
 use crate::hydration::metrics::record_viewer_country;
 use std::sync::Arc;
 use tracing::warn;
@@ -9,10 +9,7 @@ use tracing::warn;
 use {super::InMemoryCall, std::collections::HashMap};
 
 impl SourceFetch for source::ViewerCountry {
-    const BACKEND_LABEL: &'static str = "about_this_account";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<Arc<str>>;
 
@@ -20,9 +17,7 @@ impl SourceFetch for source::ViewerCountry {
         let Some(viewer_id) = input.viewer_id else {
             return Ok(HydrationBatch::default());
         };
-        let country = backends
-            .about_this_account
-            .tfe_top_country(viewer_id)
+        let country = about_this_account_client::tfe_top_country(&backends.strato, viewer_id)
             .await
             .inspect_err(|error| warn!(%error, "tfe_top_country lookup failed"));
         Ok(one_viewer_batch(

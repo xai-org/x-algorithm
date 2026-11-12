@@ -6,7 +6,7 @@ use crate::models::{EvaluationKey, Placement, RequestViewer, TweetId};
 use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
 use crate::result_label::{label, Class, NONE};
-use crate::rules::SafetyLevel;
+use crate::rules::{QuoteEntries, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -115,17 +115,9 @@ fn entry_comparisons(
     outcomes: &[PostEvaluation],
     quote_passes: &[QuotePass],
 ) -> Option<EntryComparisons> {
-    match safety_level {
-        SafetyLevel::TimelineHomeHydration => {}
-        SafetyLevel::FilterAll
-        | SafetyLevel::TimelineHome
-        | SafetyLevel::TimelineHomeRecommendations
-        | SafetyLevel::TimelineHomePromotedHydration
-        | SafetyLevel::ImmersiveExpandedRecommendations
-        | SafetyLevel::QuotedTweetRules
-        | SafetyLevel::NotificationsFollow
-        | SafetyLevel::NotificationsWriterV2 => return None,
-    }
+    let QuoteEntries::JudgedWithQuotePass { .. } = safety_level.spec().quote_entries() else {
+        return None;
+    };
     let outers: HashSet<TweetId> = outcomes
         .iter()
         .filter_map(|outcome| match outcome.placement {

@@ -1,11 +1,11 @@
 use super::{one_viewer_batch, source, Backends, CallContext, Expired, Input, SourceFetch};
+use crate::clients::gizmoduck_client::{get_users, get_viewer};
 use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
 use crate::hydration::decode::author::{
-    actor_batch, author_batch, AuthorColumn, DecodedActor, DecodedAuthor,
+    decoded_actor, decoded_author, AuthorColumn, DecodedActor, DecodedAuthor,
 };
 use crate::hydration::decode::viewer::{decode_viewer, DecodedViewer};
 use crate::hydration::execute::fall_back;
-use crate::hydration::hydrator::Edge;
 use tracing::warn;
 #[cfg(test)]
 use {
@@ -15,10 +15,7 @@ use {
 };
 
 impl SourceFetch for source::GizmoduckViewer {
-    const BACKEND_LABEL: &'static str = "gizmoduck";
     const DECIDES_EXISTENCE: bool = false;
-    const NEEDS_VIEWER: bool = true;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<DecodedViewer>;
 
@@ -26,9 +23,7 @@ impl SourceFetch for source::GizmoduckViewer {
         let Some(viewer_id) = input.viewer_id else {
             return Ok(HydrationBatch::default());
         };
-        let viewer = backends
-            .gizmoduck
-            .get_viewer(viewer_id, input.fields)
+        let viewer = get_viewer(&*backends.gizmoduck, viewer_id, input.fields)
             .await
             .inspect_err(|error| warn!(%error, "Gizmoduck viewer lookup failed; failing open"));
         let viewer = viewer.map(|user| Some(decode_viewer(user.as_ref(), input.fields)));
@@ -47,22 +42,17 @@ impl SourceFetch for source::GizmoduckViewer {
 }
 
 impl SourceFetch for source::GizmoduckAuthor {
-    const BACKEND_LABEL: &'static str = "gizmoduck";
     const DECIDES_EXISTENCE: bool = true;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<DecodedAuthor>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
-        let users = backends
-            .gizmoduck
-            .get_users(input.keys.to_vec(), input.fields)
-            .await;
-        Ok(author_batch(HydrationBatch::from_results(
+        let users = get_users(&*backends.gizmoduck, input.keys, input.fields).await;
+        Ok(HydrationBatch::from_results_with(
             input.keys.iter().copied(),
             users,
-        )))
+            |user| decoded_author(user.into()),
+        ))
     }
 
     fn fall_back(context: &CallContext<'_>, authors: Self::Reply) -> Self::Reply {
@@ -76,27 +66,22 @@ impl SourceFetch for source::GizmoduckAuthor {
 
     #[cfg(test)]
     fn in_memory(world: &Self::World, input: &Input<'_>, call: &InMemoryCall<'_>) -> Self::Reply {
-        author_batch(users(world, input, call))
+        users(world, input, call).map_hydrated(decoded_author)
     }
 }
 
 impl SourceFetch for source::GizmoduckActor {
-    const BACKEND_LABEL: &'static str = "gizmoduck";
     const DECIDES_EXISTENCE: bool = true;
-    const NEEDS_VIEWER: bool = false;
-    const EDGE: Option<Edge> = None;
     type Key = u64;
     type Reply = RawHydrationBatch<DecodedActor>;
 
     async fn fetch(backends: &Backends, input: &Input<'_>) -> Result<Self::Reply, Expired> {
-        let users = backends
-            .gizmoduck
-            .get_users(input.keys.to_vec(), input.fields)
-            .await;
-        Ok(actor_batch(HydrationBatch::from_results(
+        let users = get_users(&*backends.gizmoduck, input.keys, input.fields).await;
+        Ok(HydrationBatch::from_results_with(
             input.keys.iter().copied(),
             users,
-        )))
+            |user| decoded_actor(user.into()),
+        ))
     }
 
     #[cfg(test)]
@@ -104,7 +89,7 @@ impl SourceFetch for source::GizmoduckActor {
 
     #[cfg(test)]
     fn in_memory(world: &Self::World, input: &Input<'_>, call: &InMemoryCall<'_>) -> Self::Reply {
-        actor_batch(users(world, input, call))
+        users(world, input, call).map_hydrated(decoded_actor)
     }
 }
 
@@ -136,6 +121,7 @@ mod tests {
     use crate::hydration::{
         Cause, HydrationPlan, Hydrator, Hydrators, Lookup, Relation, Unresolved,
     };
+    use crate::metrics::families::HYDRATOR_LATENCY_MS;
     use crate::metrics::{Endpoint, Metrics, RequestLevel};
     use crate::models::{AuthorId, RequestFacts, RetweetMerge};
     use crate::rules::SafetyLevel;
@@ -225,6 +211,7 @@ mod tests {
             authors: None,
         };
         let users = [10, 20, 10, 30].map(AuthorId).to_vec();
+        let (metrics, recording) = Metrics::recording();
         let hydration = plan
             .hydrate(
                 &sources,
@@ -232,7 +219,7 @@ mod tests {
                     RequestFacts::logged_in(VIEWER),
                     users,
                     &caches,
-                    &Metrics::none().request(
+                    &metrics.request(
                         Endpoint::EvaluateTweets,
                         RequestLevel::Named(SafetyLevel::QuotedTweetRules),
                     ),
@@ -240,6 +227,14 @@ mod tests {
             )
             .await;
         assert_eq!(call_labels(&sources), ["Flock blocks", "GizmoduckActor"]);
+        let latencies = recording.take(&HYDRATOR_LATENCY_MS.family);
+        assert!(
+            !latencies.is_empty()
+                && latencies
+                    .iter()
+                    .all(|sample| sample.label("call") != Some("join")),
+            "a hydration that calls no TES records its calls' latency and no join"
+        );
         assert_eq!(sources.keys(Source::GizmoduckActor), [vec![10, 20, 30]]);
         assert!(matches!(
             hydration.user(AuthorId(10)),

@@ -2,6 +2,7 @@ use super::rule::{Rule, RuleCond};
 use super::{truth_of, Contribution, Predicate, Truth};
 use crate::hydration::Hydrators;
 use crate::models::Evaluation;
+use crate::rules::action_kind::ActionKind;
 use crate::rules::defaults::{Bucket, Defaults, Effect};
 use crate::rules::rule_spec::engine::{Engine, Fold};
 use crate::rules::RuleContext;
@@ -12,7 +13,7 @@ type Completed = (Option<Contribution>, Hydrators);
 pub enum Skip<H> {
     FalseConjunct(H),
     TrueDisjunct(H),
-    Terminal(usize),
+    Terminal,
 }
 
 pub(in crate::rules) trait Observer<E: Engine> {
@@ -34,7 +35,8 @@ pub(in crate::rules) trait Observer<E: Engine> {
         root: Self::Handle,
         truth: Truth,
         effect: Effect,
-        defaults_admitted: (Bucket, Hydrators),
+        kind: ActionKind,
+        defaults_admitted: Hydrators,
         completed: Option<Completed>,
     );
 
@@ -60,7 +62,8 @@ impl<E: Engine> Observer<E> for NoTrace {
         (): (),
         _: Truth,
         _: Effect,
-        _: (Bucket, Hydrators),
+        _: ActionKind,
+        _: Hydrators,
         _: Option<Completed>,
     ) {
     }
@@ -120,20 +123,26 @@ fn group<E: Fold, O: Observer<E>>(
     let mut truth = identity;
     let mut decided = None;
     for &child in children {
-        let answer = if let (false, RuleCond::Leaf(leaf)) = (O::TOTAL, child) {
-            truth_of(leaf, context)
-        } else {
-            let (answer, child_handle) = evaluate(
-                child,
-                context,
-                observer,
-                Some(handle),
-                skip.or(decided.map(after)),
-            );
-            if decided.is_none() && answer == absorbing {
-                decided = Some(child_handle);
+        let answer = match child {
+            RuleCond::Leaf(leaf) if !O::TOTAL => truth_of(leaf, context),
+            RuleCond::Not(RuleCond::Leaf(leaf)) if !O::TOTAL => !truth_of(*leaf, context),
+            RuleCond::Leaf(_)
+            | RuleCond::All(_)
+            | RuleCond::Any(_)
+            | RuleCond::Not(_)
+            | RuleCond::Named(_) => {
+                let (answer, child_handle) = evaluate(
+                    child,
+                    context,
+                    observer,
+                    Some(handle),
+                    skip.or(decided.map(after)),
+                );
+                if decided.is_none() && answer == absorbing {
+                    decided = Some(child_handle);
+                }
+                answer
             }
-            answer
         };
         if answer == absorbing && !O::TOTAL {
             return answer;
@@ -148,9 +157,9 @@ pub(in crate::rules) fn evaluate_rule<E: Fold, O: Observer<E>>(
     rule: &Rule<E>,
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
-    terminal: Option<usize>,
+    after_terminal: bool,
 ) -> (Truth, O::Handle) {
-    let skip = terminal.map(Skip::Terminal);
+    let skip = after_terminal.then_some(Skip::Terminal);
     let root = observer.enter(None, None, skip);
     let truth = if O::TOTAL {
         let (audience, audience_handle) = evaluate(
@@ -257,7 +266,7 @@ impl<E: Engine> Observer<E> for Total {
     ) -> usize {
         let kind = match node {
             None => NodeKind::Rule,
-            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(E::lift(leaf)),
+            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(leaf.lift()),
             Some(RuleCond::All(_)) => NodeKind::All,
             Some(RuleCond::Any(_)) => NodeKind::Any,
             Some(RuleCond::Not(_)) => NodeKind::Not,
@@ -341,11 +350,12 @@ impl<E: Engine> Observer<E> for Total {
         root: usize,
         truth: Truth,
         effect: Effect,
-        (bucket, defaults_admitted): (Bucket, Hydrators),
+        kind: ActionKind,
+        defaults_admitted: Hydrators,
         completed: Option<Completed>,
     ) {
         self.rows.push((
-            bucket,
+            kind.bucket(),
             RowTrace {
                 by,
                 root,

@@ -4,7 +4,6 @@ use crate::rules::context::RuleContext;
 use crate::rules::rule_spec::features::leaves::{ViewerFollowsAuthor, ViewerIsAuthor};
 use crate::rules::rule_spec::inputs::{Inputs, Interpreter};
 use crate::rules::rule_spec::rule::{all, RuleCond};
-use crate::rules::rule_spec::Predicate;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -14,8 +13,6 @@ pub trait Engine: Copy + Debug + Eq + 'static {
     type Candidate: Candidate;
 
     fn open<L: Copy + Debug + Eq + 'static>(only: Self::PostOnly<L>) -> L;
-
-    fn lift(predicate: Predicate<Self>) -> Predicate;
 }
 
 pub(in crate::rules) trait Fold: Engine {
@@ -64,11 +61,6 @@ impl Engine for PostEngine {
     fn open<L: Copy + Debug + Eq + 'static>(only: L) -> L {
         only
     }
-
-    #[inline]
-    fn lift(predicate: Predicate) -> Predicate {
-        predicate
-    }
 }
 
 impl Fold for PostEngine {
@@ -99,36 +91,6 @@ impl Engine for UserEngine {
 
     fn open<L: Copy + Debug + Eq + 'static>(only: Absent<L>) -> L {
         match only.0 {}
-    }
-
-    fn lift(predicate: Predicate<Self>) -> Predicate {
-        match predicate {
-            Predicate::Request(leaf) => Predicate::Request(leaf),
-            Predicate::AuthorFacts(leaf) => Predicate::AuthorFacts(leaf),
-            Predicate::ViewerAccount(leaf) => Predicate::ViewerAccount(leaf),
-            Predicate::ViewerLabel(leaf) => Predicate::ViewerLabel(leaf),
-            Predicate::NotificationFilter(leaf) => Predicate::NotificationFilter(leaf),
-            Predicate::AuthorSafety(leaf) => Predicate::AuthorSafety(leaf),
-            Predicate::AuthorLabels(leaf) => Predicate::AuthorLabels(leaf),
-            Predicate::AuthorProfile(leaf) => Predicate::AuthorProfile(leaf),
-            Predicate::AuthorEmail(leaf) => Predicate::AuthorEmail(leaf),
-            Predicate::AuthorPhone(leaf) => Predicate::AuthorPhone(leaf),
-            Predicate::Relationship(leaf) => Predicate::Relationship(leaf),
-            Predicate::PairEdge(leaf) => Predicate::PairEdge(leaf),
-            Predicate::PostFacts(Absent(never, _))
-            | Predicate::SourceTweetId(Absent(never, _))
-            | Predicate::Tweet(Absent(never, _))
-            | Predicate::TweetSafetyLabels(Absent(never, _))
-            | Predicate::ReplyControl(Absent(never, _))
-            | Predicate::PostModeration(Absent(never, _))
-            | Predicate::ArticleStage(Absent(never, _))
-            | Predicate::CommunityModerator(Absent(never, _))
-            | Predicate::CommunityViewerRemoved(Absent(never, _))
-            | Predicate::ReactedToPostSafetyLabels(Absent(never, _))
-            | Predicate::ReactedToAuthorSafety(Absent(never, _))
-            | Predicate::Edge(Absent(never, _))
-            | Predicate::Compound(Absent(never, _)) => match never {},
-        }
     }
 }
 

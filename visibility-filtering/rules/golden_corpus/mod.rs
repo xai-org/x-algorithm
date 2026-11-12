@@ -32,7 +32,7 @@ use crate::models::{
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{builder_call, logged_out_viewer, viewer, VIEWER_ID};
 use crate::rules::levels::{LevelLists, LevelRules};
-use crate::rules::rule_spec::engine::{Engine, UserEngine};
+use crate::rules::rule_spec::engine::UserEngine;
 use crate::rules::rule_spec::laws::WIRED_DIFFERENTLY;
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::{placed_test_context, RuleEngine, SafetyLevel};
@@ -554,7 +554,7 @@ fn lifted(condition: RuleCond<UserEngine>) -> RuleCond {
             .leak()
     };
     match condition {
-        RuleCond::Leaf(leaf) => RuleCond::Leaf(UserEngine::lift(leaf)),
+        RuleCond::Leaf(leaf) => RuleCond::Leaf(leaf.lift()),
         RuleCond::All(all) => RuleCond::All(children(all)),
         RuleCond::Any(any) => RuleCond::Any(children(any)),
         RuleCond::Not(child) => RuleCond::Not(Box::leak(Box::new(lifted(*child)))),

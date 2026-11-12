@@ -595,3 +595,16 @@ NEGATIVE_FEEDBACK_HEAD_INDICES = [
     recsys_pb2.ActionName.CLIENT_NOTIFICATION_SEE_LESS_OFTEN,
     recsys_pb2.ActionName.CLIENT_TWEET_SEARCH_QUERY_REFORMULATED,
 ]
+
+EXPLICIT_NEGATIVE_ACTIONS = [
+    recsys_pb2.ActionName.SERVER_TWEET_REPORT,
+    recsys_pb2.ActionName.CLIENT_TWEET_REPORT,
+    recsys_pb2.ActionName.CLIENT_TWEET_NOT_INTERESTED_IN,
+    recsys_pb2.ActionName.CLIENT_TWEET_SEE_FEWER,
+    recsys_pb2.ActionName.CLIENT_TWEET_UNFOLLOW_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_BLOCK_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_MUTE_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_MUTE_CONVERSATION,
+    recsys_pb2.ActionName.CLIENT_TWEET_NOT_RELEVANT,
+    recsys_pb2.ActionName.CLIENT_NOTIFICATION_SEE_LESS_OFTEN,
+]

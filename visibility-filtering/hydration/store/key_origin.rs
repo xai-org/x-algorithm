@@ -2,7 +2,7 @@ use super::conversation_root::ConversationRootAuthor;
 use super::{RequestRow, RowSubject, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::UserPair;
-use crate::hydration::relation::Related;
+use crate::hydration::relation::{Related, Relation};
 use crate::hydration::sources::source;
 use crate::hydration::{Cause, Hydrator, Hydrators, RequestRows};
 use crate::models::{AuthorId, ClientSwitch, RetweetMerge, TweetId};
@@ -24,8 +24,8 @@ pub(in crate::hydration) enum KeyOrigin {
     ControlRoot(ControlArms),
     ConversationControlBlockAuthor,
     ConversationRootToFetch,
-    RelatedTweet,
-    RelatedAuthor,
+    RelatedTweet(Relation),
+    RelatedAuthor(Relation),
     ConversationRootPostAuthor,
     ViewerForCoAllowedList,
     MyNetworkRootNotFollowingViewer,
@@ -55,7 +55,8 @@ pub(in crate::hydration) enum Names {
 enum KeyedBy {
     Request(fn(&Store) -> Option<u64>),
     Row(fn(&Store, &RequestRow) -> Option<u64>),
-    Related(fn(&Store, Related) -> Option<u64>),
+    Outers(fn(&Store, &RequestRow) -> Option<TweetId>),
+    Related(Relation, fn(&Store, Related) -> Option<u64>),
     Quote(fn(&Store, &RequestRow, TweetId) -> PairKey),
 }
 
@@ -251,21 +252,23 @@ impl KeyOrigin {
                     | ConversationRootAuthor::Unresolved => None,
                 }),
             },
-            K::RelatedTweet => Spec {
+            K::RelatedTweet(relation) => Spec {
                 label: "related_tweet",
                 input: None,
                 also_reads: NOTHING,
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::Related(|_, related| Some(related.tweet_id.0)),
+                keyed_by: KeyedBy::Related(relation, |_, related| Some(related.tweet_id.0)),
             },
-            K::RelatedAuthor => Spec {
+            K::RelatedAuthor(relation) => Spec {
                 label: "related_author",
                 input: None,
                 also_reads: NOTHING,
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::Related(|_, related| related.author.map(AuthorId::get)),
+                keyed_by: KeyedBy::Related(relation, |_, related| {
+                    related.author.map(AuthorId::get)
+                }),
             },
             K::ConversationRootPostAuthor => Spec {
                 label: "conversation_root_post_author",
@@ -273,7 +276,7 @@ impl KeyOrigin {
                 also_reads: NOTHING,
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::Related(|store, root| {
+                keyed_by: KeyedBy::Related(Relation::ConversationRoot, |store, root| {
                     store
                         .fetcher_of::<source::TesPureCoreData>(store.owner(H::ConversationRootPost))
                         .get(root.tweet_id.0)
@@ -425,15 +428,10 @@ impl KeyOrigin {
                 also_reads: NOTHING,
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::Row(|store, row| {
+                keyed_by: KeyedBy::Outers(|store, row| {
                     let tweet_id = row.tweet_id()?;
-                    store
-                        .quotes
-                        .outer_of(tweet_id)
-                        .filter(|_| {
-                            store.existence_miss(H::PureCore, tweet_id.0) == Some(Cause::NotFound)
-                        })
-                        .map(|outer| outer.0)
+                    (store.existence_miss(H::PureCore, tweet_id.0) == Some(Cause::NotFound))
+                        .then_some(tweet_id)
                 }),
             },
             K::MissingRequestTweet => Spec {
@@ -521,6 +519,14 @@ impl KeyOrigin {
         self.spec().needs_viewer
     }
 
+    pub(in crate::hydration) const fn relation(self) -> Option<Relation> {
+        match self.spec().keyed_by {
+            KeyedBy::Related(relation, _) => Some(relation),
+            KeyedBy::Quote(_) => Some(Relation::QuoteOuter),
+            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Outers(_) => None,
+        }
+    }
+
     pub(in crate::hydration) const fn is_quote_pair(self) -> bool {
         matches!(self.spec().keyed_by, KeyedBy::Quote(_))
     }
@@ -568,14 +574,15 @@ fn lists_countries(control: &ConversationControl) -> bool {
 
 impl Store {
     pub(super) fn key(&self, origin: KeyOrigin, row: &RequestRow) -> Option<u64> {
-        let spec = origin.spec();
-        if spec.needs_viewer && self.facts.viewer_id().is_none() {
-            return None;
-        }
-        match spec.keyed_by {
+        match origin.spec().keyed_by {
             KeyedBy::Request(key) => key(self),
             KeyedBy::Row(key) => key(self, row),
-            KeyedBy::Related(_) | KeyedBy::Quote(_) => None,
+            KeyedBy::Outers(inner) => self
+                .quotes
+                .outers_of(inner(self, row)?)
+                .next()
+                .map(|outer| outer.0),
+            KeyedBy::Related(..) | KeyedBy::Quote(_) => None,
         }
     }
 
@@ -587,35 +594,39 @@ impl Store {
     ) -> PairKey {
         match origin.spec().keyed_by {
             KeyedBy::Quote(key) => key(self, parent, outer),
-            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Related(_) => PairKey::Unasked,
+            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Outers(_) | KeyedBy::Related(..) => {
+                PairKey::Unasked
+            }
         }
     }
 
     pub(super) fn related_key(&self, origin: KeyOrigin, related: Related) -> Option<u64> {
-        let spec = origin.spec();
-        if spec.needs_viewer && self.facts.viewer_id().is_none() {
-            return None;
-        }
-        match spec.keyed_by {
-            KeyedBy::Related(key) => key(self, related),
-            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Quote(_) => None,
+        match origin.spec().keyed_by {
+            KeyedBy::Related(_, key) => key(self, related),
+            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Outers(_) | KeyedBy::Quote(_) => None,
         }
     }
 
-    pub(super) fn node_keys(&self, node: Hydrator) -> Vec<u64> {
-        let spec = self.origin(node).spec();
-        if spec.needs_viewer && self.facts.viewer_id().is_none() {
-            return Vec::new();
-        }
-        match spec.keyed_by {
-            KeyedBy::Request(key) => key(self).into_iter().collect(),
-            KeyedBy::Row(key) => self.rows.iter().filter_map(|row| key(self, row)).collect(),
-            KeyedBy::Related(key) => node.spec().relation.map_or_else(Vec::new, |relation| {
-                self.related_posts(relation)
-                    .filter_map(|related| key(self, related))
-                    .collect()
-            }),
-            KeyedBy::Quote(_) => Vec::new(),
+    pub(super) fn node_keys(&self, node: Hydrator, each: impl FnMut(u64)) {
+        match self.origin(node).spec().keyed_by {
+            KeyedBy::Request(key) => key(self).into_iter().for_each(each),
+            KeyedBy::Row(key) => self
+                .rows
+                .iter()
+                .filter_map(|row| key(self, row))
+                .for_each(each),
+            KeyedBy::Outers(inner) => self
+                .rows
+                .iter()
+                .filter_map(|row| inner(self, row))
+                .flat_map(|inner| self.quotes.outers_of(inner))
+                .map(|outer| outer.0)
+                .for_each(each),
+            KeyedBy::Related(relation, key) => self
+                .related_posts(relation)
+                .filter_map(|related| key(self, related))
+                .for_each(each),
+            KeyedBy::Quote(_) => {}
         }
     }
 

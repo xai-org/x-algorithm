@@ -60,7 +60,8 @@ else:
     AsyncEmbContextHandle = typing.Any
 
 from xrex.data.recsys.array_allocator import ArrayAllocator
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
+from xrex.data.recsys.constants import EXPLICIT_NEGATIVE_ACTIONS
+from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch, compute_time_gap_timestamps
 from xrex.data.recsys.sequence_packing import (
     PACK_BLOCK_SIZE,
     FixedLengthDistribution,
@@ -183,6 +184,15 @@ def pbroadcast(x, axis_name, source):
 
 _CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000
 _LOOKUP_CHUNK_BYTES = 4 << 30
+
+_RECENT_HISTORY_METRIC_WINDOWS = (
+    ("15m", 900),
+    ("30m", 1800),
+    ("1h", 3600),
+    ("2h", 7200),
+    ("1d", 86400),
+    ("full", None),
+)
 
 
 def _pad_axis(x: jax.Array, axis: int, length: int | None) -> jax.Array:
@@ -465,6 +475,9 @@ class RecsysTrainer(Trainer):
 
     empty_history_user_dropout_rate: float = 0.0
 
+    recent_history_dropout_rate: float = 0.0
+    recent_history_dropout_window_secs: int = 900
+
     split_home_checkpoint: bool = False
 
     export_stablehlo_bundle: bool = False
@@ -518,6 +531,14 @@ class RecsysTrainer(Trainer):
     )
     _last_history_user_dropout_count: int = field(default=0, init=False, repr=False)
     _last_history_user_dropout_bsz: int = field(default=0, init=False, repr=False)
+    _recent_history_dropout_rng: np.random.Generator | None = field(
+        default=None, init=False, repr=False
+    )
+    _last_recent_history_users: int = field(default=0, init=False, repr=False)
+    _last_recent_history_window_rows: collections.Counter[str] = field(
+        default_factory=collections.Counter, init=False, repr=False
+    )
+    _last_recent_history_dropped_rows: int = field(default=0, init=False, repr=False)
     _retrieval_post_emb_built: bool = field(default=False, init=False, repr=False)
     retrieval_staged_corpus: bool = False
     retrieval_staged_corpus_dir: str = "/dev/shm/retrieval_corpus"
@@ -1093,6 +1114,58 @@ class RecsysTrainer(Trainer):
             batch["user_ip_hashes"][drop_mask] = 0
         return n_dropped
 
+    def _apply_recent_history_dropout(
+        self, batch: RecsysFeaturesBatch
+    ) -> tuple[dict[str, int], int]:
+        assert isinstance(self.dataset, PhoenixDataset)
+        if self._recent_history_dropout_rng is None:
+            self._recent_history_dropout_rng = np.random.default_rng(
+                [self.rng_seed, self.data_rank]
+            )
+
+        impr_ts = batch["history_seq"]["impr_ts"]
+        assert impr_ts is not None
+        request_sec, _, _ = compute_time_gap_timestamps(
+            batch["history_seq"], batch["candidate_seq"], self.dataset.candidate_seq_len
+        )
+        real = batch["history_seq"]["post_hashes"][..., 0] != 0
+        window_rows = {
+            name: int(
+                np.count_nonzero(
+                    real if secs is None else (request_sec > 0) & (impr_ts > request_sec - secs)
+                )
+            )
+            for name, secs in _RECENT_HISTORY_METRIC_WINDOWS
+        }
+        in_window = (request_sec > 0) & (
+            impr_ts > request_sec - self.recent_history_dropout_window_secs
+        )
+        negative = np.zeros_like(in_window)
+        actions = batch["history_seq"]["actions"]
+        if actions is not None:
+            ids = [a for a in EXPLICIT_NEGATIVE_ACTIONS if a < actions.shape[-1]]
+            negative = actions[..., ids].any(axis=-1)
+        draws = self._recent_history_dropout_rng.random(in_window.shape)
+        drop = in_window & ~negative & (draws < self.recent_history_dropout_rate)
+        users = np.flatnonzero(drop.any(axis=1))
+        if users.size:
+            seq_len = drop.shape[1]
+            user_drop = drop[users]
+            first = user_drop.argmax(axis=1)
+            num_real = np.count_nonzero(batch["history_seq"]["post_hashes"][users, :, 0], axis=1)
+            width = int((num_real - first).max())
+            cols = np.minimum(first, seq_len - width)[:, None] + np.arange(width)
+            segment_drop = np.take_along_axis(user_drop, cols, axis=1)
+            src = np.take_along_axis(cols, np.argsort(segment_drop, axis=1, kind="stable"), axis=1)
+            removed = np.arange(width) >= width - segment_drop.sum(axis=1, keepdims=True)
+            history = typing.cast("dict[str, np.ndarray | None]", batch["history_seq"])
+            for arr in history.values():
+                if isinstance(arr, np.ndarray) and arr.ndim >= 2 and arr.shape[1] == seq_len:
+                    moved = arr[users[:, None], src]
+                    moved[removed] = 0
+                    arr[users[:, None], cols] = moved
+        return window_rows, int(drop.sum())
+
     def _precompile_batch_transfer(self) -> None:
         if len(self.mesh.local_devices) != 1:
             return
@@ -1121,6 +1194,15 @@ class RecsysTrainer(Trainer):
                 self._last_history_user_dropout_count += self._apply_per_history_user_dropout(
                     batch, history_user_drop_rate
                 )
+            if self.recent_history_dropout_rate > 0.0:
+                if i % self.num_microbatch == 0:
+                    self._last_recent_history_users = 0
+                    self._last_recent_history_window_rows = collections.Counter()
+                    self._last_recent_history_dropped_rows = 0
+                window_rows, dropped_rows = self._apply_recent_history_dropout(batch)
+                self._last_recent_history_users += batch["user_hashes"].shape[0]
+                self._last_recent_history_window_rows.update(window_rows)
+                self._last_recent_history_dropped_rows += dropped_rows
 
             microbatches.append((batch, offsets))
             if len(microbatches) == self.num_microbatch:
@@ -1240,6 +1322,13 @@ class RecsysTrainer(Trainer):
         if self.empty_history_user_dropout_rate > 0.0 and self._last_history_user_dropout_bsz > 0:
             metrics["train/empty_history_user_dropout_frac"] = (
                 self._last_history_user_dropout_count / self._last_history_user_dropout_bsz
+            )
+        if self.recent_history_dropout_rate > 0.0 and self._last_recent_history_users > 0:
+            users = self._last_recent_history_users
+            for name, rows in self._last_recent_history_window_rows.items():
+                metrics[f"train/recent_history_window_{name}_rows_per_user"] = rows / users
+            metrics["train/recent_history_dropped_rows_per_user"] = (
+                self._last_recent_history_dropped_rows / users
             )
 
         self._report_save_timing(metrics)

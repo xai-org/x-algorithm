@@ -5,8 +5,10 @@ use crate::hydration::hydrator::UserPair;
 use crate::hydration::tweet_source::TweetState;
 use crate::models::{ArticleLifecycle, CommunityModeration, TweetFeatures};
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::time::{sleep, Instant};
 use xai_core_entities::entities::{
     ConversationControl, ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData,
@@ -55,7 +57,7 @@ pub(crate) fn control(
 pub(crate) enum Fault {
     Fails,
     Hangs,
-    Delays(std::time::Duration),
+    Delays(Duration),
     AnswersPartial,
 }
 
@@ -206,10 +208,6 @@ impl InMemorySources {
     pub(crate) fn hold<L: Held>(mut self, edit: impl FnOnce(&mut L::World)) -> Self {
         edit(L::world_mut(&mut self.worlds));
         self
-    }
-
-    fn world<L: Held>(&self) -> &L::World {
-        L::world(&self.worlds)
     }
 
     pub(crate) fn tweet(self, tweet_id: u64, author_id: u64) -> Self {
@@ -558,28 +556,5 @@ impl InMemorySources {
             .iter()
             .find(|(faulty, _)| *faulty == fetcher)
             .map(|(_, fault)| *fault)
-    }
-}
-
-#[tonic::async_trait]
-impl PostCards for InMemorySources {
-    async fn post_card(&self, tweet_id: u64) -> Option<PostCard> {
-        if matches!(self.fault_for(Source::TesPureCoreData), Some(Fault::Fails)) {
-            return None;
-        }
-        let core = self
-            .world::<source::TesPureCoreData>()
-            .get(&tweet_id)?
-            .clone();
-        let author = self
-            .world::<source::GizmoduckAuthor>()
-            .get(&core.author_id)
-            .and_then(|result| result.user.as_ref());
-        Some(PostCard::new(
-            tweet_id,
-            core,
-            author.map(|user| &user.profile),
-            &[],
-        ))
     }
 }
