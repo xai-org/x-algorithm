@@ -347,7 +347,12 @@ mod tests {
     ) -> impl Iterator<Item = &HydrationPlan> {
         std::iter::once(engine.plan(level))
             .chain(engine.post_kinds_plan(level))
-            .chain(engine.recipient_posts_plan(level))
+            .chain(
+                engine
+                    .recipient_posts(level)
+                    .into_iter()
+                    .flat_map(|posts| [&posts.plan, &posts.retweet_sources_plan]),
+            )
     }
 
     #[test]

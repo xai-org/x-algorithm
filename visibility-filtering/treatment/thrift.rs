@@ -370,7 +370,10 @@ fn limited_engagements(
             .iter()
             .any(|kept| kept.limited_action_type == action_type)
         {
-            let prompt = action.prompt.as_ref().map(limited_action_prompt);
+            let prompt = action
+                .prompt
+                .as_ref()
+                .map(|prompt| limited_action_prompt(prompt, policies.language()));
             actions.push(LimitedAction::new(action_type, prompt));
         }
     }
@@ -381,9 +384,9 @@ fn limited_engagements(
     )
 }
 
-fn limited_action_prompt(prompt: &Prompt) -> LimitedActionPrompt {
-    let headline = prompt.headline.clone();
-    let subtext = prompt.subtext.clone();
+fn limited_action_prompt(prompt: &Prompt, language: &str) -> LimitedActionPrompt {
+    let headline = prompt.headline.to_string();
+    let subtext = prompt.subtext.to_string();
     match &prompt.kind {
         PromptKind::Basic => LimitedActionPrompt::BasicLimitedActionPrompt(
             BasicLimitedActionPrompt::new(headline, subtext),
@@ -391,24 +394,22 @@ fn limited_action_prompt(prompt: &Prompt) -> LimitedActionPrompt {
         PromptKind::SeeConversation => LimitedActionPrompt::CtaLimitedActionPrompt(
             CtaLimitedActionPrompt::new(headline, subtext, LimitedActionCtaType::SEE_CONVERSATION),
         ),
-        PromptKind::LearnMore {
-            language,
-            link_text,
-            url,
-        } => LimitedActionPrompt::LocalizedMessageLimitedActionPrompt(
-            LocalizedMessageLimitedActionPrompt::new(
-                LocalizedMessage::new(headline, language.clone(), Vec::new()),
-                LocalizedMessage::new(
-                    subtext,
-                    language.clone(),
-                    vec![MessageLink::new(
-                        LEARN_MORE_PLACEHOLDER.to_string(),
-                        link_text.to_string(),
-                        url.clone(),
-                    )],
+        PromptKind::LearnMore { link_text, url } => {
+            LimitedActionPrompt::LocalizedMessageLimitedActionPrompt(
+                LocalizedMessageLimitedActionPrompt::new(
+                    LocalizedMessage::new(headline, language.to_string(), Vec::new()),
+                    LocalizedMessage::new(
+                        subtext,
+                        language.to_string(),
+                        vec![MessageLink::new(
+                            LEARN_MORE_PLACEHOLDER.to_string(),
+                            link_text.to_string(),
+                            url.clone(),
+                        )],
+                    ),
                 ),
-            ),
-        ),
+            )
+        }
     }
 }
 

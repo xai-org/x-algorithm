@@ -229,6 +229,22 @@ lazy_static! {
         &["pool_size"]
     )
     .unwrap();
+    pub static ref DPP_WINDOW_ADJACENT_COS: Histogram = register_histogram!(
+        HistogramOpts::new(
+            "vm_ranker_dpp_window_adjacent_cos",
+            "Mean cosine between consecutive served picks per sliding-window DPP request (missing embeddings count as 0)"
+        )
+        .buckets(vec![-1.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0])
+    )
+    .unwrap();
+    pub static ref DPP_WINDOW_HISTORY_ITEMS: Histogram = register_histogram!(
+        HistogramOpts::new(
+            "vm_ranker_dpp_window_history_items",
+            "Served-history posts in the sliding-window DPP context per request (served in the last 10 minutes, at most the window size)"
+        )
+        .buckets(vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 35.0, 50.0])
+    )
+    .unwrap();
     pub static ref CONFIG_SYNC_LAST_SUCCESS_SECS: Gauge = register_gauge!(
         "vm_ranker_config_sync_last_success_timestamp_seconds",
         "Unix time of the last successful config poll (fetch succeeded, files current)"

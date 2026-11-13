@@ -7,7 +7,7 @@ use crate::params::CountryLists;
 use crate::rules::action_kind::{ActionKind, Filled};
 use crate::rules::defaults::{Defaults, Effect};
 use crate::rules::experiment::{Experiment, ExperimentSet};
-use crate::rules::levels::{PostRow, PostRules};
+use crate::rules::levels::{LevelLists, PostRow, PostRules};
 #[cfg(test)]
 use crate::rules::rule_spec::ActionSpec;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
@@ -15,6 +15,8 @@ use crate::rules::rule_spec::inputs::EvaluateInputs;
 use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
 use crate::rules::rule_spec::rule::{self, Rule};
 use crate::rules::rule_spec::{Contribution, RuleAction, RuleId, Truth, rule_name};
+#[cfg(test)]
+use crate::rules::safety_level::Judging;
 use crate::rules::{Predicate, RequestLeaf, RuleContext, SafetyLevel};
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -388,12 +390,18 @@ struct Level {
     reads_soft_nsfw_new_user_drop: bool,
     experiments: ExperimentSet,
     post_kinds: Option<PostKinds>,
-    recipient_posts: Option<HydrationPlan>,
+    recipient_posts: Option<RecipientPosts>,
 }
 
 struct PostKinds {
     policies: Vec<(NotificationKind, PostPolicy)>,
     plan: HydrationPlan,
+}
+
+pub(crate) struct RecipientPosts {
+    pub(crate) plan: HydrationPlan,
+    retweet_source: PostPolicy,
+    pub(crate) retweet_sources_plan: HydrationPlan,
 }
 
 impl Level {
@@ -408,13 +416,25 @@ impl Level {
             policy,
             plan,
             post_kinds: None,
-            recipient_posts: level.judges_recipient_posts().then(|| {
-                HydrationPlan::with_rows(
-                    level,
-                    RequestRows::Posts,
-                    Hydrators::of(Hydrator::PureCore),
-                )
-            }),
+            recipient_posts: None,
+        }
+    }
+}
+
+impl RecipientPosts {
+    fn new(level: SafetyLevel, retweet_source: PostPolicy) -> Self {
+        Self {
+            plan: HydrationPlan::with_rows(
+                level,
+                RequestRows::Posts,
+                Hydrators::of(Hydrator::PureCore),
+            ),
+            retweet_sources_plan: HydrationPlan::with_rows(
+                level,
+                RequestRows::Posts,
+                retweet_source.hydrators,
+            ),
+            retweet_source,
         }
     }
 }
@@ -426,14 +446,7 @@ impl PostKinds {
         names: &mut Vec<(RuleId, RuleAction, &'static str)>,
     ) -> Self {
         let policies: Vec<(NotificationKind, PostPolicy)> = kinds
-            .map(|(kind, rules)| {
-                let rules = rules.lists();
-                let user = named(names, &rules.user);
-                (
-                    kind,
-                    PostPolicy::gated(user, named_rows(names, &rules.post)),
-                )
-            })
+            .map(|(kind, rules)| (kind, named_policy(names, &rules.lists())))
             .collect();
         let hydrators = policies
             .iter()
@@ -480,6 +493,13 @@ fn plans_from_its_rows(plan: &HydrationPlan) -> bool {
         RequestRows::Posts | RequestRows::ActorPosts => !plan.keys_a_node_only_user_rows_give(),
         RequestRows::Users => plan.keys_only_user_rows_or_viewer(),
     }
+}
+
+fn named_policy(
+    names: &mut Vec<(RuleId, RuleAction, &'static str)>,
+    rules: &LevelLists,
+) -> PostPolicy {
+    PostPolicy::gated(named(names, &rules.user), named_rows(names, &rules.post))
 }
 
 fn named<E: Engine>(
@@ -637,12 +657,7 @@ impl RuleEngine {
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
-                let spec = level.spec();
-                let rules = spec.rules().lists();
-                let policy = PostPolicy::gated(
-                    named(&mut names, &rules.user),
-                    named_rows(&mut names, &rules.post),
-                );
+                let policy = named_policy(&mut names, &level.spec().rules().lists());
                 let mut entry = Level::new(level, policy);
                 assert!(
                     plans_from_its_rows(&entry.plan),
@@ -662,6 +677,16 @@ impl RuleEngine {
                             experiments.union(policy.post.experiments())
                         });
                     entry.post_kinds = Some(post_kinds);
+                }
+                if let Some(rules) = level.retweet_source_rules() {
+                    let policy = named_policy(&mut names, &rules.lists());
+                    entry.experiments = entry.experiments.union(policy.post.experiments());
+                    let recipient_posts = RecipientPosts::new(level, policy);
+                    assert!(
+                        plans_from_its_rows(&recipient_posts.retweet_sources_plan),
+                        "{level:?} plans keys its retweet sources cannot give"
+                    );
+                    entry.recipient_posts = Some(recipient_posts);
                 }
                 entry
             })
@@ -764,22 +789,28 @@ impl RuleEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn evaluate_post_kind(
+    pub(super) fn evaluate_judged(
         &self,
         level: SafetyLevel,
-        kind: NotificationKind,
+        judging: Judging,
         viewer: &ViewerFeatures,
         candidate: &PostCandidate,
         placement: Placement,
     ) -> Evaluation {
-        let policy = self.post_kind_policy(level, kind);
+        let policy = self.judged_policy(level, judging);
         self.fold(policy, viewer, candidate, placement, &mut NoTrace)
     }
 
     #[cfg(test)]
-    fn post_kind_policy(&self, level: SafetyLevel, kind: NotificationKind) -> &PostPolicy {
-        self.post_kind(level, kind)
-            .unwrap_or_else(|| panic!("{level:?} judges no {kind:?}"))
+    fn judged_policy(&self, level: SafetyLevel, judging: Judging) -> &PostPolicy {
+        match judging {
+            Judging::Level => Some(self.policy(level)),
+            Judging::PostKind(kind) => self.post_kind(level, kind),
+            Judging::RetweetSource => self
+                .recipient_posts(level)
+                .map(|posts| &posts.retweet_source),
+        }
+        .unwrap_or_else(|| panic!("{level:?} judges no {judging:?}"))
     }
 
     #[cfg(test)]
@@ -833,15 +864,23 @@ impl RuleEngine {
         Some(&self.level(level).post_kinds.as_ref()?.plan)
     }
 
-            pub(crate) fn recipient_posts_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
+            pub(crate) fn recipient_posts(&self, level: SafetyLevel) -> Option<&RecipientPosts> {
         self.level(level).recipient_posts.as_ref()
+    }
+
+            pub(crate) fn admit_retweet_sources<'a>(
+        &'a self,
+        posts: &'a RecipientPosts,
+        hydration: &'a Hydration,
+    ) -> Option<Admitted<'a>> {
+        self.admit_under(&posts.retweet_source, posts.plan.level(), hydration)
     }
 
         pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {
         self.level(level).reads_soft_nsfw_new_user_drop
     }
 
-        pub(crate) fn experiments(&self, level: SafetyLevel) -> ExperimentSet {
+            pub(crate) fn experiments(&self, level: SafetyLevel) -> ExperimentSet {
         self.level(level).experiments
     }
 
@@ -851,12 +890,12 @@ impl RuleEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn post_kind_rule_names(
+    pub(super) fn judged_rule_names(
         &self,
         level: SafetyLevel,
-        kind: NotificationKind,
+        judging: Judging,
     ) -> Vec<&'static str> {
-        self.post_kind_policy(level, kind).rule_names()
+        self.judged_policy(level, judging).rule_names()
     }
 }
 
@@ -915,20 +954,8 @@ impl RuleEngine {
         total.into_trace(evaluation)
     }
 
-    pub(super) fn fold_order(&self, level: SafetyLevel) -> FoldOrder<'_> {
-        fold_order(self.policy(level))
-    }
-
-    pub(super) fn post_kind_fold_orders(
-        &self,
-        level: SafetyLevel,
-    ) -> Vec<(NotificationKind, FoldOrder<'_>)> {
-        self.level(level)
-            .post_kinds
-            .iter()
-            .flat_map(|post_kinds| &post_kinds.policies)
-            .map(|(kind, policy)| (*kind, fold_order(policy)))
-            .collect()
+    pub(super) fn judged_fold_order(&self, level: SafetyLevel, judging: Judging) -> FoldOrder<'_> {
+        fold_order(self.judged_policy(level, judging))
     }
 
     pub(super) fn with_level_for_tests(

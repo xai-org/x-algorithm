@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
             theta: args.dpp_theta,
             max_selected_rank: args.dpp_max_selected_rank,
             debug_viewer_id: args.dpp_debug_viewer_id,
+            greedy_order: false,
+            window: None,
         };
         info!(
             "DPP enabled: top_k={}, theta={}, max_selected_rank={}, embedding_dim={}, debug_viewer_id={}",

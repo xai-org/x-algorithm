@@ -17,7 +17,7 @@ pub(crate) async fn fetch_each(
 ) -> Vec<Result<Bytes>> {
     let calls = keys
         .into_iter()
-        .map(|(column, key)| (column.to_owned(), FETCH.to_owned(), vec![key]))
+        .map(|(column, key)| (column, FETCH, [key]))
         .collect();
     let viewer = viewer_id.map(|user_id| TwitterContextViewer {
         user_id: user_id.cast_signed(),

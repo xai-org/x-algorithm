@@ -198,6 +198,7 @@ class SequencePackedLayout:
     token_to_source: np.ndarray | None = None
     source_to_token: np.ndarray | None = None
     dropped_candidate_slots: np.ndarray | None = None
+    value_scale: np.ndarray | None = None
 
 
 PACK_BLOCK_SIZE = 128

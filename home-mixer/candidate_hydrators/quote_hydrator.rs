@@ -9,7 +9,7 @@ use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::media_info_cache_client::MediaInfoCacheClient;
 use xai_candidate_pipeline::component_library::clients::SocialGraphClientOps;
 use xai_candidate_pipeline::component_library::utils::{default_quick_cache, QuickCache};
-use xai_candidate_pipeline::hydrator::{CacheStore, Hydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, TwoPhaseHydrator};
 use xai_stats_receiver::global_stats_receiver;
 
 const QUOTED_CONTENT_CACHE_METRIC: &str = "QuoteHydrator.quoted_content_cache";
@@ -171,30 +171,31 @@ pub struct QuotedContent {
     pub media: Option<QuotedMedia>,
 }
 
-impl QuotedContent {
-    fn apply(&self, candidate: &mut PostCandidate) {
-        candidate.quoted_tweet_text = self.text.clone();
-        if let Some(media) = &self.media {
-            candidate.quoted_has_media = Some(media.has_media);
-            candidate.quoted_has_photo = Some(media.has_photo);
-            candidate.quoted_has_video = Some(media.has_video);
-            candidate.quoted_media_count = Some(media.media_count);
-            candidate.quoted_max_video_duration_ms = media.max_video_duration_ms;
-        }
-    }
+pub struct Quote {
+    tweet_id: Option<u64>,
+    user_id: Option<u64>,
+    author_blocks_viewer: bool,
+    video_duration_ms: Option<i32>,
+}
+
+pub struct Quotes {
+    quotes: Vec<Quote>,
+    content: HashMap<u64, QuotedContent>,
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
+    type Fetched = Quotes;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Quotes, String> {
         let tweet_ids: Vec<u64> = candidates.iter().map(|c| c.tweet_id).collect();
 
         let mut cache_misses: Vec<u64> = Vec::new();
@@ -267,31 +268,42 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
             self.get_quoted_content(unique_quoted_tweet_ids),
         );
 
-        resolved
+        let quotes = resolved
             .iter()
-            .map(|(_, qt_tweet_id, qt_user_id)| {
-                let quoted_author_blocks_viewer = qt_user_id
-                    .map(|uid| blocked_by.contains(&uid))
-                    .unwrap_or(false);
-                let quoted_video_duration_ms = qt_tweet_id
+            .map(|&(_, tweet_id, user_id)| Quote {
+                tweet_id,
+                user_id,
+                author_blocks_viewer: user_id.is_some_and(|uid| blocked_by.contains(&uid)),
+                video_duration_ms: tweet_id
                     .and_then(|id| quoted_durations.get(&id).copied())
-                    .flatten();
-                let mut hydrated = PostCandidate {
-                    quoted_tweet_id: *qt_tweet_id,
-                    quoted_user_id: *qt_user_id,
-                    quoted_author_blocks_viewer: Some(quoted_author_blocks_viewer),
-                    quoted_video_duration_ms,
-                    ..Default::default()
-                };
-                if let Some(content) = qt_tweet_id.and_then(|id| quoted_content.get(&id)) {
-                    content.apply(&mut hydrated);
-                }
-                Ok(hydrated)
+                    .flatten(),
             })
-            .collect()
+            .collect();
+        Ok(Quotes {
+            quotes,
+            content: quoted_content,
+        })
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(&self, _query: &ScoredPostsQuery, candidates: &mut [PostCandidate], fetched: Quotes) {
+        for (candidate, quote) in candidates.iter_mut().zip(fetched.quotes) {
+            let content = quote.tweet_id.and_then(|id| fetched.content.get(&id));
+            let media = content.and_then(|content| content.media.as_ref());
+            candidate.quoted_tweet_id = quote.tweet_id;
+            candidate.quoted_user_id = quote.user_id;
+            candidate.quoted_author_blocks_viewer = Some(quote.author_blocks_viewer);
+            candidate.quoted_video_duration_ms = quote.video_duration_ms;
+            candidate.quoted_tweet_text = content.and_then(|content| content.text.clone());
+            candidate.quoted_has_media = media.map(|media| media.has_media);
+            candidate.quoted_has_photo = media.map(|media| media.has_photo);
+            candidate.quoted_has_video = media.map(|media| media.has_video);
+            candidate.quoted_media_count = media.map(|media| media.media_count);
+            candidate.quoted_max_video_duration_ms =
+                media.and_then(|media| media.max_video_duration_ms);
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.quoted_tweet_id = hydrated.quoted_tweet_id;
         candidate.quoted_user_id = hydrated.quoted_user_id;
         candidate.quoted_author_blocks_viewer = hydrated.quoted_author_blocks_viewer;

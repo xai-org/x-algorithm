@@ -6,7 +6,7 @@ use half::f16;
 use crate::helpers::dot_product;
 use crate::metrics::{
     DPP_AVG_SIMILARITY, DPP_EMBEDDING_MISS_RATIO, DPP_LOG_DET, DPP_POOL_SCORES, DPP_POOL_SIZE,
-    DPP_RESCALING, DPP_SELECTED_COUNT, DPP_TERMINAL_CV, DPP_TOP_K_OVERLAP,
+    DPP_RESCALING, DPP_SELECTED_COUNT, DPP_TERMINAL_CV, DPP_TOP_K_OVERLAP, DPP_WINDOW_ADJACENT_COS,
 };
 
 const EPSILON: f64 = 1e-6;
@@ -17,6 +17,14 @@ pub struct DppConfig {
     pub theta: f64,
     pub max_selected_rank: usize,
     pub debug_viewer_id: u64,
+    pub greedy_order: bool,
+    pub window: Option<SlidingWindow>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SlidingWindow {
+    pub size: usize,
+    pub half_distance: f64,
 }
 
 pub struct DppInput {
@@ -35,6 +43,7 @@ pub struct DppResult {
 pub fn rescore(
     inputs: &[DppInput],
     seed: Option<&DppInput>,
+    history: &[DppInput],
     config: &DppConfig,
     _viewer_id: u64,
 ) -> Vec<DppResult> {
@@ -94,6 +103,18 @@ pub fn rescore(
     let theta = config.theta.clamp(0.0, 1.0 - EPSILON);
     let alpha = theta / (2.0 * (1.0 - theta));
 
+    if let Some(window) = config.window {
+        let pool: Vec<&DppInput> = top_indices.iter().map(|&i| &inputs[i]).collect();
+        let quality: Vec<f64> = pool
+            .iter()
+            .map(|c| (2.0 * alpha * c.score / max_score).exp())
+            .collect();
+        let context: Vec<&DppInput> = seed.into_iter().chain(history).collect();
+        let picks = window_greedy(&pool, &quality, &context, window, config.top_k);
+        let greedy = picks.iter().map(|&i| top_indices[i]).collect();
+        return serve(inputs, &sorted, greedy, config);
+    }
+
     let total = m + usize::from(seed.is_some());
     let item_at = |ki: usize| -> &DppInput {
         if ki < m {
@@ -151,7 +172,25 @@ pub fn rescore(
         .with_label_values(&[reason])
         .observe(dpp_result.terminal_cv);
 
-    let mut dpp_selected: Vec<usize> = selected.iter().map(|&(ki, _)| top_indices[ki]).collect();
+    if let Some(&(_, log_det)) = selected.last() {
+        DPP_LOG_DET
+            .with_label_values(&[&config.top_k.to_string()])
+            .observe(log_det);
+    }
+
+    let greedy: Vec<usize> = selected.iter().map(|&(ki, _)| top_indices[ki]).collect();
+    serve(inputs, &sorted, greedy, config)
+}
+
+fn serve(
+    inputs: &[DppInput],
+    sorted: &[usize],
+    greedy: Vec<usize>,
+    config: &DppConfig,
+) -> Vec<DppResult> {
+    let n = inputs.len();
+
+    let mut dpp_selected = greedy.clone();
     dpp_selected.sort_unstable_by(|&a, &b| {
         inputs[b]
             .score
@@ -159,14 +198,17 @@ pub fn rescore(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let results: Vec<DppResult> = dpp_selected
+    let order = if config.greedy_order || config.window.is_some() {
+        &greedy
+    } else {
+        &dpp_selected
+    };
+    let results: Vec<DppResult> = order
         .iter()
-        .map(|&orig_idx| {
-            let score = inputs[orig_idx].score;
-            DppResult {
-                id: inputs[orig_idx].id,
-                score,
-            }
+        .zip(&dpp_selected)
+        .map(|(&orig_idx, &score_idx)| DppResult {
+            id: inputs[orig_idx].id,
+            score: inputs[score_idx].score,
         })
         .collect();
 
@@ -177,10 +219,12 @@ pub fn rescore(
         .with_label_values(&[&top_k_label])
         .observe(k as f64);
 
-    if let Some(&(_, log_det)) = selected.last() {
-        DPP_LOG_DET
-            .with_label_values(&[&top_k_label])
-            .observe(log_det);
+    if config.window.is_some() && k >= 2 {
+        let adjacent: f64 = order
+            .windows(2)
+            .map(|pair| cosine(&inputs[pair[0]], &inputs[pair[1]]))
+            .sum();
+        DPP_WINDOW_ADJACENT_COS.observe(adjacent / (k - 1) as f64);
     }
 
     if k >= 2 {
@@ -313,6 +357,65 @@ fn greedy_dpp(kernel: &[f64], n: usize, k: usize, pinned_first: Option<usize>) -
     }
 }
 
+fn window_greedy(
+    pool: &[&DppInput],
+    quality: &[f64],
+    context: &[&DppInput],
+    window: SlidingWindow,
+    k: usize,
+) -> Vec<usize> {
+    let size = window.size.min(context.len() + k);
+    let weights: Vec<f64> = (0..size)
+        .map(|d| {
+            if window.half_distance > 0.0 {
+                0.5f64.powf(d as f64 / window.half_distance).min(1.0)
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let cos2_row = |item: &DppInput| -> Vec<f64> {
+        pool.iter()
+            .map(|c| cosine(item, c).powi(2).min(1.0))
+            .collect()
+    };
+    let mut sequence: Vec<Vec<f64>> = context
+        .iter()
+        .take(size)
+        .rev()
+        .map(|&item| cos2_row(item))
+        .collect();
+    let mut available = vec![true; pool.len()];
+    let mut picks = Vec::with_capacity(k.min(pool.len()));
+    for _ in 0..k.min(pool.len()) {
+        let recent = &sequence[sequence.len().saturating_sub(size)..];
+        let mut best: Option<(usize, f64)> = None;
+        for i in (0..pool.len()).filter(|&i| available[i]) {
+            let gain = recent
+                .iter()
+                .rev()
+                .zip(&weights)
+                .fold(quality[i], |g, (row, w)| g * (1.0 - w * row[i]));
+            if best.is_none_or(|(_, b)| gain > b) {
+                best = Some((i, gain));
+            }
+        }
+        let Some((pick, _)) = best else { break };
+        available[pick] = false;
+        picks.push(pick);
+        sequence.push(cos2_row(pool[pick]));
+    }
+    picks
+}
+
+fn cosine(a: &DppInput, b: &DppInput) -> f64 {
+    let denom = a.norm * b.norm;
+    if a.embedding_missing || b.embedding_missing || denom <= EPSILON {
+        return 0.0;
+    }
+    dot_product(&a.embedding, &b.embedding) / denom
+}
+
 fn avg_pairwise_cosine(inputs: &[DppInput], indices: &[usize]) -> f64 {
     if indices.len() < 2 {
         return 0.0;
@@ -369,19 +472,21 @@ mod tests {
             theta: 0.5,
             max_selected_rank: 50,
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         }
     }
 
     #[test]
     fn empty_input() {
-        let result = rescore(&[], None, &default_config(), 0);
+        let result = rescore(&[], None, &[], &default_config(), 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn single_candidate() {
         let inputs = vec![make_input(1, 5.0, &[1.0, 0.0, 0.0])];
-        let result = rescore(&inputs, None, &default_config(), 0);
+        let result = rescore(&inputs, None, &[], &default_config(), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 1);
         assert!((result[0].score - 5.0).abs() < 1e-9);
@@ -401,8 +506,10 @@ mod tests {
             max_selected_rank: 10,
 
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
-        let result = rescore(&inputs, None, &config, 0);
+        let result = rescore(&inputs, None, &[], &config, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 1);
     }
@@ -420,8 +527,10 @@ mod tests {
             max_selected_rank: 10,
 
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
-        let result = rescore(&inputs, None, &config, 0);
+        let result = rescore(&inputs, None, &[], &config, 0);
         let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
         assert!(ids.contains(&3), "orthogonal candidate should be selected");
         assert!(
@@ -444,8 +553,10 @@ mod tests {
             max_selected_rank: 20,
 
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
-        let result = rescore(&inputs, None, &config, 0);
+        let result = rescore(&inputs, None, &[], &config, 0);
         assert!(result.len() <= 10, "at most top_k items returned");
         assert!(!result.is_empty(), "should select at least one item");
         for w in result.windows(2) {
@@ -477,8 +588,10 @@ mod tests {
             max_selected_rank: 10,
 
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
-        let result = rescore(&inputs, None, &config, 0);
+        let result = rescore(&inputs, None, &[], &config, 0);
         assert!(result.len() <= 5, "at most top_k items");
         assert!(!result.is_empty());
         for r in &result {
@@ -498,15 +611,17 @@ mod tests {
             theta: 0.5,
             max_selected_rank: 10,
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
 
-        let ids: Vec<u64> = rescore(&inputs, None, &config, 0)
+        let ids: Vec<u64> = rescore(&inputs, None, &[], &config, 0)
             .iter()
             .map(|r| r.id)
             .collect();
         assert!(ids.contains(&1) && ids.contains(&2));
 
-        let result = rescore(&inputs, Some(&seed), &config, 0);
+        let result = rescore(&inputs, Some(&seed), &[], &config, 0);
         let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
         assert!(
             !ids.contains(&1),
@@ -528,11 +643,86 @@ mod tests {
             theta: 0.5,
             max_selected_rank: 10,
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
-        let result = rescore(&inputs, Some(&seed), &config, 0);
+        let result = rescore(&inputs, Some(&seed), &[], &config, 0);
         let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
         assert_eq!(ids.len(), 2, "seed must not eat top_k budget, got {ids:?}");
         assert!(ids.contains(&1) && ids.contains(&2));
+    }
+
+    #[test]
+    fn greedy_order_serves_picks_in_selection_order_with_sorted_scores() {
+        let inputs = vec![
+            make_input(1, 10.0, &[1.0, 0.0, 0.0]),
+            make_input(2, 9.0, &[0.8, 0.0, 0.6]),
+            make_input(3, 5.0, &[0.0, 1.0, 0.0]),
+        ];
+        let mut config = DppConfig {
+            top_k: 3,
+            ..default_config()
+        };
+        let served = |config: &DppConfig| -> Vec<(u64, f64)> {
+            rescore(&inputs, None, &[], config, 0)
+                .iter()
+                .map(|r| (r.id, r.score))
+                .collect()
+        };
+
+        assert_eq!(served(&config), [(1, 10.0), (2, 9.0), (3, 5.0)]);
+
+        config.greedy_order = true;
+        assert_eq!(served(&config), [(1, 10.0), (3, 9.0), (2, 5.0)]);
+    }
+
+    fn window_picks(
+        inputs: &[DppInput],
+        history: &[DppInput],
+        size: usize,
+        half_distance: f64,
+    ) -> Vec<u64> {
+        let config = DppConfig {
+            greedy_order: false,
+            window: Some(SlidingWindow {
+                size,
+                half_distance,
+            }),
+            ..default_config()
+        };
+        rescore(inputs, None, history, &config, 0)
+            .iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn window_suppresses_a_duplicate_only_inside_the_window() {
+        let inputs = vec![
+            make_input(1, 10.0, &[1.0, 0.0, 0.0, 0.0]),
+            make_input(2, 9.0, &[1.0, 0.0, 0.0, 0.0]),
+            make_input(3, 5.0, &[0.0, 1.0, 0.0, 0.0]),
+            make_input(4, 4.0, &[0.0, 0.0, 1.0, 0.0]),
+            make_input(5, 3.0, &[0.0, 0.0, 0.0, 1.0]),
+        ];
+        assert_eq!(window_picks(&inputs, &[], 2, 5.0), [1, 3, 4, 2, 5]);
+        assert_eq!(window_picks(&inputs, &[], usize::MAX, 5.0), [1, 3, 4, 5, 2]);
+        assert_eq!(window_picks(&inputs, &[], 2, 0.0), [1, 3, 4, 2, 5]);
+    }
+
+    #[test]
+    fn window_ignores_missing_embeddings() {
+        let missing = |mut input: DppInput| {
+            input.embedding_missing = true;
+            input
+        };
+        let history = [missing(make_input(9, 0.0, &[1.0, 0.0]))];
+        let inputs = vec![
+            make_input(1, 10.0, &[1.0, 0.0]),
+            missing(make_input(2, 9.0, &[1.0, 0.0])),
+            make_input(3, 5.0, &[0.0, 1.0]),
+        ];
+        assert_eq!(window_picks(&inputs, &history, 1, 5.0), [1, 2, 3]);
     }
 
     fn f16_vec(vals: &[f32]) -> Vec<f16> {

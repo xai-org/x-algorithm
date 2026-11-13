@@ -11,7 +11,7 @@ use std::{
     cmp,
     collections::BTreeMap,
     fs, io,
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -102,7 +102,24 @@ impl CheckpointProxy {
             )
         })?;
 
-        let addrs: Vec<SocketAddr> = format!("{}:{}", name, port).to_socket_addrs()?.collect();
+        let connect_timeout = std::time::Duration::from_secs(
+            std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        );
+
+        let lookup = format!("{}:{}", name, port);
+        let addrs: Vec<SocketAddr> =
+            tokio::time::timeout(connect_timeout, tokio::net::lookup_host(&lookup))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("DNS lookup for {lookup} timed out after {connect_timeout:?}"),
+                    )
+                })??
+                .collect();
 
         if addrs.is_empty() {
             return Err(io::Error::new(
@@ -112,13 +129,6 @@ impl CheckpointProxy {
         }
 
         let dns_count = addrs.len();
-
-        let connect_timeout = std::time::Duration::from_secs(
-            std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
-        );
 
         let request_timeout = self.request_timeout;
 

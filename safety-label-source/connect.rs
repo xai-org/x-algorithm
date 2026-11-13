@@ -120,11 +120,6 @@ impl LabelClients {
         }
     }
 
-    pub fn spawn_label_cache_invalidator(&self) -> Option<LabelCacheInvalidator> {
-        let cache: Arc<CacheClient> = Arc::clone(self.dragonfly.as_ref()?);
-        Some(LabelCacheInvalidator::spawn(cache, self.metrics.clone()))
-    }
-
     pub fn into_source(self, warm_fetcher: Option<Arc<dyn WarmFetcher>>) -> SafetyLabelSource {
         let Self {
             manhattan,

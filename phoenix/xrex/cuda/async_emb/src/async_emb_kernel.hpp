@@ -7,7 +7,7 @@
 
 namespace xai::kernels::async_emb {
 
-constexpr int kMaxShardWidth = 32;
+constexpr int kMaxShardWidth = 128;
 
 struct SliceLayout {
   int64_t tokens_per_rank;

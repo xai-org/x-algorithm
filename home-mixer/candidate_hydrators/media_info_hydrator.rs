@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use tonic::async_trait;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::clients::media_info_cache_client::MediaInfoCacheClient;
 use xai_candidate_pipeline::component_library::utils::{default_quick_cache, QuickCache};
-use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
@@ -19,17 +20,6 @@ pub struct MediaInfoCacheValue {
 }
 
 impl MediaInfoCacheValue {
-    fn from_candidate(candidate: &PostCandidate) -> Self {
-        Self {
-            has_media: candidate.has_media,
-            has_photo: candidate.has_photo,
-            has_video: candidate.has_video,
-            media_count: candidate.media_count,
-            min_video_duration_ms: candidate.min_video_duration_ms,
-            max_video_duration_ms: candidate.max_video_duration_ms,
-        }
-    }
-
     fn no_media() -> Self {
         Self {
             has_media: Some(false),
@@ -38,18 +28,6 @@ impl MediaInfoCacheValue {
             media_count: Some(0),
             min_video_duration_ms: None,
             max_video_duration_ms: None,
-        }
-    }
-
-    fn into_candidate(self) -> PostCandidate {
-        PostCandidate {
-            has_media: self.has_media,
-            has_photo: self.has_photo,
-            has_video: self.has_video,
-            media_count: self.media_count,
-            min_video_duration_ms: self.min_video_duration_ms,
-            max_video_duration_ms: self.max_video_duration_ms,
-            ..Default::default()
         }
     }
 }
@@ -78,74 +56,99 @@ fn max_video_duration_ms(durations: &[i64]) -> Option<i32> {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
-    type CacheKey = u64;
-
-    type CacheValue = MediaInfoCacheValue;
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
+    type Fetched = Vec<Option<MediaInfoCacheValue>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
     }
 
-    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
-        &self.cache
+    async fn fetch(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Result<Vec<Option<MediaInfoCacheValue>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
     }
 
-    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
-        candidate.get_original_tweet_id()
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<MediaInfoCacheValue>>, String> {
+        self.fetch_cached(query, candidates, stage).await
     }
 
-    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        MediaInfoCacheValue::from_candidate(hydrated)
-    }
-
-    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        value.into_candidate()
-    }
-
-    async fn hydrate_from_client(
+    fn apply(
         &self,
         _query: &ScoredPostsQuery,
-        candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
-        let tweet_ids: Vec<u64> = candidates
-            .iter()
-            .map(|c| c.get_original_tweet_id())
-            .collect();
-
-        let media_info = self
-            .media_info_cache_client
-            .multi_get_media_info(&tweet_ids)
-            .await;
-
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for tweet_id in tweet_ids {
-            let hydrated = match media_info.get(&tweet_id) {
-                Some(Ok(Some(info))) => Ok(MediaInfoCacheValue {
-                    has_media: Some(info.has_media),
-                    has_photo: Some(info.has_photo),
-                    has_video: Some(info.has_video),
-                    media_count: Some(info.media_count.clamp(0, i32::MAX as i64) as i32),
-                    min_video_duration_ms: min_video_duration_ms(&info.video_durations_ms),
-                    max_video_duration_ms: max_video_duration_ms(&info.video_durations_ms),
-                }
-                .into_candidate()),
-                Some(Ok(None)) | None => Ok(MediaInfoCacheValue::no_media().into_candidate()),
-                Some(Err(err)) => Err(err.clone()),
-            };
-            hydrated_candidates.push(hydrated);
+        candidates: &mut [PostCandidate],
+        values: Vec<Option<MediaInfoCacheValue>>,
+    ) {
+        for (candidate, value) in candidates.iter_mut().zip(values) {
+            if let Some(value) = value {
+                candidate.has_media = value.has_media;
+                candidate.has_photo = value.has_photo;
+                candidate.has_video = value.has_video;
+                candidate.media_count = value.media_count;
+                candidate.min_video_duration_ms = value.min_video_duration_ms;
+                candidate.max_video_duration_ms = value.max_video_duration_ms;
+            }
         }
-
-        hydrated_candidates
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.has_media = hydrated.has_media;
         candidate.has_photo = hydrated.has_photo;
         candidate.has_video = hydrated.has_video;
         candidate.media_count = hydrated.media_count;
         candidate.min_video_duration_ms = hydrated.min_video_duration_ms;
         candidate.max_video_duration_ms = hydrated.max_video_duration_ms;
+    }
+}
+
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
+    type CacheKey = u64;
+    type Value = MediaInfoCacheValue;
+
+    fn cache_store(&self) -> &dyn CacheStore<u64, MediaInfoCacheValue> {
+        &self.cache
+    }
+
+    fn cache_key(&self, _query: &ScoredPostsQuery, candidate: &PostCandidate) -> u64 {
+        candidate.get_original_tweet_id()
+    }
+
+    async fn fetch_values(
+        &self,
+        _query: &ScoredPostsQuery,
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<MediaInfoCacheValue>> {
+        let tweet_ids: Vec<u64> = misses.iter().map(|c| c.get_original_tweet_id()).collect();
+
+        let media_info = self
+            .media_info_cache_client
+            .multi_get_media_info(&tweet_ids)
+            .await;
+
+        tweet_ids
+            .iter()
+            .map(|tweet_id| match media_info.get(tweet_id) {
+                Some(Ok(Some(info))) => Some(MediaInfoCacheValue {
+                    has_media: Some(info.has_media),
+                    has_photo: Some(info.has_photo),
+                    has_video: Some(info.has_video),
+                    media_count: Some(info.media_count.clamp(0, i32::MAX as i64) as i32),
+                    min_video_duration_ms: min_video_duration_ms(&info.video_durations_ms),
+                    max_video_duration_ms: max_video_duration_ms(&info.video_durations_ms),
+                }),
+                Some(Ok(None)) | None => Some(MediaInfoCacheValue::no_media()),
+                Some(Err(_)) => None,
+            })
+            .collect()
     }
 }
 

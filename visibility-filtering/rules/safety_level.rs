@@ -105,6 +105,14 @@ static TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS: [(RuleId, RerenderReason); 8] = 
     ),
 ];
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Judging {
+    Level,
+    PostKind(NotificationKind),
+    RetweetSource,
+}
+
 impl SafetyLevel {
     pub(crate) const fn spec(self) -> LevelSpec {
         match self {
@@ -201,24 +209,31 @@ impl SafetyLevel {
             .filter(move |&kind| self.judges(kind))
             .filter_map(|kind| match notification_kind::judged(kind) {
                 Judged::ActorPost(rules) => Some((kind, rules)),
-                Judged::Actor | Judged::ActorOnRecipientPost => None,
+                Judged::Actor | Judged::ActorOnRecipientPost(_) => None,
             })
     }
 
-    pub(super) fn judges_recipient_posts(self) -> bool {
-        NotificationKind::VARIANTS.iter().any(|&kind| {
-            self.judges(kind)
-                && matches!(
-                    notification_kind::judged(kind),
-                    Judged::ActorOnRecipientPost
-                )
-        })
+    pub(super) fn retweet_source_rules(self) -> Option<PostRules> {
+        NotificationKind::VARIANTS
+            .iter()
+            .filter(|&&kind| self.judges(kind))
+            .find_map(|&kind| match notification_kind::judged(kind) {
+                Judged::ActorOnRecipientPost(rules) => Some(rules),
+                Judged::Actor | Judged::ActorPost(_) => None,
+            })
     }
 
     #[cfg(test)]
-    pub(super) fn rule_lists(self) -> impl Iterator<Item = levels::LevelLists> {
-        std::iter::once(self.spec().rules().lists())
-            .chain(self.post_kinds().map(|(_, rules)| rules.lists()))
+    pub(super) fn judged_lists(self) -> impl Iterator<Item = (Judging, levels::LevelLists)> {
+        std::iter::once((Judging::Level, self.spec().rules().lists()))
+            .chain(
+                self.post_kinds()
+                    .map(|(kind, rules)| (Judging::PostKind(kind), rules.lists())),
+            )
+            .chain(
+                self.retweet_source_rules()
+                    .map(|rules| (Judging::RetweetSource, rules.lists())),
+            )
     }
 
     fn served_where(serves: impl Fn(&LevelSpec) -> bool) -> Result<Self, LevelError> {

@@ -7,6 +7,7 @@ use xai_cache::{KVCacheError, Key, Value};
 use xai_manhattan::ManhattanError;
 use xai_safety_label_store::types::encode_lkey;
 use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
+use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::servo_repo::{CachedValue, CachedValueStatus};
 use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
 
@@ -16,12 +17,17 @@ use crate::mh_client::{FetchResult, ManhattanLabelFetcher};
 use crate::remote::{cache_key, CacheRead, RemoteSource};
 use crate::source::SafetyLabelSource;
 
+const EXPIRED_CAPACITY: usize = 1024;
+
 #[derive(Default)]
 pub struct FakeLabels {
     labels: HashMap<u64, Vec<(SafetyLabelType, SafetyLabel)>>,
     cached: HashMap<u64, Vec<u8>>,
     not_found: HashSet<u64>,
     failing: HashSet<u64>,
+    hanging: HashSet<u64>,
+    cache_hanging: HashSet<u64>,
+    expired: HashMap<u64, vf_pb::SafetyLabelMap>,
 }
 
 impl FakeLabels {
@@ -52,7 +58,26 @@ impl FakeLabels {
         self
     }
 
-    pub fn into_source(self) -> SafetyLabelSource {
+    #[must_use]
+    pub fn hanging(mut self, tweet_id: u64) -> Self {
+        self.hanging.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn cache_hanging(mut self, tweet_id: u64) -> Self {
+        self.cache_hanging.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn expired(mut self, tweet_id: u64, labels: vf_pb::SafetyLabelMap) -> Self {
+        self.expired.insert(tweet_id, labels);
+        self
+    }
+
+    pub fn into_source(mut self) -> SafetyLabelSource {
+        let expired = std::mem::take(&mut self.expired);
         let backends = Arc::new(self);
         let remote = RemoteSource::new(
             Some(Arc::<Self>::clone(&backends) as _),
@@ -60,13 +85,25 @@ impl FakeLabels {
             backends,
             LabelMetrics::default(),
         );
-        SafetyLabelSource::new(Arc::new(remote), None, LabelMetrics::default())
+        let capacity = (!expired.is_empty()).then_some(EXPIRED_CAPACITY);
+        let source = SafetyLabelSource::new(Arc::new(remote), capacity, LabelMetrics::default());
+        for (tweet_id, labels) in expired {
+            source.hold_expired(tweet_id, Arc::new(labels));
+        }
+        source
     }
 }
 
 #[async_trait]
 impl CacheRead for FakeLabels {
     async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, Result<Option<Value>, KVCacheError>> {
+        if self
+            .cache_hanging
+            .iter()
+            .any(|&id| keys.contains(&cache_key(id)))
+        {
+            std::future::pending::<()>().await;
+        }
         let not_found: Vec<Key> = self.not_found.iter().map(|&id| cache_key(id)).collect();
         let cached: HashMap<Key, &Vec<u8>> = self
             .cached
@@ -92,6 +129,9 @@ impl CacheRead for FakeLabels {
 #[async_trait]
 impl ManhattanLabelFetcher for FakeLabels {
     async fn fetch_labels(&self, tweet_ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError> {
+        if tweet_ids.iter().any(|id| self.hanging.contains(id)) {
+            std::future::pending::<()>().await;
+        }
         let fetch = |id: &u64| {
             if self.failing.contains(id) || self.not_found.contains(id) {
                 return Err(ManhattanError::NativeProtocol("fake failure".to_owned()));

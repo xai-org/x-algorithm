@@ -6,6 +6,7 @@ use crate::params::{
     PhoenixMaxResults, PhoenixRetrievalTopicInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
     TopicFilteringId, TopicFilteringOverrides,
 };
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -66,8 +67,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
             }
         }
 
-        let response = self
-            .phoenix_retrieval_client
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
             .retrieve(
                 cluster,
                 user_id,

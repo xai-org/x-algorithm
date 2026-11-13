@@ -150,7 +150,7 @@ pub(crate) fn filter_notifications(
             (_, Some(0)) => {
                 return Err(Status::invalid_argument("a notification names no post"));
             }
-            (Some(Judged::ActorOnRecipientPost), Some(post)) => users.push((
+            (Some(Judged::ActorOnRecipientPost(_)), Some(post)) => users.push((
                 kind,
                 NotificationUser {
                     actor,
@@ -171,7 +171,7 @@ pub(crate) fn filter_notifications(
             )),
             (None, _)
             | (Some(Judged::Actor), Some(_))
-            | (Some(Judged::ActorOnRecipientPost | Judged::ActorPost(_)), None) => {
+            | (Some(Judged::ActorOnRecipientPost(_) | Judged::ActorPost(_)), None) => {
                 return Err(Status::invalid_argument(
                     "the safety level does not serve this notification kind",
                 ));
@@ -217,7 +217,7 @@ pub(crate) fn filter_tweets_batch(
     candidates: Vec<PlacedCandidate>,
 ) -> PostBatch {
     let soft_nsfw_new_user_drop = rule_engine.reads_soft_nsfw_new_user_drop(safety_level)
-        && client_switches.soft_nsfw_new_user_drop(viewer.id(), viewer.country_code());
+        && client_switches.soft_nsfw_new_user_drop(&viewer);
     let experiments = client_switches.experiments(rule_engine.experiments(safety_level), &viewer);
     PostBatch {
         facts: RequestFacts::new(viewer, ClientCapability::DEFAULT)
@@ -235,8 +235,7 @@ pub(crate) fn evaluate_tweets_batch(
     safety_level: SafetyLevel,
     candidates: Vec<PlacedCandidate>,
 ) -> PostBatch {
-    let client_capability =
-        client_switches.resolve(viewer.context(), viewer.id(), viewer.country_code());
+    let client_capability = client_switches.resolve(&viewer);
     PostBatch {
         facts: RequestFacts::new(viewer, client_capability),
         safety_level,

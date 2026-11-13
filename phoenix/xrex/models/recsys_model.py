@@ -7,7 +7,7 @@ import logging
 import math
 import typing
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, NamedTuple
 
 import haiku as hk
@@ -48,6 +48,7 @@ from xrex.data.recsys.constants import (
     VIEW_LOSS_ACTION_INDICES,
     LineItemObjective,
     action_type_map,
+    action_type_map_raw,
     engagement_to_ids,
 )
 from xrex.data.recsys.feature_config import (
@@ -59,6 +60,7 @@ from xrex.data.recsys.feature_config import (
     FloatFeature,
     Int64Feature,
 )
+from xrex.data.recsys.history_id_lists import NEGATIVE_ACTIONS
 from xrex.data.recsys.recsys_batch import (
     AUX_VALUE_EVENTS,
     EMBEDDING_CONFIG,
@@ -186,6 +188,16 @@ RECENCY_ACTIONS = (
 RECENCY_LOG_DT_SCALE = 15.0
 RECENCY_FOURIER = 8
 
+RECENT_POSITIVE_ACTIONS: tuple[str, ...] = (
+    "SERVER_TWEET_FAV",
+    "SERVER_TWEET_RETWEET",
+    "SERVER_TWEET_REPLY",
+    "SERVER_TWEET_QUOTE",
+    "CLIENT_TWEET_SHARE",
+    "CLIENT_TWEET_SHARE_VIA_COPY_LINK",
+    "CLIENT_TWEET_CLICK_SEND_VIA_DIRECT_MESSAGE",
+)
+
 
 def recency_time_features(x: jax.Array, k: int = RECENCY_FOURIER) -> jax.Array:
     freqs = jnp.arange(1, k + 1, dtype=jnp.float32) * jnp.pi
@@ -284,6 +296,59 @@ def right_anchored_rope_positions(
         [positions[..., None], jnp.zeros((*positions.shape, 2), positions.dtype)],
         axis=-1,
     )
+
+
+def action_indices(names: Sequence[str], vocab_size: int) -> list[int]:
+    return sorted({action_type_map_raw[n] for n in names if action_type_map_raw[n] < vocab_size})
+
+
+def packed_history_users(layout: SequencePackedLayout) -> tuple[jax.Array, int]:
+    user_starts = (
+        layout.candidate_key_starts
+        if layout.candidate_key_starts is not None
+        else layout.cu_seqlens
+    )
+    user_starts = cast_jax(user_starts).astype(jnp.int32)
+    history_positions = cast_jax(layout.history_positions).astype(jnp.int32)
+    num_users = user_starts.shape[1] - 1
+    users = jax.vmap(lambda s, p: jnp.searchsorted(s[1:], p, side="right"))(
+        user_starts, history_positions
+    )
+    return jnp.clip(users, 0, num_users - 1).astype(jnp.int32), num_users
+
+
+def recent_positive_history_mask(
+    history_actions: jax.Array,
+    history_post_hashes: jax.Array,
+    history_impr_ts: jax.Array,
+    history_request_secs: jax.Array,
+    history_users: jax.Array,
+    num_users: int,
+    window_secs: int,
+    last_n: int,
+    last_n_cap_secs: int,
+) -> jax.Array:
+    vocab_size = history_actions.shape[-1]
+    positive_idx = action_indices(RECENT_POSITIVE_ACTIONS, vocab_size)
+    negative_idx = action_indices(NEGATIVE_ACTIONS, vocab_size)
+    positive = jnp.any(history_actions[..., positive_idx] != 0, axis=-1)
+    negative = jnp.any(history_actions[..., negative_idx] != 0, axis=-1)
+    impr_secs = history_impr_ts.astype(jnp.int32)
+    request_secs = history_request_secs.astype(jnp.int32)
+    real = (history_post_hashes[..., 0] != 0) & (impr_secs > 0) & (request_secs > 0)
+    eligible = real & positive & ~negative
+    age_secs = request_secs - impr_secs
+    mask = eligible & (age_secs < window_secs)
+    if last_n > 0:
+        capped = eligible & (age_secs < last_n_cap_secs)
+        count = jnp.cumsum(capped.astype(jnp.int32), axis=1)
+        owner = (history_users[..., None] == jnp.arange(num_users, dtype=jnp.int32)) & real[
+            ..., None
+        ]
+        user_last_count = jnp.max(jnp.where(owner, count[..., None], 0), axis=1)
+        newer_count = jnp.take_along_axis(user_last_count, history_users, axis=1) - count
+        mask = mask | (capped & (newer_count < last_n))
+    return mask
 
 
 def packed_per_user_history_event_count(
@@ -1237,6 +1302,33 @@ class RecsysAggregatedModelConfig(Config):
         if self.ad_side_ids_emb_dim:
             parse_ad_side_fields(self.ad_side_fields)
 
+    @property
+    def recent_positive_enabled(self) -> bool:
+        return self.recent_positive_value_scale != 1.0 or self.recent_positive_dropout_rate > 0.0
+
+    def validate_recent_positive(self) -> None:
+        scale = self.recent_positive_value_scale
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError("recent_positive_value_scale must be finite and nonnegative")
+        if not 0.0 <= self.recent_positive_dropout_rate <= 1.0:
+            raise ValueError("recent_positive_dropout_rate must be in [0, 1]")
+        if (
+            min(
+                self.recent_positive_window_secs,
+                self.recent_positive_last_n,
+                self.recent_positive_last_n_cap_secs,
+            )
+            < 0
+        ):
+            raise ValueError(
+                "recent_positive_window_secs, recent_positive_last_n and "
+                "recent_positive_last_n_cap_secs must be nonnegative"
+            )
+        if self.recent_positive_enabled and not self.use_seqpack:
+            raise ValueError(
+                "recent_positive_value_scale / recent_positive_dropout_rate need use_seqpack"
+            )
+
     continuous_action_hidden_dim: int = 64
 
     final_logit_cap: float = -1.0
@@ -1261,6 +1353,12 @@ class RecsysAggregatedModelConfig(Config):
     ad_side_ids_emb_dim: int = 0
     ad_side_fields: str = ",".join(AD_SIDE_DEFAULT_FIELDS)
     wallclock_recency: bool = False
+
+    recent_positive_value_scale: float = 1.0
+    recent_positive_window_secs: int = 900
+    recent_positive_last_n: int = 5
+    recent_positive_last_n_cap_secs: int = 7200
+    recent_positive_dropout_rate: float = 0.0
 
     effective_sequence_len: int | None = None
 
@@ -1368,6 +1466,7 @@ class RecsysAggregatedModelConfig(Config):
         self.validate_aux_value_heads()
         self.validate_ads_head_masking()
         self.validate_side_inputs()
+        self.validate_recent_positive()
         if (
             not (self.pad_candidates_to_128 or self.use_seqpack)
             and self.model_config.attn_config.attn_impl != "cutedsl_ranker_attn"
@@ -3804,6 +3903,52 @@ class RecsysAggregatedModel(hk.Module):
         return history_embeddings, candidate_embeddings
 
     @hk.transparent
+    def _with_recent_positive_value_scale(
+        self,
+        batch: RecsysFeaturesBatch,
+        layout: SequencePackedLayout,
+        is_training: bool,
+    ) -> SequencePackedLayout:
+        cfg = self.config
+        if not cfg.recent_positive_enabled:
+            return layout
+        history = batch["history_seq"]
+        int64_features = history.get("int64_features")
+        assert (
+            int64_features is not None and int64_features.shape[-1] > Int64Feature.requestTimeSecSeq
+        ), "recent_positive_value_scale needs the history requestTimeSecSeq int64 feature"
+        users, num_users = packed_history_users(layout)
+        mask = recent_positive_history_mask(
+            cast_jax(history["actions"]),
+            cast_jax(history["post_hashes"]),
+            cast_jax(history["impr_ts"]),
+            cast_jax(int64_features)[..., Int64Feature.requestTimeSecSeq],
+            users,
+            num_users,
+            cfg.recent_positive_window_secs,
+            cfg.recent_positive_last_n,
+            cfg.recent_positive_last_n_cap_secs,
+        )
+        if is_training and cfg.recent_positive_dropout_rate > 0.0:
+            keep_user = jax.random.bernoulli(
+                hk.next_rng_key(),
+                1.0 - cfg.recent_positive_dropout_rate,
+                (mask.shape[0], num_users),
+            )
+            row_scale = jnp.take_along_axis(keep_user, users, axis=1).astype(jnp.float32)
+        else:
+            row_scale = jnp.full(mask.shape, cfg.recent_positive_value_scale, jnp.float32)
+        history_scale = jnp.where(mask, row_scale, 1.0)
+        history_positions = cast_jax(layout.history_positions).astype(jnp.int32)
+        rows = jnp.arange(history_positions.shape[0])[:, None]
+        token_scale = (
+            jnp.ones(layout.segment_ids.shape, jnp.float32)
+            .at[rows, history_positions]
+            .min(history_scale)
+        )
+        return replace(layout, value_scale=token_scale)
+
+    @hk.transparent
     def _maybe_add_dpa_input_embedding(
         self,
         candidate_embeddings: jax.Array,
@@ -4838,6 +4983,7 @@ class RecsysAggregatedModel(hk.Module):
                 if self.config.page_rl.enabled
                 else None
             )
+            layout = self._with_recent_positive_value_scale(batch, layout, is_training)
             with Summary() as summarizer:
                 outputs = self(
                     input_embeddings,
@@ -5695,6 +5841,7 @@ class RecsysAggregatedModel(hk.Module):
 
             segment_ids = cast_jax(layout.segment_ids)
             positions = cast_jax(layout.positions)
+            layout = self._with_recent_positive_value_scale(batch, layout, is_training=False)
 
             outputs = self(
                 input_embeddings,

@@ -35,6 +35,11 @@ class TaskRateLimitSafetyPtosKeyFrames(TaskTTLDedupeWithPost):
     DEDUPE_NAME = "safety ptos key frames"
 
 
+class TaskRateLimitSafetyPtosManyMedia(TaskTTLDedupeWithPost):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos many media"
+
+
 class TaskRateLimitSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(
     TaskTTLDedupeWithPost
 ):

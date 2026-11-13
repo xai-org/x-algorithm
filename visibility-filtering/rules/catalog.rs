@@ -2,6 +2,7 @@ use crate::rules::engine::WiredRule;
 use crate::rules::rule_spec::engine::Engine;
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::rule_spec::rule_name;
+use crate::rules::safety_level::Judging;
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::cmp::Reverse;
 use std::fmt::Write;
@@ -48,7 +49,7 @@ pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let level_name: &'static str = level.into();
-        for listed in level.rule_lists() {
+        for (_, listed) in level.judged_lists() {
             for entry in
                 catalog_rules(listed.user.iter().copied()).chain(catalog_rules(listed.post_rules()))
             {
@@ -109,19 +110,19 @@ pub(super) fn catalog() -> String {
         "\n## Levels\n\n\
          Each level's rules in fold order: the user list, then the post list, each under its\n\
          actions in precedence order. A notification level's post kinds follow it, each as\n\
-         `<level>_<kind>`.\n",
+         `<level>_<kind>`, then the rules on its recipient's retweet sources as\n\
+         `<level>_retweet_source`.\n",
     );
     let rule_engine = RuleEngine::for_tests();
     for &level in SafetyLevel::VARIANTS {
         let level_name: &str = level.into();
-        let post_kinds = rule_engine
-            .post_kind_fold_orders(level)
-            .into_iter()
-            .map(|(kind, fold_order)| (format!("{level_name}_{}", <&str>::from(kind)), fold_order));
-        for (heading, (user, post)) in
-            std::iter::once((level_name.to_owned(), rule_engine.fold_order(level)))
-                .chain(post_kinds)
-        {
+        for (judging, _) in level.judged_lists() {
+            let heading = match judging {
+                Judging::Level => level_name.to_owned(),
+                Judging::PostKind(kind) => format!("{level_name}_{}", <&str>::from(kind)),
+                Judging::RetweetSource => format!("{level_name}_retweet_source"),
+            };
+            let (user, post) = rule_engine.judged_fold_order(level, judging);
             writeln!(doc, "\n### {heading}\n").unwrap();
             write_wired(&mut doc, "user", &user);
             write_wired(&mut doc, "post", &post);

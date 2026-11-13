@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-11T16:00:37Z
+// mirrored from config feature-switch defaults; last sync 2026-11-12T16:00:36Z
 use xai_feature_switches::param;
 
 param!(
@@ -276,6 +276,12 @@ param!(
     "rust_home_mixer_phoenix_xds_retrieval_max_retries",
     0
 );
+param!(
+    PhoenixXdsRetrievalUncompressedClustersList,
+    Vec<String>,
+    "rust_home_mixer_phoenix_xds_retrieval_uncompressed_clusters_list",
+    vec![]
+);
 
 param!(
     PhoenixRetrievalExcludeSeenPosts,
@@ -490,7 +496,7 @@ param!(
     ShareViaCopyLinkWeight,
     f64,
     "rust_home_mixer_share_via_copy_link_weight",
-    20.0
+    0.0
 );
 param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.05);
 param!(QuoteWeight, f64, "rust_home_mixer_quote_weight", 5.0);
@@ -623,6 +629,18 @@ param!(
     bool,
     "rust_home_mixer_vm_ranker_send_history_topics",
     false
+);
+param!(
+    VMRankerSendDppHistory,
+    bool,
+    "rust_home_mixer_vm_ranker_send_dpp_history",
+    false
+);
+param!(
+    VMRankerDppHistoryMaxItems,
+    usize,
+    "rust_home_mixer_vm_ranker_dpp_history_max_items",
+    200
 );
 param!(
     HistoryTopicsEnabled,
@@ -1008,6 +1026,13 @@ param!(
     String,
     "rust_home_mixer_ads_blender",
     "slot_spread"
+);
+
+param!(
+    AdsFollowingMinPosts,
+    u32,
+    "rust_home_mixer_ads_following_min_posts",
+    5
 );
 
 param!(

@@ -5,7 +5,7 @@ use crate::rules::levels::PostRules;
 #[derive(Clone, Copy)]
 pub(crate) enum Judged {
     Actor,
-    ActorOnRecipientPost,
+    ActorOnRecipientPost(PostRules),
     ActorPost(PostRules),
 }
 
@@ -15,7 +15,9 @@ pub(crate) const fn judged(kind: NotificationKind) -> Judged {
         | NotificationKind::FollowRequestAccepted
         | NotificationKind::ContactJoined
         | NotificationKind::AddedToList => Judged::Actor,
-        NotificationKind::Like | NotificationKind::Repost => Judged::ActorOnRecipientPost,
+        NotificationKind::Like | NotificationKind::Repost => {
+            Judged::ActorOnRecipientPost(levels::NOTIFICATIONS_WRITER_V2_RETWEET_SOURCE)
+        }
         NotificationKind::Mention => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MENTION),
         NotificationKind::Reply => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_REPLY),
         NotificationKind::MediaTagged => {

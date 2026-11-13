@@ -37,7 +37,7 @@ fn truths() -> Vec<Truth> {
 fn wired<E: Engine>(list: fn(LevelLists) -> Vec<&'static Rule<E>>) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for rule in level.rule_lists().flat_map(list) {
+        for rule in level.judged_lists().flat_map(|(_, lists)| list(lists)) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }

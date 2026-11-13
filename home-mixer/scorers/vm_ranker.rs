@@ -5,6 +5,7 @@ use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
 use crate::scorers::value_model;
 use crate::scorers::vm_ranker_request::RequestShape;
+use crate::side_effects::redis_post_candidate_cache_side_effect::REDIS_TTL_SECONDS;
 use crate::util::post_annotations::fetch_post_topics;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -129,7 +130,9 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
                 weighted_score: Some(local.weighted[i]),
                 score: Some(local.cold_start.scores[i]),
                 cold_start_lift_to_rank: local.cold_start.lift_to_rank(i),
-                slate_context: slate_contexts.as_ref().map(|contexts| contexts[i]),
+                slate_context: slate_contexts
+                    .as_ref()
+                    .map(|contexts| Box::new(contexts[i])),
                 ..Default::default()
             })
             .collect();
@@ -143,6 +146,10 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
         let request = shape.build(query, candidates, &scored, &topics);
         record_request(&cluster);
+        if shape.sends_dpp_history() && query.has_cached_posts && !has_recent_served_response(query)
+        {
+            record_dpp_history_stale_cached();
+        }
 
         let response = match self.rank(query, cluster, request).await {
             Ok(resp) => resp,
@@ -193,12 +200,19 @@ fn slate_contexts(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
 ) -> Option<Vec<SlateContext>> {
-    let served: Option<Vec<SlateContext>> =
-        candidates.iter().map(|c| c.served_slate_context).collect();
+    let served: Option<Vec<SlateContext>> = candidates
+        .iter()
+        .map(|c| c.served_slate_context.as_deref().copied())
+        .collect();
     served.or_else(|| {
         query
             .has_cached_posts
-            .then(|| candidates.iter().map(|c| c.slate_context).collect())
+            .then(|| {
+                candidates
+                    .iter()
+                    .map(|c| c.slate_context.as_deref().copied())
+                    .collect()
+            })
             .flatten()
     })
 }
@@ -210,6 +224,20 @@ fn record_request(cluster: &VMRankerCluster) {
             &[("vm_cluster", &format!("{cluster:?}"))],
             1,
         );
+    }
+}
+
+fn has_recent_served_response(query: &ScoredPostsQuery) -> bool {
+    let cutoff_ms = query.request_time_ms - REDIS_TTL_SECONDS as i64 * 1_000;
+    query
+        .served_history
+        .iter()
+        .any(|response| response.served_time_ms.is_some_and(|t| t > cutoff_ms))
+}
+
+fn record_dpp_history_stale_cached() {
+    if let Some(receiver) = global_stats_receiver() {
+        receiver.incr(&format!("{METRIC_PREFIX}.dpp_history_stale_cached"), &[], 1);
     }
 }
 

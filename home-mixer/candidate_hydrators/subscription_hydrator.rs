@@ -3,8 +3,9 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::utils::{default_quick_cache, QuickCache};
-use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 
 pub struct SubscriptionHydrator {
     pub tes_client: Arc<dyn TESClient + Send + Sync>,
@@ -19,64 +20,78 @@ impl SubscriptionHydrator {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
-    type CacheKey = u64;
-    type CacheValue = Option<u64>;
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
+    type Fetched = Vec<Option<Option<u64>>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
     }
 
-    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
+    async fn fetch(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Result<Vec<Option<Option<u64>>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
+
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<Option<u64>>>, String> {
+        self.fetch_cached(query, candidates, stage).await
+    }
+
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        values: Vec<Option<Option<u64>>>,
+    ) {
+        for (candidate, value) in candidates.iter_mut().zip(values) {
+            if let Some(value) = value {
+                candidate.subscription_author_id = value;
+            }
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+        candidate.subscription_author_id = hydrated.subscription_author_id;
+    }
+}
+
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for SubscriptionHydrator {
+    type CacheKey = u64;
+    type Value = Option<u64>;
+
+    fn cache_store(&self) -> &dyn CacheStore<u64, Option<u64>> {
         &self.cache
     }
-    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
+
+    fn cache_key(&self, _query: &ScoredPostsQuery, candidate: &PostCandidate) -> u64 {
         candidate.tweet_id
     }
 
-    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        hydrated.subscription_author_id
-    }
-
-    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        PostCandidate {
-            subscription_author_id: value,
-            ..Default::default()
-        }
-    }
-
-    async fn hydrate_from_client(
+    async fn fetch_values(
         &self,
         _query: &ScoredPostsQuery,
-        candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
-        let client = &self.tes_client;
-
-        let tweet_ids: Vec<u64> = candidates.iter().map(|c| c.tweet_id).collect();
-
-        let post_features = client.get_subscription_author_ids(tweet_ids.clone()).await;
-
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for tweet_id in tweet_ids {
-            let post_features = post_features.get(&tweet_id);
-            let hydrated = match post_features {
-                Some(Ok(value)) => Ok(PostCandidate {
-                    subscription_author_id: *value,
-                    ..Default::default()
-                }),
-                None => Err(format!(
-                    "Missing subscription author id for tweet_id={}",
-                    tweet_id
-                )),
-                Some(Err(err)) => Err(err.to_string()),
-            };
-            hydrated_candidates.push(hydrated);
-        }
-
-        hydrated_candidates
-    }
-
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        candidate.subscription_author_id = hydrated.subscription_author_id;
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<Option<u64>>> {
+        let tweet_ids: Vec<u64> = misses.iter().map(|c| c.tweet_id).collect();
+        let author_ids = self
+            .tes_client
+            .get_subscription_author_ids(tweet_ids.clone())
+            .await;
+        tweet_ids
+            .iter()
+            .map(|tweet_id| match author_ids.get(tweet_id) {
+                Some(Ok(author_id)) => Some(*author_id),
+                Some(Err(_)) | None => None,
+            })
+            .collect()
     }
 }

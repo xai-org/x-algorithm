@@ -14,12 +14,14 @@ const SPACING_PROBE_ADS: usize = 4;
 
 pub struct FollowingAdBlender {
     pub(crate) result_size: usize,
+    pub(crate) min_posts: usize,
 }
 
 impl Default for FollowingAdBlender {
     fn default() -> Self {
         Self {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
+            min_posts: MIN_POSTS_FOR_ADS,
         }
     }
 }
@@ -31,13 +33,7 @@ impl AdsBlender for FollowingAdBlender {
         ads: Vec<AdIndexInfo>,
         drops: &mut Vec<DroppedAd>,
     ) -> Vec<FeedItem> {
-        blend_with_drops(
-            scored_posts,
-            ads,
-            MIN_POSTS_FOR_ADS,
-            self.result_size,
-            drops,
-        )
+        blend_with_drops(scored_posts, ads, self.min_posts, self.result_size, drops)
     }
 }
 

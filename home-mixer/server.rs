@@ -4,7 +4,7 @@ use crate::candidate_pipeline::phoenix_candidate_pipeline::PhoenixCandidatePipel
 use crate::candidate_pipeline::phoenix_scores_pipeline::PhoenixScoresPipeline;
 use crate::candidate_pipeline::ranked_following_candidate_pipeline::RankedFollowingCandidatePipeline;
 use crate::clients::gizmoduck_client::{
-    GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient, ViewerData,
+    GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient, QueryFields, ViewerData,
 };
 use crate::clients::resurrection_date_client::{
     MockResurrectionDateClient, ProdResurrectionDateClient, ResurrectionDateClient,
@@ -207,7 +207,19 @@ impl QueryBuilder {
     async fn fetch_viewer_data(&self, viewer_id: u64) -> ViewerData {
         match tokio::time::timeout(
             std::time::Duration::from_millis(VIEWER_ROLES_TIMEOUT_MS),
-            self.gizmoduck_client.get_viewer_data(viewer_id),
+            self.gizmoduck_client.get_viewer_data_with_fields(
+                viewer_id,
+                &[
+                    QueryFields::ROLES,
+                    QueryFields::MUTE_SETTINGS,
+                    QueryFields::COUNTS,
+                    QueryFields::SAFETY,
+                    QueryFields::EXTENDED_PROFILE,
+                    QueryFields::ACCOUNT,
+                    QueryFields::DEVICES,
+                    QueryFields::EXTENDED_ACCOUNT,
+                ],
+            ),
         )
         .await
         {

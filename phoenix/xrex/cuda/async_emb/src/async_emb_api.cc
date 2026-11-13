@@ -742,6 +742,7 @@ nb::bytes testSnapshot(int64_t context_id, const std::string& region) {
 }
 
 NB_MODULE(async_emb_api, m) {
+  m.attr("max_shard_width") = kMaxShardWidth;
   m.def("lookup_start_init", [] { return encapsulate(kLookupStartInit); });
   m.def("lookup_start", [] { return encapsulate(kLookupStart); });
   m.def("lookup_done", [] { return encapsulate(kLookupDone); });

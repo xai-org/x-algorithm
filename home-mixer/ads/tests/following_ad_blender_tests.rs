@@ -334,6 +334,13 @@ fn conversation_units_and_min_posts() {
         .unwrap();
     assert_eq!(i100, i101 + 1);
     assert!(!is_ad(&result[i101 + 1]));
+
+    let two: Vec<_> = (1..=2).map(make_post).collect();
+    let result = blend_with_spacing(two, vec![make_ad(201)], 2, 50, 3, &mut Vec::new());
+    assert_eq!(
+        result.iter().map(is_ad).collect::<Vec<_>>(),
+        vec![false, true, false]
+    );
 }
 
 #[test]

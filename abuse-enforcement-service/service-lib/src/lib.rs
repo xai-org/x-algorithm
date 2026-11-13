@@ -757,6 +757,7 @@ async fn run_enforcement_inner(
                             spec,
                             facts.entity_id,
                             facts.user_id,
+                            crate::facts::head_label(score),
                             Vec::new(),
                         )
                         .name()
@@ -913,10 +914,11 @@ async fn run_enforcement_inner(
                 .map(decision::ActionSpec::dedup_action_class)
                 .max()
                 .unwrap_or(dedup_cache::CLASS_NONE);
+            let head = crate::facts::head_label(score);
             let actions: Vec<EnforcementAction> = specs
                 .iter()
                 .map(|spec| {
-                    EnforcementAction::from_spec(spec, entity_id, user_id, ais_notes.clone())
+                    EnforcementAction::from_spec(spec, entity_id, user_id, head, ais_notes.clone())
                 })
                 .collect();
             let uas_action_dims: Vec<(&'static str, String)> = actions
@@ -1064,7 +1066,7 @@ async fn final_checks(
         let dropped: Vec<&'static str> = specs
             .iter()
             .map(|spec| {
-                EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, Vec::new())
+                EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, head, Vec::new())
                     .name()
             })
             .collect();

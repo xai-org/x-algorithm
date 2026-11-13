@@ -51,7 +51,7 @@ class SampleDetails:
 
 
 class EapiSampler:
-    _cached_clients: dict[tuple[int, str, str], AsyncClient] = {}
+    _cached_clients: dict[tuple[int, str, str, int], AsyncClient] = {}
 
     def __init__(self, eapi_config: EapiModelConfig):
         self.model: str = eapi_config.model
@@ -75,7 +75,6 @@ class EapiSampler:
 
         self.client_kwargs = {
             "api_key": api_key,
-            "timeout": self.timeout,
             "channel_options": [("grpc.enable_retries", 0)],
         }
 
@@ -84,14 +83,14 @@ class EapiSampler:
 
     def _get_client(self) -> AsyncClient:
         loop_id = get_loop_id()
-        key = (loop_id, self.model, self.api_host)
+        key = (loop_id, self.model, self.api_host, self.timeout)
         if key in self._cached_clients:
             client = self._cached_clients[key]
             return client
         logger.info(
             f"Creating new AsyncClient for {self.model} and {self.api_host} (loop_id={loop_id})"
         )
-        client = AsyncClient(**self.client_kwargs)
+        client = AsyncClient(**self.client_kwargs, timeout=self.timeout)
         self._cached_clients[key] = client
         return client
 

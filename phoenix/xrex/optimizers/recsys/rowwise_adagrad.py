@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     )
 
 _LN2 = math.log(2)
-_MAX_FUSED_SHARD_WIDTH = 32
+_LEGACY_MAX_FUSED_SHARD_WIDTH = 32
 
 
 def _hash_u32(x: jax.Array) -> jax.Array:
@@ -128,12 +128,16 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
 
         async_emb = recsys_async_emb.kernel_bindings(context)
         row_sharded = recsys_async_emb.is_row_sharded(context)
-        if not row_sharded and _MAX_FUSED_SHARD_WIDTH % context.shard_width != 0:
-            raise ValueError(
-                "the fused rowwise Adagrad update needs shard_width to divide "
-                f"{_MAX_FUSED_SHARD_WIDTH}, got shard_width={context.shard_width} "
-                f"(emb_width={context.emb_width})"
+        if not row_sharded:
+            max_width = getattr(
+                async_emb.async_emb_api, "max_shard_width", _LEGACY_MAX_FUSED_SHARD_WIDTH
             )
+            if max_width % context.shard_width != 0:
+                raise ValueError(
+                    "the fused rowwise Adagrad update needs shard_width to divide "
+                    f"{max_width}, got shard_width={context.shard_width} "
+                    f"(emb_width={context.emb_width})"
+                )
 
         metrics: dict[str, jax.Array] = {}
         lazy_options: dict[str, Any] = {}

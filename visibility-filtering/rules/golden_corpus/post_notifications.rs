@@ -1,5 +1,5 @@
 use super::notifications::{post_kind_cases, recipient};
-use super::{CorpusCase, Subject};
+use super::{CorpusCase, Judging, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{
     ArticleLifecycle, AuthorFeatures, CommunityModeration, NotificationKind, NsfwViewerDropReason,
@@ -28,6 +28,7 @@ struct Case {
     post: PostCandidate,
     mention_and_reply: Verdict,
     media_tagged: Verdict,
+    retweet_source: Verdict,
 }
 
 fn shown(
@@ -43,6 +44,7 @@ fn shown(
         post,
         mention_and_reply: allow(),
         media_tagged: allow(),
+        retweet_source: allow(),
     }
 }
 
@@ -54,7 +56,8 @@ fn dropped_at_79(
     verdict: Verdict,
 ) -> Case {
     Case {
-        mention_and_reply: verdict,
+        mention_and_reply: verdict.clone(),
+        retweet_source: verdict,
         ..shown(name, role, recipient, post)
     }
 }
@@ -127,17 +130,20 @@ fn post_cases() -> Vec<Case> {
             filters_to_followed(),
             community_post(candidate(), CommunityModeration::default()),
         ),
-        dropped_at_79(
-            "stale_edit",
-            "non_follower",
-            default_recipient(),
-            tweet(TweetFeatures {
-                latest_edit_tweet_id: Some(2),
-                ..TweetFeatures::default()
-            })
-            .build(),
-            unspecified("stale_tweet/drop/unspecified"),
-        ),
+        Case {
+            retweet_source: allow(),
+            ..dropped_at_79(
+                "stale_edit",
+                "non_follower",
+                default_recipient(),
+                tweet(TweetFeatures {
+                    latest_edit_tweet_id: Some(2),
+                    ..TweetFeatures::default()
+                })
+                .build(),
+                unspecified("stale_tweet/drop/unspecified"),
+            )
+        },
         dropped_at_79(
             "protected_author_community_post",
             "follower",
@@ -328,13 +334,13 @@ fn post_cases() -> Vec<Case> {
                 .build(),
         ),
         Case {
-            mention_and_reply: undesirable("spam_high_recall/drop/undesirable"),
             media_tagged: undesirable("spam_high_recall_oon/drop/undesirable"),
-            ..shown(
+            ..dropped_at_79(
                 "spam_high_recall_label",
                 "non_follower",
                 default_recipient(),
                 labeled(SafetyLabelType::SPAM_HIGH_RECALL),
+                undesirable("spam_high_recall/drop/undesirable"),
             )
         },
         dropped_at_79(
@@ -447,7 +453,7 @@ fn post_case_verdict(kind: NotificationKind, case: &Case) -> Verdict {
 }
 
 pub(super) fn cases() -> Vec<CorpusCase> {
-    SafetyLevel::VARIANTS
+    let post_kinds = SafetyLevel::VARIANTS
         .iter()
         .flat_map(|&level| level.post_kinds().map(move |(kind, _)| (level, kind)))
         .flat_map(|(level, kind)| {
@@ -456,7 +462,7 @@ pub(super) fn cases() -> Vec<CorpusCase> {
                 CorpusCase {
                     name: format!("{}/{level:?}/{kind:?}/{}", case.name, case.role),
                     level,
-                    kind: Some(kind),
+                    judging: Judging::PostKind(kind),
                     viewer: case.recipient,
                     subject: Subject::Post(case.post),
                     placement: Placement::Standalone,
@@ -464,6 +470,20 @@ pub(super) fn cases() -> Vec<CorpusCase> {
                 }
             });
             post_kind_cases(level, kind).into_iter().chain(posts)
-        })
-        .collect()
+        });
+    let retweet_sources = SafetyLevel::VARIANTS
+        .iter()
+        .filter(|level| level.retweet_source_rules().is_some())
+        .flat_map(|&level| {
+            post_cases().into_iter().map(move |case| CorpusCase {
+                name: format!("{}/{level:?}/retweet_source/{}", case.name, case.role),
+                level,
+                judging: Judging::RetweetSource,
+                viewer: case.recipient,
+                subject: Subject::Post(case.post),
+                placement: Placement::RetweetSource,
+                expected: case.retweet_source,
+            })
+        });
+    post_kinds.chain(retweet_sources).collect()
 }

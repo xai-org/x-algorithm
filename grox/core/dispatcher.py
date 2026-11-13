@@ -66,8 +66,9 @@ class Dispatcher:
 
     def _get_task_generator(self) -> TaskGenerator:
         load_all()
-        generators: list[tuple[TaskGenerator, int]] = [
-            (build_generator(cfg), cfg.weight) for cfg in self.config.task_generators
+        generators: list[tuple[TaskGenerator, int, int | None]] = [
+            (build_generator(cfg), cfg.weight, cfg.max_in_flight)
+            for cfg in self.config.task_generators
         ]
         return PriorityTaskGenerator(generators)
 

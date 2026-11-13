@@ -183,11 +183,8 @@ impl Why {
                 |outcome| filter_label(&treatment::filter_tweets_result(outcome)),
             ),
             Rpc::EvaluateTweets => {
-                let viewer = hydration.viewer().facts.viewer();
                 let policies = self.client_switches.limited_actions_policies(
-                    viewer.context(),
-                    viewer.id(),
-                    viewer.country_code(),
+                    hydration.viewer().facts.viewer(),
                     evaluation.verdict().limited_engagement_reasons(),
                     &Metrics::none(),
                 );

@@ -4,10 +4,11 @@ use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, HydrationRequest
 use crate::ingress::{NotificationPost, NotificationUser};
 use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, Evaluation, NotificationKind, Placement, RawCandidate, RequestFacts, RetweetMerge,
-    TweetId,
+    AuthorId, Evaluation, EvaluationKey, NotificationKind, Placement, RawCandidate, RequestFacts,
+    RetweetMerge, TweetId, Verdict,
 };
-use crate::rules::SafetyLevel;
+use crate::rules::engine::RecipientPosts;
+use crate::rules::{NoTrace, SafetyLevel};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -18,15 +19,23 @@ pub(crate) struct UserNotifications {
 
 impl UserNotifications {
     pub(crate) fn evaluation(&self, user: NotificationUser) -> Option<&Evaluation> {
+        let actor = || self.actors.get(&user.actor).and_then(Option::as_ref);
         match user
             .recipient_post
             .map(|post| self.recipient_posts.get(&post))
         {
-            None | Some(Some(Ok(()))) => self.actors.get(&user.actor).and_then(Option::as_ref),
-            Some(Some(Err(evaluation))) => Some(evaluation),
+            None | Some(Some(Ok(()))) => actor(),
+            Some(Some(Err(post))) if drops(post) => Some(post),
+            Some(Some(Err(post))) => actor().filter(|actor| drops(actor)).or(Some(post)),
             Some(None) => None,
         }
     }
+}
+
+fn drops(evaluation: &Evaluation) -> bool {
+    !matches!(evaluation, Evaluation::Failed(_))
+        && matches!(evaluation.verdict(), Verdict::Withheld(_))
+        && evaluation.fail_open_defaults().is_empty()
 }
 
 impl PostEvaluator {
@@ -110,7 +119,7 @@ impl PostEvaluator {
         if posts.is_empty() {
             return HashMap::new();
         }
-        let Some(plan) = self.rule_engine.recipient_posts_plan(level) else {
+        let Some(recipient_posts) = self.rule_engine.recipient_posts(level) else {
             warn!(
                 ?level,
                 "recipient posts resolved at a level whose kinds name none; failing them"
@@ -121,10 +130,68 @@ impl PostEvaluator {
                 .collect();
         };
         let recipient = facts.viewer_id().map(AuthorId);
-        let hydration = self.hydrate_posts(plan, facts, &posts, metrics).await;
-        posts
+        let hydration = self
+            .hydrate_posts(&recipient_posts.plan, facts, &posts, metrics)
+            .await;
+        let mut resolved: HashMap<TweetId, Result<(), Evaluation>> = posts
             .into_iter()
             .map(|post| (post, owned_post(&hydration, post, recipient)))
+            .collect();
+        let reposts: Vec<(TweetId, TweetId)> = resolved
+            .iter()
+            .filter(|(_, owned)| owned.is_ok())
+            .filter_map(|(&post, _)| Some((post, hydration.tweet(post)?.source_tweet_id()?)))
+            .collect();
+        if reposts.is_empty() {
+            return resolved;
+        }
+        let mut sources: Vec<TweetId> = reposts.iter().map(|&(_, source)| source).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let withheld = self
+            .judge_retweet_sources(recipient_posts, facts, sources, metrics)
+            .await;
+        for (post, source) in reposts {
+            if let Some(evaluation) = withheld.get(&source) {
+                resolved.insert(post, Err(evaluation.clone()));
+            }
+        }
+        resolved
+    }
+
+    async fn judge_retweet_sources(
+        &self,
+        posts: &RecipientPosts,
+        facts: &RequestFacts,
+        sources: Vec<TweetId>,
+        metrics: &RequestMetrics,
+    ) -> HashMap<TweetId, Evaluation> {
+        let hydration = self
+            .hydrate_posts(&posts.retweet_sources_plan, facts, &sources, metrics)
+            .await;
+        let admitted = self
+            .rule_engine
+            .admit_retweet_sources(posts, &hydration)
+            .filter(|_| !viewer_lookup_failed(&hydration));
+        sources
+            .into_iter()
+            .map(|source| {
+                let key = EvaluationKey::retweet_source(source);
+                let tweet = hydration.tweet(source);
+                let evaluation = Self::evaluation(admitted.as_ref(), key, tweet, &mut NoTrace);
+                let evaluation = match evaluation {
+                    Evaluation::NotFound(_) => Evaluation::NotFound(Lookup::SharedTweet),
+                    Evaluation::Failed(_) => Evaluation::Failed(Lookup::SharedTweet),
+                    evaluation @ (Evaluation::Complete { .. }
+                    | Evaluation::Partial { .. }
+                    | Evaluation::Deleted(_)) => evaluation,
+                };
+                (source, evaluation)
+            })
+            .filter(|(_, evaluation)| {
+                matches!(evaluation.verdict(), Verdict::Withheld(_))
+                    || !evaluation.fail_open_defaults().is_empty()
+            })
             .collect()
     }
 

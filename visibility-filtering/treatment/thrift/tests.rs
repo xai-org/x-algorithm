@@ -808,6 +808,35 @@ fn each_public_interest_reason_has_english_copy() {
 }
 
 #[test]
+fn a_learn_more_prompt_links_its_subtext_in_the_request_language() {
+    let prompt = Prompt {
+        headline: "返信できません".into(),
+        subtext: "このポストには返信できません {learnmore}".into(),
+        kind: PromptKind::LearnMore {
+            link_text: "詳細はこちら",
+            url: "https://example.com/rules".to_string(),
+        },
+    };
+    assert_eq!(
+        limited_action_prompt(&prompt, "ja"),
+        LimitedActionPrompt::LocalizedMessageLimitedActionPrompt(
+            LocalizedMessageLimitedActionPrompt::new(
+                LocalizedMessage::new("返信できません".to_string(), "ja".to_string(), Vec::new()),
+                LocalizedMessage::new(
+                    "このポストには返信できません {learnmore}".to_string(),
+                    "ja".to_string(),
+                    vec![MessageLink::new(
+                        "learnmore".to_string(),
+                        "詳細はこちら".to_string(),
+                        "https://example.com/rules".to_string(),
+                    )],
+                ),
+            )
+        )
+    );
+}
+
+#[test]
 fn each_quote_rerender_sends_tweetypies_filtered_reason() {
     use crate::rules::QuoteEntries;
     use strum::VariantArray;

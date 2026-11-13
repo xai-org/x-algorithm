@@ -395,14 +395,6 @@ impl PhoenixCandidatePipeline {
         ];
 
         let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
-            Box::new(InNetworkCandidateHydrator),
-            Box::new(BidirectionalFollowHydrator {
-                socialgraph_client: socialgraph_client.clone(),
-            }),
-            Box::new(core_data_hydrator),
-            Box::new(PhoenixReplyAncestorsHydrator {
-                tes_client: tes_client.clone(),
-            }),
             Box::new(
                 QuoteHydrator::new(
                     tes_client.clone(),
@@ -411,20 +403,26 @@ impl PhoenixCandidatePipeline {
                 )
                 .await,
             ),
-            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
-            Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
-            Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
-            Box::new(BlockedByHydrator::new(socialgraph_client).await),
-            Box::new(FilteredTopicsHydrator {
-                strato_client: strato_client.clone(),
+            Box::new(core_data_hydrator),
+            Box::new(PhoenixReplyAncestorsHydrator {
+                tes_client: tes_client.clone(),
             }),
+            Box::new(BidirectionalFollowHydrator {
+                socialgraph_client: socialgraph_client.clone(),
+            }),
+            Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
+            Box::new(BlockedByHydrator::new(socialgraph_client).await),
+            Box::new(FilteredTopicsHydrator::new(strato_client.clone())),
+            Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
             Box::new(LanguageCodeHydrator::new(tes_client.clone()).await),
             Box::new(EngagementCountsHydrator::new(engagement_counts_client).await),
+            Box::new(SemanticIdHydrator::new(sid_client.clone())),
             Box::new(PostEngagersHydrator::new(post_engagers_client)),
-            Box::new(SemanticIdHydrator::new(sid_client)),
             Box::new(NewUserSoftNsfwLabelHydrator {
                 client: vf_safety_labels_client.clone(),
             }),
+            Box::new(InNetworkCandidateHydrator),
         ];
 
         let author_rules = Arc::new(xai_feature_switches::AuthorRulesEvaluator::new(
@@ -461,6 +459,7 @@ impl PhoenixCandidatePipeline {
             dispatch: crate::util::egress::PredictionDispatch {
                 client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                uncompressed_clusters_key: "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
             },
         });
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
@@ -476,6 +475,7 @@ impl PhoenixCandidatePipeline {
             dispatch: crate::util::egress::PredictionDispatch {
                 client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                uncompressed_clusters_key: "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
             },
         });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
@@ -504,9 +504,7 @@ impl PhoenixCandidatePipeline {
             Box::new(TopicFeedbackContextHydrator {
                 strato_client: strato_client.clone(),
             }),
-            Box::new(AiTrendFeedbackContextHydrator {
-                strato_client: strato_client.clone(),
-            }),
+            Box::new(AiTrendFeedbackContextHydrator::new(strato_client.clone())),
             Box::new(VideoMediaHydrator::new(tes_client.clone())),
             Box::new(VideoEmbeddingHydrator::new(post_v8_search_embedding_client)),
             Box::new(AncestorVideoHydrator {
@@ -537,7 +535,7 @@ impl PhoenixCandidatePipeline {
                 )),
                 Box::new(RedisPostCandidateCacheSideEffect::new(redis_client)),
                 Box::new(ScoredStatsSideEffect),
-                Box::new(ResponseDiversityStatsSideEffect),
+                Box::new(ResponseDiversityStatsSideEffect { sid_client }),
                 Box::new(SerendipityStatsSideEffect),
                 Box::new(AuthorServedMetricsSideEffect { popular_authors }),
                 Box::new(MutualFollowStatsSideEffect),

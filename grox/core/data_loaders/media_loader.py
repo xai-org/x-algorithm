@@ -105,13 +105,18 @@ class MediaLoader:
         return image_count >= 2 and video_count == 0
 
     @classmethod
-    async def hydrate_screenshot(cls, post: Post) -> None:
+    async def hydrate_screenshot(cls, post: Post, v2: bool = False) -> None:
         if not post.screenshot or not post.screenshot.convo_image:
             Metrics.counter("media_loader.hydrate_screenshot.count").add(
                 1, attributes=cls._metrics_attributes()
             )
             try:
-                screenshot_bytes = await cls.tweet_render.take_screenshot(post.id)
+                if v2:
+                    screenshot_bytes = await cls.tweet_render.take_screenshot_v2(
+                        post.id
+                    )
+                else:
+                    screenshot_bytes = await cls.tweet_render.take_screenshot(post.id)
                 if screenshot_bytes:
                     resized = resize_tile(
                         screenshot_bytes,
@@ -168,14 +173,17 @@ class MediaLoader:
         await asyncio.gather(*media_tasks)
 
         if (
-            (
+            grox_config.media_hydration.enable_screenshot
+            and (
                 cls.post_media_is_screenshot_target(post)
                 or cls.post_media_is_screenshot_target(post.quoted_post)
             )
             and not post.ancestors
             and is_high_fav
         ):
-            await cls.hydrate_screenshot(post)
+            await cls.hydrate_screenshot(
+                post, v2=grox_config.media_hydration.enable_screenshot_v2
+            )
 
     @classmethod
     def ranked_posts_associated(cls, post: Post) -> list[Post]:
@@ -313,7 +321,11 @@ class MediaLoader:
                         post.chat_group_metadata.group_avatar, False, False
                     )
                 )
-        if is_main_post and is_high_fav:
+        if (
+            grox_config.media_hydration.enable_url_videos
+            and is_main_post
+            and is_high_fav
+        ):
             video_urls = cls._extract_video_urls(post)
             if video_urls:
                 post.url_videos = [Video(url=url) for url in video_urls]

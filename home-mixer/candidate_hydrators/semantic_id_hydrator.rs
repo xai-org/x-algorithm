@@ -7,11 +7,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::async_trait;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::clients::SidClient;
 use xai_candidate_pipeline::component_library::utils::{
     build_moka_cache, MokaCache, MokaCacheConfig,
 };
-use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 
 const CACHE_SIZE: u64 = 1_000_000;
 const CACHE_TTL: Duration = Duration::from_secs(7200);
@@ -38,9 +39,8 @@ impl SemanticIdHydrator {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SemanticIdHydrator {
-    type CacheKey = (u64, u64);
-    type CacheValue = Vec<i32>;
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for SemanticIdHydrator {
+    type Fetched = Vec<Option<Vec<i32>>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
@@ -48,40 +48,66 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SemanticIdHydrator {
             && !query.params.get(SidServerEndpoint).is_empty()
     }
 
-    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
+    async fn fetch(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Result<Vec<Option<Vec<i32>>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
+
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<Vec<i32>>>, String> {
+        self.fetch_cached(query, candidates, stage).await
+    }
+
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        values: Vec<Option<Vec<i32>>>,
+    ) {
+        for (candidate, value) in candidates.iter_mut().zip(values) {
+            if let Some(value) = value {
+                candidate.semantic_ids = Some(value);
+            }
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+        candidate.semantic_ids = hydrated.semantic_ids;
+    }
+}
+
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for SemanticIdHydrator {
+    type CacheKey = (u64, u64);
+    type Value = Vec<i32>;
+
+    fn cache_store(&self) -> &dyn CacheStore<(u64, u64), Vec<i32>> {
         &self.cache
     }
 
-    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
-        (candidate.get_original_tweet_id(), 0)
-    }
-
-    fn cache_key_for(&self, query: &ScoredPostsQuery, candidate: &PostCandidate) -> Self::CacheKey {
+    fn cache_key(&self, query: &ScoredPostsQuery, candidate: &PostCandidate) -> (u64, u64) {
         (
             candidate.get_original_tweet_id(),
             endpoint_hash(&query.params.get(SidServerEndpoint)),
         )
     }
 
-    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        hydrated.semantic_ids.clone().unwrap_or_default()
-    }
-
-    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        PostCandidate {
-            semantic_ids: Some(value),
-            ..Default::default()
-        }
-    }
-
-    async fn hydrate_from_client(
+    async fn fetch_values(
         &self,
         query: &ScoredPostsQuery,
-        candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<Vec<i32>>> {
         let endpoint = query.params.get(SidServerEndpoint);
 
-        let mut unique_ids: Vec<i64> = candidates
+        let mut unique_ids: Vec<i64> = misses
             .iter()
             .map(|c| c.get_original_tweet_id() as i64)
             .collect();
@@ -89,31 +115,20 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for SemanticIdHydrator {
         unique_ids.dedup();
 
         let Some(looked_up) = self.client.lookup(&endpoint, &unique_ids).await else {
-            return vec![Err("SID lookup failed".to_string()); candidates.len()];
+            return vec![None; misses.len()];
         };
 
         let codes_by_id: HashMap<i64, Option<Vec<i32>>> =
             unique_ids.into_iter().zip(looked_up).collect();
 
-        candidates
+        misses
             .iter()
             .map(|candidate| {
-                match codes_by_id
+                codes_by_id
                     .get(&(candidate.get_original_tweet_id() as i64))
                     .cloned()
                     .flatten()
-                {
-                    Some(codes) => Ok(PostCandidate {
-                        semantic_ids: Some(codes),
-                        ..Default::default()
-                    }),
-                    None => Err("no SID codes".to_string()),
-                }
             })
             .collect()
-    }
-
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        candidate.semantic_ids = hydrated.semantic_ids;
     }
 }

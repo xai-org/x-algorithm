@@ -961,7 +961,7 @@ mod tests {
         let labels = FakeLabels::default()
             .cached(post.post.tweet_id, captured)
             .into_source()
-            .get(&[post.post.tweet_id])
+            .get(&[post.post.tweet_id], None)
             .await
             .remove(&post.post.tweet_id)
             .and_then(Result::ok)

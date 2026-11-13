@@ -1,58 +1,76 @@
 use crate::filters::topic_ids_filter::TopicFilteringOverrideMap;
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::candidate_features::{FilteredTopicsByExperiment, TopicFilteringExperiment};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{TopicFilteringId, TopicFilteringOverrides};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::async_trait;
 use tracing::warn;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
-use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
+use xai_candidate_pipeline::component_library::utils::{build_moka_cache_value_ttl, MokaCache};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 use xai_strato::{decode, Bytes, StratoResult, StratoValue};
 
-fn decode_topics_pair(
-    result: &Result<Bytes, Box<dyn std::error::Error>>,
-    experiment: TopicFilteringExperiment,
-    need_unfiltered: bool,
-) -> (Option<Vec<i64>>, Option<Vec<i64>>) {
+const CACHE_SIZE: u64 = 1_000_000;
+const ANNOTATED_TTL: Duration = Duration::from_secs(30 * 60);
+const UNANNOTATED_TTL: Duration = Duration::from_secs(30);
+
+type Topics = Option<Arc<FilteredTopicsByExperiment>>;
+
+fn decode_topics(result: &Result<Bytes, Box<dyn std::error::Error>>) -> Option<Topics> {
     match result {
         Ok(bytes) if !bytes.is_empty() => {
             let decoded: StratoResult<StratoValue<FilteredTopicsByExperiment>> = decode(bytes);
             match decoded {
-                StratoResult::Ok(v) => {
-                    let ft = v.v;
-                    let exp_topics = ft
-                        .as_ref()
-                        .and_then(|ft| ft.topic_ids_for_experiment(experiment).cloned());
-                    let unf_topics = if need_unfiltered {
-                        ft.as_ref().and_then(|ft| {
-                            ft.topic_ids_for_experiment(TopicFilteringExperiment::Unfiltered)
-                                .cloned()
-                        })
-                    } else {
-                        None
-                    };
-                    (exp_topics, unf_topics)
-                }
-                StratoResult::Err(_) => (None, None),
+                StratoResult::Ok(v) => Some(v.v.map(Arc::new)),
+                StratoResult::Err(_) => None,
             }
         }
-        Ok(_) => (None, None),
+        Ok(_) => Some(None),
         Err(e) => {
             warn!("FilteredTopicsHydrator: strato fetch error: {}", e);
-            (None, None)
+            None
         }
     }
 }
 
+fn topics_ttl(topics: &Topics) -> Duration {
+    if topics.is_some() {
+        ANNOTATED_TTL
+    } else {
+        UNANNOTATED_TTL
+    }
+}
+
+fn experiment(query: &ScoredPostsQuery) -> TopicFilteringExperiment {
+    if query.is_bulk_topic_request() || query.has_excluded_topics() {
+        return TopicFilteringExperiment::Unfiltered;
+    }
+    let default_experiment = TopicFilteringExperiment::parse(&query.params.get(TopicFilteringId));
+    let override_map = TopicFilteringOverrideMap::parse(&query.params.get(TopicFilteringOverrides));
+    override_map.resolve(&query.topic_ids, default_experiment)
+}
+
 pub struct FilteredTopicsHydrator {
     pub strato_client: Arc<dyn StratoClient + Send + Sync>,
+    cache: MokaCache<u64, Topics>,
+}
+
+impl FilteredTopicsHydrator {
+    pub fn new(strato_client: Arc<dyn StratoClient + Send + Sync>) -> Self {
+        Self {
+            strato_client,
+            cache: build_moka_cache_value_ttl(CACHE_SIZE, topics_ttl),
+        }
+    }
 }
 
 #[async_trait]
 impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
-    type Fetched = Vec<TopicIds>;
+    type Fetched = Vec<Option<Topics>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.is_topic_request() || query.has_excluded_topics()
@@ -62,78 +80,43 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrato
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<TopicIds>, String> {
-        let experiment = if query.is_bulk_topic_request() || query.has_excluded_topics() {
-            TopicFilteringExperiment::Unfiltered
-        } else {
-            let default_experiment =
-                TopicFilteringExperiment::parse(&query.params.get(TopicFilteringId));
-            let override_map =
-                TopicFilteringOverrideMap::parse(&query.params.get(TopicFilteringOverrides));
-            override_map.resolve(&query.topic_ids, default_experiment)
-        };
+    ) -> Result<Vec<Option<Topics>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
 
-        let client = &self.strato_client;
-        let need_unfiltered = experiment != TopicFilteringExperiment::Unfiltered;
-
-        let mut all_ids: Vec<u64> = candidates.iter().map(|c| c.tweet_id).collect();
-        let retweet_offset = all_ids.len();
-        for c in candidates {
-            if let Some(rt_id) = c.retweeted_tweet_id {
-                all_ids.push(rt_id);
-            }
-        }
-
-        let all_results = client
-            .batch_get_filtered_topics_by_experiment(&all_ids)
-            .await;
-
-        let mut retweet_topics: HashMap<u64, Vec<i64>> = HashMap::new();
-        let mut retweet_unfiltered: HashMap<u64, Vec<i64>> = HashMap::new();
-        let mut rt_idx = retweet_offset;
-        for c in candidates {
-            if let Some(rt_id) = c.retweeted_tweet_id {
-                let (exp, unf) =
-                    decode_topics_pair(&all_results[rt_idx], experiment, need_unfiltered);
-                if let Some(topics) = exp {
-                    retweet_topics.insert(rt_id, topics);
-                }
-                if let Some(topics) = unf {
-                    retweet_unfiltered.insert(rt_id, topics);
-                }
-                rt_idx += 1;
-            }
-        }
-
-        Ok(candidates
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let (filtered, unfiltered) = if let Some(rt_id) = c.retweeted_tweet_id {
-                    (
-                        retweet_topics.get(&rt_id).cloned(),
-                        retweet_unfiltered.get(&rt_id).cloned(),
-                    )
-                } else {
-                    decode_topics_pair(&all_results[i], experiment, need_unfiltered)
-                };
-                TopicIds {
-                    filtered,
-                    unfiltered,
-                }
-            })
-            .collect())
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<Topics>>, String> {
+        self.fetch_cached(query, candidates, stage).await
     }
 
     fn apply(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: &mut [PostCandidate],
-        topic_ids: Vec<TopicIds>,
+        values: Vec<Option<Topics>>,
     ) {
-        for (candidate, topic_ids) in candidates.iter_mut().zip(topic_ids) {
-            candidate.filtered_topic_ids = topic_ids.filtered;
-            candidate.unfiltered_topic_ids = topic_ids.unfiltered;
+        let experiment = experiment(query);
+        let need_unfiltered = experiment != TopicFilteringExperiment::Unfiltered;
+        for (candidate, topics) in candidates.iter_mut().zip(values) {
+            let Some(topics) = topics else {
+                continue;
+            };
+            let topic_ids = |experiment| {
+                topics
+                    .as_ref()
+                    .and_then(|topics| topics.topic_ids_for_experiment(experiment).cloned())
+            };
+            candidate.filtered_topic_ids = topic_ids(experiment);
+            candidate.unfiltered_topic_ids = if need_unfiltered {
+                topic_ids(TopicFilteringExperiment::Unfiltered)
+            } else {
+                None
+            };
         }
     }
 
@@ -143,7 +126,82 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrato
     }
 }
 
-pub struct TopicIds {
-    filtered: Option<Vec<i64>>,
-    unfiltered: Option<Vec<i64>>,
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for FilteredTopicsHydrator {
+    type CacheKey = u64;
+    type Value = Topics;
+
+    fn cache_store(&self) -> &dyn CacheStore<u64, Topics> {
+        &self.cache
+    }
+
+    fn cache_key(&self, _query: &ScoredPostsQuery, candidate: &PostCandidate) -> u64 {
+        candidate.get_original_tweet_id()
+    }
+
+    async fn fetch_values(
+        &self,
+        _query: &ScoredPostsQuery,
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<Topics>> {
+        let mut post_ids: Vec<u64> = misses.iter().map(|c| c.get_original_tweet_id()).collect();
+        post_ids.sort_unstable();
+        post_ids.dedup();
+
+        let results = self
+            .strato_client
+            .batch_get_filtered_topics_by_experiment(&post_ids)
+            .await;
+        let topics_by_id: HashMap<u64, Option<Topics>> = post_ids
+            .into_iter()
+            .zip(results.iter().map(decode_topics))
+            .collect();
+
+        misses
+            .iter()
+            .map(|c| {
+                topics_by_id
+                    .get(&c.get_original_tweet_id())
+                    .cloned()
+                    .flatten()
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use xai_candidate_pipeline::component_library::clients::MockStratoClient;
+
+    #[tokio::test]
+    async fn unannotated_posts_are_looked_up_once_per_original_and_then_cached() {
+        let strato = Arc::new(MockStratoClient::default());
+        let hydrator = FilteredTopicsHydrator::new(strato.clone());
+        let query = ScoredPostsQuery::default();
+        let candidates = vec![
+            PostCandidate {
+                tweet_id: 1,
+                ..Default::default()
+            },
+            PostCandidate {
+                tweet_id: 1,
+                ..Default::default()
+            },
+            PostCandidate {
+                tweet_id: 2,
+                retweeted_tweet_id: Some(1),
+                ..Default::default()
+            },
+        ];
+
+        for _ in 0..2 {
+            let mut hydrated = candidates.clone();
+            let fetched = hydrator.fetch(&query, &hydrated).await.unwrap();
+            hydrator.apply(&query, &mut hydrated, fetched);
+            assert!(hydrated.iter().all(|c| c.filtered_topic_ids.is_none()));
+        }
+        assert_eq!(strato.call_count.load(Ordering::SeqCst), 1);
+    }
 }

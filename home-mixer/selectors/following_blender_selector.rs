@@ -2,8 +2,8 @@ use super::build_non_selected;
 use crate::ads::{AdsBlender, FollowingAdBlender};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS, PROMPTS_POSITION,
-    WHO_TO_FOLLOW_POSITION,
+    AdsFollowingMinPosts, FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS,
+    PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
 };
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 use xai_home_mixer_proto::{feed_item, FeedItem, Prompt, ScoredPost, WhoToFollowModule};
@@ -35,6 +35,7 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
 
         let blender = FollowingAdBlender {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
+            min_posts: query.params.get(AdsFollowingMinPosts) as usize,
         };
         let mut drops = Vec::new();
         let mut blended = blender.blend(posts, ads, &mut drops);

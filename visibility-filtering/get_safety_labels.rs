@@ -6,6 +6,7 @@ use prost::encoding::{hash_map, message, uint64};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::time::Instant;
 use tonic::codec::{Codec, EncodeBuf, Encoder};
 use tonic::{Request, Response, Status};
 use tonic_prost::ProstDecoder;
@@ -34,7 +35,9 @@ impl GetSafetyLabelsEndpoint {
             crate::metrics::Endpoint::GetSafetyLabels,
             crate::metrics::RequestLevel::Absent,
             request,
-            |request, _, request_metrics| self.handle_inner(request, request_metrics),
+            |request, context, request_metrics| {
+                self.handle_inner(request, context.deadline, request_metrics)
+            },
         )
         .await
     }
@@ -42,6 +45,7 @@ impl GetSafetyLabelsEndpoint {
     async fn handle_inner(
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
+        deadline: Option<Instant>,
         request_metrics: crate::metrics::RequestMetrics,
     ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
         let req = request.into_inner();
@@ -55,7 +59,7 @@ impl GetSafetyLabelsEndpoint {
         crate::metrics::record_batch_size(&request_metrics, unique_ids.len());
         let metrics = request_metrics.plain();
 
-        let resolved = self.safety_label_source.get(&unique_ids).await;
+        let resolved = self.safety_label_source.get(&unique_ids, deadline).await;
         let (response, failure_counts) =
             CachedGetSafetyLabelsResponse::try_from_resolved(resolved, unique_ids.len())?;
 
@@ -174,7 +178,9 @@ impl Encoder for GetSafetyLabelsCodec {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::time::Duration;
     use tonic::Code;
+    use xai_safety_label_source::testing::FakeLabels;
 
     fn labels_with_entry(type_id: i32) -> vf_pb::SafetyLabelMap {
         vf_pb::SafetyLabelMap {
@@ -291,6 +297,42 @@ mod tests {
             .encode(&mut cached_bytes);
             assert_eq!(cached_bytes, generated_bytes, "{name}");
         }
+    }
+
+    async fn handle_with_100ms_timeout(
+        labels: FakeLabels,
+        tweet_ids: Vec<u64>,
+    ) -> CachedGetSafetyLabelsResponse {
+        let endpoint =
+            GetSafetyLabelsEndpoint::new(Arc::new(labels.into_source()), Metrics::none());
+        let mut request = Request::new(vf_pb::GetSafetyLabelsRequest { tweet_ids });
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", "100m".parse().unwrap());
+        tokio::time::timeout(Duration::from_millis(100), endpoint.handle(request))
+            .await
+            .expect("answered before the caller gave up")
+            .unwrap()
+            .into_inner()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_by_the_callers_deadline_failing_only_posts_manhattan_still_owes() {
+        let labels = FakeLabels::default().not_found(1).hanging(2);
+
+        let response = handle_with_100ms_timeout(labels, vec![1, 2]).await;
+
+        assert_eq!(response.results.keys().collect::<Vec<_>>(), [&1]);
+        assert_eq!(response.failed_ids, vec![2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_by_the_callers_deadline_when_twemcache_hangs() {
+        let response =
+            handle_with_100ms_timeout(FakeLabels::default().cache_hanging(1), vec![1]).await;
+
+        assert!(response.results.is_empty());
+        assert_eq!(response.failed_ids, vec![1]);
     }
 
     #[test]

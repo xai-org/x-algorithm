@@ -587,10 +587,8 @@ async fn each_level_72_user_kind_judges_its_actor_as_an_accepted_follow_request(
 #[tokio::test]
 async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_s() {
     const FAILED_POST: u64 = 105;
-    const RECIPIENT_REPOST: u64 = 106;
     let sources = world()
         .tweet(POST, ACTOR)
-        .retweet(RECIPIENT_REPOST, RECIPIENT, POST, Some(ACTOR))
         .tweet(FAILED_POST, RECIPIENT)
         .fail_key(Source::TesPureCoreData, FAILED_POST);
     let (seen, sources) = filter(
@@ -606,8 +604,6 @@ async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_
             like(SUSPENDED_ACTOR, FAILED_POST),
             accepted(ACTOR),
             repost(OTHER_ACTOR, RECIPIENT_POST),
-            like(ACTOR, RECIPIENT_REPOST),
-            repost(SUSPENDED_ACTOR, RECIPIENT_REPOST),
         ],
     )
     .await;
@@ -619,22 +615,14 @@ async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_
             Seen::Dropped(DropReason::PostNotFound),
             Seen::Dropped(DropReason::PostNotFound),
             Seen::Failed,
-            Seen::Failed,
-            Seen::Allowed,
-            Seen::Allowed,
-            Seen::Allowed,
             Seen::Dropped(DropReason::ActorSuspended),
+            Seen::Allowed,
+            Seen::Allowed,
         ])
     );
     assert_eq!(
         sources.keys(Source::TesPureCoreData),
-        [vec![
-            POST,
-            RECIPIENT_POST,
-            FAILED_POST,
-            RECIPIENT_REPOST,
-            MISSING_POST
-        ]]
+        [vec![POST, RECIPIENT_POST, FAILED_POST, MISSING_POST]]
     );
     for unasked in [
         Source::TesTweetForVisibility,
@@ -643,6 +631,96 @@ async fn a_like_or_a_repost_drops_when_its_post_is_missing_or_not_the_recipient_
     ] {
         assert!(!sources.calls().contains(&unasked), "{unasked:?}");
     }
+}
+
+#[tokio::test]
+async fn a_like_or_a_repost_of_the_recipient_s_repost_drops_when_level_79_withholds_its_source() {
+    use crate::models::SafetyLabelType;
+    use std::collections::HashMap;
+    const SPAM_POST: u64 = 107;
+    const OWN_SPAM_POST: u64 = 108;
+    const FAILED_POST: u64 = 109;
+    const REPOST_OF_POST: u64 = 110;
+    const REPOST_OF_SPAM: u64 = 111;
+    const REPOST_OF_OWN_SPAM: u64 = 112;
+    const REPOST_OF_MISSING: u64 = 113;
+    const REPOST_OF_FAILED: u64 = 114;
+    const AUTHORLESS_POST: u64 = 115;
+    const REPOST_OF_AUTHORLESS: u64 = 116;
+    let spam = || vf_pb::SafetyLabelMap {
+        labels: HashMap::from([(
+            SafetyLabelType::SPAM_HIGH_RECALL.0,
+            vf_pb::SafetyLabel::default(),
+        )]),
+    };
+    let sources = world()
+        .authors(&[RECIPIENT])
+        .tweet(POST, ACTOR)
+        .tweet(SPAM_POST, OTHER_ACTOR)
+        .labels(SPAM_POST, spam())
+        .tweet(OWN_SPAM_POST, RECIPIENT)
+        .labels(OWN_SPAM_POST, spam())
+        .tweet(FAILED_POST, OTHER_ACTOR)
+        .fail_key(Source::SafetyLabels, FAILED_POST)
+        .retweet(REPOST_OF_POST, RECIPIENT, POST, Some(ACTOR))
+        .retweet(REPOST_OF_SPAM, RECIPIENT, SPAM_POST, Some(OTHER_ACTOR))
+        .retweet(
+            REPOST_OF_OWN_SPAM,
+            RECIPIENT,
+            OWN_SPAM_POST,
+            Some(RECIPIENT),
+        )
+        .retweet(REPOST_OF_MISSING, RECIPIENT, MISSING_POST, Some(ACTOR))
+        .retweet(REPOST_OF_FAILED, RECIPIENT, FAILED_POST, Some(OTHER_ACTOR))
+        .tweet(AUTHORLESS_POST, MISSING_ACTOR)
+        .retweet(
+            REPOST_OF_AUTHORLESS,
+            RECIPIENT,
+            AUTHORLESS_POST,
+            Some(MISSING_ACTOR),
+        );
+    let (seen, sources) = filter(
+        sources,
+        FOLLOW_REQUEST_ACCEPTED,
+        RECIPIENT,
+        vec![
+            like(ACTOR, REPOST_OF_POST),
+            repost(SUSPENDED_ACTOR, REPOST_OF_POST),
+            like(ACTOR, REPOST_OF_SPAM),
+            repost(SUSPENDED_ACTOR, REPOST_OF_SPAM),
+            like(ACTOR, REPOST_OF_OWN_SPAM),
+            like(ACTOR, REPOST_OF_MISSING),
+            like(ACTOR, REPOST_OF_FAILED),
+            repost(SUSPENDED_ACTOR, REPOST_OF_FAILED),
+            like(ACTOR, REPOST_OF_AUTHORLESS),
+        ],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        Ok(vec![
+            Seen::Allowed,
+            Seen::Dropped(DropReason::ActorSuspended),
+            Seen::Dropped(DropReason::Unspecified),
+            Seen::Dropped(DropReason::Unspecified),
+            Seen::Allowed,
+            Seen::Dropped(DropReason::PostNotFound),
+            Seen::Failed,
+            Seen::Dropped(DropReason::ActorSuspended),
+            Seen::Dropped(DropReason::PostNotFound),
+        ])
+    );
+    assert_eq!(
+        sources.keys(Source::SafetyLabels),
+        [vec![
+            POST,
+            SPAM_POST,
+            OWN_SPAM_POST,
+            FAILED_POST,
+            AUTHORLESS_POST,
+            MISSING_POST
+        ]]
+    );
 }
 
 #[tokio::test]

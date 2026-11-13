@@ -145,10 +145,6 @@ pub(crate) struct Serving {
     pub(crate) metrics: Metrics,
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
 pub(crate) async fn serving(
     datacenter: &str,
     metadata: Option<&MetadataMap>,
@@ -174,29 +170,13 @@ pub(crate) async fn serving(
         tweets: tweet_cache_capacity.map(tweet_fallback_cache),
         authors: author_cache_capacity.map(author_fallback_cache),
     };
-    let mut switch_files =
-        crate::params::SwitchFiles::beside(&crate::config::fs_path(), experiments);
-    let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
-        switch_files
-            .load(&metrics)
-            .expect("files that each built an engine build one together"),
-    ));
-    let country_lists = Arc::new(CountryLists::starting_at_default());
-    country_lists.refresh(&feature_switches.load());
-    safety_label_source.set_label_cache_switches(
-        xai_safety_label_source::LabelCacheSwitches::from_feature_switches(
-            &feature_switches.load(),
-        ),
-    );
-    let client_switches = ClientSwitches::new(Arc::clone(&feature_switches), limited_actions_copy);
-    crate::params::spawn_refresh(
-        switch_files,
-        feature_switches,
-        Arc::clone(&country_lists),
+    let (feature_switches, country_lists) = crate::params::serve(
+        crate::params::SwitchFiles::beside(&crate::config::fs_path(), experiments),
         Arc::clone(&safety_label_source),
         copy_drift,
         metrics.clone(),
     );
+    let client_switches = ClientSwitches::new(feature_switches, limited_actions_copy);
     Serving {
         init_deadline,
         sources,

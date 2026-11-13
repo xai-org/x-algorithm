@@ -61,6 +61,8 @@ _bridge_o2_env()
 
 _SID_SNAPSHOTS = "post_sid_v8_256x6_snapshots"
 
+_AI_VIDEO_MODEL_DIR = Path(settings.AI_VIDEO_MODEL_DIR)
+
 
 def _sid_window(filename: str) -> tuple[str, str]:
     return (
@@ -329,6 +331,10 @@ class RetrievalDataset(Enum):
     AI_VIDEO_DETECTED_1DAY = (23, *_sid_window("ai_video_detected_1day.parquet"))
     AI_VIDEO_DETECTED_2DAY = (24, *_sid_window("ai_video_detected_2day.parquet"))
     AI_VIDEO_DETECTED_7DAY = (25, *_sid_window("ai_video_detected_7day.parquet"))
+    AI_VIDEO_MODEL_1DAY = (26, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_1day.parquet"), None)
+    AI_VIDEO_MODEL_2DAY = (27, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_2day.parquet"), None)
+    AI_VIDEO_MODEL_7DAY = (28, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_7day.parquet"), None)
+    AI_VIDEO_MODEL_14DAY = (29, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_14day.parquet"), None)
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)

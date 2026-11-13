@@ -72,6 +72,14 @@ fn join_audit_info(mut additional_info: Vec<String>) -> String {
     additional_info.join("; ")
 }
 
+fn post_label_source(head: &str) -> String {
+    if head.is_empty() {
+        PLUGIN_ID.to_owned()
+    } else {
+        format!("{PLUGIN_ID}/{head}")
+    }
+}
+
 fn compute_expires_at_msec(ttl_msec: i64) -> i64 {
     let now_msec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -162,7 +170,8 @@ pub enum EnforcementAction {
                                                 AddPostLabelsV2 {
         tweet_id: i64,
         labels: Vec<String>,
-                                        expires_at_msec: Option<i64>,
+                                expires_at_msec: Option<i64>,
+                        source: String,
                         audit_note: String,
     },
                                     BounceArkose { user_id: i64, audit_note: String },
@@ -203,12 +212,14 @@ impl EnforcementAction {
         tweet_id: i64,
         labels: Vec<String>,
         ttl_msec: Option<i64>,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         Self::AddPostLabelsV2 {
             tweet_id,
             labels,
             expires_at_msec: ttl_msec.map(compute_expires_at_msec),
+            source: post_label_source(head),
             audit_note: join_audit_info(additional_info),
         }
     }
@@ -234,10 +245,11 @@ impl EnforcementAction {
         }
     }
 
-                                                                    pub fn from_spec(
+                                                                        pub fn from_spec(
         spec: &ActionSpec,
         entity_id: i64,
         user_id: i64,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         match spec {
@@ -248,7 +260,7 @@ impl EnforcementAction {
                 Self::add_user_label(user_id, labels.clone(), *ttl_msec, additional_info)
             }
             ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {
-                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, additional_info)
+                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, head, additional_info)
             }
             ActionSpec::Arkose => Self::bounce_arkose(user_id, additional_info),
             ActionSpec::Captcha => Self::bounce_captcha(user_id, additional_info),
@@ -377,6 +389,7 @@ impl EnforcementAction {
                 tweet_id,
                 labels,
                 expires_at_msec,
+                source,
                 ..
             } => {
                 let tweet_entity = json!({
@@ -386,8 +399,10 @@ impl EnforcementAction {
                     }
                 });
                 let safety_label = match expires_at_msec {
-                    Some(expires_at_msec) => json!({"expiresAtMsec": expires_at_msec}),
-                    None => json!({}),
+                    Some(expires_at_msec) => {
+                        json!({"source": source, "expiresAtMsec": expires_at_msec})
+                    }
+                    None => json!({"source": source}),
                 };
                 let labels_json: Vec<Value> = labels
                     .iter()
@@ -4169,6 +4184,7 @@ mod tests {
                 2,
                 vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
                 Some(LABEL_EXPIRY_MSEC),
+                "",
                 vec![],
             ),
             EnforcementAction::bounce_arkose(1, vec!["n".to_owned()]),
@@ -4427,7 +4443,7 @@ mod tests {
             perm: true,
             policy: "TestPolicy".into(),
         };
-        let action = EnforcementAction::from_spec(&suspend, 1, 1, vec!["k: v".into()]);
+        let action = EnforcementAction::from_spec(&suspend, 1, 1, "", vec!["k: v".into()]);
         let v = action.to_json();
         assert_eq!(v["suspendUser"]["perm"], true);
         assert_eq!(v["suspendUser"]["policy"], "TestPolicy");
@@ -4436,7 +4452,7 @@ mod tests {
             labels: vec!["LowQualityReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&label, 2, 2, vec![]);
+        let action = EnforcementAction::from_spec(&label, 2, 2, "", vec![]);
         let v = action.to_json();
         let label_id_type = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["labelReference"]["labelIdType"];
@@ -4446,20 +4462,20 @@ mod tests {
             labels: vec!["RiskyHighVizReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&post_label, 555, 999, vec![]);
+        let action = EnforcementAction::from_spec(&post_label, 555, 999, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::AddPostLabelsV2 { tweet_id: 555, .. }
         ));
         assert_eq!(action.name(), "addPostLabelsV2");
 
-        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, vec![]);
+        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, "", vec![]);
         assert!(matches!(
             arkose,
             EnforcementAction::BounceArkose { user_id: 3, .. }
         ));
         assert_eq!(arkose.name(), "bounceArkose");
-        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, vec![]);
+        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, "", vec![]);
         assert!(matches!(
             captcha,
             EnforcementAction::BounceCaptcha { user_id: 4, .. }
@@ -4473,6 +4489,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec!["model_version: v51".to_owned()],
         );
         assert_eq!(action.name(), "addPostLabelsV2");
@@ -4507,14 +4524,95 @@ mod tests {
     }
 
     #[test]
-    fn add_post_label_without_ttl_emits_empty_safety_label() {
+    fn add_post_label_without_ttl_emits_no_expiry() {
         let action =
-            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, vec![]);
+            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, "", vec![]);
         let v = action.to_json();
         let safety_label = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["safetyLabel"];
-        assert_eq!(*safety_label, json!({}));
+        assert_eq!(*safety_label, json!({"source": PLUGIN_ID}));
         assert!(safety_label["expiresAtMsec"].is_null());
+    }
+
+    #[test]
+    fn post_label_request_names_the_head_in_label_source() {
+        let t = xai_abuse_thrift_codec::Transcoder::from_schema_bytes(
+            xai_abuse_thrift_codec::SCHEMA_AIS,
+        )
+        .unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        for (label, head) in [
+            ("NsfwHighPrecision", "AdultExplicitEmbeddingPtosDistilled"),
+            ("SpamHighRecall", "CopyLinkBaitEmbeddingGrokDistilled"),
+        ] {
+            let action = EnforcementAction::from_spec(
+                &ActionSpec::AddPostLabelsV2 {
+                    labels: vec![label.into()],
+                    ttl_msec: None,
+                },
+                555,
+                999,
+                head,
+                vec!["k: v".into()],
+            );
+            let payload = build_intake_request(
+                action.actor_header(),
+                action.to_json(),
+                AIS_TOOL,
+                Some(action.audit_note()),
+            );
+            let source = format!("xai-abuse-enforcement-service/{head}");
+            let tweet = json!({"entity": {"entityType": "Tweet", "entityId": {"longId": 555}}});
+            assert_eq!(
+                payload,
+                json!({
+                    "actorHeader": {"botmakerBot": {"botId": 0}},
+                    "action": {
+                        "addLabelsV2": {
+                            "entityId": tweet,
+                            "entityRef": tweet,
+                            "labels": [{
+                                "nonPolicyBasedLabel": {
+                                    "label": {
+                                        "labelReferenceWithSafetyLabel": {
+                                            "labelReference": {
+                                                "entityType": "Tweet",
+                                                "labelIdType": {"safetyTweetLabels": label},
+                                                "labelType": "Safety"
+                                            },
+                                            "safetyLabel": {"source": source}
+                                        }
+                                    }
+                                }
+                            }],
+                            "violatingUserIds": []
+                        }
+                    },
+                    "tool": "RtpPlugin",
+                    "auditHeader": {"note": format!("k: v; {}", AUDIT_NOTE.as_str())}
+                })
+            );
+            let bytes = encode(&payload).expect("encodes through the AIS schema");
+            assert!(
+                bytes.windows(source.len()).any(|w| w == source.as_bytes()),
+                "{source} missing from the encoded call"
+            );
+        }
     }
 
     #[test]
@@ -4529,6 +4627,7 @@ mod tests {
             99,
             vec!["RiskyHighVizReply".into()],
             Some(LABEL_EXPIRY_MSEC),
+            "",
             vec![],
         );
         let plugin_b = EnforcementAction::bounce_captcha(1, vec![]);
@@ -4568,6 +4667,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec![],
         );
         assert_eq!(
@@ -4617,6 +4717,7 @@ mod tests {
             },
             9,
             9,
+            "",
             vec!["head: AdsRenderBot".into()],
         );
         assert_eq!(
@@ -4704,7 +4805,7 @@ mod tests {
 
     #[test]
     fn from_spec_builds_spam_liveness_check() {
-        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, vec![]);
+        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::SpamLivenessCheck { user_id: 9, .. }

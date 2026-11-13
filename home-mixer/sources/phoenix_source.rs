@@ -6,6 +6,7 @@ use crate::params::{
     PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
     PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,
 };
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
     retrieval_value_model_weights,
@@ -119,8 +120,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let client_context = build_client_context(query);
         let user_context = build_user_context(query);
 
-        let response = self
-            .phoenix_retrieval_client
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
             .retrieve_excluding(
                 cluster,
                 user_id,

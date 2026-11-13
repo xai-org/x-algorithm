@@ -47,6 +47,10 @@ OBJECT_STORE_ENDPOINT: str = os.environ.get(
 OBJECT_STORE_CREDENTIALS_DIR: str = os.environ.get(
     "XREX_OBJECT_STORE_CREDENTIALS_DIR", ".credentials/object_store"
 )
+
+DATASET_OBJECT_STORE_ENDPOINT: str = os.environ.get(
+    "XREX_DATASET_OBJECT_STORE_ENDPOINT", "http://object-store.example.invalid"
+)
 GCS_CREDENTIALS_DIR: str = os.environ.get("XREX_GCS_CREDENTIALS_DIR", ".credentials/gcs")
 
 GCS_MIRROR_BUCKET: str = os.environ.get("XREX_GCS_MIRROR_BUCKET", "")
@@ -55,6 +59,8 @@ GCS_MIRROR_PREFIX: str = os.environ.get("GCS_PREFIX", "")
 O2_ENV_PREFIX: str = os.environ.get("XREX_O2_ENV_PREFIX", "")
 
 PHOENIX_INDEX_BASE: str = os.environ.get("PHOENIX_INDEX_BASE", "phoenix_index")
+
+AI_VIDEO_MODEL_DIR: str = os.environ.get("XREX_AI_VIDEO_MODEL_DIR", "ai_video_model")
 
 ADS_INDEX_URI: str = os.environ.get("ADS_INDEX_URI", "")
 DPA_INDEX_URI: str = os.environ.get("DPA_INDEX_URI", "")

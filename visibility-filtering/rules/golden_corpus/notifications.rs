@@ -1,4 +1,4 @@
-use super::{CorpusCase, Role, Row, Subject};
+use super::{CorpusCase, Judging, Role, Row, Subject};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorLabel, AuthorProfile, EdgeSet, NotificationFilters, NotificationKind, Placement,
@@ -450,7 +450,7 @@ pub(super) fn post_kind_cases(level: SafetyLevel, kind: NotificationKind) -> Vec
         let as_recipient = |role, id, edges, expected| CorpusCase {
             name: format!("{}/{level:?}/{kind:?}/{role}", case.name),
             level,
-            kind: Some(kind),
+            judging: Judging::PostKind(kind),
             viewer: recipient(id, case.recipient.clone()),
             subject: post(edges),
             placement: Placement::Standalone,

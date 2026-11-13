@@ -27,11 +27,11 @@ pub struct PostCandidate {
     pub score: Option<f64>,
     #[serde(default)]
     pub cold_start_lift_to_rank: Option<u32>,
-    pub slate_context: Option<SlateContext>,
+    pub slate_context: Option<Box<SlateContext>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub top_heads: Vec<(String, f64, f64)>,
     #[serde(default)]
-    pub served_slate_context: Option<SlateContext>,
+    pub served_slate_context: Option<Box<SlateContext>>,
     #[serde(default)]
     pub reranker_head_tag: Option<u32>,
     #[serde(default)]
@@ -41,7 +41,7 @@ pub struct PostCandidate {
     #[serde(default)]
     pub page_rl_exploration_prob: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backbone_scores: Option<PhoenixScores>,
+    pub backbone_scores: Option<Box<PhoenixScores>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immersive_scores: Option<PhoenixScores>,
     #[serde(skip)]
@@ -295,25 +295,28 @@ impl CandidateHelpers for PostCandidate {
             prediction_scores: Default::default(),
             weighted_score: self.weighted_score,
             final_score: self.score,
-            slate_context: self.slate_context.map(|c| xai_recsys_proto::SlateContext {
-                k: c.k,
-                pool_rank: c.pool_rank,
-                pool_rank_gap: c.pool_rank_gap,
-                fatigue: c.fatigue,
-                pre_diversity_score: c.pre_diversity_score,
-                sid_known: c.sid_known,
-                sid_k1: c.sid_k_l1,
-                sid_k2: c.sid_k_l2,
-                sid_k3: c.sid_k_l3,
-                sid_gap1: c.sid_gap_l1,
-                sid_gap2: c.sid_gap_l2,
-                sid_gap3: c.sid_gap_l3,
-                recon_cos_milli: c.recon_cos_milli,
-                recon_count_above: c.recon_count_above,
-                recon_gap_above: c.recon_gap_above,
-                exact_k: c.exact_k,
-                exact_gap: c.exact_gap,
-            }),
+            slate_context: self
+                .slate_context
+                .as_deref()
+                .map(|c| xai_recsys_proto::SlateContext {
+                    k: c.k,
+                    pool_rank: c.pool_rank,
+                    pool_rank_gap: c.pool_rank_gap,
+                    fatigue: c.fatigue,
+                    pre_diversity_score: c.pre_diversity_score,
+                    sid_known: c.sid_known,
+                    sid_k1: c.sid_k_l1,
+                    sid_k2: c.sid_k_l2,
+                    sid_k3: c.sid_k_l3,
+                    sid_gap1: c.sid_gap_l1,
+                    sid_gap2: c.sid_gap_l2,
+                    sid_gap3: c.sid_gap_l3,
+                    recon_cos_milli: c.recon_cos_milli,
+                    recon_count_above: c.recon_count_above,
+                    recon_gap_above: c.recon_gap_above,
+                    exact_k: c.exact_k,
+                    exact_gap: c.exact_gap,
+                }),
             reward_rerank_slot_prob: None,
             page_decode_slot_prob: None,
             reranker_head_tag: self.reranker_head_tag,
@@ -420,6 +423,46 @@ mod tests {
         let json = r#"{"label_type":1,"description":null,"source":null}"#;
         let info: SafetyLabelInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.label_type, SafetyLabelType::SPAM);
+    }
+
+    #[test]
+    fn boxed_reranker_fields_keep_their_serialized_form() {
+        let context = SlateContext {
+            k: 2,
+            pool_rank: 7,
+            ..Default::default()
+        };
+        let scores = PhoenixScores {
+            favorite_score: Some(0.5),
+            ..Default::default()
+        };
+        let candidate = PostCandidate {
+            slate_context: Some(Box::new(context)),
+            served_slate_context: Some(Box::new(context)),
+            backbone_scores: Some(Box::new(scores.clone())),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(
+            value["slate_context"],
+            serde_json::to_value(context).unwrap()
+        );
+        assert_eq!(
+            value["served_slate_context"],
+            serde_json::to_value(context).unwrap()
+        );
+        assert_eq!(
+            value["backbone_scores"],
+            serde_json::to_value(&scores).unwrap()
+        );
+        let decoded: PostCandidate = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.slate_context.as_deref(), Some(&context));
+        assert_eq!(decoded.served_slate_context.as_deref(), Some(&context));
+        assert_eq!(
+            decoded.backbone_scores.unwrap().favorite_score,
+            scores.favorite_score
+        );
     }
 
     #[test]

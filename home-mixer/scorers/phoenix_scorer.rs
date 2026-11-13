@@ -140,10 +140,11 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
                         predictions.candidate_scores(&c.get_original_tweet_id())
                     },
                     backbone_scores: predictions
-                        .candidate_backbone_scores(&c.get_original_tweet_id()),
+                        .candidate_backbone_scores(&c.get_original_tweet_id())
+                        .map(Box::new),
                     served_slate_context: predictions
                         .candidate_slate_context(&c.get_original_tweet_id())
-                        .map(Into::into),
+                        .map(|context| Box::new(context.into())),
                     prediction_request_id: Some(query.prediction_id),
                     last_scored_at_ms,
                     reranker_head_tag: Some(query.params.get(RerankerHeadTag) as u32),

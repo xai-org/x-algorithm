@@ -468,7 +468,7 @@ mod tests {
     use crate::hydration::{Hydrators, Lookup};
     use crate::metrics::{Metrics, Recorded};
     use crate::models::viewer::Client;
-    use crate::models::{Decided, DropReason, Verdict, Withholding};
+    use crate::models::{Decided, DropReason, RequestViewer, Verdict, Withholding};
     use crate::params::ClientSwitches;
     use crate::rules::RuleId;
     use crate::rules::fixtures::{CLIENT_CLASSES, allow};
@@ -669,11 +669,10 @@ mod tests {
                 .find(|class| name == class.name)
                 .unwrap_or_else(|| panic!("no client class named {name}"));
             assert_eq!(
-                switches.resolve(
-                    Some(&client.context(Some(1), Some("fr"))),
+                switches.resolve(&RequestViewer::with_context(
                     Some(1),
-                    Some("fr")
-                ),
+                    Some(client.context(Some(1), Some("fr")))
+                )),
                 class.capability,
                 "{name}"
             );

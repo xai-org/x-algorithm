@@ -73,6 +73,10 @@ pub(crate) trait Batches: AsRef<[RawHydrationBatch<Self::Value>]> + Send {
     type Value;
 
     fn timed_out(failed: RawHydrationBatch<Self::Value>, queries: usize) -> Self;
+
+    fn ran_out(&self) -> bool {
+        false
+    }
 }
 
 impl<V: Send> Batches for RawHydrationBatch<V> {

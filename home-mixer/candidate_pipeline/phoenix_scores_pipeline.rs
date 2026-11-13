@@ -166,6 +166,8 @@ impl PhoenixScoresPipeline {
                 dispatch: crate::util::egress::PredictionDispatch {
                     client: phoenix_client,
                     max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                    uncompressed_clusters_key:
+                        "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
                 },
             }),
             Box::new(PhoenixScoresRankingScorer),

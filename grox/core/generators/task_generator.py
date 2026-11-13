@@ -68,21 +68,30 @@ class TaskGenerator(ABC):
 
 
 class PriorityTaskGenerator(TaskGenerator):
-    def __init__(self, generators: list[tuple[TaskGenerator, int]]):
+    def __init__(self, generators: list[tuple[TaskGenerator, int, int | None]]):
         if not generators:
             raise ValueError("No generators provided")
-        if any(weight <= 0 for _, weight in generators):
+        if any(weight <= 0 for _, weight, _ in generators):
             raise ValueError("All weights must be positive")
         super().__init__(None)
         self._generators: dict[str, TaskGenerator] = {}
         self._weights: dict[str, int] = {}
-        for i, (gen, weight) in enumerate(generators):
+        self._max_in_flight: dict[str, int | None] = {}
+        for i, (gen, weight, max_in_flight) in enumerate(generators):
             label = f"GEN_{i}"
             self._generators[label] = gen
             self._weights[label] = weight
+            self._max_in_flight[label] = max_in_flight
         self._result_cache: dict[str, str] = {}
         logger.info(
             f"Initialized priority task generator with {list(zip(self._generators.keys(), [gen.__class__.__name__ for gen in self._generators.values()], self._weights.values(), strict=True))}"
+        )
+
+    def _at_max_in_flight(self, label: str) -> bool:
+        cap = self._max_in_flight[label]
+        return (
+            cap is not None
+            and sum(1 for owner in self._result_cache.values() if owner == label) >= cap
         )
 
     async def start(self) -> None:
@@ -101,7 +110,11 @@ class PriorityTaskGenerator(TaskGenerator):
         if not self._streams:
             raise RuntimeError("Task generators not started")
         while self._weights:
-            _weights = self._weights.copy()
+            _weights = {
+                label: weight
+                for label, weight in self._weights.items()
+                if not self._at_max_in_flight(label)
+            }
             polled = False
             while _weights:
                 labels = list(_weights.keys())

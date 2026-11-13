@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import functools
 import json
 import logging
 import os
@@ -10,11 +11,17 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 import numpy as np
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
+from xrex import settings
+
 logger = logging.getLogger("rank")
+
+_OBJECT_STORE_SCHEMES = ("s3://", "s3a://", "s3n://", "o2://")
 
 DATE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DATE_TIME_FORMATS = (DATE_TIME_FORMAT, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d")
@@ -42,6 +49,66 @@ class DataPosition(TypedDict):
     block_shuffle_rows_in_file: NotRequired[int]
     block_shuffle_rows_in_next_file: NotRequired[int]
     rows_in_file: NotRequired[int]
+    copy_roots: NotRequired[dict[str, DataPosition | None]]
+
+
+def is_object_store_path(path: str) -> bool:
+    return path.startswith(_OBJECT_STORE_SCHEMES)
+
+
+@functools.cache
+def _object_store() -> pafs.S3FileSystem:
+    endpoint = settings.DATASET_OBJECT_STORE_ENDPOINT
+    parts = urlsplit(endpoint if "://" in endpoint else f"https://{endpoint}")
+    os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+    return pafs.S3FileSystem(
+        endpoint_override=parts.netloc, scheme=parts.scheme, region="us-east-1"
+    )
+
+
+def _filesystem(path: str) -> tuple[pafs.FileSystem | None, str]:
+    for scheme in _OBJECT_STORE_SCHEMES:
+        if path.startswith(scheme):
+            return _object_store(), path[len(scheme) :]
+    return None, path
+
+
+def parquet_file(path: str) -> pq.ParquetFile:
+    fs, p = _filesystem(path)
+    return pq.ParquetFile(p, filesystem=fs)
+
+
+def is_file(path: str) -> bool:
+    fs, p = _filesystem(path)
+    if fs is None:
+        return os.path.isfile(p)
+    return fs.get_file_info(p).type == pafs.FileType.File
+
+
+def _read_text(path: str) -> str:
+    fs, p = _filesystem(path)
+    if fs is None:
+        with open(p) as f:
+            return f.read()
+    with fs.open_input_stream(p) as f:
+        return f.read().decode()
+
+
+def _file_stamp(path: str) -> tuple[int, int] | None:
+    fs, p = _filesystem(path)
+    if fs is None:
+        try:
+            st = os.stat(p)
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size
+    try:
+        info = fs.get_file_info(p)
+    except OSError:
+        return None
+    if info.type != pafs.FileType.File:
+        return None
+    return info.mtime_ns or 0, info.size or 0
 
 
 def batch_path(topic_dir: str, partition_id: int, batch_id: int) -> str:
@@ -53,8 +120,7 @@ def batch_path(topic_dir: str, partition_id: int, batch_id: int) -> str:
 
 def load_valid_batches_metadata(path: str) -> ValidBatchesMetadata | None:
     try:
-        with open(path) as f:
-            data = json.load(f)
+        data = json.loads(_read_text(path))
         return ValidBatchesMetadata(
             min_valid_batch=int(data["min_valid_batch"]),
             max_valid_batch=int(data["max_valid_batch"]),
@@ -98,7 +164,7 @@ class _FooterTimestamps:
         bid = self._min_batch + idx
         path = batch_path(self._topic_dir, 0, bid)
         try:
-            pf = pq.ParquetFile(path)
+            pf = parquet_file(path)
             meta = pf.metadata.metadata or {}
             return int(meta[b"min_kafka_timestamp_ms"])
         except (KeyError, TypeError, ValueError) as e:
@@ -134,7 +200,7 @@ class BatchManifest:
             ]
         for i, p in zip(*np.nonzero(out < 0)):
             path = batch_path(topic_dir, int(p), start_batch_id + int(i))
-            out[i, p] = pq.ParquetFile(path).metadata.num_rows
+            out[i, p] = parquet_file(path).metadata.num_rows
         return out
 
     def batch_timestamps(self, min_batch: int, max_batch: int) -> list[int]:
@@ -165,19 +231,16 @@ _manifest_cache: dict[str, tuple[tuple[int, int], BatchManifest | None]] = {}
 
 def load_batch_manifest(topic_dir: str) -> BatchManifest | None:
     path = os.path.join(topic_dir, BATCH_MANIFEST_FILENAME)
-    try:
-        st = os.stat(path)
-    except OSError:
+    stamp = _file_stamp(path)
+    if stamp is None:
         return None
-    stamp = (st.st_mtime_ns, st.st_size)
     cached = _manifest_cache.get(path)
     if cached is not None and cached[0] == stamp:
         return cached[1]
 
     manifest: BatchManifest | None = None
     try:
-        with open(path) as f:
-            raw = json.load(f)
+        raw = json.loads(_read_text(path))
         entries: list[tuple[int, int, int, int]] = []
         for key, stats in raw.items():
             m = _MANIFEST_KEY.match(key)

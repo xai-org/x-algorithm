@@ -5,6 +5,7 @@ use crate::params::{
     PhoenixRetrievalMOEInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
 };
 use crate::sources::sid_source::sid_source_enabled;
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -46,8 +47,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
             &query.params.get(PhoenixRetrievalMOEInferenceClusterId),
         );
 
-        let response = self
-            .phoenix_retrieval_client
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
             .retrieve(
                 cluster,
                 user_id,

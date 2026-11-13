@@ -1,8 +1,10 @@
+use enum_map::EnumMap;
 use quanta::Clock;
 use quick_cache::sync::Cache;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
@@ -11,6 +13,7 @@ use super::metrics::{self, BatchStage, CacheKeyCounts, CacheTier, LabelMetrics, 
 use super::remote::{FailureKind, LookupError, LookupResults, RemoteLabels, StaleEntries};
 
 const TTL: Duration = Duration::from_secs(10);
+const REPLY_ALLOWANCE: Duration = Duration::from_millis(5);
 
 pub(crate) fn tweet_timestamp_ms(tweet_id: u64) -> u64 {
     const SNOWFLAKE_EPOCH_MS: u64 = 1288834974657;
@@ -59,6 +62,11 @@ struct Entry {
     expires_at: quanta::Instant,
 }
 
+pub struct LabelResults {
+        pub labels: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        pub stale: Vec<(u64, Arc<vf_pb::SafetyLabelMap>)>,
+}
+
 pub struct SafetyLabelSource {
         cache: Option<Cache<u64, Entry>>,
     clock: Clock,
@@ -102,10 +110,21 @@ impl SafetyLabelSource {
         }
     }
 
-    pub async fn get(
+            pub async fn get(
         &self,
         ids: &[u64],
+        deadline: Option<Instant>,
     ) -> FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
+        let LabelResults { mut labels, stale } = self.get_marking_stale(ids, deadline).await;
+        labels.extend(
+            stale
+                .into_iter()
+                .map(|(tweet_id, stale)| (tweet_id, Ok(stale))),
+        );
+        labels
+    }
+
+        pub async fn get_marking_stale(&self, ids: &[u64], deadline: Option<Instant>) -> LabelResults {
         let total = ids.len();
         let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
             FxHashMap::with_capacity_and_hasher(total, Default::default());
@@ -113,18 +132,24 @@ impl SafetyLabelSource {
         let (local_misses, stale) = self.get_local(ids, &mut results);
         let (batch_size, expired) = (local_misses.len(), stale.len());
 
-        let remote_results = self.remote.get(&local_misses, &stale).await;
-        let unavailable = self.backfill_local(remote_results, &mut results);
-        if !unavailable.is_empty() {
-            self.serve_outage(unavailable, stale, &mut results);
-        }
+        let answer_by =
+            deadline.map(|deadline| deadline.checked_sub(REPLY_ALLOWANCE).unwrap_or(deadline));
+        let remote_results = self.remote.get(&local_misses, &stale, answer_by).await;
+        let failed = self.backfill_local(remote_results, &mut results);
+        let mut stale_answers = if failed.is_empty() {
+            Vec::new()
+        } else {
+            self.serve_stale(failed, stale)
+        };
 
         self.emit_stats(total - batch_size, batch_size, expired);
 
         let now_ms = (self.now_ms)();
         let mut dropped = 0;
-        for labels in results.values_mut() {
-            let Ok(map) = labels else { continue };
+        let answered = results
+            .values_mut()
+            .filter_map(|result| result.as_mut().ok());
+        for map in answered.chain(stale_answers.iter_mut().map(|(_, labels)| labels)) {
             if map
                 .labels
                 .values()
@@ -137,35 +162,51 @@ impl SafetyLabelSource {
         }
         metrics::record_expired_labels(&self.metrics, dropped);
 
-        results
+        LabelResults {
+            labels: results,
+            stale: stale_answers,
+        }
+    }
+
+    pub(crate) fn hold_expired(&self, tweet_id: u64, labels: Arc<vf_pb::SafetyLabelMap>) {
+        if let Some(cache) = &self.cache {
+            let expires_at = self.clock.now();
+            cache.insert(tweet_id, Entry { labels, expires_at });
+        }
     }
 
         pub fn set_label_cache_switches(&self, switches: LabelCacheSwitches) {
         self.remote.set_switches(switches);
     }
 
-            fn serve_outage(
+    fn serve_stale(
         &self,
-        unavailable: Vec<u64>,
+        failed: Vec<(u64, FailureKind)>,
         mut stale: StaleEntries,
-        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-    ) {
-        let total = unavailable.len();
-        let mut answered = 0;
-        for tweet_id in unavailable {
+    ) -> Vec<(u64, Arc<vf_pb::SafetyLabelMap>)> {
+        let mut answers = Vec::new();
+        let mut counts = EnumMap::<FailureKind, (usize, usize)>::default();
+        for (tweet_id, kind) in failed {
             let labels = self
                 .cache
                 .as_ref()
                 .and_then(|cache| cache.peek(&tweet_id))
                 .map(|entry| entry.labels)
                 .or_else(|| stale.remove(&tweet_id));
-            if let Some(labels) = labels {
-                results.insert(tweet_id, Ok(labels));
-                answered += 1;
+            let (answered, unanswered) = &mut counts[kind];
+            match labels {
+                Some(labels) => {
+                    answers.push((tweet_id, labels));
+                    *answered += 1;
+                }
+                None => *unanswered += 1,
             }
         }
-        metrics::record_outage_keys(&self.metrics, OutageResult::Stale, answered);
-        metrics::record_outage_keys(&self.metrics, OutageResult::Failed, total - answered);
+        for (kind, (answered, unanswered)) in counts {
+            metrics::record_outage_keys(&self.metrics, OutageResult::Stale, kind, answered);
+            metrics::record_outage_keys(&self.metrics, OutageResult::Failed, kind, unanswered);
+        }
+        answers
     }
 
     fn get_local(
@@ -194,19 +235,17 @@ impl SafetyLabelSource {
         (misses, stale)
     }
 
-        fn backfill_local(
+    fn backfill_local(
         &self,
         remote_results: LookupResults,
         results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-    ) -> Vec<u64> {
+    ) -> Vec<(u64, FailureKind)> {
         let wall_now = SystemTime::now();
         let mut expires_at = None;
-        let mut unavailable = Vec::new();
+        let mut failed = Vec::new();
         for (id, result) in remote_results {
-            if let Err(failure) = &result
-                && failure.kind == FailureKind::LabelCacheUnavailable
-            {
-                unavailable.push(id);
+            if let Err(failure) = &result {
+                failed.push((id, failure.kind));
             }
             let result = result.map(Arc::new);
             if let Some(cache) = &self.cache
@@ -223,7 +262,7 @@ impl SafetyLabelSource {
             }
             results.insert(id, result);
         }
-        unavailable
+        failed
     }
 
     fn emit_stats(&self, hits: usize, batch_size: usize, expired: usize) {
@@ -243,6 +282,7 @@ mod tests {
     use super::*;
 
     use crate::remote::FailureKind;
+    use crate::testing::RecordedStats;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tonic::async_trait;
@@ -267,7 +307,12 @@ mod tests {
 
     #[async_trait]
     impl RemoteLabels for FakeRemote {
-        async fn get(&self, ids: &[u64], _stale: &StaleEntries) -> LookupResults {
+        async fn get(
+            &self,
+            ids: &[u64],
+            _stale: &StaleEntries,
+            _answer_by: Option<Instant>,
+        ) -> LookupResults {
             self.fetched_keys.fetch_add(ids.len(), Ordering::SeqCst);
             ids.iter()
                 .filter_map(|id| self.results.get(id).map(|result| (*id, result.clone())))
@@ -320,12 +365,12 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results1 = source.get(&[42]).await;
+        let results1 = source.get(&[42], None).await;
         let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());
         assert_eq!(remote.fetched_keys(), 1);
         assert!(l1_expiry(&source, 42).is_some());
 
-        let results2 = source.get(&[42]).await;
+        let results2 = source.get(&[42], None).await;
         assert!(Arc::ptr_eq(
             results2.get(&42).unwrap().as_ref().unwrap(),
             &first
@@ -345,11 +390,11 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results1 = source.get(&[42]).await;
+        let results1 = source.get(&[42], None).await;
         assert!(results1.get(&42).unwrap().is_err());
         assert!(l1_expiry(&source, 42).is_none());
 
-        let results2 = source.get(&[42]).await;
+        let results2 = source.get(&[42], None).await;
         assert!(results2.get(&42).unwrap().is_err());
         assert_eq!(remote.fetched_keys(), 2);
     }
@@ -364,7 +409,7 @@ mod tests {
         );
 
         for _ in 0..2 {
-            assert!(source.get(&[42]).await.get(&42).unwrap().is_ok());
+            assert!(source.get(&[42], None).await.get(&42).unwrap().is_ok());
         }
         assert_eq!(remote.fetched_keys(), 2);
     }
@@ -374,7 +419,7 @@ mod tests {
         let tweet_id = tweet_id_created_at(SystemTime::now() + Duration::from_secs(60));
         let source = SafetyLabelSource::new(found(tweet_id), Some(1024), LabelMetrics::default());
 
-        let results = source.get(&[tweet_id]).await;
+        let results = source.get(&[tweet_id], None).await;
 
         assert!(results.get(&tweet_id).unwrap().is_ok());
         assert!(l1_expiry(&source, tweet_id).is_none());
@@ -393,11 +438,11 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        source.get(&[tweet_id]).await;
+        source.get(&[tweet_id], None).await;
         let first_expiry = l1_expiry(&source, tweet_id).expect("backfilled");
 
         mock.increment(TTL);
-        source.get(&[tweet_id]).await;
+        source.get(&[tweet_id], None).await;
         let restamped = l1_expiry(&source, tweet_id).expect("re-backfilled");
 
         assert_eq!(remote.fetched_keys(), 2);
@@ -435,9 +480,42 @@ mod tests {
         );
 
         let ids: Vec<u64> = (1..66).collect();
-        let results = source.get(&ids).await;
+        let results = source.get(&ids, None).await;
 
         assert_eq!(results.get(&1).unwrap().as_deref().ok(), Some(&*stale));
+    }
+
+    #[tokio::test]
+    async fn a_failed_manhattan_read_answers_from_the_expired_entry_and_fails_without_one() {
+        let (clock, _mock) = Clock::mock();
+        let failed = || Err(LookupError::new(FailureKind::ManhattanFetch, "down"));
+        let stats = Arc::new(RecordedStats::default());
+        let source = SafetyLabelSource::with_clocks(
+            FakeRemote::new(HashMap::from([(1, failed()), (2, failed())])),
+            Some(8),
+            clock,
+            Arc::new(system_unix_ms),
+            LabelMetrics::new(Some(Arc::<RecordedStats>::clone(&stats) as _)),
+        );
+        let stale = Arc::new(vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(1, proto_label(None))]),
+        });
+        source.hold_expired(1, Arc::clone(&stale));
+
+        let results = source.get(&[1, 2], None).await;
+
+        assert_eq!(results.get(&1).unwrap().as_deref().ok(), Some(&*stale));
+        assert!(matches!(
+            results.get(&2),
+            Some(Err(failure)) if failure.kind == FailureKind::ManhattanFetch
+        ));
+        let outage = |result| {
+            stats.count(
+                "safety_labels_outage_keys",
+                &[("result", result), ("kind", "manhattan_fetch")],
+            )
+        };
+        assert_eq!((outage("stale"), outage("failed")), (1, 1));
     }
 
     fn label_ids(map: &vf_pb::SafetyLabelMap) -> Vec<i32> {
@@ -468,7 +546,7 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let first = source.get(&[42]).await;
+        let first = source.get(&[42], None).await;
         assert_eq!(
             label_ids(first.get(&42).unwrap().as_ref().unwrap()),
             vec![1, 3]
@@ -476,7 +554,7 @@ mod tests {
         assert_eq!(remote.fetched_keys(), 1);
 
         now.store(5_000, Ordering::Relaxed);
-        let later = source.get(&[42]).await;
+        let later = source.get(&[42], None).await;
         assert_eq!(
             label_ids(later.get(&42).unwrap().as_ref().unwrap()),
             vec![1]
@@ -484,7 +562,7 @@ mod tests {
         assert_eq!(remote.fetched_keys(), 1);
 
         now.store(0, Ordering::Relaxed);
-        let rewound = source.get(&[42]).await;
+        let rewound = source.get(&[42], None).await;
         assert_eq!(
             label_ids(rewound.get(&42).unwrap().as_ref().unwrap()),
             vec![1, 2, 3]

@@ -11,6 +11,7 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kSideGrid = 2048;
 constexpr int kMainGrid = 1024;
+constexpr int kCellsPerChunk = 32;
 
 int grid_for(int64_t work, int max_blocks) {
   int64_t blocks = (work + kThreads - 1) / kThreads;
@@ -78,6 +79,55 @@ stochastic_round_bf16(float value, uint32_t step, uint32_t row, uint32_t col) {
   __nv_bfloat16_raw raw;
   raw.x = static_cast<uint16_t>((__float_as_uint(value) + rand) >> 16);
   return raw;
+}
+
+template <int kCells>
+__device__ __forceinline__ void apply_cells(
+    __nv_bfloat16* table_row,
+    const float* grad_row,
+    float step,
+    float wd,
+    const AdagradParams& adagrad,
+    int32_t clock,
+    int64_t token,
+    int first_cell
+) {
+  alignas(16) __nv_bfloat16 cells[kCells];
+  alignas(16) float grads[kCells];
+  copy_row(cells, table_row, kCells, 0, 1);
+  if constexpr (kCells % 4 == 0) {
+#pragma unroll
+    for (int unit = 0; unit < kCells / 4; ++unit) {
+      reinterpret_cast<float4*>(grads)[unit] =
+          __ldg(reinterpret_cast<const float4*>(grad_row) + unit);
+    }
+  } else {
+#pragma unroll
+    for (int col = 0; col < kCells; ++col) {
+      grads[col] = __ldg(grad_row + col);
+    }
+  }
+#pragma unroll
+  for (int col = 0; col < kCells; ++col) {
+    const float grad = __bfloat162float(__float2bfloat16(grads[col]));
+
+    if (adagrad.stochastic_rounding) {
+      const float candidate =
+          __fadd_rn(__fmul_rn(__bfloat162float(cells[col]), wd), __fmul_rn(step, grad));
+
+      cells[col] = stochastic_round_bf16(
+          candidate,
+          static_cast<uint32_t>(clock),
+          static_cast<uint32_t>(token),
+          static_cast<uint32_t>(adagrad.col_offset + first_cell + col)
+      );
+    } else {
+      const float delta = __bfloat162float(__float2bfloat16(step * grad));
+      const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(cells[col]) * wd));
+      cells[col] = __float2bfloat16(decayed + delta);
+    }
+  }
+  copy_row(table_row, cells, kCells, 0, 1);
 }
 
 }
@@ -456,42 +506,17 @@ __global__ void rowwise_adagrad_apply(
     const float step = (-adagrad.lr) * (1.f / (sqrtf(accum) + adagrad.eps));
     __nv_bfloat16* table_row = table_shard + token * kShardWidth;
     const float* grad_row = grad_accum + row * kShardWidth;
-    alignas(16) __nv_bfloat16 cells[kShardWidth];
-    alignas(16) float grads[kShardWidth];
-    copy_row(cells, table_row, kShardWidth, 0, 1);
-    if constexpr (kShardWidth % 4 == 0) {
-#pragma unroll
-      for (int unit = 0; unit < kShardWidth / 4; ++unit) {
-        reinterpret_cast<float4*>(grads)[unit] =
-            __ldg(reinterpret_cast<const float4*>(grad_row) + unit);
-      }
+    if constexpr (kShardWidth <= kCellsPerChunk) {
+      apply_cells<kShardWidth>(table_row, grad_row, step, wd, adagrad, clock, token, 0);
     } else {
-#pragma unroll
-      for (int col = 0; col < kShardWidth; ++col) {
-        grads[col] = __ldg(grad_row + col);
-      }
-    }
-#pragma unroll
-    for (int col = 0; col < kShardWidth; ++col) {
-      const float grad = __bfloat162float(__float2bfloat16(grads[col]));
-
-      if (adagrad.stochastic_rounding) {
-        const float candidate =
-            __fadd_rn(__fmul_rn(__bfloat162float(cells[col]), wd), __fmul_rn(step, grad));
-
-        cells[col] = stochastic_round_bf16(
-            candidate,
-            static_cast<uint32_t>(clock),
-            static_cast<uint32_t>(token),
-            static_cast<uint32_t>(adagrad.col_offset + col)
+      static_assert(kShardWidth % kCellsPerChunk == 0, "wide rows go in whole chunks");
+#pragma unroll 1
+      for (int chunk = 0; chunk < kShardWidth; chunk += kCellsPerChunk) {
+        apply_cells<kCellsPerChunk>(
+            table_row + chunk, grad_row + chunk, step, wd, adagrad, clock, token, chunk
         );
-      } else {
-        const float delta = __bfloat162float(__float2bfloat16(step * grad));
-        const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(cells[col]) * wd));
-        cells[col] = __float2bfloat16(decayed + delta);
       }
     }
-    copy_row(table_row, cells, kShardWidth, 0, 1);
     row_state[token] = accum;
   }
 }
@@ -525,7 +550,7 @@ void launch_rowwise_adagrad_apply(
     );
     XAI_CUDA_LAUNCH_CHECK();
   };
-  static_assert(kMaxShardWidth == 32, "add a case for every divisor of kMaxShardWidth");
+  static_assert(kMaxShardWidth == 128, "add a case for every divisor of kMaxShardWidth");
   switch (shard_width) {
     case 1:
       return launch(rowwise_adagrad_apply<1>);
@@ -539,6 +564,10 @@ void launch_rowwise_adagrad_apply(
       return launch(rowwise_adagrad_apply<16>);
     case 32:
       return launch(rowwise_adagrad_apply<32>);
+    case 64:
+      return launch(rowwise_adagrad_apply<64>);
+    case 128:
+      return launch(rowwise_adagrad_apply<128>);
     default:
       XAI_ASSERT(
           false,

@@ -130,9 +130,7 @@ impl EvaluateTweetsEndpoint {
                 .count(),
         );
         let policies = self.client_switches.limited_actions_policies(
-            viewer.context(),
-            viewer.id(),
-            viewer.country_code(),
+            &viewer,
             evaluations().flat_map(|evaluation| evaluation.verdict().limited_engagement_reasons()),
             metrics.plain(),
         );

@@ -623,17 +623,21 @@ fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
     for (language, subtext) in [
         ("", "Only some accounts can reply."),
         ("ja", "一部のアカウントのみが返信できます。"),
+        ("JA", "一部のアカウントのみが返信できます。"),
     ] {
         let context = TwitterContextViewer {
             request_language_code: language.to_string(),
             ..TwitterContextViewer::default()
         };
-        let policies = ClientSwitches::for_tests().limited_actions_policies(
-            Some(&context),
-            None,
-            None,
+        let switches = ClientSwitches::for_tests();
+        let policies = switches.limited_actions_policies(
+            &RequestViewer::with_context(None, Some(context)),
             [ConversationControl],
             &Metrics::none(),
+        );
+        assert_eq!(
+            policies.language(),
+            if language.is_empty() { "en" } else { "ja" }
         );
         let thrift_limit = LimitedEngagements::new(
             action::LimitedEngagementReason::ConversationControl(action::ConversationControl::new()),

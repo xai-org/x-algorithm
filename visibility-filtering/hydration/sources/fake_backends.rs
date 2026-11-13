@@ -6,13 +6,16 @@ use crate::hydration::batch::Hydrated;
 use crate::hydration::community_source::CommunityPost;
 use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::fetcher::Owner;
+use crate::hydration::sources::safety_labels::LabelReply;
 use crate::hydration::sources::Source;
 use crate::hydration::tweet_source::TweetState;
+use crate::metrics::{Endpoint, Metrics, RequestLevel};
 use crate::models::NsfwFeature;
 use crate::models::{ArticleLifecycle, CommunityModeration, TweetFeatures};
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::time::Duration;
 use thrift::protocol::TType;
 use tonic::{Request, Response, Status};
 use tower::util::BoxCloneSyncService;
@@ -33,6 +36,7 @@ use xai_strato::strato_proto::rpc_server::{Rpc, RpcServer};
 use xai_strato::strato_proto::{result, Call3, Issue3, ResultList};
 use xai_strato::StratoGrpc;
 use xai_visibility_filtering_proto as vf_pb;
+use xai_x_rpc::WithBudget;
 use xai_x_thrift::entities::ApiMediaEntity;
 use xai_x_thrift::tweet_safety_label::{PerspectivalUser, SafetyLabel, SafetyLabelType};
 use xai_x_thrift::tweets::ApiPerspective;
@@ -668,13 +672,16 @@ fn defaults() -> InMemorySources {
 
 fn shown<V: fmt::Debug>(
     unanswered: &mut Vec<u64>,
-    batch: &RawHydrationBatch<V>,
+    batches: &impl AsRef<[RawHydrationBatch<V>]>,
     keys: &[u64],
 ) -> String {
     let shown: Vec<String> = keys
         .iter()
         .map(|&key| {
-            let answer = batch.hydrated(&key);
+            let answer = batches
+                .as_ref()
+                .iter()
+                .find_map(|batch| batch.hydrated(&key));
             if matches!(answer, None | Some(Hydrated::Unanswered)) {
                 unanswered.push(key);
             }
@@ -949,4 +956,56 @@ async fn prod_sources_answer_what_their_backends_hold() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_safety_label_call_manhattan_has_not_answered_by_its_deadline_times_out() {
+    let prod = ProdSources::new(Backends {
+        safety_labels: Arc::new(FakeLabels::default().hanging(TWEET).into_source()),
+        ..prod_sources().backends
+    });
+    let call_input = input(FetcherId::from(Source::SafetyLabels), &[TWEET]);
+    let answer = Fetches::<source::SafetyLabels>::fetch(&prod, &call_input)
+        .with_budget(Duration::from_millis(100))
+        .await;
+    assert!(matches!(answer, Ok(Ok(reply)) if reply.ran_out()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_safety_label_answered_from_its_expired_entry_counts_as_its_lookups_failure() {
+    let stale = Arc::new(vf_pb::SafetyLabelMap {
+        labels: HashMap::from([(1, vf_pb::SafetyLabel::default())]),
+    });
+    let metrics = Metrics::none().request(Endpoint::FilterTweets, RequestLevel::Absent);
+    let context = CallContext {
+        metrics: &metrics,
+        label: ("safety_labels", "safety_labels"),
+        tweet_cache: None,
+        author_cache: None,
+        author_not_found: AuthorNotFound::Unresolves,
+    };
+    for (labels, ran_out) in [
+        (FakeLabels::default().failing(TWEET), false),
+        (FakeLabels::default().hanging(TWEET), true),
+    ] {
+        let labels = labels.expired(TWEET, (*stale).clone());
+        let prod = ProdSources::new(Backends {
+            safety_labels: Arc::new(labels.into_source()),
+            ..prod_sources().backends
+        });
+        let call_input = input(FetcherId::from(Source::SafetyLabels), &[TWEET]);
+        let reply = Fetches::<source::SafetyLabels>::fetch(&prod, &call_input)
+            .with_budget(Duration::from_millis(100))
+            .await
+            .expect("answered by the deadline")
+            .expect("answered");
+        assert_eq!(reply.ran_out(), ran_out);
+        let recorded = |reply: &LabelReply| {
+            let batch = reply.as_ref().first();
+            batch.and_then(|batch| batch.hydrated(&TWEET)).cloned()
+        };
+        assert_eq!(recorded(&reply), Some(Hydrated::Failed));
+        let landed = source::SafetyLabels::fall_back(&context, reply);
+        assert_eq!(recorded(&landed), Some(Hydrated::Found(Arc::clone(&stale))));
+    }
 }

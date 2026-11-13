@@ -42,6 +42,13 @@ from xrex.utils.model import MemoryModelOutput
 from xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual
 
 
+def scale_value_heads(value_heads: jax.Array, token_scale: jax.Array | None) -> jax.Array:
+    if token_scale is None:
+        return value_heads
+    scaled = value_heads.astype(jnp.float32) * token_scale[:, : value_heads.shape[1], None, None]
+    return scaled.astype(value_heads.dtype)
+
+
 def rope_angles(
     dim: int, base_exponent: int, seq_len: int, positions: jax.Array | None = None
 ) -> jax.Array:
@@ -255,6 +262,9 @@ class MultiHeadAttention(hk.Module):
                 )
                 query_heads = checkpoint_name(query_heads, "query_heads_rope")
                 key_heads = checkpoint_name(key_heads, "key_heads_rope")
+
+        if seqpack_layout is not None:
+            value_heads = scale_value_heads(value_heads, seqpack_layout.value_scale)
 
         if self.config.attn_impl == "recsys_flash_attn":
             raise NotImplementedError(
@@ -626,6 +636,8 @@ class CandidateOnlyAttention(MultiHeadAttention):
             shard_heads(checkpoint_name(v, "value_heads"), "kv_head")
             for v in (candidate_values, history_values)
         )
+        if seqpack_layout is not None:
+            history_values = scale_value_heads(history_values, seqpack_layout.value_scale)
 
         if config.qk_norm:
             query_heads = all_heads_qk_norm("q_norm", self.scale_config)(query_heads)

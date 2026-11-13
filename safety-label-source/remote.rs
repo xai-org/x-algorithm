@@ -50,18 +50,19 @@ pub(crate) enum FallbackReason {
 pub enum FailureKind {
     ManhattanFetch,
     ManhattanDecode,
-        LabelCacheUnavailable,
+            LabelCacheUnavailable,
+        Deadline,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{kind:?}: {message}")]
 pub struct LookupError {
     pub kind: FailureKind,
-    pub(crate) message: String,
+    pub(crate) message: Cow<'static, str>,
 }
 
 impl LookupError {
-    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: FailureKind, message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -80,9 +81,28 @@ fn label_cache_unavailable() -> LookupError {
     )
 }
 
+fn missed_deadline() -> LookupError {
+    LookupError::new(FailureKind::Deadline, "read pending at the deadline")
+}
+
+async fn by_deadline<T>(
+    answer_by: Option<tokio::time::Instant>,
+    read: impl Future<Output = T>,
+) -> Option<T> {
+    match answer_by {
+        Some(answer_by) => tokio::time::timeout_at(answer_by, read).await.ok(),
+        None => Some(read.await),
+    }
+}
+
 #[async_trait]
 pub(crate) trait RemoteLabels: Send + Sync {
-                async fn get(&self, ids: &[u64], stale: &StaleEntries) -> LookupResults;
+                        async fn get(
+        &self,
+        ids: &[u64],
+        stale: &StaleEntries,
+        answer_by: Option<tokio::time::Instant>,
+    ) -> LookupResults;
 
     fn set_switches(&self, switches: LabelCacheSwitches);
 }
@@ -192,7 +212,12 @@ impl RemoteSource {
 
 #[async_trait]
 impl RemoteLabels for RemoteSource {
-    async fn get(&self, ids: &[u64], stale: &StaleEntries) -> LookupResults {
+    async fn get(
+        &self,
+        ids: &[u64],
+        stale: &StaleEntries,
+        answer_by: Option<tokio::time::Instant>,
+    ) -> LookupResults {
         let context = ReadContext {
             now_ms: (self.now_ms)(),
             switches: **self.switches.load(),
@@ -211,22 +236,33 @@ impl RemoteLabels for RemoteSource {
         let served_reads = async {
             match dragonfly {
                 Some(dragonfly) if !served.is_empty() => {
-                    dragonfly
-                        .read(&served, &context, CacheTier::Dragonfly)
-                        .await
+                    let read = dragonfly.read(&served, &context, CacheTier::Dragonfly);
+                    by_deadline(answer_by, read).await
                 }
-                _ => Vec::new(),
+                _ => Some(Vec::new()),
             }
         };
         let twemcache_reads = async {
             match &self.twemcache {
-                Some(twemcache) => twemcache.get(&unserved).await,
-                None => unserved.iter().map(|&id| (id, None)).collect(),
+                Some(twemcache) if !unserved.is_empty() => {
+                    by_deadline(answer_by, twemcache.get(&unserved)).await
+                }
+                _ => Some(unserved.iter().map(|&id| (id, None)).collect()),
             }
         };
         let (twemcache_reads, served_reads) = tokio::join!(twemcache_reads, served_reads);
+        let read_at = tokio::time::Instant::now();
+        let past_deadline = answer_by.is_some_and(|answer_by| read_at >= answer_by);
         let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         let mut fallback_ids = Vec::new();
+        let twemcache_reads = twemcache_reads.unwrap_or_else(|| {
+            results.extend(unserved.iter().map(|&id| (id, Err(missed_deadline()))));
+            Vec::new()
+        });
+        let served_reads = served_reads.unwrap_or_else(|| {
+            results.extend(served.iter().map(|&id| (id, Err(missed_deadline()))));
+            Vec::new()
+        });
         for (tweet_id, labels) in twemcache_reads {
             match labels {
                 Some(labels) => {
@@ -252,6 +288,9 @@ impl RemoteLabels for RemoteSource {
                     fill_ids.insert(tweet_id);
                     fallback_ids.push(tweet_id);
                 }
+                EntryRead::Failed if past_deadline && !stale.contains_key(&tweet_id) => {
+                    results.insert(tweet_id, Err(missed_deadline()));
+                }
                 EntryRead::Failed => {
                     let admitted = !stale.contains_key(&tweet_id)
                         && dragonfly.is_some_and(|dragonfly| dragonfly.admit_outage_read());
@@ -264,7 +303,12 @@ impl RemoteLabels for RemoteSource {
                 }
             }
         }
-        metrics::record_outage_keys(&self.metrics, OutageResult::Manhattan, outage_reads);
+        metrics::record_outage_keys(
+            &self.metrics,
+            OutageResult::Manhattan,
+            FailureKind::LabelCacheUnavailable,
+            outage_reads,
+        );
 
         fallback_ids.sort_unstable();
         fallback_ids.dedup();
@@ -273,8 +317,18 @@ impl RemoteLabels for RemoteSource {
             BatchStage::ManhattanFallback,
             fallback_ids.len(),
         );
-        let read_at = tokio::time::Instant::now();
-        for (tweet_id, result) in self.manhattan.scan(&fallback_ids).await {
+        let scan_results = if fallback_ids.is_empty() {
+            Some(FxHashMap::default())
+        } else if past_deadline {
+            None
+        } else {
+            by_deadline(answer_by, self.manhattan.scan(&fallback_ids)).await
+        }
+        .unwrap_or_else(|| {
+            results.extend(fallback_ids.iter().map(|&id| (id, Err(missed_deadline()))));
+            FxHashMap::default()
+        });
+        for (tweet_id, result) in scan_results {
             let result = match result {
                 Ok(Scan { items, labels }) => {
                     if fill_ids.contains(&tweet_id) {
@@ -609,7 +663,7 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42, 42], &StaleEntries::default()).await;
+        let results = source.get(&[42, 42], &StaleEntries::default(), None).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);
@@ -632,7 +686,9 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[1, 2, 3, 4, 5], &StaleEntries::default()).await;
+        let results = source
+            .get(&[1, 2, 3, 4, 5], &StaleEntries::default(), None)
+            .await;
 
         assert_eq!(results.len(), 5);
         assert!(results.values().all(Result::is_ok));
@@ -662,13 +718,35 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42], &StaleEntries::default()).await;
+        let results = source.get(&[42], &StaleEntries::default(), None).await;
 
         assert!(matches!(
             results.get(&42),
             Some(Err(failure)) if failure.kind == FailureKind::ManhattanFetch
         ));
         assert_eq!(fetcher.calls(), vec![vec![42]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_manhattan_read_due_once_the_deadline_has_passed_is_never_sent() {
+        let fetcher = Arc::new(FakeLabelFetcher::default());
+        let source = RemoteSource::new(
+            Some(FakeCache::new([(42, Ok(None))]) as _),
+            None,
+            Arc::<FakeLabelFetcher>::clone(&fetcher),
+            LabelMetrics::default(),
+        );
+
+        let answer_by = tokio::time::Instant::now();
+        let results = source
+            .get(&[42], &StaleEntries::default(), Some(answer_by))
+            .await;
+
+        assert!(matches!(
+            results.get(&42),
+            Some(Err(failure)) if failure.kind == FailureKind::Deadline
+        ));
+        assert!(fetcher.calls().is_empty());
     }
 
     #[tokio::test]
@@ -685,7 +763,7 @@ mod tests {
             LabelMetrics::default(),
         );
 
-        let results = source.get(&[42], &StaleEntries::default()).await;
+        let results = source.get(&[42], &StaleEntries::default(), None).await;
 
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(fetcher.calls(), vec![vec![42]]);

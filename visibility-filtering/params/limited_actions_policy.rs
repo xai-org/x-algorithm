@@ -1,11 +1,11 @@
+use super::client_switches::ViewerRecipient;
 use crate::metrics::families::LIMITED_ACTIONS_POLICY_MISSING;
 use crate::metrics::Metrics;
-use crate::models::{LimitedActionType, LimitedEngagementReason};
-use crate::params::limited_actions_copy::{Prompt, PromptCopy};
-use xai_feature_switches::FeatureSwitchResults;
+use crate::models::{LimitedActionType, LimitedEngagementReason, RequestViewer};
+use crate::params::limited_actions_copy::{LimitedActionsCopy, Prompt, PromptCopy};
+use xai_feature_switches::FeatureSwitches;
 use xai_stringcenter::DEFAULT_LANGUAGE;
 
-pub(super) const REASON_FIELD: &str = "LimitedEngagementReason";
 const LIMITED_ACTIONS_KEY: &str = "limited_actions_policy_limited_actions";
 const COPY_NAMESPACE_KEY: &str = "limited_actions_policy_copy_namespace";
 const PROMPT_TYPE_KEY: &str = "limited_actions_policy_prompt_type";
@@ -32,13 +32,19 @@ pub(crate) struct LimitedActionsPolicies {
 
 impl LimitedActionsPolicies {
     pub(super) fn resolve(
+        feature_switches: &FeatureSwitches,
+        copy: &LimitedActionsCopy,
+        viewer: &RequestViewer,
         reasons: impl IntoIterator<Item = LimitedEngagementReason>,
-        match_reason: impl Fn(LimitedEngagementReason) -> FeatureSwitchResults,
-        prompt: impl Fn(LimitedActionType, &PromptCopy) -> Option<Prompt>,
         metrics: &Metrics,
     ) -> Self {
-        let mut matched: Vec<LimitedEngagementReason> = Vec::new();
-        let mut policies = Vec::new();
+        let language = viewer
+            .context()
+            .map(|context| context.request_language_code.as_str())
+            .filter(|language| !language.is_empty())
+            .map(str::to_ascii_lowercase);
+        let request_language = language.as_deref().unwrap_or(DEFAULT_LANGUAGE);
+        let mut policies: Vec<(LimitedEngagementReason, Vec<LimitedAction>)> = Vec::new();
         let count = |reason: LimitedEngagementReason, missing: Missing| {
             metrics.count(
                 &LIMITED_ACTIONS_POLICY_MISSING,
@@ -46,48 +52,48 @@ impl LimitedActionsPolicies {
                 1,
             );
         };
+        let mut base_recipient: Option<ViewerRecipient<'_>> = None;
         for reason in reasons {
-            if matched.contains(&reason) {
+            if policies.iter().any(|(held, _)| *held == reason) {
                 continue;
             }
-            matched.push(reason);
-            let results = match_reason(reason);
-            let action_types: Vec<LimitedActionType> = results
+            let reason_recipient = base_recipient.get_or_insert_with(|| {
+                ViewerRecipient::new(viewer).with_language(language.as_deref())
+            });
+            reason_recipient.set_reason(reason);
+            let results = feature_switches.match_recipient(reason_recipient);
+            let names = results
                 .get_array_no_impression(LIMITED_ACTIONS_KEY)
-                .into_iter()
-                .flatten()
-                .filter_map(|name| name.as_str()?.parse().ok())
-                .collect();
-            if action_types.is_empty() {
+                .map_or(&[][..], Vec::as_slice);
+            let mut action_types = names
+                .iter()
+                .filter_map(|name| name.as_str()?.parse::<LimitedActionType>().ok())
+                .peekable();
+            if action_types.peek().is_none() {
                 count(reason, Missing::Actions);
+                policies.push((reason, Vec::new()));
                 continue;
             }
-            let copy = PromptCopy::from_switches(
+            let prompt_copy = PromptCopy::from_switches(
                 results.get_string_no_impression(COPY_NAMESPACE_KEY),
                 results.get_string_no_impression(PROMPT_TYPE_KEY),
                 results.get_string_no_impression(LEARN_MORE_URL_KEY),
+                request_language,
             );
-            let actions: Vec<LimitedAction> = action_types
-                .into_iter()
-                .map(|action_type| LimitedAction {
-                    action_type,
-                    prompt: copy.as_ref().and_then(|copy| prompt(action_type, copy)),
-                })
-                .collect();
-            if copy.is_some() && actions.iter().any(|action| action.prompt.is_none()) {
+            let mut prompts = prompt_copy.as_ref().map(|prompt_copy| {
+                copy.prompts(prompt_copy, request_language, viewer.country_code())
+            });
+            let mut actions = Vec::with_capacity(names.len());
+            actions.extend(action_types.map(|action_type| LimitedAction {
+                action_type,
+                prompt: prompts.as_mut().and_then(|prompts| prompts(action_type)),
+            }));
+            if prompt_copy.is_some() && actions.iter().any(|action| action.prompt.is_none()) {
                 count(reason, Missing::Copy);
             }
             policies.push((reason, actions));
         }
-        Self {
-            policies,
-            language: None,
-        }
-    }
-
-    pub(super) fn in_language(mut self, language: Option<&str>) -> Self {
-        self.language = language.map(str::to_owned);
-        self
+        Self { policies, language }
     }
 
     pub(crate) fn language(&self) -> &str {
@@ -122,8 +128,9 @@ impl LimitedActionsPolicies {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RequestFacts;
     use crate::params::limited_actions_copy::LimitedActionsCopy;
-    use crate::params::ClientSwitches;
+    use crate::params::{ClientSwitches, SwitchEngines};
     use arc_swap::ArcSwap;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -328,10 +335,9 @@ mod tests {
                 .filter_map(|(_, namespace, actions)| Some(((*namespace)?, actions.as_slice()))),
         );
         let (metrics, recording) = Metrics::recording();
-        let policies = ClientSwitches::for_tests_with(copy).limited_actions_policies(
-            None,
-            None,
-            None,
+        let switches = ClientSwitches::for_tests_with(copy);
+        let policies = switches.limited_actions_policies(
+            RequestFacts::default().viewer(),
             expected.iter().map(|(reason, _, _)| *reason),
             &metrics,
         );
@@ -345,7 +351,7 @@ mod tests {
                     action
                         .prompt
                         .as_ref()
-                        .map(|prompt| prompt.headline.as_str()),
+                        .map(|prompt| prompt.headline.as_ref()),
                     namespace,
                     "{reason:?} {:?}",
                     action.action_type
@@ -371,16 +377,15 @@ limited_actions_policy:
       limited_actions_policy_limited_actions: ["no_such_action"]
 "#;
         let switches = ClientSwitches::new(
-            Arc::new(ArcSwap::from_pointee(
-                FeatureSwitches::load_string(POLICY).unwrap(),
-            )),
+            Arc::new(ArcSwap::from_pointee(SwitchEngines {
+                visibility: FeatureSwitches::null().unwrap(),
+                limited_actions: FeatureSwitches::load_string(POLICY).unwrap(),
+            })),
             LimitedActionsCopy::from_json("[]"),
         );
         let (metrics, recording) = Metrics::recording();
         let policies = switches.limited_actions_policies(
-            None,
-            None,
-            None,
+            RequestFacts::default().viewer(),
             [StaleTweet, ConversationControl, BlockedViewer, StaleTweet],
             &metrics,
         );

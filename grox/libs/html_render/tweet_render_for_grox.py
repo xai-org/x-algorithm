@@ -9,6 +9,8 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 logger = logging.getLogger(__name__)
 
+_IMAGES_LOADED = """article => [...article.querySelectorAll('img')].every(img => img.complete && img.naturalWidth > 0)"""
+
 
 @dataclass
 class BrowserPool:
@@ -148,6 +150,49 @@ class TweetRenderForGrox:
                         await page.close()
         except Exception as e:
             logger.warning(f"Error screenshotting {tweet_id}: {str(e)}")
+            return None
+
+    async def take_screenshot_v2(self, tweet_id: str) -> Optional[bytes]:
+        logger.info(f"Taking screenshot v2 for tweet_id: {tweet_id}")
+        start = time.perf_counter()
+
+        try:
+            async with self.get_browser_context() as context:
+                page = await context.new_page()
+                try:
+                    await page.goto(
+                        f"https://x.com/i/status/{tweet_id}",
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    tweet_locator = page.locator(
+                        f'article:has(a[href*="/status/{tweet_id}"])'
+                    ).first
+                    await tweet_locator.wait_for(state="visible", timeout=15000)
+                    article = await tweet_locator.element_handle()
+                    try:
+                        await page.wait_for_function(
+                            _IMAGES_LOADED, arg=article, timeout=10000
+                        )
+                    except Exception:
+                        logger.info(
+                            f"Screenshot v2 of {tweet_id}: images still loading, taking it anyway"
+                        )
+
+                    screenshot_bytes = await tweet_locator.screenshot(
+                        type="jpeg", quality=85
+                    )
+
+                    logger.info(
+                        f"Screenshot v2 taken in {time.perf_counter() - start:.2f}s"
+                    )
+
+                    return screenshot_bytes
+                finally:
+                    if not page.is_closed():
+                        await page.close()
+        except Exception as e:
+            logger.warning(f"Error taking screenshot v2 of {tweet_id}: {str(e)}")
             return None
 
     async def cleanup(self):

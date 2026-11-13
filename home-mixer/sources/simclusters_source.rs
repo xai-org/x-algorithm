@@ -13,7 +13,7 @@ use tonic::async_trait;
 use xai_candidate_pipeline::component_library::utils::{
     build_moka_cache, duration_since_creation_opt, MokaCache, MokaCacheConfig,
 };
-use xai_candidate_pipeline::hydrator::{CacheStore, Hydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, TwoPhaseHydrator};
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
 use xai_stats_receiver::global_stats_receiver;
@@ -266,9 +266,10 @@ impl Source<ScoredPostsQuery, PostCandidate> for SimclustersSource {
             })
             .collect();
 
-        let hydrated = self.core_data_hydrator.hydrate(query, &candidates).await;
-        self.core_data_hydrator
-            .update_all(&mut candidates, hydrated);
+        if let Ok(fetched) = self.core_data_hydrator.fetch(query, &candidates).await {
+            self.core_data_hydrator
+                .apply(query, &mut candidates, fetched);
+        }
         candidates.retain(|c| c.author_id != 0);
         Ok(candidates)
     }

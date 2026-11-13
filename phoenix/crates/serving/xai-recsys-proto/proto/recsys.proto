@@ -195,6 +195,20 @@ message PredictNextActionsRequest {
   FeedCursorDirection feed_cursor_direction = 26;
 
   bool hydrate_history_url_embeddings = 27;
+
+  ScoreCacheInfo score_cache = 28;
+}
+
+message ScoreCacheInfo {
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_RANKER = 1;
+    SOURCE_SCORE_CACHE = 2;
+  }
+  Source source = 1;
+  int64 scoring_request_id = 2;
+  uint32 rows_cached = 3;
+  uint32 rows_reused = 4;
 }
 
 message PurchaseValueBaseline {
@@ -427,6 +441,10 @@ enum RetrievalDatasetType {
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_1DAY = 23;
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_2DAY = 24;
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_7DAY = 25;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_1DAY = 26;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_2DAY = 27;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_7DAY = 28;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_14DAY = 29;
 }
 
 message ScoredCandidate {

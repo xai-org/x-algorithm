@@ -43,6 +43,10 @@ pub enum VMRankerCluster {
     Experiment5,
     #[strum(props(host = "experiment-6.prod.fou"))]
     Experiment6,
+    #[strum(props(host = "experiment-7.prod.fou"))]
+    Experiment7,
+    #[strum(props(host = "experiment-8.prod.fou"))]
+    Experiment8,
 }
 
 impl VMRankerCluster {

@@ -135,12 +135,19 @@ impl Timed<'_> {
             .with_budget(self.call_deadline)
             .await
             .unwrap_or(Err(Expired));
+        let recorded = answer.as_ref().and_then(|reply| {
+            if reply.ran_out() {
+                Err(&Expired)
+            } else {
+                Ok(reply)
+            }
+        });
         record_keyed_hydrator_request(
             self.metrics,
             self.backend,
             self.call,
             &self.candidate_count_by_claimed_key,
-            answer.as_ref(),
+            recorded,
             start.elapsed().as_secs_f64() * 1000.0,
         );
         answer.unwrap_or_else(|Expired| {

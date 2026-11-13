@@ -8,20 +8,21 @@ import importlib.util
 import logging
 import os
 import sys
-from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+import threading
+from typing import Callable, Iterable, Iterator, Sequence, cast
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from xai_configlib import configclass
+from xrex import settings
 from xrex.data import rust_ext
 from xrex.data.parquet_recsys import (
     PhoenixDataset,
     ShuffleMode,
     _block_resume_window,
     _block_shuffle_fingerprint,
+    _block_shuffle_order,
     _block_shuffle_ranges,
     _block_shuffle_resume,
     _block_shuffle_sequence,
@@ -32,13 +33,17 @@ from xrex.data.parquet_recsys import (
 from xrex.data.parquet_recsys_metadata import (
     DataPosition,
     batch_path,
+    is_file,
+    is_object_store_path,
     load_batch_manifest,
     load_valid_batches_metadata,
+    parquet_file,
     parse_date_bound,
     resolve_time_range,
 )
 
 rank_logger = logging.getLogger("rank")
+_COPY_ROOT_BOUNDS_LOCK = threading.Lock()
 
 
 def _block_shuffle_record_batches(
@@ -68,7 +73,7 @@ def _block_shuffle_record_batches(
     owners = num_shards // shards_per_partition
     read_size = batch_size * shards_per_partition
     pps = num_partitions // owners
-    metadata_path = str(Path(topic_dir) / ".valid_batches.json")
+    metadata_path = os.path.join(topic_dir, ".valid_batches.json")
     range_start = start_batch_id or 0
     shard = shard_index if per_shard else None
 
@@ -272,7 +277,7 @@ def _row_counter(
 
     @functools.cache
     def row_counts(bid: int) -> tuple[int, ...]:
-        return tuple(pq.ParquetFile(batch_path(topic_dir, p, bid)).metadata.num_rows for p in parts)
+        return tuple(parquet_file(batch_path(topic_dir, p, bid)).metadata.num_rows for p in parts)
 
     return row_counts
 
@@ -343,7 +348,9 @@ def _sequence_reads(
         raise RuntimeError(
             f"The Rust reader returned {n} of {expected} record batches for batch_ids "
             f"{bids[0]}..{bids[-1]}: a partition stopped early (a missing or unreadable file, "
-            "or files that share no column). Read this data with python_reader=True."
+            "or files that share no column). Read local data with python_reader=True; on O2, "
+            "which only the Rust reader reads, an object is missing or a GET failed after "
+            "object_store's retries."
         )
 
 
@@ -427,7 +434,7 @@ def _time_order_record_batches(
     resume_position: DataPosition | None,
 ) -> Iterator[tuple[pa.RecordBatch, DataPosition]]:
     pps = num_partitions // num_shards
-    meta = load_valid_batches_metadata(str(Path(topic_dir) / ".valid_batches.json"))
+    meta = load_valid_batches_metadata(os.path.join(topic_dir, ".valid_batches.json"))
     if meta is None:
         raise ValueError(f"Cannot load metadata from {topic_dir}/.valid_batches.json")
     lo = max(meta["min_valid_batch"], start_batch_id or 0)
@@ -544,6 +551,26 @@ def _rust_remaining_batches(
     return total
 
 
+def _merge_by_visit(
+    roots: list[Iterator[tuple[pa.RecordBatch, DataPosition]]],
+    visit_key: Callable[[DataPosition], tuple[int, ...]],
+) -> Iterator[tuple[int, pa.RecordBatch, DataPosition]]:
+    heads = []
+    for i, it in enumerate(roots):
+        item = next(it, None)
+        if item is not None:
+            heads.append((visit_key(item[1]), i, item, it))
+    while heads:
+        j = min(range(len(heads)), key=lambda k: heads[k][:2])
+        _, i, (record_batch, position), it = heads[j]
+        yield i, record_batch, position
+        item = next(it, None)
+        if item is None:
+            heads.pop(j)
+        else:
+            heads[j] = (visit_key(item[1]), i, item, it)
+
+
 def _shards_per_partition(num_partitions: int, num_shards: int) -> int:
     if num_partitions and num_shards > num_partitions and num_shards % num_partitions == 0:
         return num_shards // num_partitions
@@ -560,9 +587,49 @@ class RustParquetDataset(PhoenixDataset):
     queue_size: int = 4
     lookahead_files: int = 4
     python_reader: bool = False
+    copy_roots: str = ""
 
     _position: DataPosition | None = dataclasses.field(init=False, default=None, repr=False)
     _rust_window_start: int | None = dataclasses.field(init=False, default=None, repr=False)
+    _copy_root_bounds: dict[str, tuple[int, int]] | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
+
+    def _copy_root_paths(self) -> list[str]:
+        return [r.strip().rstrip("/") for r in self.copy_roots.split(",") if r.strip()]
+
+    def _check_copy_roots(self) -> None:
+        reason = self.python_reader_reason()
+        if reason is not None:
+            raise ValueError(f"copy_roots needs the Rust reader, not the Python one ({reason})")
+        if self.dump_keep_rate_per_10000 is not None:
+            raise ValueError(
+                "copy_roots needs the stored sampleWeight: dump_keep_rate_per_10000 recomputes "
+                "the keep rule from the actions, which relabeled copies change"
+            )
+        if not self.ads_head_masking:
+            raise ValueError(
+                "copy_roots needs ads_head_masking=True: copies train by sample_source"
+            )
+
+    def _copy_root_bounds_of(self, root: str, num_partitions: int) -> tuple[int, int]:
+        with _COPY_ROOT_BOUNDS_LOCK:
+            if self._copy_root_bounds is None:
+                self._copy_root_bounds = {}
+            if root not in self._copy_root_bounds:
+                meta = load_valid_batches_metadata(os.path.join(root, ".valid_batches.json"))
+                if meta is None:
+                    raise ValueError(f"copy root {root} has no readable .valid_batches.json")
+                if meta["num_partitions"] != num_partitions:
+                    raise ValueError(
+                        f"copy root {root} has {meta['num_partitions']} partitions, {self.path} "
+                        f"{num_partitions}"
+                    )
+                self._copy_root_bounds[root] = (
+                    meta["min_valid_batch"],
+                    meta["max_valid_batch"] + 1,
+                )
+            return self._copy_root_bounds[root]
 
     def python_reader_reason(self) -> str | None:
         if self.python_reader:
@@ -577,9 +644,7 @@ class RustParquetDataset(PhoenixDataset):
             return "ad_fields_sidecar_root (the ad-field sidecar join)"
         if self.continuous:
             return "continuous=True"
-        if self.path is not None and not os.path.isfile(
-            os.path.join(self.path, ".valid_batches.json")
-        ):
+        if self.path is not None and not is_file(os.path.join(self.path, ".valid_batches.json")):
             return "index mode (no .valid_batches.json)"
         if not self.is_eval and (
             self.shuffle_in_memory_buffer_rows > 0
@@ -588,6 +653,13 @@ class RustParquetDataset(PhoenixDataset):
         ):
             return "file_shuffle or shuffle_in_memory_buffer_rows"
         return None
+
+    def _check_python_readable(self, reason: str) -> None:
+        if self.path is not None and is_object_store_path(self.path):
+            raise ValueError(
+                f"{self.path} is on O2, which only the Rust reader reads, but this config needs "
+                f"the Python reader: {reason}"
+            )
 
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
@@ -623,7 +695,11 @@ class RustParquetDataset(PhoenixDataset):
         end_batch_id: int | None = None,
         start_batch_id: int | None = None,
     ) -> int | None:
-        if self.python_reader_reason() is not None:
+        if self._copy_root_paths():
+            self._check_copy_roots()
+        reason = self.python_reader_reason()
+        if reason is not None:
+            self._check_python_readable(reason)
             return super().compute_max_steps(
                 num_shards=num_shards,
                 batch_size=batch_size,
@@ -659,6 +735,48 @@ class RustParquetDataset(PhoenixDataset):
         if end_bid <= start_bid or pps <= 0:
             return current_step - 1
 
+        left, source = self._rust_shard_batches(
+            topic_dir, start_bid, end_bid, num_partitions, num_shards, batch_size, resume_position
+        )
+        for root in self._copy_root_paths():
+            root_min, root_end = self._copy_root_bounds_of(root, num_partitions)
+            root_left, _ = self._rust_shard_batches(
+                root,
+                max(start_bid, root_min),
+                min(end_bid, root_end),
+                num_partitions,
+                num_shards,
+                batch_size,
+                (resume_position or {}).get("copy_roots", {}).get(root),
+            )
+            left = {shard: n + root_left.get(shard, 0) for shard, n in left.items()}
+        remaining = min(left.values(), default=0)
+        data_end_step = current_step + remaining - 1
+        rank_logger.info(
+            "Data end (Rust reader, %s): batch_ids [%d, %d), %d batches left -> step %d",
+            source,
+            start_bid,
+            end_bid,
+            remaining,
+            data_end_step,
+        )
+        return data_end_step
+
+    def _rust_shard_batches(
+        self,
+        topic_dir: str,
+        start_bid: int,
+        end_bid: int,
+        num_partitions: int,
+        num_shards: int,
+        batch_size: int,
+        resume_position: DataPosition | None,
+    ) -> tuple[dict[int, int], str]:
+        shards_per_partition = _shards_per_partition(num_partitions, num_shards)
+        owners = num_shards // shards_per_partition
+        pps = num_partitions // owners
+        if end_bid <= start_bid:
+            return {}, "empty range"
         manifest = load_batch_manifest(topic_dir)
         if manifest is not None:
             matrix = manifest.rows_matrix(topic_dir, start_bid, end_bid, num_partitions)
@@ -666,8 +784,10 @@ class RustParquetDataset(PhoenixDataset):
 
             def rows(bid: int) -> np.ndarray:
                 return matrix[bid - start_bid]
+        elif topic_dir != self.path:
+            raise ValueError(f"copy root {topic_dir} has no readable .batch_manifest.json")
         else:
-            sample = pq.ParquetFile(batch_path(topic_dir, 0, start_bid)).metadata.num_rows
+            sample = parquet_file(batch_path(topic_dir, 0, start_bid)).metadata.num_rows
             uniform = np.full(num_partitions, sample, dtype=np.int64)
             source = f"{sample}-row sample file"
 
@@ -675,7 +795,7 @@ class RustParquetDataset(PhoenixDataset):
                 return uniform
 
         block_shuffle = not self.is_eval and self.shuffle_mode == ShuffleMode.BLOCK_SHUFFLE
-        remaining: int | None = None
+        left: dict[int, int] = {}
         for shard in range(num_shards):
             if shard % shards_per_partition and not self.block_shuffle_order_per_shard:
                 continue
@@ -709,24 +829,14 @@ class RustParquetDataset(PhoenixDataset):
                     row_counts=shard_counts,
                 )
                 segments = [(list(range(first, end_bid)), bulk, discard)]
-            left = _rust_remaining_batches(
+            left[shard] = _rust_remaining_batches(
                 rows=rows,
                 parts=parts,
                 segments=segments,
                 batch_size=batch_size,
                 shards_per_partition=shards_per_partition,
             )
-            remaining = left if remaining is None else min(remaining, left)
-        data_end_step = current_step + (remaining or 0) - 1
-        rank_logger.info(
-            "Data end (Rust reader, %s): batch_ids [%d, %d), %d batches left -> step %d",
-            source,
-            start_bid,
-            end_bid,
-            remaining or 0,
-            data_end_step,
-        )
-        return data_end_step
+        return left, source
 
     def _rust_block_segments(
         self,
@@ -802,8 +912,12 @@ class RustParquetDataset(PhoenixDataset):
         skip_rows: int,
         resume_position: DataPosition | None,
     ) -> Iterator[pa.RecordBatch]:
+        copy_roots = self._copy_root_paths()
+        if copy_roots:
+            self._check_copy_roots()
         reason = self.python_reader_reason()
         if reason is not None:
+            self._check_python_readable(reason)
             rank_logger.warning("RustParquetDataset reads through the Python reader: %s", reason)
             return super()._record_batches(
                 batch_size=batch_size,
@@ -829,7 +943,7 @@ class RustParquetDataset(PhoenixDataset):
 
         assert self.path is not None, f"Called make() on {self.__class__} but self.path was None"
         topic_dir = self.path
-        meta = load_valid_batches_metadata(str(Path(topic_dir) / ".valid_batches.json"))
+        meta = load_valid_batches_metadata(os.path.join(topic_dir, ".valid_batches.json"))
         if meta is None:
             raise ValueError(f"Cannot load metadata from {topic_dir}/.valid_batches.json")
         num_partitions = meta["num_partitions"]
@@ -855,9 +969,14 @@ class RustParquetDataset(PhoenixDataset):
                     "only shuffle_mode=block_shuffle supports"
                 )
         elif num_partitions % num_shards != 0:
+            remedy = (
+                "on O2, which only the Rust reader reads, pick a num_shards that divides it"
+                if is_object_store_path(topic_dir)
+                else "the Python reader (dataset.python_reader=True) splits partitions across shards"
+            )
             raise ValueError(
                 f"num_partitions ({num_partitions}) must be divisible by num_shards ({num_shards}); "
-                "the Python reader (dataset.python_reader=True) splits partitions across shards"
+                f"{remedy}"
             )
         shards_per_partition = _shards_per_partition(num_partitions, num_shards)
         owners = num_shards // shards_per_partition
@@ -884,10 +1003,22 @@ class RustParquetDataset(PhoenixDataset):
         self._rust_window_start = None
         self._position = None
         self._rb_provider = None
+        for root in [topic_dir, *copy_roots]:
+            if is_object_store_path(root):
+                rank_logger.info(
+                    "Rust reader: %s through O2 at %s",
+                    root,
+                    settings.DATASET_OBJECT_STORE_ENDPOINT,
+                )
 
-        def make_provider(**kw: object) -> Iterable[pa.RecordBatch]:
+        def make_provider(root: str, **kw: object) -> Iterable[pa.RecordBatch]:
+            o2: dict = (
+                dict(o2_endpoint=settings.DATASET_OBJECT_STORE_ENDPOINT)
+                if is_object_store_path(root)
+                else {}
+            )
             return RecordBatchProvider(
-                topic_dir=topic_dir,
+                topic_dir=root,
                 batch_size=batch_size * shards_per_partition,
                 num_shards=owners,
                 shard_index=shard_index // shards_per_partition,
@@ -897,41 +1028,142 @@ class RustParquetDataset(PhoenixDataset):
                 row_split=(
                     (shards_per_partition, rank_in_partition) if shards_per_partition > 1 else None
                 ),
+                **o2,
                 **kw,
             )
 
-        common: dict = dict(
-            topic_dir=topic_dir,
-            num_partitions=num_partitions,
-            batch_size=batch_size,
-            shard_index=shard_index,
-            num_shards=num_shards,
-            start_batch_id=start_batch_id,
-            end_batch_id=end_batch_id(),
-            skip_rows=0 if self.is_eval else skip_rows,
-            resume_position=resume_position,
-        )
-        if block_shuffle:
-            reads = _block_shuffle_record_batches(
-                make_provider,
-                window=self.shuffle_window_time_slices,
-                block=self.block_shuffle_block_time_slices,
-                seed=self.shuffle_seed,
-                per_shard=self.block_shuffle_order_per_shard,
-                end_batch_id_fn=end_batch_id,
-                on_window=self._set_rust_window_start,
-                shards_per_partition=shards_per_partition,
-                **common,
+        def root_reads(
+            root: str,
+            start: int | None,
+            end_fn: Callable[[], int | None],
+            skip: int,
+            resume: DataPosition | None,
+            on_window: Callable[[int], None] | None = None,
+        ) -> Iterator[tuple[pa.RecordBatch, DataPosition]]:
+            common: dict = dict(
+                topic_dir=root,
+                num_partitions=num_partitions,
+                batch_size=batch_size,
+                shard_index=shard_index,
+                num_shards=num_shards,
+                start_batch_id=start,
+                end_batch_id=end_fn(),
+                skip_rows=skip,
+                resume_position=resume,
             )
-        else:
-            reads = _time_order_record_batches(make_provider, **common)
-        return self._tracking_position(reads)
+            provider = functools.partial(make_provider, root)
+            if block_shuffle:
+                return _block_shuffle_record_batches(
+                    provider,
+                    window=self.shuffle_window_time_slices,
+                    block=self.block_shuffle_block_time_slices,
+                    seed=self.shuffle_seed,
+                    per_shard=self.block_shuffle_order_per_shard,
+                    end_batch_id_fn=end_fn,
+                    on_window=on_window,
+                    shards_per_partition=shards_per_partition,
+                    **common,
+                )
+            return _time_order_record_batches(provider, **common)
+
+        reads = root_reads(
+            topic_dir,
+            start_batch_id,
+            end_batch_id,
+            0 if self.is_eval else skip_rows,
+            resume_position,
+            self._set_rust_window_start,
+        )
+        if not copy_roots:
+            return self._tracking_position(reads)
+        if resume_position is None and skip_rows > 0:
+            raise ValueError(
+                "copy_roots cannot resume from skip_rows without a data position: turn it on "
+                "at the start of a run"
+            )
+        resumed = (resume_position or {}).get("copy_roots", {})
+        missing = [
+            root for root in copy_roots if resume_position is not None and root not in resumed
+        ]
+        if missing:
+            raise ValueError(
+                f"The checkpoint's data position has no copy_roots {missing}: turn copy_roots on "
+                "at the start of a run (or load= this checkpoint with reset_data_position=True)"
+            )
+
+        def capped(end: int) -> Callable[[], int | None]:
+            return lambda: end if end_batch_id() is None else min(end_batch_id(), end)
+
+        start = max(start_batch_id or 0, meta["min_valid_batch"])
+        lanes = [
+            root_reads(
+                root,
+                start,
+                capped(self._copy_root_bounds_of(root, num_partitions)[1]),
+                0,
+                resumed.get(root),
+            )
+            for root in copy_roots
+        ]
+        return self._tracking_position(
+            self._merged_positions(
+                reads,
+                lanes,
+                copy_roots,
+                resume_position,
+                self._visit_key(block_shuffle, shard_index),
+            )
+        )
+
+    def _visit_key(
+        self, block_shuffle: bool, shard_index: int
+    ) -> Callable[[DataPosition], tuple[int, ...]]:
+        if not block_shuffle:
+            return lambda position: (position["last_batch_id"],)
+        block = self.block_shuffle_block_time_slices
+        window_blocks = self.shuffle_window_time_slices // block
+        shard = shard_index if self.block_shuffle_order_per_shard else None
+
+        @functools.cache
+        def ranks(window_start: int) -> dict[int, int]:
+            order = _block_shuffle_order(self.shuffle_seed, window_start, window_blocks, shard)
+            return {j: rank for rank, j in enumerate(order)}
+
+        def key(position: DataPosition) -> tuple[int, ...]:
+            window_start = position["block_shuffle_window_start"]
+            bid = position["last_batch_id"]
+            return (window_start, ranks(window_start)[(bid - window_start) // block], bid)
+
+        return key
+
+    @staticmethod
+    def _merged_positions(
+        reads: Iterator[tuple[pa.RecordBatch, DataPosition]],
+        lanes: list[Iterator[tuple[pa.RecordBatch, DataPosition]]],
+        copy_roots: list[str],
+        resume_position: DataPosition | None,
+        visit_key: Callable[[DataPosition], tuple[int, ...]],
+    ) -> Iterator[tuple[pa.RecordBatch, DataPosition | None]]:
+        resumed = dict(resume_position or {})
+        last_lanes = resumed.pop("copy_roots", {})
+        last: list[DataPosition | None] = [
+            cast(DataPosition, resumed) if resume_position else None,
+            *(last_lanes.get(root) for root in copy_roots),
+        ]
+        for i, record_batch, position in _merge_by_visit([reads, *lanes], visit_key):
+            last[i] = position
+            fresh = last[0]
+            if fresh is None:
+                yield record_batch, None
+                continue
+            copies = dict(zip(copy_roots, last[1:]))
+            yield record_batch, cast(DataPosition, {**fresh, "copy_roots": copies})
 
     def _set_rust_window_start(self, window_start: int) -> None:
         self._rust_window_start = window_start
 
     def _tracking_position(
-        self, reads: Iterator[tuple[pa.RecordBatch, DataPosition]]
+        self, reads: Iterator[tuple[pa.RecordBatch, DataPosition | None]]
     ) -> Iterator[pa.RecordBatch]:
         self._rb_provider = None
         for record_batch, position in reads:

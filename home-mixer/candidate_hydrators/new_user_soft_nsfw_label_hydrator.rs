@@ -4,19 +4,12 @@ use crate::models::query::ScoredPostsQuery;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::async_trait;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_visibility_filtering::tweet_safety_label::TweetSafetyLabelClient;
 use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
 pub struct NewUserSoftNsfwLabelHydrator {
     pub client: Arc<dyn TweetSafetyLabelClient>,
-}
-
-fn keep_existing_label(candidate: &PostCandidate) -> Result<PostCandidate, String> {
-    Ok(PostCandidate {
-        soft_nsfw: candidate.soft_nsfw,
-        ..Default::default()
-    })
 }
 
 fn followed_or_self(query: &ScoredPostsQuery) -> HashSet<u64> {
@@ -30,16 +23,18 @@ fn followed_or_self(query: &ScoredPostsQuery) -> HashSet<u64> {
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for NewUserSoftNsfwLabelHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for NewUserSoftNsfwLabelHydrator {
+    type Fetched = Vec<Option<bool>>;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         new_user_soft_nsfw_filter_enabled(query)
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Vec<Option<bool>>, String> {
         let in_network_authors = followed_or_self(query);
         let needs_label =
             |c: &PostCandidate| c.soft_nsfw.is_none() && !in_network_authors.contains(&c.author_id);
@@ -51,41 +46,44 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for NewUserSoftNsfwLabelHydrator 
             .into_iter()
             .collect();
         if tweet_ids.is_empty() {
-            return candidates.iter().map(keep_existing_label).collect();
+            return Ok(vec![None; candidates.len()]);
         }
-        let batch = match self.client.get_safety_labels(tweet_ids).await {
-            Ok(batch) => batch,
-            Err(e) => {
-                let err = format!("new user SoftNsfw label lookup failed: {e}");
-                return candidates.iter().map(|_| Err(err.clone())).collect();
-            }
-        };
+        let batch = self
+            .client
+            .get_safety_labels(tweet_ids)
+            .await
+            .map_err(|e| format!("new user SoftNsfw label lookup failed: {e}"))?;
 
-        candidates
+        Ok(candidates
             .iter()
             .map(|c| {
-                if !needs_label(c) {
-                    return keep_existing_label(c);
+                if !needs_label(c) || batch.failures.contains_key(&c.tweet_id) {
+                    return None;
                 }
-                if batch.failures.contains_key(&c.tweet_id) {
-                    return Err(format!(
-                        "new user SoftNsfw label missing for tweet {}",
-                        c.tweet_id
-                    ));
-                }
-                let soft_nsfw = batch
-                    .labels
-                    .get(&c.tweet_id)
-                    .is_some_and(|labels| labels.contains_key(&SafetyLabelType::SOFT_NSFW));
-                Ok(PostCandidate {
-                    soft_nsfw: Some(soft_nsfw),
-                    ..Default::default()
-                })
+                Some(
+                    batch
+                        .labels
+                        .get(&c.tweet_id)
+                        .is_some_and(|labels| labels.contains_key(&SafetyLabelType::SOFT_NSFW)),
+                )
             })
-            .collect()
+            .collect())
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        soft_nsfw: Vec<Option<bool>>,
+    ) {
+        for (candidate, soft_nsfw) in candidates.iter_mut().zip(soft_nsfw) {
+            if soft_nsfw.is_some() {
+                candidate.soft_nsfw = soft_nsfw;
+            }
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.soft_nsfw = hydrated.soft_nsfw;
     }
 }
@@ -160,8 +158,9 @@ mod tests {
         mut candidates: Vec<PostCandidate>,
     ) -> Vec<u64> {
         let h = hydrator(client);
-        let results = h.hydrate(query, &candidates).await;
-        h.update_all(&mut candidates, results);
+        if let Ok(fetched) = h.fetch(query, &candidates).await {
+            h.apply(query, &mut candidates, fetched);
+        }
         NewUserSoftNsfwFilter
             .filter(query, candidates)
             .kept
@@ -253,10 +252,12 @@ mod tests {
     #[tokio::test]
     async fn skips_the_call_when_nothing_needs_a_label() {
         let client = FakeVfClient::new(Err(Status::unavailable("unused")));
-        let results = hydrator(client.clone())
-            .hydrate(&enabled_query(), &[candidate(1, Some(false), Some(false))])
-            .await;
-        assert_eq!(results[0].as_ref().unwrap().soft_nsfw, Some(false));
+        let h = hydrator(client.clone());
+        let query = enabled_query();
+        let mut candidates = vec![candidate(1, Some(false), Some(false))];
+        let fetched = h.fetch(&query, &candidates).await.unwrap();
+        h.apply(&query, &mut candidates, fetched);
+        assert_eq!(candidates[0].soft_nsfw, Some(false));
         assert!(client.requested().is_empty());
     }
 

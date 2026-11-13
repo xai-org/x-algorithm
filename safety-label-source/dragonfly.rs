@@ -287,8 +287,12 @@ fn filtered_labels(labels: &vf_pb::SafetyLabelMap, now_ms: u64) -> vf_pb::Safety
 }
 
 fn twemcache_types_only(mut labels: vf_pb::SafetyLabelMap) -> vf_pb::SafetyLabelMap {
-    static DECODED: LazyLock<FxHashSet<i32>> =
-        LazyLock::new(|| safety_label_metas().iter().map(|meta| meta.value).collect());
+    static DECODED: LazyLock<FxHashSet<i32>> = LazyLock::new(|| {
+        safety_label_metas()
+            .iter()
+            .map(|meta| i32::from(meta.label_type))
+            .collect()
+    });
     labels
         .labels
         .retain(|label_type, _| DECODED.contains(label_type));
@@ -2015,7 +2019,7 @@ rust_vf:
         w.twemcache.found.lock().unwrap().insert(1);
         w.manhattan.set_spam(2, 0.5);
 
-        let answers = w.source.get(&[1, 2, 3]).await;
+        let answers = w.source.get(&[1, 2, 3], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), nsfa());
@@ -2031,7 +2035,7 @@ rust_vf:
         let w = world(LabelCacheSwitches::serving_every_post());
         w.manhattan.set_spam(1, 0.5);
 
-        let first = w.source.get(&[1, 2]).await;
+        let first = w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(labels(&first, 1), spam(0.5));
@@ -2058,7 +2062,7 @@ rust_vf:
             ))
         );
 
-        let second = w.source.get(&[1, 2]).await;
+        let second = w.source.get(&[1, 2], None).await;
         assert_eq!(labels(&second, 1), spam(0.5));
         assert_eq!(labels(&second, 2), empty());
         assert_eq!(
@@ -2080,7 +2084,7 @@ rust_vf:
         w.dragonfly.put_bytes(1, newer);
         w.manhattan.set_spam(1, 0.5);
 
-        let answers = w.source.get(&[1]).await;
+        let answers = w.source.get(&[1], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), spam(0.5));
@@ -2103,7 +2107,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(2, 0.7);
 
-        let answers = w.source.get(&[1, 2, 3]).await;
+        let answers = w.source.get(&[1, 2, 3], None).await;
         assert_eq!(labels(&answers, 1), spam(0.5));
         assert_eq!(labels(&answers, 2), spam(0.7));
         assert_eq!(labels(&answers, 3), empty());
@@ -2113,7 +2117,7 @@ rust_vf:
             found_ttl: Duration::from_secs(300),
             ..LabelCacheSwitches::serving_every_post()
         });
-        let answers = w.source.get(&[1]).await;
+        let answers = w.source.get(&[1], None).await;
         assert_eq!(labels(&answers, 1), spam(0.9));
     }
 
@@ -2133,7 +2137,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(3, 0.7);
 
-        let answers = w.source.get(&[1, 2, 3]).await;
+        let answers = w.source.get(&[1, 2, 3], None).await;
 
         assert_eq!(labels(&answers, 1), spam(0.5));
         assert_eq!(labels(&answers, 2), empty());
@@ -2146,18 +2150,18 @@ rust_vf:
         let start = tokio::time::Instant::now();
         let at = |secs| tokio::time::sleep_until(start + Duration::from_secs(secs));
         w.manhattan.set_spam(1, 0.5);
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
         w.manhattan.set_spam(1, 0.9);
 
         at(59).await;
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
         assert_eq!(w.manhattan.calls().len(), 1, "not due before 60 s");
 
         at(60).await;
-        let first = w.source.get(&[1]).await;
-        let second = w.source.get(&[1]).await;
+        let first = w.source.get(&[1], None).await;
+        let second = w.source.get(&[1], None).await;
         assert_eq!(labels(&first, 1), spam(0.5));
         assert_eq!(labels(&second, 1), spam(0.5));
         settle().await;
@@ -2167,10 +2171,10 @@ rust_vf:
             "one reread for two due reads"
         );
         assert_eq!(w.dragonfly.entry(1).unwrap().0.fill, fill(BASE_MS, 1));
-        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
+        assert_eq!(labels(&w.source.get(&[1], None).await, 1), spam(0.9));
 
         at(3600).await;
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
         assert_eq!(w.manhattan.calls().len(), 2, "step 1 is never reread");
     }
@@ -2183,7 +2187,7 @@ rust_vf:
         w.manhattan
             .add_label(1, SafetyLabelType::DEPRECATED_LABEL_144);
 
-        let answers = w.source.get(&[1]).await;
+        let answers = w.source.get(&[1], None).await;
         settle().await;
 
         assert!(
@@ -2197,7 +2201,7 @@ rust_vf:
 
         w.dragonfly
             .put(1, Status::Found(spam(0.1)), fill(BASE_MS - 60_000, 0));
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
 
         assert_eq!(w.manhattan.calls().len(), 2);
@@ -2232,7 +2236,7 @@ rust_vf:
         w.manhattan.set_spam(3, 0.7);
         w.manhattan.set_spam(5, 0.5);
 
-        w.source.get(&[1, 2, 3, 4, 5]).await;
+        w.source.get(&[1, 2, 3, 4, 5], None).await;
         settle().await;
 
         let refreshes = |step, status, result| {
@@ -2260,7 +2264,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(2, 0.9);
 
-        let answers = w.source.get(&[1, 2]).await;
+        let answers = w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), spam(0.5));
@@ -2286,7 +2290,7 @@ rust_vf:
             .put(1, Status::Found(spam(0.5)), fill(BASE_MS - 1_000, 2));
         w.manhattan.set_spam(1, 0.9);
 
-        let answers = w.source.get(&[1]).await;
+        let answers = w.source.get(&[1], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), spam(0.5));
@@ -2304,8 +2308,8 @@ rust_vf:
         w.manhattan.set_spam(1, 0.5);
         w.manhattan.set_spam(2, 0.6);
 
-        let first = w.source.get(&[1]).await;
-        let second = w.source.get(&[2]).await;
+        let first = w.source.get(&[1], None).await;
+        let second = w.source.get(&[2], None).await;
 
         assert_eq!(labels(&first, 1), spam(0.5));
         assert_eq!(labels(&second, 2), spam(0.6));
@@ -2321,7 +2325,7 @@ rust_vf:
             "a dropped fill can be queued again"
         );
 
-        w.source.get(&[2]).await;
+        w.source.get(&[2], None).await;
         assert!(matches!(fill_rx.try_recv(), Ok(job) if job.tweet_id == 2));
         assert_eq!(fills("enqueued"), 2);
     }
@@ -2335,7 +2339,7 @@ rust_vf:
         w.twemcache.found.lock().unwrap().insert(1);
         w.manhattan.set_spam(2, 0.5);
 
-        let answers = w.source.get(&[1, 2]).await;
+        let answers = w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), nsfa());
@@ -2361,7 +2365,7 @@ rust_vf:
                 .count("safety_labels_shadow_keys", &[("result", result)])
         };
 
-        let answers = w.source.get(&[1, 2]).await;
+        let answers = w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), nsfa());
@@ -2379,7 +2383,7 @@ rust_vf:
 
         w.dragonfly
             .put(2, Status::Found(spam(0.5)), fill(BASE_MS, 2));
-        w.source.get(&[1, 2]).await;
+        w.source.get(&[1, 2], None).await;
         settle().await;
         assert_eq!(shadow("mismatch"), 1);
         assert_eq!(shadow("match"), 1);
@@ -2392,7 +2396,7 @@ rust_vf:
         w.manhattan
             .add_label(1, SafetyLabelType::DEPRECATED_LABEL_144);
 
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
 
         assert_eq!(
@@ -2429,7 +2433,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.9);
         w.manhattan.set_spam(2, 0.8);
 
-        let answers = w.source.get(&[1, 2]).await;
+        let answers = w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 1), nsfa());
@@ -2477,7 +2481,7 @@ rust_vf:
             w.dragonfly.put(1, stale.status.clone(), stale.fill);
             w.manhattan.set_spam(1, 0.9);
 
-            w.source.get(&[1]).await;
+            w.source.get(&[1], None).await;
             settle().await;
 
             let repair = Envelope {
@@ -2510,7 +2514,7 @@ rust_vf:
         w.manhattan.set_spam(2, 0.5);
         w.dragonfly.put(2, Status::NotFound, fill(BASE_MS, 2));
 
-        let answers = w.source.get(&[2]).await;
+        let answers = w.source.get(&[2], None).await;
         settle().await;
 
         assert_eq!(labels(&answers, 2), spam(0.5));
@@ -2559,7 +2563,7 @@ rust_vf:
                 .count("safety_labels_shadow_keys", &[("result", result)])
         };
 
-        w.source.get(&[1, 2]).await;
+        w.source.get(&[1, 2], None).await;
         settle().await;
 
         assert_eq!(shadow("match"), 1);
@@ -2616,7 +2620,7 @@ rust_vf:
         };
 
         w.source
-            .get(&[in_match_slice, differs, source_differs])
+            .get(&[in_match_slice, differs, source_differs], None)
             .await;
         settle().await;
 
@@ -2659,7 +2663,7 @@ rust_vf:
             )
         };
 
-        w.source.get(&[in_match_slice]).await;
+        w.source.get(&[in_match_slice], None).await;
         settle().await;
 
         assert_eq!(mh_check("all_equal", "filtered"), 1);
@@ -2683,14 +2687,14 @@ rust_vf:
         let projected = || w.stats.count("safety_labels_shadow_manhattan_keys", &[]);
         w.dragonfly.failing.store(true, Ordering::SeqCst);
 
-        w.source.get(&[1, 2]).await;
+        w.source.get(&[1, 2], None).await;
         settle().await;
         assert_eq!(projected(), 2, "failed reads");
 
         let _permits = Arc::clone(&label_cache.shadow_tasks)
             .try_acquire_many_owned(SHADOW_TASKS as u32)
             .unwrap();
-        w.source.get(&[3]).await;
+        w.source.get(&[3], None).await;
         assert_eq!(
             w.stats
                 .count("safety_labels_shadow_keys", &[("result", "shed")]),
@@ -2704,13 +2708,16 @@ rust_vf:
         let (clock, mock) = quanta::Clock::mock();
         let w = build(LabelCacheSwitches::serving_every_post(), Some(clock), None).world;
         w.manhattan.set_spam(1, 0.5);
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         mock.increment(Duration::from_secs(10));
         w.manhattan.set_spam(1, 0.9);
         w.dragonfly.failing.store(true, Ordering::SeqCst);
         let uncached: Vec<u64> = (2..3_002).collect();
 
-        let answers = w.source.get(&[vec![1], uncached.clone()].concat()).await;
+        let answers = w
+            .source
+            .get(&[vec![1], uncached.clone()].concat(), None)
+            .await;
 
         assert_eq!(labels(&answers, 1), spam(0.5), "the expired hot-key entry");
         let admitted = uncached.iter().filter(|id| answers[id].is_ok()).count();
@@ -2720,8 +2727,10 @@ rust_vf:
             Err(failure) => failure.kind == FailureKind::LabelCacheUnavailable,
         }));
         let outage = |result| {
-            w.stats
-                .count("safety_labels_outage_keys", &[("result", result)])
+            w.stats.count(
+                "safety_labels_outage_keys",
+                &[("result", result), ("kind", "label_cache_unavailable")],
+            )
         };
         assert_eq!(outage("stale"), 1);
         assert_eq!(outage("manhattan"), admitted as u64);
@@ -2735,14 +2744,14 @@ rust_vf:
         for id in 1..=3 {
             w.manhattan.set_spam(id, 0.5);
         }
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
         mock.increment(Duration::from_secs(10));
         w.manhattan.set_spam(1, 0.9);
         w.dragonfly.fail(1);
         w.dragonfly.fail(2);
 
-        let answers = w.source.get(&[1, 2, 3]).await;
+        let answers = w.source.get(&[1, 2, 3], None).await;
 
         assert_eq!(labels(&answers, 1), spam(0.5), "the expired hot-key entry");
         assert_eq!(labels(&answers, 2), spam(0.5));
@@ -2752,13 +2761,28 @@ rust_vf:
         calls[1].sort_unstable();
         assert_eq!(calls[1], vec![2, 3]);
         let outage = |result| {
-            w.stats
-                .count("safety_labels_outage_keys", &[("result", result)])
+            w.stats.count(
+                "safety_labels_outage_keys",
+                &[("result", result), ("kind", "label_cache_unavailable")],
+            )
         };
         assert_eq!(
             (outage("stale"), outage("manhattan"), outage("failed")),
             (1, 1, 0)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_label_cache_failure_read_once_the_deadline_has_passed_spends_no_outage_read() {
+        let w = world(LabelCacheSwitches::serving_every_post());
+        w.dragonfly.fail(2);
+
+        let answers = w.source.get(&[2], Some(tokio::time::Instant::now())).await;
+
+        assert!(matches!(&answers[&2], Err(failure) if failure.kind == FailureKind::Deadline));
+        assert!(w.manhattan.calls().is_empty());
+        let manhattan = [("result", "manhattan"), ("kind", "label_cache_unavailable")];
+        assert_eq!(w.stats.count("safety_labels_outage_keys", &manhattan), 0);
     }
 
     fn invalidator(w: &World, repeat_queue: usize) -> LabelCacheInvalidator {
@@ -2787,7 +2811,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.5);
         w.dragonfly.hold_sets();
 
-        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.5));
+        assert_eq!(labels(&w.source.get(&[1], None).await, 1), spam(0.5));
         settle().await;
         w.manhattan.set_spam(1, 0.9);
         invalidator.invalidate(&[1]).await;
@@ -2795,7 +2819,7 @@ rust_vf:
         settle().await;
 
         assert_eq!(
-            labels(&w.source.get(&[1]).await, 1),
+            labels(&w.source.get(&[1], None).await, 1),
             spam(0.5),
             "the fill landed after the first delete"
         );
@@ -2805,7 +2829,7 @@ rust_vf:
         settle().await;
 
         assert_eq!(w.dragonfly.entry(1), None);
-        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
+        assert_eq!(labels(&w.source.get(&[1], None).await, 1), spam(0.9));
         assert_eq!(deletes(&w, "first", "deleted"), 1);
         assert_eq!(deletes(&w, "repeat", "deleted"), 1);
     }
@@ -2820,7 +2844,7 @@ rust_vf:
         w.manhattan.set_spam(1, 0.5);
         w.dragonfly.hold_sets();
 
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
         w.manhattan.set_spam(1, 0.9);
         invalidator.invalidate(&[1]).await;
@@ -2840,7 +2864,7 @@ rust_vf:
         settle().await;
 
         assert_eq!(w.dragonfly.entry(1), None);
-        assert_eq!(labels(&w.source.get(&[1]).await, 1), spam(0.9));
+        assert_eq!(labels(&w.source.get(&[1], None).await, 1), spam(0.9));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2854,11 +2878,11 @@ rust_vf:
             .put(3, Status::Found(spam(0.5)), fill(filled_at_ms, 0));
         w.dragonfly.hold_sets();
 
-        w.source.get(&[1]).await;
+        w.source.get(&[1], None).await;
         settle().await;
-        w.source.get(&[2, 3]).await;
+        w.source.get(&[2, 3], None).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        w.source.get(&[4]).await;
+        w.source.get(&[4], None).await;
         tokio::time::sleep(REPEAT_AFTER - Duration::from_secs(1)).await;
         w.dragonfly.release_sets();
         settle().await;

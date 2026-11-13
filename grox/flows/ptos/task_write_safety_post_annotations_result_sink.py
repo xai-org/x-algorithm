@@ -232,20 +232,51 @@ class TaskWriteSafetyPostAnnotationsResultSink(Task):
 
             if category == SafetyPolicyCategory.Spam:
                 should_label_for_spam = False
+                should_add_promote_label = False
                 if policy_type in (
                     SafetyPolicyType.SpamEngagementBaiting,
                     SafetyPolicyType.SpamEngagementFarming,
                     SafetyPolicyType.SpamCardManipulation,
+                    SafetyPolicyType.SpamPromotesShares,
                 ):
                     should_label_for_spam = True
-                elif policy_type != SafetyPolicyType.NoViolation:
+                elif policy_type in (
+                    SafetyPolicyType.NoViolation,
+                    SafetyPolicyType.SpamPromotesClicks,
+                    SafetyPolicyType.SpamPromotesReplies,
+                ):
+                    should_label_for_spam = False
+                else:
                     should_label_for_spam = not is_high_page_rank_user
+
+                if policy_type in (
+                    SafetyPolicyType.SpamPromotesClicks,
+                    SafetyPolicyType.SpamPromotesReplies,
+                    SafetyPolicyType.SpamPromotesShares,
+                ):
+                    should_add_promote_label = True
 
                 if should_label_for_spam:
                     await cls._strato_apply_label_from_ptos.apply(
                         tweet_id, SafetyLabelType.SpamHighRecall
                     )
                     applied.append(SafetyLabelType.SpamHighRecall.value)
+                if should_add_promote_label:
+                    if policy_type == SafetyPolicyType.SpamPromotesClicks:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesClicks
+                        )
+                        applied.append(SafetyLabelType.PromotesClicks.value)
+                    elif policy_type == SafetyPolicyType.SpamPromotesReplies:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesReplies
+                        )
+                        applied.append(SafetyLabelType.PromotesReplies.value)
+                    elif policy_type == SafetyPolicyType.SpamPromotesShares:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesShares
+                        )
+                        applied.append(SafetyLabelType.PromotesShares.value)
 
             if category == SafetyPolicyCategory.IllegalAndRegulatedBehaviors:
                 if policy_type != SafetyPolicyType.NoViolation:

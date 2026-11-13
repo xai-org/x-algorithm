@@ -417,14 +417,14 @@ mod tests {
                 favorite_score: Some(0.25),
                 ..Default::default()
             },
-            slate_context: Some(crate::models::candidate::SlateContext {
+            slate_context: Some(Box::new(crate::models::candidate::SlateContext {
                 k: 2,
                 pool_rank: 7,
                 pool_rank_gap: Some(3),
                 fatigue: 1.5,
                 pre_diversity_score: 0.42,
                 ..Default::default()
-            }),
+            })),
             ..candidate(1, 100)
         };
         let input = Arc::new(SideEffectInput {

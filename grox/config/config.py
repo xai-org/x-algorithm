@@ -84,8 +84,6 @@ class ModelName:
     GROK_4_1_FAST_X_ALGO_EXTRA = "grok-4-1-fast-x-algo-extra"
     GROK_4_MINI_CRITICAL = "grok-4-mini-critical"
     GROK_4_MINI_CRITICAL_SAFETY = "critical-safety"
-    EAPI_GROK_420_REASONING_X_ALGO = "eapi-grok-420-reasoning-x-algo"
-    EAPI_GROK_420_REASONING_INTERNAL = "eapi-grok-420-reasoning-internal"
     EAPI_GROK_4_1_FAST_X_ALGO = "eapi-grok-4-1-fast-x-algo"
     EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"
     EAPI_GROK_4_3_X_ALGO = "eapi-grok-4-3-x-algo"
@@ -114,6 +112,9 @@ class MediaHydrationConfig(BaseModel):
     enable_clahe_enhancement: bool = False
     enable_local_broadcast_frame_extraction: bool = False
     enable_video_preview_image: bool = False
+    enable_screenshot: bool = True
+    enable_screenshot_v2: bool = False
+    enable_url_videos: bool = True
     highest_video_bitrate: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
@@ -159,6 +160,7 @@ class TaskGeneratorConfig(BaseModel):
     type: str
     weight: int
     max_qps: int | None = None
+    max_in_flight: int | None = None
 
 
 class DispatcherConfig(BaseModel):

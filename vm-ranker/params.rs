@@ -258,6 +258,19 @@ param!(
     150
 );
 param!(
+    DppGreedyOrder,
+    bool,
+    "rust_home_mixer_vm_ranker_dpp_greedy_order",
+    false
+);
+param!(DppWindow, u32, "rust_home_mixer_vm_ranker_dpp_window", 0);
+param!(
+    DppWindowHalfDistance,
+    f64,
+    "rust_home_mixer_vm_ranker_dpp_window_half_distance",
+    0.0
+);
+param!(
     UserDebiasEnabled,
     bool,
     "rust_home_mixer_vm_ranker_user_debias_enabled",

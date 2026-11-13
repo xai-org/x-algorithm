@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
 
-use super::remote::{FallbackReason, LabelSource};
+use super::remote::{FailureKind, FallbackReason, LabelSource};
 
 const SOURCE_REQUESTS: &str = "safety_labels_source_requests";
 const SOURCE_LATENCY_MS: &str = "safety_labels_source_latency_ms";
@@ -286,8 +286,14 @@ pub(crate) fn record_deletes(
     metrics.incr(DELETES, &labels, count);
 }
 
-pub(crate) fn record_outage_keys(metrics: &LabelMetrics, result: OutageResult, count: usize) {
-    metrics.incr(OUTAGE_KEYS, &[("result", result.into())], count);
+pub(crate) fn record_outage_keys(
+    metrics: &LabelMetrics,
+    result: OutageResult,
+    kind: FailureKind,
+    count: usize,
+) {
+    let labels = [("result", result.into()), ("kind", kind.into())];
+    metrics.incr(OUTAGE_KEYS, &labels, count);
 }
 
 pub(crate) fn record_expired_labels(metrics: &LabelMetrics, count: usize) {

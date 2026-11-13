@@ -10,7 +10,7 @@ use xai_feature_switches::Params;
 use xai_user_debias::UserDebiasModel;
 use xai_vm_ranker_proto::{DppParams, RankRequest, RankedCandidate};
 
-use crate::dpp::DppConfig;
+use crate::dpp::{DppConfig, SlidingWindow};
 use crate::embedding_store::EmbeddingStore;
 use crate::metrics::PARAMS_RESOLVED;
 use crate::params::*;
@@ -56,6 +56,14 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
             (Some(p), _) => {
                 dpp.config.theta = p.get(DppTheta);
                 dpp.config.max_selected_rank = p.get(DppMaxSelectedRank) as usize;
+                dpp.config.greedy_order = p.get(DppGreedyOrder);
+                dpp.config.window = match p.get(DppWindow) {
+                    0 => None,
+                    size => Some(SlidingWindow {
+                        size: size as usize,
+                        half_distance: p.get(DppWindowHalfDistance),
+                    }),
+                };
             }
             (None, Some(overrides)) => apply_dpp_overrides(&mut dpp.config, overrides),
             (None, None) => {}
@@ -445,6 +453,8 @@ rust_home_mixer_author_exploration:
             theta: 0.7,
             max_selected_rank: 150,
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
         apply_dpp_overrides(
             &mut config,
