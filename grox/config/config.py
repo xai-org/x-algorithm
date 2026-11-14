@@ -113,7 +113,7 @@ class MediaHydrationConfig(BaseModel):
     enable_local_broadcast_frame_extraction: bool = False
     enable_video_preview_image: bool = False
     enable_screenshot: bool = True
-    enable_screenshot_v2: bool = False
+    enable_combined_view: bool = False
     enable_url_videos: bool = True
     highest_video_bitrate: bool = False
     deluxe_fav_count_threshold: int = 64

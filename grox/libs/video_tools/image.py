@@ -149,6 +149,20 @@ def _padded_image(image: Image.Image, high_quality_jpeg: bool = False) -> bytes:
     return _img_to_bytes(image, high_quality_jpeg)
 
 
+def side_by_side(images: list[bytes], max_aspect: float) -> bytes | None:
+    opened = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
+    height = max(im.height for im in opened)
+    widths = [max(1, round(im.width * height / im.height)) for im in opened]
+    if sum(widths) > max_aspect * height:
+        return None
+    with Image.new("RGB", (sum(widths), height), (255, 255, 255)) as row:
+        x = 0
+        for im, width in zip(opened, widths):
+            row.paste(im.resize((width, height), Image.Resampling.LANCZOS), (x, 0))
+            x += width
+        return _img_to_bytes(row)
+
+
 def pad_image(image_bytes: bytes) -> bytes:
     with Image.open(io.BytesIO(image_bytes)) as img:
         with img.convert("RGB") as image:

@@ -7,7 +7,12 @@ from tenacity import retry, wait_fixed, stop_after_attempt
 from broadcast_tools.broadcast import BroadcastLoader
 from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
 from monitor.metrics import Metrics
-from video_tools.image import process_image_bytes, resize_tile, enhance_image_with_clahe
+from video_tools.image import (
+    process_image_bytes,
+    resize_tile,
+    enhance_image_with_clahe,
+    side_by_side,
+)
 from grox.config.config import grox_config
 from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
 from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
@@ -26,6 +31,7 @@ from grox.core.data_loaders.data_types import (
 )
 from blobstore_http.cdn_downloader import CDNDownloader
 from html_render.tweet_render_for_grox import TweetRenderForGrox
+from strato_http.queries.media_entities import StratoMediaEntities
 from strato_http.queries.video_subtitle import StratoVideoSubtitle
 
 logger = logging.getLogger(__name__)
@@ -35,6 +41,8 @@ _VIDEO_DURATION_LIMIT_MINUTES = 360
 _VIDEO_PREVIEW_MIN_DURATION_MS = 30_000
 _VIDEO_MAX_ESTIMATED_BYTES = int(2 * 1024**3)
 _MAX_URL_VIDEOS_PER_POST = 7
+_COMBINED_VIEW_MIN_IMAGES = 5
+_COMBINED_VIEW_MAX_ASPECT = 3
 
 
 def _create_descendant_id_provider() -> DescendantIdProvider | None:
@@ -53,6 +61,7 @@ def _create_descendant_id_provider() -> DescendantIdProvider | None:
 
 class MediaLoader:
     strato_video_subtitle = StratoVideoSubtitle()
+    strato_media_entities = StratoMediaEntities()
     descendant_id_provider = _create_descendant_id_provider()
     descendant_hydrator = DescendantHydrator()
     cdn_downloader = CDNDownloader()
@@ -105,18 +114,13 @@ class MediaLoader:
         return image_count >= 2 and video_count == 0
 
     @classmethod
-    async def hydrate_screenshot(cls, post: Post, v2: bool = False) -> None:
+    async def hydrate_screenshot(cls, post: Post) -> None:
         if not post.screenshot or not post.screenshot.convo_image:
             Metrics.counter("media_loader.hydrate_screenshot.count").add(
                 1, attributes=cls._metrics_attributes()
             )
             try:
-                if v2:
-                    screenshot_bytes = await cls.tweet_render.take_screenshot_v2(
-                        post.id
-                    )
-                else:
-                    screenshot_bytes = await cls.tweet_render.take_screenshot(post.id)
+                screenshot_bytes = await cls.tweet_render.take_screenshot(post.id)
                 if screenshot_bytes:
                     resized = resize_tile(
                         screenshot_bytes,
@@ -181,9 +185,70 @@ class MediaLoader:
             and not post.ancestors
             and is_high_fav
         ):
-            await cls.hydrate_screenshot(
-                post, v2=grox_config.media_hydration.enable_screenshot_v2
+            await cls.hydrate_screenshot(post)
+
+        if grox_config.media_hydration.enable_combined_view:
+            if cls.post_media_is_screenshot_target(post):
+                await cls.hydrate_combined_view(post)
+            if post.quoted_post and cls.post_media_is_screenshot_target(
+                post.quoted_post
+            ):
+                await cls.hydrate_combined_view(post.quoted_post, source="quoted")
+
+    @classmethod
+    async def hydrate_combined_view(cls, post: Post, source: str = "post") -> None:
+        outcome = "failed"
+        try:
+            if not await cls._sort_in_display_order(post):
+                outcome = "unordered"
+            else:
+                images = [
+                    m.convo_image.content
+                    for m in post.media or []
+                    if isinstance(m, Image) and m.convo_image
+                ]
+                view = None
+                if len(images) >= _COMBINED_VIEW_MIN_IMAGES and len(images) == len(
+                    post.media or []
+                ):
+                    view = side_by_side(images, _COMBINED_VIEW_MAX_ASPECT)
+                if view:
+                    tile_size = grox_config.media_hydration.deluxe_image_tile_size
+                    post.combined_view = Image(
+                        id=post.id,
+                        url=None,
+                        convo_image=ConvoImage(content=resize_tile(view, tile_size)),
+                    )
+                outcome = "built" if view else "none"
+        except Exception:
+            logger.error(
+                f"failed to hydrate combined view for post {post.id}, error: {traceback.format_exc()}"
             )
+        Metrics.counter("media_loader.hydrate_combined_view.count").add(
+            1,
+            attributes={
+                **cls._metrics_attributes(),
+                "outcome": outcome,
+                "source": source,
+            },
+        )
+
+    @classmethod
+    async def _sort_in_display_order(cls, post: Post) -> bool:
+        media = post.media or []
+        if len(media) < 2:
+            return True
+        entities = await cls.strato_media_entities.fetch(int(post.id))
+        position = {
+            str(e.get("mediaKey", {}).get("mediaId")): i for i, e in enumerate(entities)
+        }
+        if any((m.id or "") not in position for m in media):
+            logger.warning(
+                f"Post {post.id}: display order doesn't place every medium, keeping the loaded order"
+            )
+            return False
+        post.media = sorted(media, key=lambda m: position[m.id or ""])
+        return True
 
     @classmethod
     def ranked_posts_associated(cls, post: Post) -> list[Post]:

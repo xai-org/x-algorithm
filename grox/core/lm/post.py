@@ -136,6 +136,12 @@ class PostRenderer:
                 res.extend(
                     cls.render(descendant_post, indent=indent + 4, max_media=max_media)
                 )
+        if post.combined_view:
+            res.append(
+                f"\n\n{indent_str}Sometimes user slice one picture across the post's images. So all of the post's images are attached"
+                " side by side as one view, in the order X shows them, for reference\n\n"
+            )
+            res.extend(post.combined_view.to_convo())
         if post.screenshot:
             res.append(
                 f"\n\n{indent_str}Sometimes user present their content by combining multiple images to one view. So screenshot is attached for reference\n\n"

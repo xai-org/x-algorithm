@@ -101,10 +101,12 @@ def chunk_posts(post: Post) -> list[Post]:
         update = {"media": _media_window(post, i)}
         if i > 0:
             update["screenshot"] = None
+            update["combined_view"] = None
         if post.quoted_post:
-            update["quoted_post"] = post.quoted_post.model_copy(
-                update={"media": _media_window(post.quoted_post, i)}
-            )
+            quoted_update = {"media": _media_window(post.quoted_post, i)}
+            if i > 0:
+                quoted_update["combined_view"] = None
+            update["quoted_post"] = post.quoted_post.model_copy(update=quoted_update)
         chunks.append(post.model_copy(update=update))
     return chunks
 

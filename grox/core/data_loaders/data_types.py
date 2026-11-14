@@ -721,6 +721,7 @@ class Post(BaseModel):
     created_at: datetime | None = None
     ancestors: list["Post"] | None = None
     screenshot: Image | None = None
+    combined_view: Image | None = None
     reply: Reply | None = None
     cardsV2: list[CardV2] | None = None
     grok_share_metadatas: list[GrokShare] | None = None

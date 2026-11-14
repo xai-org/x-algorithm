@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-12T16:00:36Z
+// mirrored from config feature-switch defaults; last sync 2026-11-13T16:00:28Z
 use xai_feature_switches::param;
 
 param!(
@@ -634,13 +634,13 @@ param!(
     VMRankerSendDppHistory,
     bool,
     "rust_home_mixer_vm_ranker_send_dpp_history",
-    false
+    true
 );
 param!(
     VMRankerDppHistoryMaxItems,
     usize,
     "rust_home_mixer_vm_ranker_dpp_history_max_items",
-    200
+    50
 );
 param!(
     HistoryTopicsEnabled,
