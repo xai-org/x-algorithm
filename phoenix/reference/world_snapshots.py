@@ -25,7 +25,7 @@ _SID_NUM_LEVELS = 6
 _SID_CODEBOOK_SIZE = 256
 
 _SID_TRAIN_CAP = 20_000
-_SID_KMEANS_ITERS = 15
+_SID_EMEANS_EPOCHS = 5
 
 _MM_REL = "mm_snapshot/post_mm_v5.parquet"
 _SID_REL = "sid_snapshot/post_sid_v5_256x6.parquet"
@@ -85,13 +85,13 @@ def _train_and_assign_sids(
         return codes.astype(np.int64), None
 
     from sid_assign import encode_batch
-    from sid_codebook import train_rq_kmeans
+    from sid_codebook import train_rq_emeans
 
     if n > _SID_TRAIN_CAP:
         rng = np.random.default_rng(np.random.SeedSequence(entropy=seed, spawn_key=(7,)))
         train_idx = np.sort(rng.choice(n, size=_SID_TRAIN_CAP, replace=False))
         print(
-            f"  [SID] training RQ-KMeans on a {_SID_TRAIN_CAP}/{n} deterministic "
+            f"  [SID] training RQ-e-means on a {_SID_TRAIN_CAP}/{n} deterministic "
             "subsample (codebook generalises to all posts via the assigner)",
             flush=True,
         )
@@ -99,11 +99,11 @@ def _train_and_assign_sids(
     else:
         train_mm = mm
 
-    codebooks = train_rq_kmeans(
+    codebooks = train_rq_emeans(
         train_mm,
         num_levels=_SID_NUM_LEVELS,
         num_centroids=_SID_CODEBOOK_SIZE,
-        n_iters=_SID_KMEANS_ITERS,
+        num_epochs=_SID_EMEANS_EPOCHS,
         seed=seed,
     )
     codes = encode_batch(mm, codebooks.astype(np.float32), None)
@@ -128,7 +128,7 @@ def _write_sid(world, codes: np.ndarray, codebooks: np.ndarray | None, out: Path
         save_codebook_npz(
             str(out / _CODEBOOK_REL),
             codebooks,
-            n_iters=_SID_KMEANS_ITERS,
+            n_iters=_SID_EMEANS_EPOCHS,
             seed=world.seed,
             n_train=min(world.num_posts, _SID_TRAIN_CAP),
         )
@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--skip-sid-train",
         action="store_true",
-        help="use the oss_recsys_synth RANDOM codebook instead of training RQ-KMeans",
+        help="use the oss_recsys_synth RANDOM codebook instead of training RQ-e-means",
     )
     ap.add_argument("--self-check", action="store_true", help="assert reader schemas after write")
     args = ap.parse_args(argv)

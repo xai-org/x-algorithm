@@ -300,6 +300,15 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 | [`phoenix/`](phoenix/) ranking | Predicts how likely the viewer is to take each action on each post. Training and serving code, in JAX with a Rust serving layer.                                                                |
 | [`vm-ranker/`](vm-ranker/)     | The service `VMRanker` calls once posts are scored. It reorders them with a determinantal point process over their embeddings, giving up a little score for less similarity between neighbours. |
 
+The SID reference trainer's `train` CLI and snapshot workflow use e-means for
+fixed-embedding codebooks: mini-batch EMA updates, scaling-law batch and step
+sizes, cosine annealing, split-based dead-code revival, and a full-data
+finalization pass. Its RQ-VAE path uses e-means for initialization only; the
+encoder keeps changing the latent distribution, so subsequent codebook
+updates remain standard VQ-VAE EMA. The legacy `train_rq_kmeans` callable
+remains available as a Lloyd baseline. See the
+[SID training notes](phoenix/reference/README.md).
+
 
 
 
@@ -372,8 +381,10 @@ There is a common misconception to be aware of about the weights: they scale the
 Three adjustments follow:
 
 - **Author Diversity**: each post after an author's first is multiplied by a decaying factor, down to a floor.
-- **Out-of-Network Discount**: posts from accounts the viewer does not follow are multiplied by a factor below 1, as are replies and reposts from accounts the viewer does follow.
+- **Out-of-Network Discount**: positive value for posts from accounts the viewer does not follow is multiplied by a factor below 1, as are replies and reposts from accounts the viewer does follow. Negative predictions are not scaled.
 - **New-Author Boost**: posts from authors whose impressions are below a threshold are lifted toward a target position.
+
+Before top-K selection, out-of-network posts must also have at least one predicted positive-action probability of 1% or higher. For viewers with fewer than five scoring-history actions, the selector keeps at most one below-floor out-of-network post as a cold-start exploration opportunity. This check runs after scoring and page-level exploration, so score lifts alone cannot bypass it for established viewers.
 
 `VMRanker` then calls [`vm-ranker/`](vm-ranker/), a separate service that reorders the result.
 

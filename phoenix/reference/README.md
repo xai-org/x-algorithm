@@ -38,9 +38,9 @@ comments or docstrings, so no in-file banner survives to say it there).
 
 | File | What it is |
 | --- | --- |
-| `sid_codebook.py` | The RQ-KMeans / RQ-VAE codebook **trainer** (JAX), mirrored from the internal pipeline source. CLI: `train` / `evaluate` / VAE variants. |
+| `sid_codebook.py` | The JAX RQ-e-means / RQ-VAE codebook **trainer**. Fixed embeddings use e-means; the CLI also exposes `train` / `evaluate` / VAE variants. |
 | `sid_assign.py` | The SID **assigner**, mirrored from the internal pipeline source: MLP encode → residual-quantize against a trained codebook. |
-| `sid_io.py` | Shared IO for the two files above (codebook `.npz` format, MLP forward), mirrored from the internal pipeline source. |
+| `sid_io.py` | Shared codebook IO and MLP forward helpers, with metadata for fixed-embedding e-means outputs. |
 | `sid_snapshot_gen.py` | Writes the post-SID snapshot parquet. Default: synthetic random-codebook codes. Opt-in: codes from a codebook you trained with `sid_codebook.py`. |
 | `sid_index_server.py` | **Real** SID lookup server: serves codes from a snapshot parquet over the production `SidLookupService` gRPC contract. |
 | `sid_mock_server.py` | Stand-alone mock SID server: same wire contract, codes generated on the fly (no snapshot needed). |
@@ -55,11 +55,12 @@ comments or docstrings, so no in-file banner survives to say it there).
 | `repack_checkpoint.py` | Repacks a trained checkpoint into a publishable artifact: keeps load/infer tensors, drops optimizer state, scrubs internal metadata, regenerates checksums. |
 | `retrieve_then_rank.py` | The QUICKSTART §5 driver: sends real dump sessions through the two live servers — `RetrieveTopKCandidates` on retrieval, then `PredictNextActions` on ranking — over the production gRPC contract. |
 
-Provenance, in one line each: `sid_codebook.py`, `sid_assign.py`, and `sid_io.py`
-are the real internal SID pipeline source, mirrored at export time with only
-infrastructure stripped; `train_step.py` and `mm_encoder.py` are faithful ports
-of the production algorithm; everything else is reference tooling authored for
-this release.
+Provenance, in one line each: `sid_assign.py` mirrors the internal SID
+assigner; `sid_io.py` preserves its codebook format and adds e-means metadata;
+`sid_codebook.py` retains its RQ-VAE path and adds the fixed-embedding e-means
+trainer described below; `train_step.py` and
+`mm_encoder.py` are faithful ports of the production algorithm; everything
+else is reference tooling authored for this release.
 
 ## How the pieces relate
 
@@ -125,7 +126,7 @@ residual-quantization code (each level in `[0, 256)`) computed from its MM
 embedding. What ships is the *entire* loop:
 
 - *Train:* `sid_codebook.py train --training-data emb.npy --codebook-out cb.npz`
-  (real mirrored trainer, RQ-KMeans or RQ-VAE).
+  (fixed-embedding RQ-e-means trainer; `--epochs` defaults to 5).
 - *Assign:* `sid_assign.py` encodes embeddings against the trained codebook.
 - *Snapshot:* `sid_snapshot_gen.write_sid_snapshot` writes `post_id → post_sid`
   parquet — synthetic codes by default, trained-codebook codes via `codes=`.
@@ -137,6 +138,22 @@ embedding. What ships is the *entire* loop:
   `SidLookupService` gRPC contract from that parquet;
   `sid_mock_server.py` answers it with on-the-fly synthetic codes. The
   serving engine's `PySemanticIdClient` speaks to either, unchanged.
+
+The fixed-embedding `train` path uses e-means (Bessa et al.,
+[arXiv:2611.09501](https://arxiv.org/abs/2611.09501)), not Lloyd's full-dataset
+iterations: it initializes centroids from sampled vectors, updates counts and
+sums from shuffled mini-batches with the paper's batch-size and initial-step
+scaling laws, cosine-anneals the step size to 10% of its initial value, revives
+dead codes by splitting active ones every five updates (disabled for dimensions
+at most two), and finalizes each residual level with exact full-data cluster
+means. `--iters` remains an alias for `--epochs`.
+
+RQ-VAE is different: its encoder changes the latent distribution during
+training, so e-means' fixed-dataset guarantees do not apply to those ongoing
+updates. It uses e-means to initialize codebooks from the warmup latent
+snapshot, then retains the standard VQ-VAE EMA updates and dead-code revival
+while the encoder is learning. This is an explicit moving-target adaptation,
+not a claim that the full RQ-VAE loop implements e-means.
 
 Wire convention note: servers speak 0-indexed codes (`[0, 256)`); the model's
 input buffer is 1-indexed `uint16` (`0` = missing). `oss_recsys_synth.py`
@@ -185,8 +202,8 @@ assertions when executed bare, e.g. `python reference/world.py`.
 Same seed → same world → byte-identical artifacts, across runs and machines:
 generators use explicitly seeded NumPy generators, fixed row order, and fixed
 parquet writer settings. The one caveat: `world_snapshots.py` trains its SID
-codebook on GPU with JAX, and k-means reductions can wobble in the last float
-bit run-to-run — the `codebook_v5_256x6.npz` centroids may differ at ~1e-8
-while every parquet artifact, including the assigned SID codes, stays
-byte-identical. Default seed everywhere is `20260721`; pass `--seed` to make a
-different world.
+codebook on GPU with JAX, and floating-point reductions can vary in their last
+bits across devices. The seeded mini-batch order is repeatable on the same
+setup, but small centroid differences across hardware can change codes for
+posts close to a cluster boundary. Default seed everywhere is `20260721`; pass
+`--seed` to make a different world.
