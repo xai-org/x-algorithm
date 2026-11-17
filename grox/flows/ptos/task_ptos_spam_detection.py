@@ -23,7 +23,6 @@ class TaskPtosSpamDetection(TaskWithPost):
     policy_classifier = SafetyPtosPolicyClassifier(
         model_name=ModelName.GROK_4_1_FAST_HEDGEHOG_CRITICAL,
         mode=SafetyPtosMode.STANDARD,
-        use_gemma=True,
         gemma_model_name=GEMMA_PTOS_REALTIME,
     )
 

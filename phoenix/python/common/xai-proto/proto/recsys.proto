@@ -21,6 +21,9 @@ service RecsysRetrievalPredictor {
 
   rpc ScorePosts(ScorePostsRequest) returns (ScorePostsResponse) {}
 
+  rpc RetrieveTopKUsers(RetrieveTopKUsersRequest)
+      returns (RetrieveTopKUsersResponse) {}
+
   rpc ReloadModel(ReloadModelRequest) returns (ReloadModelResponse) {}
 }
 
@@ -239,6 +242,10 @@ message PageDecodeParams {
   optional float nuAuthor = 8;
   optional float nuSid = 9;
   optional float priorTau = 10;
+  optional float notDwelledPowerExponent = 11;
+  optional float notDwelledPowerOffset = 12;
+  optional float engageBias = 13;
+  optional float multiplicative = 14;
 }
 
 message RankingScoreWeights {
@@ -257,6 +264,7 @@ message RankingScoreWeights {
   float minVideoDurationMs = 13;
   float shareViaDmWeight = 14;
   float shareViaCopyLinkWeight = 15;
+  float completionWeight = 16;
 }
 
 message PageDecodeResult {
@@ -364,6 +372,26 @@ message ScorePostsRequest {
 
 message ScorePostsResponse {
   PostActionScores scores = 1;
+}
+
+message RetrieveTopKUsersRequest {
+  repeated TweetInfo posts = 1;
+  uint32 top_k = 2;
+  uint32 max_age_seconds = 3;
+}
+
+message ScoredUser {
+  uint64 user_id = 1;
+  float score = 2;
+}
+
+message ScoredUsers {
+  uint64 post_id = 1;
+  repeated ScoredUser users = 2;
+}
+
+message RetrieveTopKUsersResponse {
+  repeated ScoredUsers results = 1;
 }
 
 message PostActionScores {

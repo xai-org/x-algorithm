@@ -20,6 +20,10 @@ impl QuotedPostTextHydrator {
 impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for QuotedPostTextHydrator {
     type Fetched = Vec<Option<String>>;
 
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        !query.user_features.muted_keywords.is_empty()
+    }
+
     async fn fetch(
         &self,
         _query: &ScoredPostsQuery,
@@ -110,5 +114,16 @@ mod tests {
             Some("quoted text")
         );
         assert_eq!(candidates[1].quoted_tweet_text, None);
+    }
+
+    #[test]
+    fn enable_only_when_the_viewer_has_muted_keywords() {
+        let hydrator = QuotedPostTextHydrator::new(
+            Arc::new(MockTESClient::default()) as Arc<dyn TESClient + Send + Sync>
+        );
+        assert!(!hydrator.enable(&ScoredPostsQuery::default()));
+        let mut query = ScoredPostsQuery::default();
+        query.user_features.muted_keywords = vec!["spam".to_string()];
+        assert!(hydrator.enable(&query));
     }
 }

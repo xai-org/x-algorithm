@@ -22,6 +22,7 @@ from xrex.models.model_utils import unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.sharding_context import make_legacy_sharding_context
+from xrex.utils import gpu
 
 if typing.TYPE_CHECKING:
     from xrex.train.trainer_recsys import RecsysTrainer
@@ -46,13 +47,17 @@ TOPIC_QUERY_KEY = "topic_query"
 TOPIC_FILTER_MODES = 6
 DECODE_OUTPUT_NAMES = ("picked_idx", "picked_prob", "picked_score")
 
+_SM80_INT8_SCORE_PAD_ROWS = 64
+
 _RETRIEVAL_RUNNER_ATTRS = (
     "large_k",
     "retrieval_dataset_types",
     "enable_async_topk",
     "enable_radix_select_topk",
+    "int8_score_pad_rows",
     "enable_int8_post_table",
     "enable_dataset_slice_topk",
+    "enable_shard_local_topk",
     "enable_bloom_filter",
     "enable_topic_filter",
 )
@@ -96,6 +101,8 @@ REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
         "candidate_seq.conversion_dense_features",
         "candidate_seq.account_hashes",
         "candidate_seq.post_sids",
+        "dwell_cread_power",
+        "dwell_cread_scale",
     }
 )
 
@@ -162,11 +169,13 @@ class RetrievalExport:
     dataset_types_dtype: str
     int8_post_table: bool = False
     dataset_capacities: tuple[int, ...] | None = None
+    int8_score_pad_rows: int = 0
     rows_from: tuple[tuple[int, ...], ...] | None = None
     max_age_seconds: tuple[float | None, ...] | None = None
     optional_targets: tuple[bool, ...] | None = None
     topic_filter: bool = False
     mol_side_table_shape: tuple[int, int] | None = None
+    strided_shards: int | None = None
 
     @property
     def output_names(self) -> list[str]:
@@ -232,13 +241,15 @@ class RetrievalExport:
             "dataset_types_key": POST_DATASET_TYPES_KEY,
             "post_ids_key": POST_IDS_KEY,
             "author_ids_key": AUTHOR_IDS_KEY,
-            "topk_unordered": self.use_radix_select_topk,
+            "topk_unordered": self.use_radix_select_topk and self.strided_shards is None,
         }
         if self.int8_post_table:
             block["post_scales_key"] = POST_SCALES_KEY
         if self.dataset_capacities is not None:
             block["dataset_ranges_key"] = DATASET_RANGES_KEY
             block["dataset_capacities"] = list(self.dataset_capacities)
+        if self.strided_shards is not None:
+            block["strided_shards"] = self.strided_shards
         if self.topic_filter:
             block["topic_filter"] = _topic_filter_manifest_block()
         return block
@@ -569,7 +580,20 @@ def _batch_avals(
                 np.uint16,
             )
 
+    if packed and getattr(model_config, "dwell_cread_decode_from_request", False):
+        from xrex.models.recsys_model import cread_request_decode_avals
+
+        batch.update(cread_request_decode_avals(batch))
+
     return batch
+
+
+def _request_fills(model_config: Any) -> dict[str, float]:
+    if not getattr(model_config, "dwell_cread_decode_from_request", False):
+        return {}
+    from xrex.models.recsys_model import cread_request_decode_fills
+
+    return cread_request_decode_fills(model_config)
 
 
 def _embedding_slices(export_cfg: Any, history_seq_len: int, candidate_seq_len: int):
@@ -764,6 +788,8 @@ def _make_retrieval_forward_fn(
             post_scales=by_kind.get("post_scales"),
             dataset_capacities=retrieval.dataset_capacities,
             mol_side_tables=mol_side_tables,
+            int8_score_pad_rows=retrieval.int8_score_pad_rows,
+            shard_local_top_k=retrieval.strided_shards is not None,
         )
         flat: list[jax.Array] = []
         for indices, scores in results:
@@ -877,6 +903,7 @@ def _input_spec(
     batch_template: Any,
     retrieval_inputs: list[tuple[str, str, Any, str]] | None = None,
     page_decode_avals: PageDecodeInputs | None = None,
+    request_fills: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
@@ -901,7 +928,10 @@ def _input_spec(
         if key.startswith("packing_layout."):
             spec.append({"kind": "packing_layout", "key": key, **_aval_entry(leaf)})
         elif key in REQUEST_BATCH_KEYS:
-            spec.append({"kind": "batch", "key": key, "source": "request", **_aval_entry(leaf)})
+            entry = {"kind": "batch", "key": key, "source": "request"}
+            if request_fills and key in request_fills:
+                entry["fill"] = request_fills[key]
+            spec.append({**entry, **_aval_entry(leaf)})
         else:
             if key not in template_leaves:
                 raise ValueError(
@@ -938,7 +968,7 @@ def _page_decode_avals(bs: int, candidate_seq_len: int) -> PageDecodeInputs:
 
 
 def _retrieval_export(
-    runner: Any, dataset_capacities: Mapping[str, int] | None = None
+    runner: Any, dataset_capacities: Mapping[str, int] | None = None, mesh_devices: int = 1
 ) -> RetrievalExport:
     missing = [name for name in _RETRIEVAL_RUNNER_ATTRS if not hasattr(runner, name)]
     if missing:
@@ -1029,6 +1059,26 @@ def _retrieval_export(
                 f"MoL side table has {mol_side_table_shape[0]} rows but the post table has "
                 f"{int(table.shape[0])}; the serving forward slices both per shard"
             )
+    int8_post_table = bool(runner.enable_int8_post_table)
+    mol = runner.model_config.mol_item_components > 0
+    int8_score_pad_rows = 0
+    if int8_post_table and not mol:
+        int8_score_pad_rows = int(runner.int8_score_pad_rows)
+        if int8_score_pad_rows < 0:
+            sm80 = gpu.cuda_compute_capability(jax.devices()[0]) == (8, 0)
+            int8_score_pad_rows = _SM80_INT8_SCORE_PAD_ROWS if sm80 else 0
+        logger.info(
+            "int8 post-table scoring: users padded to %d rows below 32 (0 = unpadded)",
+            int8_score_pad_rows,
+        )
+    strided_shards = None
+    if runner.enable_shard_local_topk:
+        if capacities is None or not int8_post_table or mol:
+            raise ValueError(
+                "enable_shard_local_topk needs --dataset_capacities, enable_int8_post_table and "
+                "dot-product scoring (no MoL)"
+            )
+        strided_shards = mesh_devices
     return RetrievalExport(
         large_k=large_k,
         target_dataset_types=tuple((ds.name, int(ds.value)) for ds in datasets),
@@ -1038,13 +1088,15 @@ def _retrieval_export(
         post_table_dtype=_dtype_name(table.dtype),
         dataset_types_shape=tuple(int(d) for d in post_embeddings.dataset_types.shape),
         dataset_types_dtype=_dtype_name(post_embeddings.dataset_types.dtype),
-        int8_post_table=bool(runner.enable_int8_post_table),
+        int8_post_table=int8_post_table,
         dataset_capacities=capacities,
+        int8_score_pad_rows=int8_score_pad_rows,
         rows_from=_split_rows_from(runner, datasets) if split_home else None,
         max_age_seconds=_split_max_age(runner, datasets) if split_home else None,
         optional_targets=_split_optional(runner, datasets) if split_home else None,
         topic_filter=topic_filter,
         mol_side_table_shape=mol_side_table_shape,
+        strided_shards=strided_shards,
     )
 
 
@@ -1098,9 +1150,9 @@ def build_bundle(
             "StableHLO bundle export does not support ad_side_ids_emb_dim > 0; "
             "serve with the JAX backend"
         )
-    retrieval = _retrieval_export(trainer, dataset_capacities) if two_tower else None
     if mesh_devices < 1:
         raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")
+    retrieval = _retrieval_export(trainer, dataset_capacities, mesh_devices) if two_tower else None
     if not two_tower and mesh_devices != 1:
         raise NotImplementedError(
             "ranking programs are single-device (one executable per GPU); "
@@ -1289,6 +1341,7 @@ def build_bundle(
             batch_template,
             retrieval_inputs,
             page_decode_avals,
+            _request_fills(export_cfg.model_config),
         )
         if len(spec) != len(exported.in_avals):
             raise AssertionError(

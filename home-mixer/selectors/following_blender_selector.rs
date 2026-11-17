@@ -1,4 +1,4 @@
-use super::build_non_selected;
+use super::{build_non_selected, select_ads_only};
 use crate::ads::{AdsBlender, FollowingAdBlender};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
@@ -23,6 +23,9 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
         query: &ScoredPostsQuery,
         candidates: Vec<FeedItem>,
     ) -> SelectResult<FeedItem> {
+        if query.is_ads_only_timeline() {
+            return select_ads_only(candidates);
+        }
         let PartitionedFeedItems {
             posts,
             ads,

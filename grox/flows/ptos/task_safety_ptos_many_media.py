@@ -1,15 +1,23 @@
+import asyncio
 import logging
 import math
 from typing import override
 
 from monitor.metrics import Metrics
+from strato_http.queries.data_types import SafetyPolicyCategory
+from strato_http.queries.safety_post_annotations_result import (
+    StratoSafetyPostAnnotationsResultDirectMh,
+)
 
 from grox.core.data_loaders.data_types import Post
 from grox.core.plans.plan import Plan
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.core.tasks.task_filters import TaskFilterWithPost
-from grox.flows.ptos.constants import MANY_MEDIA_CHUNK_SIZE
+from grox.flows.ptos.constants import (
+    MANY_MEDIA_CHUNK_SIZE,
+    MANY_MEDIA_UNCONDITIONAL_FAV,
+)
 from grox.flows.ptos.task_safety_ptos_adult_content_cross_validation import (
     TaskSafetyPtosAdultContentCrossValidation,
 )
@@ -26,9 +34,12 @@ logger = logging.getLogger(__name__)
 
 _FILTER_METRIC_PREFIX = "task.safety_ptos_many_media_filter"
 _CHUNKS_METRIC_PREFIX = "task.safety_ptos_many_media_chunks"
+MANY_MEDIA_MAX_CONCURRENT_CHUNKS = 5
 
 
 class TaskSafetyPtosManyMediaFilter(TaskFilterWithPost):
+    _result_direct_mh = StratoSafetyPostAnnotationsResultDirectMh()
+
     @override
     @classmethod
     async def _eligible_with_post(cls, post: Post, ctx: TaskContext) -> bool:
@@ -37,16 +48,36 @@ class TaskSafetyPtosManyMediaFilter(TaskFilterWithPost):
         own, quoted = _media_counts(post)
         if max(own, quoted) <= MANY_MEDIA_CHUNK_SIZE:
             return cls._skip("few_media")
+        favs = post.get_fav_count()
+        forced = favs >= MANY_MEDIA_UNCONDITIONAL_FAV
+        prior_adult = False
+        if not forced:
+            prior = await cls._result_direct_mh.fetch(int(post.id))
+            if (
+                prior is not None
+                and prior.safetyBoolMetadata
+                and prior.safetyBoolMetadata.isNsfw
+            ):
+                return cls._skip("already_nsfw")
+            prior_adult = prior is not None and any(
+                v.category == SafetyPolicyCategory.AdultContent
+                for a in prior.safetyPostAnnotations or []
+                for v in a.violatedPolicies or []
+            )
+            if not prior_adult:
+                return cls._skip("no_prior_ptos" if prior is None else "no_adult_prior")
         chunks = math.ceil(max(own, quoted) / MANY_MEDIA_CHUNK_SIZE)
         Metrics.counter(f"{_FILTER_METRIC_PREFIX}.eligible.count").add(
             1,
             attributes={
                 "chunks": str(chunks),
                 "source": "post" if own >= quoted else "quoted",
+                "forced": str(forced).lower(),
             },
         )
         logger.info(
-            f"Post {post.id}: {own} media, {quoted} quoted media, eligible for {chunks} PTOS rounds"
+            f"Post {post.id}: {own} media, {quoted} quoted media, favs={favs}, "
+            f"forced={forced}, prior_adult={prior_adult}, eligible for {chunks} PTOS rounds"
         )
         return True
 
@@ -117,12 +148,18 @@ class TaskSafetyPtosManyMediaChunks(TaskWithPost):
     @classmethod
     async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
         chunks = chunk_posts(post)
+        semaphore = asyncio.Semaphore(MANY_MEDIA_MAX_CONCURRENT_CHUNKS)
+
+        async def _run_chunk(chunk: Post):
+            async with semaphore:
+                payload = ctx.payload.model_copy(
+                    update={"post": chunk, "plans": {PlanSafetyPtosManyMediaChunk.KEY}}
+                )
+                return await cls._chunk_plan.execute(payload)
+
+        results = await asyncio.gather(*(_run_chunk(chunk) for chunk in chunks))
         failed = 0
-        for i, chunk in enumerate(chunks):
-            payload = ctx.payload.model_copy(
-                update={"post": chunk, "plans": {PlanSafetyPtosManyMediaChunk.KEY}}
-            )
-            result = await cls._chunk_plan.execute(payload)
+        for i, result in enumerate(results):
             ok = result is not None and result.success
             Metrics.counter(f"{_CHUNKS_METRIC_PREFIX}.round.count").add(
                 1, attributes={"outcome": "success" if ok else "failed"}

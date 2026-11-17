@@ -2935,6 +2935,15 @@ impl pb::recsys_retrieval_predictor_server::RecsysRetrievalPredictor
         ))
     }
 
+    async fn retrieve_top_k_users(
+        &self,
+        _request: Request<pb::RetrieveTopKUsersRequest>,
+    ) -> tonic::Result<Response<pb::RetrieveTopKUsersResponse>> {
+        Err(Status::unimplemented(
+            "post-to-user retrieval is served by the Rust host only (--enable-post-to-user)",
+        ))
+    }
+
     async fn retrieve_top_k_candidates(
         &self,
         request: Request<pb::RetrieveTopKCandidatesRequest>,

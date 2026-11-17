@@ -7,7 +7,7 @@ use xai_value_model::{fuse_heads, CandidateScoringInputs, ValueModelWeights};
 
 pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
     let params = &query.params;
-    ValueModelWeights {
+    let mut weights = ValueModelWeights {
         favorite: params.get(FavoriteWeight),
         reply: params.get(ReplyWeight),
         retweet: params.get(RetweetWeight),
@@ -48,7 +48,15 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
         author_diversity_floor: 1.0,
         oon_rescore_in_network_replies_retweets: false,
         multiplier_pre_offset: false,
-    }
+        ..Default::default()
+    };
+    weights.set_multiplicative(
+        &params.get(ValueModelMode),
+        params.get(NotDwelledPowerExponent),
+        params.get(NotDwelledPowerOffset),
+        params.get(MultiplicativeVmEngageBias),
+    );
+    weights
 }
 
 pub(crate) fn applied_weights(query: &ScoredPostsQuery) -> HashMap<String, f64> {

@@ -20,6 +20,7 @@ from xrex.data.recsys.feature_config import (
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
 from xrex.models.fp8 import Fp8Gemms
+from xrex.models.page_critic_only import PAGE_CRITIC_ONLY_PARAM_REGEX, PageCriticOnlyConfig
 from xrex.models.page_rl import PAGE_PARAM_REGEX, PageRlConfig
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
@@ -487,6 +488,17 @@ def _immersive_page_rl_cread() -> dict:
     }
 
 
+def _immersive_page_rl_cread_critic_only() -> dict:
+    base = _immersive_page_rl_cread()
+    return {
+        **base,
+        "page_rl": replace(base["page_rl"], critic_only=PageCriticOnlyConfig()),
+        "optim_config": replace(
+            base["optim_config"], clip_partitions=[PAGE_CRITIC_ONLY_PARAM_REGEX, PAGE_PARAM_REGEX]
+        ),
+    }
+
+
 MODEL_CFGS = {
     "xrecsys_seqpack": _make_cfg(
         {
@@ -592,6 +604,13 @@ MODEL_CFGS = {
     ),
     "immersive_page_rl_cread": _make_cfg(
         _immersive_page_rl_cread(),
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl_cread_critic_only": _make_cfg(
+        _immersive_page_rl_cread_critic_only(),
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,

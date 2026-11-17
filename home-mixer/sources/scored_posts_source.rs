@@ -11,6 +11,10 @@ pub struct ScoredPostsSource {
 
 #[async_trait]
 impl Source<ScoredPostsQuery, FeedItem> for ScoredPostsSource {
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        !query.is_ads_only_timeline()
+    }
+
     async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {
         let output = self
             .scored_posts_server

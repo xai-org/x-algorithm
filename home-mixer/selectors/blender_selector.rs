@@ -1,4 +1,5 @@
-use super::build_non_selected;
+use super::{build_non_selected, select_ads_only};
+use crate::ads::user_load::UserAdLoad;
 use crate::ads::{
     AdsBlender, LeastMovementAdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender,
     SafeGapAdsBlender, SlotSpreadAdsBlender, TimeGapAdsBlender, TimeGapConfig,
@@ -20,7 +21,6 @@ pub struct BlenderSelector {
     safe_gap_blender: SafeGapAdsBlender,
     partition_organic_blender: PartitionOrganicAdsBlender,
     multi_risk_blender: MultiRiskAdsBlender,
-    slot_spread_blender: SlotSpreadAdsBlender,
     least_movement_blender: LeastMovementAdsBlender,
 }
 
@@ -30,7 +30,6 @@ impl BlenderSelector {
             safe_gap_blender: SafeGapAdsBlender::default(),
             partition_organic_blender: PartitionOrganicAdsBlender,
             multi_risk_blender: MultiRiskAdsBlender,
-            slot_spread_blender: SlotSpreadAdsBlender,
             least_movement_blender: LeastMovementAdsBlender,
         }
     }
@@ -42,6 +41,9 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
         query: &ScoredPostsQuery,
         candidates: Vec<FeedItem>,
     ) -> SelectResult<FeedItem> {
+        if query.is_ads_only_timeline() {
+            return select_ads_only(candidates);
+        }
         let PartitionedFeedItems {
             posts,
             ads,
@@ -58,11 +60,17 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
         let input_ads = ads.clone();
 
         let time_gap_blender;
+        let slot_spread_blender;
         let blender: &dyn AdsBlender = match query.params.get(AdsBlenderType).as_str() {
             "partition_organic_low_risk" => &self.partition_organic_blender,
             "safe_gap" => &self.safe_gap_blender,
             "multi_risk" => &self.multi_risk_blender,
-            "slot_spread" => &self.slot_spread_blender,
+            "slot_spread" => {
+                slot_spread_blender = SlotSpreadAdsBlender {
+                    load: UserAdLoad::for_request(query),
+                };
+                &slot_spread_blender
+            }
             "least_movement" => &self.least_movement_blender,
             "time_gap" => {
                 time_gap_blender = TimeGapAdsBlender {

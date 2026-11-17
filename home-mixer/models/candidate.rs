@@ -15,30 +15,40 @@ pub struct PostCandidate {
     pub tweet_id: u64,
     pub author_id: u64,
     pub tweet_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to_tweet_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retweeted_tweet_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retweeted_user_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_tweet_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_user_id: Option<u64>,
     pub phoenix_scores: PhoenixScores,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction_request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scored_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub weighted_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cold_start_lift_to_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slate_context: Option<Box<SlateContext>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub top_heads: Vec<(String, f64, f64)>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub served_slate_context: Option<Box<SlateContext>>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reranker_head_tag: Option<u32>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub page_decode_slot: Option<u32>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub page_decode_prob: Option<f64>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub page_rl_exploration_prob: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backbone_scores: Option<Box<PhoenixScores>>,
@@ -53,77 +63,123 @@ pub struct PostCandidate {
     pub served_type: Option<pb::ServedType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retrieval_sources: Vec<RetrievalSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub in_network: Option<bool>,
     pub ancestors: Vec<u64>,
     pub tombstone_ancestor_ids: Vec<u64>,
     pub ancestor_users: Vec<u64>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<u64>,
     pub ancestor_texts: HashMap<u64, String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ancestor_has_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_tweet_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_video_duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_video_duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_photo: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_video: Option<bool>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub video_aspect_ratio: Option<f32>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub video_media_id: Option<u64>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub video_md5_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub video_carousel_extra: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_video_duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_has_media: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_has_photo: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_has_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_media_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_max_video_duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author_followers_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author_screen_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retweeted_screen_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_action: Option<vf::Action>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_reason: Option<vf::FilteredReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub drop_ancillary_posts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_author_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tweet_type_metrics: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author_blocks_viewer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_author_blocks_viewer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filtered_topic_ids: Option<Vec<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unfiltered_topic_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub following_replied_user_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_media: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_is_live: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fav_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repost_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_count: Option<u64>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub view_count_on_home: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mutual_follow_jaccard: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_mutual_follow_author: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author_follows_viewer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub brand_safety_verdict: Option<BrandSafetyVerdict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nsfw_author: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nsfw_author_ads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nsfw_author_phoenix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_nsfw: Option<bool>,
     #[serde(default)]
     pub safety_labels: Vec<SafetyLabelInfo>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_ids: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_feedback_topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_feedback_topic_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub grok_topics: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_trend_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_trend_id: Option<String>,
     #[serde(skip)]
     pub post_engagers: Option<Arc<PostEngagers>>,
@@ -543,5 +599,48 @@ mod tests {
             deserialized.safety_labels[0].label_type,
             SafetyLabelType::BOUNCE
         );
+    }
+
+    #[test]
+    fn absent_option_fields_match_explicit_nulls() {
+        let candidate = PostCandidate {
+            tweet_id: 9,
+            author_id: 3,
+            tweet_text: "hello".into(),
+            retweeted_tweet_id: Some(11),
+            in_network: Some(false),
+            score: Some(0.0),
+            language_code: Some("en".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&candidate).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.get("quoted_tweet_id").is_none());
+        assert!(obj.get("slate_context").is_none());
+        assert_eq!(obj.get("retweeted_tweet_id"), Some(&serde_json::json!(11)));
+        assert_eq!(obj.get("in_network"), Some(&serde_json::json!(false)));
+        assert_eq!(obj.get("score"), Some(&serde_json::json!(0.0)));
+
+        let mut with_nulls = value.clone();
+        let map = with_nulls.as_object_mut().unwrap();
+        for key in [
+            "quoted_tweet_id",
+            "quoted_user_id",
+            "slate_context",
+            "served_slate_context",
+            "in_reply_to_tweet_id",
+            "cold_start_lift_to_rank",
+        ] {
+            map.insert(key.to_string(), serde_json::Value::Null);
+        }
+        let from_nulls: PostCandidate = serde_json::from_value(with_nulls).unwrap();
+        let from_skipped: PostCandidate = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(&from_nulls).unwrap(),
+            serde_json::to_value(&from_skipped).unwrap()
+        );
+        assert_eq!(from_skipped.retweeted_tweet_id, Some(11));
+        assert_eq!(from_skipped.in_network, Some(false));
+        assert_eq!(from_skipped.quoted_tweet_id, None);
     }
 }

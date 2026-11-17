@@ -317,6 +317,56 @@ def packed_history_users(layout: SequencePackedLayout) -> tuple[jax.Array, int]:
     return jnp.clip(users, 0, num_users - 1).astype(jnp.int32), num_users
 
 
+CREAD_REQUEST_DECODE_HEAD = "dwell-time-cread"
+CREAD_DECODE_POWER_KEY = "dwell_cread_power"
+CREAD_DECODE_SCALE_KEY = "dwell_cread_scale"
+
+
+def packed_candidate_users(layout: SequencePackedLayout) -> jax.Array:
+    user_starts = (
+        layout.candidate_cu_seqlens
+        if layout.candidate_cu_seqlens is not None
+        else layout.cu_seqlens
+    )
+    user_starts = cast_jax(user_starts).astype(jnp.int32)
+    candidate_positions = cast_jax(layout.candidate_positions).astype(jnp.int32)
+    num_users = user_starts.shape[1] - 1
+    users = jax.vmap(lambda s, p: jnp.searchsorted(s[1:], p, side="right"))(
+        user_starts, candidate_positions
+    )
+    return jnp.clip(users, 0, num_users - 1).astype(jnp.int32)
+
+
+def cread_request_decode_avals(batch: Any) -> dict[str, jax.ShapeDtypeStruct]:
+    shape = tuple(batch["user_hashes"].shape[:2])
+    return {
+        key: jax.ShapeDtypeStruct(shape, jnp.float32)
+        for key in (CREAD_DECODE_POWER_KEY, CREAD_DECODE_SCALE_KEY)
+    }
+
+
+def cread_request_decode_head(model_config: Any) -> Any:
+    heads = [
+        lc
+        for lc in model_config.continuous_action_losses
+        if lc.metric_name == CREAD_REQUEST_DECODE_HEAD and lc.loss_type == "cread"
+    ]
+    if len(heads) != 1:
+        raise ValueError(
+            f"dwell_cread_decode_from_request needs exactly one {CREAD_REQUEST_DECODE_HEAD!r} "
+            f"CREAD head, found {len(heads)}"
+        )
+    return heads[0]
+
+
+def cread_request_decode_fills(model_config: Any) -> dict[str, float]:
+    head = cread_request_decode_head(model_config)
+    return {
+        CREAD_DECODE_POWER_KEY: float(head.cread_serve_power),
+        CREAD_DECODE_SCALE_KEY: float(head.cread_serve_scale),
+    }
+
+
 def recent_positive_history_mask(
     history_actions: jax.Array,
     history_post_hashes: jax.Array,
@@ -429,6 +479,10 @@ class ContinuousActionLossConfig(Config):
 
     cread_mask_sentinel_labels: bool = True
 
+    cread_serve_power: float = 1.0
+
+    cread_serve_scale: float = 1.0
+
     activation: Literal["sigmoid", "softplus"] | None = None
 
     output_cap: float = -1.0
@@ -470,6 +524,8 @@ class ContinuousActionLossConfig(Config):
 
         if self.loss_type == "cread":
             _ = self.cread_threshold_values
+            if not 0.0 < self.cread_serve_power <= 1.0:
+                raise ValueError(f"cread_serve_power ({self.cread_serve_power}) must be in (0, 1]")
             if not 0.0 < self.cread_huber_delta_sec < self.norm_config.norm_scale:
                 raise ValueError(
                     f"cread_huber_delta_sec ({self.cread_huber_delta_sec}) must be in "
@@ -1355,6 +1411,7 @@ class RecsysAggregatedModelConfig(Config):
     wallclock_recency: bool = False
 
     recent_positive_value_scale: float = 1.0
+    dwell_cread_decode_from_request: bool = False
     recent_positive_window_secs: int = 900
     recent_positive_last_n: int = 5
     recent_positive_last_n_cap_secs: int = 7200
@@ -3558,9 +3615,32 @@ class RecsysAggregatedModel(hk.Module):
             for head in self.config.active_aux_value_heads
         }
 
+    def _request_cread_decode(
+        self, batch: RecsysFeaturesBatch, layout: SequencePackedLayout
+    ) -> tuple[jax.Array, jax.Array] | None:
+        if not self.config.dwell_cread_decode_from_request:
+            return None
+        cread_request_decode_head(self.config)
+        power = batch.get(CREAD_DECODE_POWER_KEY)
+        scale = batch.get(CREAD_DECODE_SCALE_KEY)
+        if power is None or scale is None:
+            raise ValueError(
+                "dwell_cread_decode_from_request needs the "
+                f"{CREAD_DECODE_POWER_KEY} and {CREAD_DECODE_SCALE_KEY} batch inputs "
+                "(served by --backend=native)"
+            )
+        users = packed_candidate_users(layout)
+        return (
+            jnp.take_along_axis(cast_jax(power).astype(jnp.float32), users, axis=1),
+            jnp.take_along_axis(cast_jax(scale).astype(jnp.float32), users, axis=1),
+        )
+
     @hk.transparent
     def _decode_cread(
-        self, inputs: jax.Array, loss_config: ContinuousActionLossConfig
+        self,
+        inputs: jax.Array,
+        loss_config: ContinuousActionLossConfig,
+        request_decode: tuple[jax.Array, jax.Array] | None = None,
     ) -> jax.Array:
         _config = self.config
         emb_size = _config.model_config.emb_size
@@ -3580,10 +3660,24 @@ class RecsysAggregatedModel(hk.Module):
         assert loss_config.metric_name is not None
         self.cread_logits[loss_config.metric_name] = cread_logits
         phi = jax.nn.sigmoid(cread_logits.astype(jnp.float32))
+        power, scale = loss_config.cread_serve_power, loss_config.cread_serve_scale
         deltas = jnp.asarray(
-            [t - t_prev for t_prev, t in zip((0.0,) + thresholds, thresholds)], dtype=jnp.float32
+            [
+                scale * (t**power - t_prev**power)
+                for t_prev, t in zip((0.0,) + thresholds, thresholds)
+            ],
+            dtype=jnp.float32,
         )
         restored = jnp.dot(phi, deltas)[..., None]
+        if request_decode is not None:
+            request_power, request_scale = request_decode
+            t = jnp.asarray(thresholds, dtype=jnp.float32)
+            t_prev = jnp.concatenate([jnp.zeros((1,), jnp.float32), t[:-1]])
+            p = request_power[..., None]
+            request_deltas = request_scale[..., None] * (jnp.power(t, p) - jnp.power(t_prev, p))
+            request_restored = jnp.sum(phi * request_deltas, axis=-1, keepdims=True)
+            is_default = (request_power == power) & (request_scale == scale)
+            restored = jnp.where(is_default[..., None], restored, request_restored)
         return restored.astype(inputs.dtype)
 
     @hk.transparent
@@ -3592,6 +3686,7 @@ class RecsysAggregatedModel(hk.Module):
         inputs: jax.Array,
         product_surface: jax.Array | None = None,
         purchase_value_features: jax.Array | None = None,
+        cread_decode: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
         self.cread_logits: dict[str, jax.Array] = {}
         unembeddings = self._get_continuous_unembedding()
@@ -3653,7 +3748,10 @@ class RecsysAggregatedModel(hk.Module):
                 c: ContinuousActionLossConfig, head_logits: jax.Array
             ) -> jax.Array:
                 if c.loss_type == "cread":
-                    return self._decode_cread(inputs, c)
+                    request_decode = (
+                        cread_decode if c.metric_name == CREAD_REQUEST_DECODE_HEAD else None
+                    )
+                    return self._decode_cread(inputs, c, request_decode)
                 out = self._apply_activation(head_logits, c.activation)
                 if c.output_cap > 0:
                     out = c.output_cap * jnp.tanh(out / c.output_cap)
@@ -4507,6 +4605,7 @@ class RecsysAggregatedModel(hk.Module):
         act_l2_mask: jax.Array | None = None,
         with_aux_value_heads: bool = False,
         purchase_value_features: jax.Array | None = None,
+        cread_decode: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, ...]:
         _debug_dir = self.config.model_config.debug_tensor_dump_output_folder
         dump_to_file(_debug_dir, "input_embeddings", input_embeddings)
@@ -4598,7 +4697,7 @@ class RecsysAggregatedModel(hk.Module):
             logits = config.final_logit_cap * jnp.tanh(logits / config.final_logit_cap)
 
         continuous_predictions, head_logits_by_index = self.decode_continuous(
-            out_embeddings, product_surface, purchase_value_features
+            out_embeddings, product_surface, purchase_value_features, cread_decode=cread_decode
         )
         aux_value_logits = (
             self.decode_aux_value_heads(out_embeddings) if with_aux_value_heads else {}
@@ -5852,9 +5951,12 @@ class RecsysAggregatedModel(hk.Module):
                 seqpack_layout=layout,
                 product_surface=product_surface,
                 return_candidate_embeddings=decode,
+                cread_decode=self._request_cread_decode(batch, layout),
             )
         else:
             assert candidate_start_offset is not None
+            if self.config.dwell_cread_decode_from_request:
+                raise ValueError("dwell_cread_decode_from_request needs use_seqpack")
 
             if self.config.pad_candidates_to_128:
                 input_embeddings, padding_mask, product_surface, targets, *_ = (

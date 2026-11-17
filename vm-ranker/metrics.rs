@@ -245,6 +245,33 @@ lazy_static! {
         .buckets(vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 35.0, 50.0])
     )
     .unwrap();
+    pub static ref DPP_HISTORY_SIDS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_dpp_history_sids_total",
+            "Served-history posts in the sliding window needing a SID, by outcome: cached, found, missing (no SID), timeout, error or skipped (breaker open)"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref SID_LOOKUP_DURATION: HistogramVec = register_histogram_vec!(
+        HistogramOpts::new(
+            "vm_ranker_sid_lookup_seconds",
+            "SID lookup latency for served-history posts in seconds, by outcome: ok, timeout or error"
+        )
+        .buckets(prometheus::exponential_buckets(0.0005, 1.5, 15).unwrap()),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref SID_CACHE_ENTRIES: IntGauge = register_int_gauge!(
+        "vm_ranker_sid_cache_entries",
+        "Entries in the local cache of history SIDs (approximate)"
+    )
+    .unwrap();
+    pub static ref SID_CACHE_CAPACITY: IntGauge = register_int_gauge!(
+        "vm_ranker_sid_cache_capacity",
+        "Capacity of the local cache of history SIDs"
+    )
+    .unwrap();
     pub static ref CONFIG_SYNC_LAST_SUCCESS_SECS: Gauge = register_gauge!(
         "vm_ranker_config_sync_last_success_timestamp_seconds",
         "Unix time of the last successful config poll (fetch succeeded, files current)"

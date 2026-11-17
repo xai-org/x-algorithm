@@ -4,6 +4,7 @@ use crate::models::engagement_signals::EngagementSignalsByType;
 use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::in_network_reply::{serialize_in_network_replies, InNetworkReplies};
 use crate::models::user_features::UserFeatures;
+use crate::params::{AdsOnlyTimelineViewerIds, EnableAdsOnlyTimeline};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -289,6 +290,14 @@ impl ScoredPostsQuery {
 
     pub fn has_excluded_topics(&self) -> bool {
         !self.excluded_topic_ids.is_empty()
+    }
+
+    pub fn is_ads_only_timeline(&self) -> bool {
+        self.params.get(EnableAdsOnlyTimeline)
+            && self
+                .params
+                .get(AdsOnlyTimelineViewerIds)
+                .contains(&self.user_id)
     }
 }
 

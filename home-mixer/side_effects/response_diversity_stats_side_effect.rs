@@ -394,7 +394,11 @@ fn record_cross_page(
         let (mut entropy, mut distinct, mut max_share, mut positions) =
             ([0.0; 2], [0.0; 2], [0.0; 2], [0; 2]);
         for end in first + 1..=sequence.len() {
-            let recent = &sequence[end.saturating_sub(size)..end];
+            let start = end.saturating_sub(size);
+            if start >= first {
+                break;
+            }
+            let recent = &sequence[start..end];
             for level in 0..2 {
                 let topics = Composition::from_keys(recent.iter().filter_map(|codes| codes[level]));
                 if topics.size > 0 {
@@ -642,6 +646,30 @@ mod tests {
                     "{name} window {window}: {got}"
                 );
             }
+        }
+
+        let page = [
+            candidate(4.0, 100, vec![1, 10]),
+            candidate(3.0, 105, vec![3, 99]),
+            candidate(2.0, 103, vec![5, 50]),
+            candidate(1.0, 106, vec![5, 51]),
+        ];
+        for (history, expected) in [(&history[..], Some(1.0)), (&[][..], None)] {
+            let recorder = Recorder::default();
+            record_cross_page(
+                &recorder,
+                &page.iter().collect::<Vec<_>>(),
+                history,
+                &sids,
+                &[&bucket],
+            );
+            assert_eq!(
+                recorder.value(
+                    "ResponseDiversity.CrossPageSidL1DistinctRatio",
+                    &[("window", "3"), ("ddg", "20140"), ("bucket", "treatment")],
+                ),
+                expected
+            );
         }
     }
 

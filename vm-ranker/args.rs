@@ -27,6 +27,9 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub embedding_dim: usize,
 
+    #[arg(long, env = "VM_RANKER_SID_ENDPOINT")]
+    pub sid_endpoint: Option<String>,
+
     #[arg(long, default_value_t = 0)]
     pub dpp_debug_viewer_id: u64,
 

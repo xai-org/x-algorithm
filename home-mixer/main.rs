@@ -224,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         .datacenter(args.datacenter)
         .otel_endpoint(args.otel_endpoint)
         .with_featureswitches_experiment_logging(params::FS_PATH)
+        .with_fs_experiment_excluded_user_ids_param(params::FS_EXPERIMENT_EXCLUDED_USER_IDS_PARAM)
         .with_decider(params::decider_path(), None)
         .with_tls(TlsMode::server_mtls_from_env()?)
         .with_max_connection_age(Duration::from_secs(300))

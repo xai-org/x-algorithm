@@ -975,6 +975,7 @@ class InterleavingRecordBatchProvider:
         self._shuffle_skip_rows: int = 0
         self._shuffle_skip_spans_windows: bool = False
         self._rows_in_window: int = 0
+        self._window_end: int | None = None
         self._range_start_batch_id: int = start_batch_id
         self._block_resume: tuple[int, list[list[int]]] | None = None
         self._block_drop_in_progress: bool = False
@@ -1444,6 +1445,7 @@ class InterleavingRecordBatchProvider:
                 files = [entries[i][1] for i in order if entries[i][0] >= min_valid]
 
                 self._current_drain_batch_id = window_start
+                self._window_end = window_end
                 self._rows_in_window = 0
                 rank_logger.info(
                     f"Shard {self._shard_index}: shuffled window [{window_start}, {window_end}), "
@@ -1639,11 +1641,14 @@ class InterleavingRecordBatchProvider:
 
     def get_position(self) -> DataPosition:
         if self._shuffle_window_time_slices > 0 and self._shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
-            return DataPosition(
+            position = DataPosition(
                 last_batch_id=self._current_drain_batch_id,
                 rows_read_in_batch=self._rows_in_window,
                 batch_size=1,
             )
+            if self._window_end is not None:
+                position["shuffle_window_end"] = self._window_end
+            return position
         rank_logger.debug(
             "Saving data position: batch_id=%d, rows_read=%d, batch_size=%d, "
             "total_rows=%d, shard_index=%d, num_shards=%d",
@@ -1961,6 +1966,7 @@ class PhoenixDataset(Dataset):
     sid_num_levels: int = 0
 
     compute_post_unexplored_label: bool = False
+    ld_label_exclude_clicks: bool = False
     enable_stale_post: bool = False
     enable_stale_post_30d: bool = False
 
@@ -2537,6 +2543,7 @@ class PhoenixDataset(Dataset):
                         global_post_sids=global_post_sids,
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
+                        ld_label_exclude_clicks=self.ld_label_exclude_clicks,
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                         stale_post_30d=self.enable_stale_post_30d,
                         ads_head_masking=self.ads_head_masking,

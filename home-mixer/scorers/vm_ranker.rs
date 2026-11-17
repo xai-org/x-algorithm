@@ -67,8 +67,8 @@ impl VMRanker {
         let weighted: Vec<f64> = candidates
             .iter()
             .map(|c| match c.weighted_score {
-                Some(cached) => cached,
-                None => value_model::weighted_score(query, &weights, c),
+                Some(cached) if !weights.multiplicative => cached,
+                _ => value_model::weighted_score(query, &weights, c),
             })
             .collect();
         let cold_start = self

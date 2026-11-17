@@ -12,4 +12,7 @@ pub use scoring::{
     diversity_multiplier, fuse_heads, offset_score, post_fusion_multipliers,
     set_user_video_continuation, unoffset_score, weighted_terms,
 };
-pub use weights::{NEGATIVE_SCORES_OFFSET, ValueModelWeights};
+pub use weights::{
+    MIN_NOT_DWELLED_POWER_OFFSET, NEGATIVE_SCORES_OFFSET, VALUE_MODEL_MULTIPLICATIVE,
+    ValueModelWeights,
+};

@@ -160,7 +160,6 @@ class TaskGeneratorConfig(BaseModel):
     type: str
     weight: int
     max_qps: int | None = None
-    max_in_flight: int | None = None
 
 
 class DispatcherConfig(BaseModel):

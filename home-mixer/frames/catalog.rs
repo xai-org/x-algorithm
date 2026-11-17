@@ -204,8 +204,13 @@ pub fn fatigue_for_route(route: &str) -> Option<Fatigue> {
 pub fn fatigue_keys(query: &ScoredPostsQuery) -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = candidates_in(TIMELINES, query)
         .filter_map(|frame| frame.fatigue)
-        .filter(|fatigue| fatigue.window_ms(query).is_some())
-        .flat_map(|fatigue| [fatigue.served_key, fatigue.dismissal_key])
+        .flat_map(|fatigue| {
+            if fatigue.window_ms(query).is_some() {
+                vec![fatigue.served_key, fatigue.dismissal_key]
+            } else {
+                vec![fatigue.dismissal_key]
+            }
+        })
         .collect();
     keys.sort_unstable();
     keys.dedup();
@@ -234,18 +239,21 @@ fn candidates_in<'a>(
 }
 
 fn fatigued(frame: &FrameDef, query: &ScoredPostsQuery) -> bool {
-    let Some(fatigue) = frame
-        .fatigue
-        .filter(|fatigue| fatigue.window_ms(query).is_some())
-    else {
+    let Some(fatigue) = frame.fatigue else {
         return false;
     };
-    query.frame_dismissals.as_ref().is_none_or(|dismissals| {
-        [fatigue.served_key, fatigue.dismissal_key]
-            .iter()
-            .filter_map(|key| dismissals.get(*key))
-            .any(|&expires_at_ms| expires_at_ms > query.request_time_ms)
-    })
+    let Some(dismissals) = query.frame_dismissals.as_ref() else {
+        return fatigue.window_ms(query).is_some();
+    };
+    let active = |key: &str| {
+        dismissals
+            .get(key)
+            .is_some_and(|&expires_at_ms| expires_at_ms > query.request_time_ms)
+    };
+    if active(fatigue.dismissal_key) {
+        return true;
+    }
+    fatigue.window_ms(query).is_some() && active(fatigue.served_key)
 }
 
 pub(super) fn placement_in(timelines: &'static [Timeline], route: &str) -> Option<Placement> {
@@ -378,16 +386,55 @@ mod tests {
     }
 
     #[test]
-    fn grokbot_suggested_tasks_frame_never_fatigues_when_its_fatigue_is_zero() {
-        let never_fatigued = ScoredPostsQuery {
+    fn grokbot_suggested_tasks_frame_skips_serve_fatigue_when_hours_are_zero() {
+        let unread = ScoredPostsQuery {
             frame_dismissals: None,
             ..home_query(true, 0)
         };
         assert_eq!(
-            eligible_routes(&never_fatigued),
+            eligible_routes(&unread),
             vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
         );
-        assert!(fatigue_keys(&never_fatigued).is_empty());
+        assert_eq!(
+            fatigue_keys(&unread),
+            vec![GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY]
+        );
+
+        let served_only = ScoredPostsQuery {
+            frame_dismissals: Some(HashMap::from([(
+                GROKBOT_SUGGESTED_TASKS_SERVED_KEY.to_string(),
+                NOW_MS + HOUR_MS,
+            )])),
+            ..home_query(true, 0)
+        };
+        assert_eq!(
+            eligible_routes(&served_only),
+            vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
+        );
+    }
+
+    #[test]
+    fn grokbot_user_dismiss_hides_the_frame_even_when_fatigue_hours_are_zero() {
+        let dismissed = ScoredPostsQuery {
+            frame_dismissals: Some(HashMap::from([(
+                GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY.to_string(),
+                NOW_MS + 30 * 24 * HOUR_MS,
+            )])),
+            ..home_query(true, 0)
+        };
+        assert!(eligible_routes(&dismissed).is_empty());
+
+        let expired = ScoredPostsQuery {
+            frame_dismissals: Some(HashMap::from([(
+                GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY.to_string(),
+                NOW_MS,
+            )])),
+            ..home_query(true, 0)
+        };
+        assert_eq!(
+            eligible_routes(&expired),
+            vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
+        );
     }
 
     #[test]

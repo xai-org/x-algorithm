@@ -477,18 +477,19 @@ class SafetyPtosPolicyClassifier:
         self,
         model_name: str,
         mode: SafetyPtosMode,
-        use_gemma: bool = True,
-        gemma_model_name: str = GEMMA,
+        gemma_model_name: str | None = GEMMA,
     ):
         self.mode = mode
         self.deluxe = mode.is_deluxe
-        self.use_gemma = use_gemma
 
         vlm_config = grox_config.get_model(model_name)
         self.llm = VisionSampler(GrokModelConfig(**vlm_config.model_dump()))
 
-        oai_config = grox_config.get_oai_model(gemma_model_name)
-        self.oai_gemma4 = OaiSampler(oai_config)
+        self.oai_gemma4 = (
+            OaiSampler(grox_config.get_oai_model(gemma_model_name))
+            if gemma_model_name
+            else None
+        )
 
         if self.deluxe:
             eapi_config_4_3_x_algo = grox_config.get_eapi_model(
@@ -640,8 +641,11 @@ class SafetyPtosPolicyClassifier:
                 result = await self._sample_4_3(convo)
         else:
             mode = self.mode.value
-            sample_for_gemma = violation.category in self.USE_GEMMA_CATEGORIES
-            result = await self._sample(convo, sample_for_gemma=sample_for_gemma)
+            use_gemma = (
+                self.oai_gemma4 is not None
+                and violation.category in self.USE_GEMMA_CATEGORIES
+            )
+            result = await self._sample(convo, use_gemma=use_gemma)
         Metrics.counter("safety_ptos.policy_requests.count").add(
             1, attributes={"mode": mode, "fav_bucket": fav_bucket}
         )
@@ -723,8 +727,8 @@ class SafetyPtosPolicyClassifier:
             convo.interleave(), conversation_id=convo.conversation_id
         )
 
-    async def _sample(self, convo: Conversation, sample_for_gemma: bool = False) -> str:
-        if sample_for_gemma:
+    async def _sample(self, convo: Conversation, use_gemma: bool = False) -> str:
+        if use_gemma and self.oai_gemma4 is not None:
             try:
                 return await self.oai_gemma4.sample(
                     convo.to_openai_messages(), conversation_id=convo.conversation_id

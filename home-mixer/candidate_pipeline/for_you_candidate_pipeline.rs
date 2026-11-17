@@ -3,6 +3,7 @@ use crate::clients::past_request_timestamps_client::{
     MockPastRequestTimestampsClient, PastRequestTimestampsClient, ProdPastRequestTimestampsClient,
 };
 use crate::clients::prompts_client::{MockPromptsClient, ProdPromptsClient, PromptsClient};
+use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::served_history_client::{
     MockServedHistoryClient, ProdServedHistoryClient, ServedHistoryClient,
 };
@@ -14,9 +15,11 @@ use crate::filters::ad_adjacent_served_filter::AdAdjacentServedFilter;
 use crate::filters::push_to_home_dedup_filter::PushToHomeDedupFilter;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
+use crate::query_hydrators::ads_user_state_query_hydrator::AdsUserStateQueryHydrator;
 use crate::query_hydrators::frame_dismissal_query_hydrator::FrameDismissalQueryHydrator;
 use crate::query_hydrators::past_request_timestamps_query_hydrator::PastRequestTimestampsQueryHydrator;
 use crate::query_hydrators::served_history_query_hydrator::ServedHistoryQueryHydrator;
+use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
@@ -48,6 +51,9 @@ use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::
     KafkaPublisherClient, MockKafkaPublisherClient,
 };
 use xai_candidate_pipeline::component_library::clients::redis_client::MockRedisClient;
+use xai_candidate_pipeline::component_library::clients::user_demographics_client::{
+    MockUserDemographicsClient, ProdUserDemographicsClient, UserDemographicsClient,
+};
 use xai_candidate_pipeline::component_library::clients::{
     JetfuelClient, MockJetfuelClient, MockReplyMixerClient, MockStratoClient, ProdReplyMixerClient,
     ProdStratoClient, ReplyMixerClient, StratoClient,
@@ -96,6 +102,7 @@ impl ForYouCandidatePipeline {
             reply_mixer_client,
             strato_client,
             (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
+            user_demographics_client,
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -162,6 +169,18 @@ impl ForYouCandidatePipeline {
                 ) as Arc<dyn StratoClient + Send + Sync>
             },
             super::shared_phoenix_request_cache_redis_clients(),
+            async {
+                let s2s = xai_manhattan::s2s::S2sConfig {
+                    client_cert_path: S2S_CRT_PATH.clone(),
+                    client_key_path: S2S_KEY_PATH.clone(),
+                    ca_cert_path: S2S_CHAIN_PATH.clone(),
+                };
+                Arc::new(
+                    ProdUserDemographicsClient::new(datacenter, s2s)
+                        .await
+                        .expect("Failed to create UserDemographics client"),
+                ) as Arc<dyn UserDemographicsClient>
+            },
         );
         let served_slate_cache = ServedSlateCacheSideEffect::new(
             phoenix_request_cache_redis_atla_client,
@@ -188,6 +207,7 @@ impl ForYouCandidatePipeline {
             tes_client,
             reply_mixer_client,
             served_slate_cache,
+            user_demographics_client,
         )
     }
 
@@ -212,6 +232,7 @@ impl ForYouCandidatePipeline {
         tes_client: Arc<dyn TESClient + Send + Sync>,
         reply_mixer_client: Arc<dyn ReplyMixerClient>,
         served_slate_cache: ServedSlateCacheSideEffect,
+        user_demographics_client: Arc<dyn UserDemographicsClient>,
     ) -> Self {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ServedHistoryQueryHydrator::from_client(Arc::clone(
@@ -222,6 +243,11 @@ impl ForYouCandidatePipeline {
             ))),
             Box::new(FrameDismissalQueryHydrator {
                 strato_client: Arc::clone(&strato_client),
+            }),
+            Box::new(AdsUserStateQueryHydrator {
+                inner: UserDemographicsQueryHydrator {
+                    client: user_demographics_client,
+                },
             }),
         ];
 
@@ -314,6 +340,8 @@ impl ForYouCandidatePipeline {
             Arc::new(MockRedisClient::default()),
             Arc::new(MockRedisClient::default()),
         );
+        let user_demographics_client: Arc<dyn UserDemographicsClient> =
+            Arc::new(MockUserDemographicsClient);
         Self::build(
             scored_posts_server,
             strato_client,
@@ -334,6 +362,7 @@ impl ForYouCandidatePipeline {
             tes_client,
             reply_mixer_client,
             served_slate_cache,
+            user_demographics_client,
         )
     }
 }

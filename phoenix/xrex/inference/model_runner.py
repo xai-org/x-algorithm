@@ -71,7 +71,7 @@ from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_model import RecsysAggregatedModelConfig, cread_request_decode_avals
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.models.topic_categories import (
     NUM_TOPIC_INT32S,
@@ -4054,6 +4054,9 @@ class RankingModelRunner(
                     np.uint16,
                 )
 
+        if self.using_seqpack and self.model_config.dwell_cread_decode_from_request:
+            init_data.update(cread_request_decode_avals(init_data))
+
         return rng, init_data
 
     def _get_persistent_buffer(
@@ -4555,7 +4558,9 @@ class RetrievalModelRunner(
     enable_async_topk: bool = False
     cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
+    int8_score_pad_rows: int = -1
     enable_int8_post_table: bool = False
+    enable_shard_local_topk: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_fn: Any = field(default=None, init=False)

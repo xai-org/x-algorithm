@@ -1,3 +1,4 @@
+pub mod ads_user_state_query_hydrator;
 pub mod blocked_user_ids_query_hydrator;
 pub mod cached_posts_query_hydrator;
 pub mod explicit_engagement_signals_query_hydrator;

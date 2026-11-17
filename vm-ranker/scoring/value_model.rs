@@ -70,7 +70,7 @@ pub fn compute(
 }
 
 pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights {
-    ValueModelWeights {
+    let mut weights = ValueModelWeights {
         favorite: params.get(FavoriteWeight),
         reply: params.get(ReplyWeight),
         retweet: params.get(RetweetWeight),
@@ -112,8 +112,15 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         oon_rescore_in_network_replies_retweets: params
             .get(EnableOonRescoreForInNetworkRepliesRetweets),
         multiplier_pre_offset: params.get(MultiplierPreOffset),
-    }
-    .perturbed(
+        ..Default::default()
+    };
+    weights.set_multiplicative(
+        &params.get(ValueModelMode),
+        params.get(NotDwelledPowerExponent),
+        params.get(NotDwelledPowerOffset),
+        params.get(MultiplicativeVmEngageBias),
+    );
+    weights.perturbed(
         params.get(WeightPerturbationSigma),
         &params.get(WeightPerturbationSalt),
         viewer_id,
@@ -177,7 +184,9 @@ fn compute_or_fallback(
     if rand::random_bool(SCORE_METRICS_SAMPLE_RATE) {
         record_score_metrics(&inputs, &raw);
     }
-    let cached_weighted = !inputs.is_empty() && inputs.iter().all(|c| c.weighted_score.is_some());
+    let cached_weighted = !weights.multiplicative
+        && !inputs.is_empty()
+        && inputs.iter().all(|c| c.weighted_score.is_some());
     let stage = if cached_weighted {
         "cached_weighted"
     } else {

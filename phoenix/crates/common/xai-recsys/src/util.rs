@@ -582,6 +582,12 @@ pub struct UserFeatures {
     pub installed_apps: Vec<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CreadDecodeOverride {
+    pub power: Option<f32>,
+    pub scale: Option<f32>,
+}
+
 #[derive(Default)]
 pub struct InputBuffer {
     pub user_hashes: Vec<i32>,
@@ -634,6 +640,7 @@ pub struct InputBuffer {
     pub history_semantic_ids: Vec<u16>,
     pub candidate_semantic_ids: Vec<u16>,
     pub num_history: usize,
+    pub cread_decode: CreadDecodeOverride,
 }
 
 pub fn repeat_query_into(dest: &mut [f32], query: &[f32], n_slots: usize) {
@@ -1555,6 +1562,7 @@ impl InputBuffer {
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
+            cread_decode: CreadDecodeOverride::default(),
         }
     }
 
@@ -1723,6 +1731,7 @@ impl InputBuffer {
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
                     candidate_semantic_ids,
                     num_history: 0,
+                    cread_decode: CreadDecodeOverride::default(),
                 });
             }
         };
@@ -2031,6 +2040,7 @@ impl InputBuffer {
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
+            cread_decode: CreadDecodeOverride::default(),
         })
     }
 

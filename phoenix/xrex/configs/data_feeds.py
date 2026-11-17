@@ -66,6 +66,7 @@ GROUP_IDS: dict[str, str] = {
     "home_direct_packed_nano": "user_action_sequence_home_direct_packed_nano",
     "immersive_page_rl": "user_action_sequence_immersive_page_rl",
     "immersive_page_rl_cread": "user_action_sequence_immersive_page_rl_cread",
+    "immersive_page_rl_cread_critic_only": "user_action_sequence_immersive_page_rl_cread_critic_only",
     "xrecsys_two_tower": "user_action_sequence_xrecsys_two_tower",
     "xrecsys_two_tower_combined": "user_action_sequence_xrecsys_two_tower_combined",
     "xrecsys_two_tower_combined_gb300": "user_action_sequence_xrecsys_two_tower_combined",
@@ -291,6 +292,7 @@ def _retrieval_aggregated_kafka(
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 
@@ -326,6 +328,7 @@ def _retrieval_rust_kafka(
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 
@@ -352,6 +355,7 @@ def _retrieval_offline_kafka_dump(
         date_range=mparams.get("date_range", None),
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 

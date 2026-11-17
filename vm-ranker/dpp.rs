@@ -21,10 +21,11 @@ pub struct DppConfig {
     pub window: Option<SlidingWindow>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct SlidingWindow {
     pub size: usize,
     pub half_distance: f64,
+    pub sid_lambda: f64,
 }
 
 pub struct DppInput {
@@ -33,6 +34,7 @@ pub struct DppInput {
     pub embedding: Arc<Vec<f16>>,
     pub norm: f64,
     pub embedding_missing: bool,
+    pub l1: Option<i32>,
 }
 
 pub struct DppResult {
@@ -374,16 +376,19 @@ fn window_greedy(
             }
         })
         .collect();
-    let cos2_row = |item: &DppInput| -> Vec<f64> {
+    let penalty_row = |item: &DppInput| -> Vec<f64> {
         pool.iter()
-            .map(|c| cosine(item, c).powi(2).min(1.0))
+            .map(|c| {
+                let same_l1 = item.l1.is_some() && item.l1 == c.l1;
+                (cosine(item, c).powi(2) + if same_l1 { window.sid_lambda } else { 0.0 }).min(1.0)
+            })
             .collect()
     };
     let mut sequence: Vec<Vec<f64>> = context
         .iter()
         .take(size)
         .rev()
-        .map(|&item| cos2_row(item))
+        .map(|&item| penalty_row(item))
         .collect();
     let mut available = vec![true; pool.len()];
     let mut picks = Vec::with_capacity(k.min(pool.len()));
@@ -403,7 +408,7 @@ fn window_greedy(
         let Some((pick, _)) = best else { break };
         available[pick] = false;
         picks.push(pick);
-        sequence.push(cos2_row(pool[pick]));
+        sequence.push(penalty_row(pool[pick]));
     }
     picks
 }
@@ -463,6 +468,7 @@ mod tests {
             embedding: Arc::new(emb),
             norm,
             embedding_missing: false,
+            l1: None,
         }
     }
 
@@ -687,6 +693,7 @@ mod tests {
             window: Some(SlidingWindow {
                 size,
                 half_distance,
+                ..Default::default()
             }),
             ..default_config()
         };

@@ -2,9 +2,10 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     ClickWeight, ContDwellTimeWeight, EnablePageDecodeRerank, FavoriteWeight, MinVideoDurationMs,
-    NotDwelledWeight, NotInterestedWeight, PageDecodePoolN, PageDecodeRewardHead, PageDecodeSteps,
+    MultiplicativeVmEngageBias, NotDwelledPowerExponent, NotDwelledPowerOffset, NotDwelledWeight,
+    NotInterestedWeight, PageDecodePoolN, PageDecodeRewardHead, PageDecodeSteps,
     PageDecodeTemperature, ProfileClickWeight, QuoteWeight, ReplyWeight, ReportWeight,
-    RetweetWeight, ShareWeight, VqvWeight,
+    RetweetWeight, ShareWeight, ValueModelMode, VqvWeight,
 };
 use std::cmp::Ordering;
 use tonic::async_trait;
@@ -20,6 +21,7 @@ const FAIL_OPEN_METRIC: &str = "PageDecodeRerank.fail_open";
 pub struct PageDecodeRerankScorer;
 
 pub(crate) fn page_decode_params(query: &ScoredPostsQuery) -> PageDecodeParams {
+    let multiplicative = query.params.get(ValueModelMode) == "multiplicative";
     PageDecodeParams {
         pool_n: query.params.get(PageDecodePoolN),
         steps: query.params.get(PageDecodeSteps),
@@ -31,6 +33,12 @@ pub(crate) fn page_decode_params(query: &ScoredPostsQuery) -> PageDecodeParams {
         nu_author: None,
         nu_sid: None,
         prior_tau: None,
+        not_dwelled_power_exponent: multiplicative
+            .then(|| query.params.get(NotDwelledPowerExponent) as f32),
+        not_dwelled_power_offset: multiplicative
+            .then(|| query.params.get(NotDwelledPowerOffset).max(0.01) as f32),
+        engage_bias: multiplicative.then(|| query.params.get(MultiplicativeVmEngageBias) as f32),
+        multiplicative: multiplicative.then_some(1.0),
     }
 }
 
@@ -52,6 +60,7 @@ fn ranking_score_weights(query: &ScoredPostsQuery) -> RankingScoreWeights {
         min_video_duration_ms: params.get(MinVideoDurationMs) as f32,
         share_via_dm_weight: 0.0,
         share_via_copy_link_weight: 0.0,
+        completion_weight: 0.0,
     }
 }
 

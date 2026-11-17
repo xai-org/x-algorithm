@@ -35,32 +35,23 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
         SafetyPtosMode.STANDARD: SafetyPtosPolicyClassifier(
             ModelName.GROK_4_1_FAST_HEDGEHOG_CRITICAL,
             mode=SafetyPtosMode.STANDARD,
-            use_gemma=True,
-            gemma_model_name=GEMMA,
         ),
         SafetyPtosMode.DELUXE: SafetyPtosPolicyClassifier(
             ModelName.GROK_4_1_FAST_HEDGEHOG_CRITICAL,
             mode=SafetyPtosMode.DELUXE,
-            use_gemma=False,
-            gemma_model_name=GEMMA,
         ),
         SafetyPtosMode.RECOVERY: SafetyPtosPolicyClassifier(
             ModelName.GROK_4_1_FAST_HEDGEHOG,
             mode=SafetyPtosMode.RECOVERY,
-            use_gemma=True,
-            gemma_model_name=GEMMA,
         ),
         SafetyPtosMode.BACKFILL: SafetyPtosPolicyClassifier(
             ModelName.GROK_4_1_FAST_X_ALGO_EXTRA,
             mode=SafetyPtosMode.BACKFILL,
-            use_gemma=False,
-            gemma_model_name=GEMMA,
+            gemma_model_name=None,
         ),
         SafetyPtosMode.LIVE_CLUSTER_ANCHORS: SafetyPtosPolicyClassifier(
             ModelName.GROK_4_1_FAST_HEDGEHOG_CRITICAL,
             mode=SafetyPtosMode.LIVE_CLUSTER_ANCHORS,
-            use_gemma=True,
-            gemma_model_name=GEMMA,
         ),
     }
 

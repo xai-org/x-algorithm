@@ -23,7 +23,7 @@ impl ReverseChronPostsSource {
 #[async_trait]
 impl Source<ScoredPostsQuery, FeedItem> for ReverseChronPostsSource {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        !query.user_features.followed_user_ids.is_empty()
+        !query.user_features.followed_user_ids.is_empty() && !query.is_ads_only_timeline()
     }
 
     async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {

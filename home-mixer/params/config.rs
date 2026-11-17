@@ -1,4 +1,6 @@
 pub const FS_PATH: &str = "/usr/local/config/features/home-mixer/main/rust_home_mixer.yml";
+pub const FS_EXPERIMENT_EXCLUDED_USER_IDS_PARAM: &str =
+    "rust_home_mixer_experiment_excluded_user_ids";
 
 pub const STRINGCENTER_BUNDLE_PATH: &str = "/config/stringcenter/timelinemixer.json";
 

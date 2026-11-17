@@ -16,6 +16,7 @@ use xai_vm_ranker::{
     ranker_service::VMRankerServiceImpl,
     ranking_config::RankingConfig,
     scoring::DppContext,
+    sid_client::SidClient,
     user_debias_store::UserDebiasStore,
 };
 
@@ -39,15 +40,25 @@ async fn main() -> Result<()> {
             greedy_order: false,
             window: None,
         };
+        let sid = args
+            .sid_endpoint
+            .as_deref()
+            .map(SidClient::connect_lazy)
+            .transpose()
+            .context("invalid --sid-endpoint")?;
         info!(
-            "DPP enabled: top_k={}, theta={}, max_selected_rank={}, embedding_dim={}, debug_viewer_id={}",
+            "DPP enabled: top_k={}, theta={}, max_selected_rank={}, embedding_dim={}, debug_viewer_id={}, sid_endpoint={:?}",
             config.top_k,
             config.theta,
             config.max_selected_rank,
             args.embedding_dim,
             config.debug_viewer_id,
+            args.sid_endpoint,
         );
-        (Some(DppContext { store, config }), Some(preload_future))
+        (
+            Some(DppContext { store, config, sid }),
+            Some(preload_future),
+        )
     } else {
         info!("DPP rescoring disabled");
         (None, None)

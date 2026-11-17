@@ -4,6 +4,7 @@ use super::neighbours::{
     assemble, page_capacity, safe_slot_estimate, unplaceable_drop, AdRules, ClassCounts,
     NeighbourChecker, PostClass,
 };
+use super::user_load::UserAdLoad;
 use super::util::{compute_spacing, posts_to_feed_items, Block, BlockReason, MIN_POSTS_FOR_ADS};
 use super::AdsBlender;
 use crate::params::RESULT_SIZE;
@@ -17,7 +18,10 @@ const METRICS: HealthMetrics = HealthMetrics {
     serving_limitation: "SlotSpread.serving_limitation",
 };
 
-pub struct SlotSpreadAdsBlender;
+#[derive(Default)]
+pub struct SlotSpreadAdsBlender {
+    pub(crate) load: UserAdLoad,
+}
 
 impl AdsBlender for SlotSpreadAdsBlender {
     fn blend_inner_with_drops(
@@ -26,18 +30,29 @@ impl AdsBlender for SlotSpreadAdsBlender {
         ads: Vec<AdIndexInfo>,
         drops: &mut Vec<DroppedAd>,
     ) -> Vec<FeedItem> {
-        blend_with_drops(scored_posts, ads, MIN_POSTS_FOR_ADS, drops)
+        blend_with_load(scored_posts, ads, MIN_POSTS_FOR_ADS, self.load, drops)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn blend_with_drops(
     scored_posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
     min_posts: usize,
     drops: &mut Vec<DroppedAd>,
 ) -> Vec<FeedItem> {
+    blend_with_load(scored_posts, ads, min_posts, UserAdLoad::default(), drops)
+}
+
+pub(crate) fn blend_with_load(
+    scored_posts: Vec<ScoredPost>,
+    ads: Vec<AdIndexInfo>,
+    min_posts: usize,
+    load: UserAdLoad,
+    drops: &mut Vec<DroppedAd>,
+) -> Vec<FeedItem> {
     let first_drop = drops.len();
-    let (items, offered) = blend(scored_posts, ads, min_posts, drops);
+    let (items, offered) = blend(scored_posts, ads, min_posts, load, drops);
     METRICS.emit_page(offered, &items, &drops[first_drop..]);
     items
 }
@@ -46,6 +61,7 @@ fn blend(
     scored_posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
     min_posts: usize,
+    load: UserAdLoad,
     drops: &mut Vec<DroppedAd>,
 ) -> (Vec<FeedItem>, usize) {
     let n = scored_posts.len();
@@ -62,7 +78,9 @@ fn blend(
         return (posts_to_feed_items(scored_posts), 0);
     }
 
-    let spacing = compute_spacing(&ads).requested;
+    let spacing = load
+        .spacing
+        .unwrap_or_else(|| compute_spacing(&ads).requested);
     let page_slots = page_capacity(spacing, n, RESULT_SIZE);
     let safe_slots = safe_slot_estimate(&scored_posts, &ads);
     METRICS.emit_serving_limitation(serving_limitation(ads.len(), page_slots, safe_slots));
@@ -79,15 +97,15 @@ fn blend(
     }
 
     let shown = n.min(RESULT_SIZE - slot_count);
-    let slots = spread_slots(slot_count, spacing, shown);
-    let overflow = if slot_count >= capacity {
+    let slots = load.thin(spread_slots(slot_count, spacing, shown));
+    let overflow = if slot_count >= capacity || slots.len() < slot_count {
         AdDropReason::SpacingCap
     } else {
         AdDropReason::NoEligibleNeighbours
     };
     let (organic, placed) = assign(&scored_posts, &ads, &slots, overflow, drops);
     if placed.is_empty() {
-        return (posts_to_feed_items(scored_posts), slot_count);
+        return (posts_to_feed_items(scored_posts), slots.len());
     }
 
     let ad_before: Vec<(usize, usize)> = placed
@@ -97,7 +115,7 @@ fn blend(
         .collect();
     (
         assemble(scored_posts, ads, &organic, &ad_before, RESULT_SIZE, drops),
-        slot_count,
+        slots.len(),
     )
 }
 

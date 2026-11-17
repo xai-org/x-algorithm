@@ -43,7 +43,7 @@ from xai_checkpointing.tree_util import tree_to_dict
 from xai_configlib import configclass
 from xai_proto import copy_pb2, copy_pb2_grpc
 from xrex.data.parquet_recsys import DataPosition, PhoenixDataset, ShuffleMode
-from xrex.data.parquet_recsys_metadata import parse_date_bound
+from xrex.data.parquet_recsys_metadata import check_resume_path, parse_date_bound
 
 if typing.TYPE_CHECKING:
     from xrex.cuda.async_emb import (
@@ -488,6 +488,7 @@ class RecsysTrainer(Trainer):
     smoothing_windows: list[int] = field(default_factory=lambda: [1_048_576, 4_194_304])
 
     reset_data_position: bool = False
+    allow_dataset_path_change: bool = False
 
     seqpack_distribution: LengthDistribution | None = None
     min_packed_history_len: int | None = None
@@ -1560,6 +1561,7 @@ class RecsysTrainer(Trainer):
                 "create_dataset: reset_data_position=True with manual load, ignoring saved data position"
             )
         rank_logger.info("create_dataset: resume_position=%s", resume_position)
+        check_resume_path(resume_position, self.dataset.path, self.allow_dataset_path_change)
 
         skip_rows = 0 if should_reset_data else max(0, elapsed_samples - self.dataloader_offset)
         loader_batch_size = self.read_bsz_per_process // self.num_microbatch
@@ -3451,8 +3453,12 @@ class RecsysTrainer(Trainer):
     def _checkpoint_data_position(self) -> DataPosition | None:
         assert isinstance(self.dataset, PhoenixDataset)
         if not self.use_async_emb or self._batch_pipeline.current is None:
-            return self.dataset.get_data_position()
-        return self._batch_pipeline.current.data_position
+            position = self.dataset.get_data_position()
+        else:
+            position = self._batch_pipeline.current.data_position
+        if position is None:
+            return None
+        return {**position, "dataset_path": self.dataset.path}
 
     def _maybe_build_stablehlo_bundle(self) -> list | None:
         if not self.export_stablehlo_bundle:

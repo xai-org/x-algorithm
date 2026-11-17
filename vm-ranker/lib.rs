@@ -9,4 +9,5 @@ pub mod params;
 pub mod ranker_service;
 pub mod ranking_config;
 pub mod scoring;
+pub mod sid_client;
 pub mod user_debias_store;

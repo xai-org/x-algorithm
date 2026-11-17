@@ -137,6 +137,30 @@ param!(
     -0.02
 );
 param!(
+    NotDwelledPowerExponent,
+    f64,
+    "rust_home_mixer_not_dwelled_power_exponent",
+    0.0
+);
+param!(
+    NotDwelledPowerOffset,
+    f64,
+    "rust_home_mixer_not_dwelled_power_offset",
+    0.0
+);
+param!(
+    ValueModelMode,
+    String,
+    "rust_home_mixer_value_model_mode",
+    "weighted"
+);
+param!(
+    MultiplicativeVmEngageBias,
+    f64,
+    "rust_home_mixer_multiplicative_vm_engage_bias",
+    0.0
+);
+param!(
     MinVideoDurationMs,
     i32,
     "rust_home_mixer_min_video_duration_ms",
@@ -268,6 +292,12 @@ param!(
     DppWindowHalfDistance,
     f64,
     "rust_home_mixer_vm_ranker_dpp_window_half_distance",
+    0.0
+);
+param!(
+    DppWindowSidLambda,
+    f64,
+    "rust_home_mixer_vm_ranker_dpp_window_sid_lambda",
     0.0
 );
 param!(

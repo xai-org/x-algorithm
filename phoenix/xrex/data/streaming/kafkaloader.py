@@ -1272,6 +1272,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             global_post_sids=global_post_sids,
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
+            ld_label_exclude_clicks=self.ld_label_exclude_clicks,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
             stale_post_30d=self.enable_stale_post_30d,
             search_negative_clear_word_match=self.search_negative_clear_word_match,

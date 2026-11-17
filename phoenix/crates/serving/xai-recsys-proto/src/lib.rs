@@ -187,6 +187,34 @@ mod tests {
     }
 
     #[test]
+    fn ranking_score_weights_completion_field_is_wire_compatible() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct RankingScoreWeightsBeforeCompletion {
+            #[prost(float, tag = "1")]
+            favorite_weight: f32,
+            #[prost(float, tag = "15")]
+            share_via_copy_link_weight: f32,
+        }
+
+        let new = RankingScoreWeights {
+            favorite_weight: 0.5,
+            share_via_copy_link_weight: 2.0,
+            completion_weight: 3.0,
+            ..Default::default()
+        };
+        let old =
+            RankingScoreWeightsBeforeCompletion::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(old.favorite_weight, 0.5);
+        assert_eq!(old.share_via_copy_link_weight, 2.0);
+
+        let from_old = RankingScoreWeights::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(from_old.favorite_weight, 0.5);
+        assert_eq!(from_old.completion_weight, 0.0);
+    }
+
+    #[test]
     fn test_is_video_card_type() {
         assert!(is_video_card_type(UnifiedCardType::VideoWebsite as i32));
         assert!(is_video_card_type(UnifiedCardType::VideoApp as i32));

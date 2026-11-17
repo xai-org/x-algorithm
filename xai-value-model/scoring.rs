@@ -1,5 +1,7 @@
 use crate::inputs::{CandidateScoringInputs, QueryScoringContext};
-use crate::weights::{NEGATIVE_SCORES_OFFSET, ValueModelWeights};
+use crate::weights::{MIN_NOT_DWELLED_POWER_OFFSET, NEGATIVE_SCORES_OFFSET, ValueModelWeights};
+
+const MIN_SKIP_BASE: f64 = 1e-6;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 
@@ -63,7 +65,48 @@ fn product(probability: Option<f64>, conditional_value: Option<f64>) -> Option<f
 }
 
 pub fn fuse_heads(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
-    offset_score(compute_weighted_score(weights, candidate), weights)
+    if weights.multiplicative {
+        multiplicative_score(weights, candidate)
+    } else {
+        offset_score(compute_weighted_score(weights, candidate), weights)
+    }
+}
+
+fn skip_score(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
+    let Some(p) = candidate.phoenix_scores.not_dwelled_score else {
+        return 1.0;
+    };
+    if !p.is_finite() || weights.not_dwelled_power_exponent == 0.0 {
+        return 1.0;
+    }
+    (p + weights
+        .not_dwelled_power_offset
+        .max(MIN_NOT_DWELLED_POWER_OFFSET))
+    .max(MIN_SKIP_BASE)
+    .powf(weights.not_dwelled_power_exponent)
+}
+
+fn engage_sum(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
+    weighted_terms(weights, candidate)
+        .iter()
+        .filter(|(name, _)| *name != "dwell_time" && *name != "not_dwelled")
+        .map(|(_, t)| *t)
+        .sum()
+}
+
+fn time_factor(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
+    1.0 + apply(candidate.phoenix_scores.dwell_time, weights.cont_dwell_time).max(0.0)
+}
+
+fn multiplicative_score(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
+    let engage = engage_sum(weights, candidate) + weights.engage_bias;
+    if engage < 0.0 {
+        return offset_score(engage, weights);
+    }
+    offset_score(
+        skip_score(weights, candidate) * engage * time_factor(weights, candidate),
+        weights,
+    )
 }
 
 pub fn compute_weighted_score(
@@ -237,22 +280,22 @@ pub fn set_user_video_continuation(candidates: &mut [CandidateScoringInputs]) {
 }
 
 pub fn offset_score(combined_score: f64, w: &ValueModelWeights) -> f64 {
-    let total_sum = w.total_sum();
+    let total_sum = w.offset_total_sum();
     if total_sum == 0.0 {
         combined_score.max(0.0)
     } else if combined_score < 0.0 {
-        (combined_score + w.negative_sum()) / total_sum * NEGATIVE_SCORES_OFFSET
+        (combined_score + w.offset_negative_sum()) / total_sum * NEGATIVE_SCORES_OFFSET
     } else {
         combined_score + NEGATIVE_SCORES_OFFSET
     }
 }
 
 pub fn unoffset_score(weighted_score: f64, w: &ValueModelWeights) -> f64 {
-    let total_sum = w.total_sum();
+    let total_sum = w.offset_total_sum();
     if total_sum == 0.0 {
         weighted_score
     } else if weighted_score < NEGATIVE_SCORES_OFFSET {
-        weighted_score / NEGATIVE_SCORES_OFFSET * total_sum - w.negative_sum()
+        weighted_score / NEGATIVE_SCORES_OFFSET * total_sum - w.offset_negative_sum()
     } else {
         weighted_score - NEGATIVE_SCORES_OFFSET
     }
@@ -369,8 +412,8 @@ where
     let weighted: Vec<f64> = candidates
         .iter()
         .map(|c| match c.weighted_score {
-            Some(weighted) => weighted,
-            None => offset_score(compute_weighted_score(weights, c), weights),
+            Some(weighted) if !weights.multiplicative => weighted,
+            _ => fuse_heads(weights, c),
         })
         .collect();
 
@@ -554,5 +597,61 @@ mod tests {
             );
         }
         assert!((fuse_heads(&weights, &candidates[0]) - weighted_mutual_original).abs() < 1e-12);
+    }
+
+    #[test]
+    fn multiplicative_score_is_skip_times_engage_times_time() {
+        let weights = ValueModelWeights {
+            favorite: 0.5,
+            report: -100.0,
+            cont_dwell_time: 0.1,
+            multiplicative: true,
+            not_dwelled_power_exponent: -0.5,
+            not_dwelled_power_offset: 0.11,
+            engage_bias: 0.1,
+            ..Default::default()
+        };
+        let positive = CandidateScoringInputs {
+            phoenix_scores: PhoenixScores {
+                favorite_score: Some(0.4),
+                dwell_time: Some(20.0),
+                not_dwelled_score: Some(0.25),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let want = (0.36_f64).powf(-0.5) * 0.3 * 3.0 + 0.001;
+        let got = fuse_heads(&weights, &positive);
+        assert!((got - want).abs() < 1e-12, "got {got} want {want}");
+
+        let toxic = CandidateScoringInputs {
+            phoenix_scores: PhoenixScores {
+                report_score: Some(0.05),
+                dwell_time: Some(20.0),
+                not_dwelled_score: Some(0.25),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let toxic_score = fuse_heads(&weights, &toxic);
+        assert!(toxic_score < 0.002);
+        assert!(toxic_score < got);
+
+        let stale = CandidateScoringInputs {
+            weighted_score: Some(99.0),
+            phoenix_scores: positive.phoenix_scores.clone(),
+            ..Default::default()
+        };
+        let ctx = QueryScoringContext::default();
+        let recomputed =
+            compute_value_scores(&weights, &ctx, std::slice::from_ref(&stale)).weighted[0];
+        assert!((recomputed - want).abs() < 1e-12);
+        let additive = ValueModelWeights {
+            multiplicative: false,
+            ..weights
+        };
+        let cached =
+            compute_value_scores(&additive, &ctx, std::slice::from_ref(&stale)).weighted[0];
+        assert!((cached - 99.0).abs() < 1e-12);
     }
 }

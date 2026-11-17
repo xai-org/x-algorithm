@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import NotRequired, TypedDict
@@ -46,10 +47,12 @@ class DataPosition(TypedDict):
     block_shuffle_segments: NotRequired[list[list[int]]]
     block_shuffle_num_shards: NotRequired[int]
     block_shuffle_fingerprint: NotRequired[str]
+    shuffle_window_end: NotRequired[int]
     block_shuffle_rows_in_file: NotRequired[int]
     block_shuffle_rows_in_next_file: NotRequired[int]
     rows_in_file: NotRequired[int]
     copy_roots: NotRequired[dict[str, DataPosition | None]]
+    dataset_path: NotRequired[str | None]
 
 
 def is_object_store_path(path: str) -> bool:
@@ -115,6 +118,25 @@ def batch_path(topic_dir: str, partition_id: int, batch_id: int) -> str:
     sub_dir = str(batch_id // BATCHES_PER_SUBDIR)
     return os.path.join(
         topic_dir, f"partition={partition_id}", sub_dir, f"batch_{batch_id}.parquet"
+    )
+
+
+def check_resume_path(position: DataPosition | None, path: str | None, allow_change: bool) -> None:
+    if position is None or path is None or allow_change:
+        return
+    saved = position.get("dataset_path")
+    if saved is None or saved.rstrip("/") == path.rstrip("/"):
+        return
+    batch_id = position["last_batch_id"]
+    try:
+        if os.path.samefile(batch_path(saved, 0, batch_id), batch_path(path, 0, batch_id)):
+            return
+    except OSError:
+        pass
+    raise ValueError(
+        f"The data position was saved on {saved}; {path} may have different batch ids. Set "
+        "reset_data_position=True (load= only) to read from the start, or "
+        "allow_dataset_path_change=True if it is a copy with the same batch ids"
     )
 
 
@@ -328,6 +350,33 @@ def _batch_timestamps(
 
 def batch_start_time_ms(topic_dir: str, batch_id: int) -> int:
     return int(_batch_timestamps(topic_dir, batch_id, batch_id)[0])
+
+
+NEXT_OFFSET_LOOKBACK_BATCHES = 8
+
+
+def next_kafka_offsets(
+    topic_dir: str, topic: str, batch_id: int, num_partitions: int
+) -> dict[int, int]:
+    def next_offset(partition: int) -> int:
+        for bid in range(batch_id, max(batch_id - NEXT_OFFSET_LOOKBACK_BATCHES, -1), -1):
+            path = batch_path(topic_dir, partition, bid)
+            if not is_file(path):
+                continue
+            meta = parquet_file(path).metadata.metadata or {}
+            if b"max_kafka_offset" not in meta:
+                raise ValueError(f"{path} has no max_kafka_offset footer")
+            if meta.get(b"topic", b"").decode() != topic:
+                raise ValueError(f"{path} is from topic {meta.get(b'topic')!r}, not {topic!r}")
+            return int(meta[b"max_kafka_offset"]) + 1
+        raise ValueError(
+            f"partition {partition} has no file in batches "
+            f"{batch_id - NEXT_OFFSET_LOOKBACK_BATCHES + 1}..{batch_id} under {topic_dir}"
+        )
+
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        offsets = list(pool.map(next_offset, range(num_partitions)))
+    return dict(enumerate(offsets))
 
 
 def resolve_time_range(

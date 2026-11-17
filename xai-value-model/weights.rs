@@ -2,6 +2,8 @@ use crate::inputs::CandidateScoringInputs;
 use std::collections::HashMap;
 
 pub const NEGATIVE_SCORES_OFFSET: f64 = 0.001;
+pub const MIN_NOT_DWELLED_POWER_OFFSET: f64 = 1e-2;
+pub const VALUE_MODEL_MULTIPLICATIVE: &str = "multiplicative";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ValueModelWeights {
@@ -45,6 +47,10 @@ pub struct ValueModelWeights {
     pub author_diversity_floor: f64,
     pub oon_rescore_in_network_replies_retweets: bool,
     pub multiplier_pre_offset: bool,
+    pub multiplicative: bool,
+    pub not_dwelled_power_exponent: f64,
+    pub not_dwelled_power_offset: f64,
+    pub engage_bias: f64,
 }
 
 impl ValueModelWeights {
@@ -81,6 +87,41 @@ impl ValueModelWeights {
 
     pub fn total_sum(&self) -> f64 {
         self.positive_sum() + self.negative_sum()
+    }
+
+    pub fn multiplicative_negative_sum(&self) -> f64 {
+        -(self.not_interested + self.block_author + self.mute_author + self.report)
+    }
+
+    pub fn multiplicative_total_sum(&self) -> f64 {
+        self.positive_sum() + self.engage_bias + self.multiplicative_negative_sum()
+    }
+
+    pub fn offset_negative_sum(&self) -> f64 {
+        if self.multiplicative {
+            self.multiplicative_negative_sum()
+        } else {
+            self.negative_sum()
+        }
+    }
+
+    pub fn offset_total_sum(&self) -> f64 {
+        if self.multiplicative {
+            self.multiplicative_total_sum()
+        } else {
+            self.total_sum()
+        }
+    }
+
+    pub fn set_multiplicative(&mut self, mode: &str, exponent: f64, offset: f64, engage_bias: f64) {
+        self.multiplicative = mode == VALUE_MODEL_MULTIPLICATIVE;
+        self.not_dwelled_power_exponent = if exponent.is_finite() { exponent } else { 0.0 };
+        self.not_dwelled_power_offset = offset.max(MIN_NOT_DWELLED_POWER_OFFSET);
+        self.engage_bias = if engage_bias.is_finite() {
+            engage_bias
+        } else {
+            0.0
+        };
     }
 
     pub fn reply_weight_for(&self, candidate: &CandidateScoringInputs) -> f64 {

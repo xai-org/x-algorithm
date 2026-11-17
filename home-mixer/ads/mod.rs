@@ -10,6 +10,7 @@ mod slot_spread_blender;
 #[cfg(test)]
 mod tests;
 mod time_gap_blender;
+pub(crate) mod user_load;
 pub(crate) mod util;
 
 pub use following_ad_blender::FollowingAdBlender;

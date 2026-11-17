@@ -11,6 +11,12 @@ use xai_stats_receiver::global_stats_receiver;
 
 pub struct HydratorOutput(Box<dyn Any + Send>);
 
+impl Default for HydratorOutput {
+    fn default() -> Self {
+        Self(Box::new(()))
+    }
+}
+
 #[async_trait]
 pub trait Hydrator<Q, C>: Any + Send + Sync
 where

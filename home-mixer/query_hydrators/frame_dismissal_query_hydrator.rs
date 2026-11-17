@@ -104,7 +104,7 @@ mod tests {
     fn skipped_when_fatigue_is_off_or_the_frame_is_not_eligible() {
         let strato = Arc::new(MockStratoClient::default());
         assert!(hydrator(&strato).enable(&home_query(6)));
-        assert!(!hydrator(&strato).enable(&home_query(0)));
+        assert!(hydrator(&strato).enable(&home_query(0)));
         let scroll_down = ScoredPostsQuery {
             is_bottom_request: true,
             ..home_query(6)

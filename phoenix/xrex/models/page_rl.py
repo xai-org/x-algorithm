@@ -16,6 +16,11 @@ from xrex.models.page_critic import (
     page_critic_loss,
     page_critic_value_matrix,
 )
+from xrex.models.page_critic_only import (
+    PageCriticOnlyConfig,
+    PageCriticTransformer,
+    page_critic_only_loss,
+)
 from xrex.models.page_decoder import (
     PageDecoder,
     PageDecoderConfig,
@@ -97,6 +102,17 @@ RANKING_SCORE_WEIGHT_FIELDS: tuple[str, ...] = (
     "share_via_copy_link_weight",
 )
 
+PAGE_SERVE_DECODE_MODES = ("actor", "critic")
+
+
+@configclass
+class PageServeDecodeConfig(Config):
+    mode: str = "actor"
+    eta: float = 1.0
+    nu_author: float = 0.0
+    nu_sid: float = 0.0
+    prior_tau: float = 0.2
+
 
 @configclass
 class PageRlConfig(Config):
@@ -107,6 +123,8 @@ class PageRlConfig(Config):
     pg: PagePgConfig = PagePgConfig()
     serve_score: PageServeScoreConfig = PageServeScoreConfig()
     bc_loss_weight: float = 0.25
+    critic_only: PageCriticOnlyConfig | None = None
+    serve_decode: PageServeDecodeConfig = PageServeDecodeConfig()
 
 
 class PageRlFields(NamedTuple):
@@ -225,6 +243,11 @@ def page_rl_loss_and_stats(
     supervised_sorted = fields.impressed_mask[:, :s_max] & valid_sorted
     score_sorted = _sorted(rl_weighted_score.astype(jnp.float32))
     logged_prob_sorted = _sorted(rl_rerank_prob.astype(jnp.float32))
+    explore_page = (logged_prob_sorted > 0.0).any(axis=1)
+    reward_sorted = fields.reward[:, :s_max]
+    return_sorted = fields.return_g[:, :s_max]
+    sids_sorted = _sorted(post_sids)
+    auth_sorted = _sorted(auth_hashes)
     critic_out = page_critic_loss(
         config=config.critic,
         emb_sorted=emb_sorted,
@@ -232,15 +255,13 @@ def page_rl_loss_and_stats(
         served_slot_sorted=_sorted(rl_served_slot),
         supervised_sorted=supervised_sorted,
         adv_label_sorted=fields.adv_label[:, :s_max],
-        reward_sorted=fields.reward[:, :s_max],
-        return_sorted=fields.return_g[:, :s_max],
-        explore_page=(logged_prob_sorted > 0.0).any(axis=1),
+        reward_sorted=reward_sorted,
+        return_sorted=return_sorted,
+        explore_page=explore_page,
         gamma=config.reward.gamma,
         grid_steps=min(config.pg.q_steps, s_max),
     )
 
-    sids_sorted = _sorted(post_sids)
-    auth_sorted = _sorted(auth_hashes)
     decoder_out = PageDecoder(config.decoder)(
         emb_sorted, slate_sorted, score_sorted, user_emb, auth_sorted, sids_sorted
     )
@@ -258,7 +279,24 @@ def page_rl_loss_and_stats(
         auth_sorted=auth_sorted,
     )
     total = critic_out.total + config.bc_loss_weight * bc_loss + pg_out.total
-    return total, {**critic_out.stats, **bc_stats, **pg_out.stats}
+    stats = {**critic_out.stats, **bc_stats, **pg_out.stats}
+    if config.critic_only is not None:
+        critic_only_out = page_critic_only_loss(
+            config=config.critic_only,
+            emb_sorted=emb_sorted,
+            user_emb=user_emb,
+            slate_sorted=slate_sorted,
+            supervised_sorted=supervised_sorted,
+            reward_sorted=reward_sorted,
+            return_sorted=return_sorted,
+            explore_page=explore_page,
+            auth_sorted=auth_sorted,
+            sids_sorted=sids_sorted,
+            gamma=config.reward.gamma,
+        )
+        total = total + critic_only_out.total
+        stats.update(critic_only_out.stats)
+    return total, stats
 
 
 class PageDecodeInputs(NamedTuple):
@@ -268,9 +306,18 @@ class PageDecodeInputs(NamedTuple):
     steps: jax.Array
     temperature: jax.Array
     ranking_score_weights: jax.Array
+    eta: jax.Array | None = None
+    nu_author: jax.Array | None = None
+    nu_sid: jax.Array | None = None
+    prior_tau: jax.Array | None = None
+    not_dwelled_power_exponent: jax.Array | None = None
+    not_dwelled_power_offset: jax.Array | None = None
+    engage_bias: jax.Array | None = None
+    multiplicative: jax.Array | None = None
 
     @classmethod
     def no_decode(cls, n_users: int, n_candidates: int) -> PageDecodeInputs:
+        unset = jnp.full((n_users,), jnp.nan, dtype=jnp.float32)
         return cls(
             video_duration_ms=jnp.zeros((n_users, n_candidates), dtype=jnp.float32),
             n_candidates=jnp.zeros((n_users,), dtype=jnp.int32),
@@ -280,6 +327,14 @@ class PageDecodeInputs(NamedTuple):
             ranking_score_weights=jnp.full(
                 (n_users, len(RANKING_SCORE_WEIGHT_FIELDS)), jnp.nan, dtype=jnp.float32
             ),
+            eta=unset,
+            nu_author=unset,
+            nu_sid=unset,
+            prior_tau=unset,
+            not_dwelled_power_exponent=unset,
+            not_dwelled_power_offset=unset,
+            engage_bias=unset,
+            multiplicative=unset,
         )
 
 
@@ -308,12 +363,23 @@ def page_rl_head_features(
     return jnp.concatenate([heads, dwell[..., None]], axis=-1)
 
 
+def _row_or_default(values: jax.Array | None, default: float) -> jax.Array:
+    if values is None:
+        return jnp.asarray(default, dtype=jnp.float32)
+    x = values.astype(jnp.float32)[:, None]
+    return jnp.where(jnp.isnan(x), default, x)
+
+
 def page_serve_weighted_score(
     cfg: PageServeScoreConfig,
     logits: jax.Array,
     cont_preds: jax.Array,
     video_duration_ms: jax.Array,
     request_weights: jax.Array | None = None,
+    power_exponent: jax.Array | None = None,
+    power_offset: jax.Array | None = None,
+    engage_bias: jax.Array | None = None,
+    multiplicative: jax.Array | None = None,
 ) -> jax.Array:
     an = recsys_pb2.ActionName
 
@@ -345,7 +411,7 @@ def page_serve_weighted_score(
     vqv_w = jnp.where(
         video_duration_ms.astype(jnp.float32) > weight("min_video_duration_ms"), vqv, 0.0
     )
-    raw = (
+    engage = (
         favorite * head(an.SERVER_TWEET_FAV)
         + reply * head(an.SERVER_TWEET_REPLY)
         + retweet * head(an.SERVER_TWEET_RETWEET)
@@ -359,13 +425,26 @@ def page_serve_weighted_score(
         + not_interested * head(an.CLIENT_TWEET_NOT_INTERESTED_IN)
         + report * head(an.CLIENT_TWEET_REPORT)
     )
-    raw = (
-        raw
-        + cont_dwell_time
-        * cont_preds[..., recsys_pb2.ContinuousActionName.DWELL_TIME].astype(jnp.float32)
-        + not_dwelled * head(an.CLIENT_TWEET_RECAP_NOT_DWELLED)
+    dwell_term = cont_dwell_time * cont_preds[
+        ..., recsys_pb2.ContinuousActionName.DWELL_TIME
+    ].astype(jnp.float32)
+    not_dwelled_p = head(an.CLIENT_TWEET_RECAP_NOT_DWELLED)
+    raw_add = engage + dwell_term + not_dwelled * not_dwelled_p
+
+    use_mult = _row_or_default(multiplicative, 0.0) > 0.5
+    exp = _row_or_default(power_exponent, 0.0)
+    off = jnp.maximum(_row_or_default(power_offset, 0.0), 1e-2)
+    skip = jnp.where(
+        exp == 0.0,
+        1.0,
+        jnp.power((not_dwelled_p + off).clip(min=1e-6), exp),
     )
-    positive_sum = (
+    engage_b = engage + _row_or_default(engage_bias, 0.0)
+    time = 1.0 + jnp.maximum(dwell_term, 0.0)
+    raw_mul = jnp.where(engage_b >= 0.0, skip * engage_b * time, engage_b)
+    raw = jnp.where(use_mult, raw_mul, raw_add)
+
+    add_positive = (
         favorite
         + reply
         + retweet
@@ -378,12 +457,20 @@ def page_serve_weighted_score(
         + quote
         + jnp.maximum(not_dwelled, 0.0)
     )
-    negative_sum = -(not_interested + report + jnp.minimum(not_dwelled, 0.0))
+    add_negative = -(not_interested + report + jnp.minimum(not_dwelled, 0.0))
+    mul_positive = add_positive - jnp.maximum(not_dwelled, 0.0) + _row_or_default(engage_bias, 0.0)
+    mul_negative = -(not_interested + report)
+    positive_sum = jnp.where(use_mult, mul_positive, add_positive)
+    negative_sum = jnp.where(use_mult, mul_negative, add_negative)
     total_sum = positive_sum + negative_sum
     return jnp.where(
-        raw < 0.0,
-        (raw + negative_sum) / total_sum * cfg.negative_offset,
-        raw + cfg.negative_offset,
+        total_sum == 0.0,
+        jnp.maximum(raw, 0.0),
+        jnp.where(
+            raw < 0.0,
+            (raw + negative_sum) / total_sum * cfg.negative_offset,
+            raw + cfg.negative_offset,
+        ),
     )
 
 
@@ -404,6 +491,10 @@ def run_page_decode(
         cont_preds[:, :n_cand],
         request.video_duration_ms,
         request.ranking_score_weights,
+        power_exponent=request.not_dwelled_power_exponent,
+        power_offset=request.not_dwelled_power_offset,
+        engage_bias=request.engage_bias,
+        multiplicative=request.multiplicative,
     )
     valid = jnp.arange(n_cand)[None, :] < request.n_candidates[:, None]
     pool_k = min(config.decoder.max_steps, n_cand)
@@ -415,24 +506,62 @@ def run_page_decode(
     pool_sids = jnp.take_along_axis(sids[:, :n_cand], top_idx[:, :, None], axis=1)
 
     decoder = config.decoder
-    slot_values = None
-    if decoder.beam_width > 1:
-        slot_values = page_critic_value_matrix(
-            config=config.critic, candidate_embeddings=pool_emb, top_k=decoder.decode_steps(pool_k)
-        )
+    serve = config.serve_decode
+    if serve.mode not in PAGE_SERVE_DECODE_MODES:
+        raise ValueError(f"serve_decode.mode={serve.mode!r} not in {PAGE_SERVE_DECODE_MODES}")
+    if serve.mode == "critic":
+        if config.critic_only is None:
+            raise ValueError("serve_decode.mode='critic' needs page_rl.critic_only")
+        if serve.eta <= 0.0 or serve.prior_tau <= 0.0:
+            raise ValueError(
+                f"serve_decode eta={serve.eta} and prior_tau={serve.prior_tau} must be > 0"
+            )
+        n_users = behavior.shape[0]
 
-    decoded = PageDecoder(decoder).decode(
-        pool_emb,
-        pool_mask,
-        behavior,
-        user_emb,
-        request.steps,
-        request.temperature,
-        hk.next_rng_key(),
-        pool_auth,
-        pool_sids,
-        slot_values=slot_values,
-    )
+        def row_param(override: jax.Array | None, default: float, *, positive: bool) -> jax.Array:
+            value = jnp.full((n_users,), default, jnp.float32)
+            if override is None:
+                return value
+            x = override.astype(jnp.float32)
+            ok = jnp.isfinite(x) & ((x > 0.0) if positive else (x >= 0.0))
+            return jnp.where(ok, x, value)
+
+        decoded = PageCriticTransformer(config.critic_only).decode(
+            pool_emb,
+            pool_mask,
+            behavior,
+            user_emb,
+            request.steps,
+            request.temperature,
+            hk.next_rng_key(),
+            pool_auth,
+            pool_sids,
+            max_steps=decoder.decode_steps(pool_k),
+            eta=row_param(request.eta, serve.eta, positive=True),
+            nu_author=row_param(request.nu_author, serve.nu_author, positive=False),
+            nu_sid=row_param(request.nu_sid, serve.nu_sid, positive=False),
+            prior_tau=row_param(request.prior_tau, serve.prior_tau, positive=True),
+        )
+    else:
+        slot_values = None
+        if decoder.beam_width > 1:
+            slot_values = page_critic_value_matrix(
+                config=config.critic,
+                candidate_embeddings=pool_emb,
+                top_k=decoder.decode_steps(pool_k),
+            )
+        decoded = PageDecoder(decoder).decode(
+            pool_emb,
+            pool_mask,
+            behavior,
+            user_emb,
+            request.steps,
+            request.temperature,
+            hk.next_rng_key(),
+            pool_auth,
+            pool_sids,
+            slot_values=slot_values,
+        )
     picked = decoded.picked
     safe = jnp.maximum(picked, 0)
     picked_idx = jnp.where(picked >= 0, jnp.take_along_axis(top_idx, safe, axis=1), -1)

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-13T16:00:28Z
+// mirrored from config feature-switch defaults; last sync 2026-11-16T16:00:37Z
 use xai_feature_switches::param;
 
 param!(
@@ -574,6 +574,30 @@ param!(
     "rust_home_mixer_not_dwelled_weight",
     -0.02
 );
+param!(
+    NotDwelledPowerExponent,
+    f64,
+    "rust_home_mixer_not_dwelled_power_exponent",
+    0.0
+);
+param!(
+    NotDwelledPowerOffset,
+    f64,
+    "rust_home_mixer_not_dwelled_power_offset",
+    0.0
+);
+param!(
+    ValueModelMode,
+    String,
+    "rust_home_mixer_value_model_mode",
+    "weighted"
+);
+param!(
+    MultiplicativeVmEngageBias,
+    f64,
+    "rust_home_mixer_multiplicative_vm_engage_bias",
+    0.0
+);
 
 param!(
     EnableFollowingRepliedUsersFacepile,
@@ -634,7 +658,7 @@ param!(
     VMRankerSendDppHistory,
     bool,
     "rust_home_mixer_vm_ranker_send_dpp_history",
-    true
+    false
 );
 param!(
     VMRankerDppHistoryMaxItems,
@@ -1071,6 +1095,30 @@ param!(
     u32,
     "rust_home_mixer_ads_time_gap_min_organic_gap",
     3
+);
+param!(
+    AdsUserStateKeepPct,
+    Vec<u64>,
+    "rust_home_mixer_ads_user_state_keep_pct",
+    vec![]
+);
+param!(
+    AdsUserStateSpacing,
+    Vec<u64>,
+    "rust_home_mixer_ads_user_state_spacing",
+    vec![]
+);
+param!(
+    EnableAdsOnlyTimeline,
+    bool,
+    "rust_home_mixer_enable_ads_only_timeline",
+    false
+);
+param!(
+    AdsOnlyTimelineViewerIds,
+    Vec<u64>,
+    "rust_home_mixer_ads_only_timeline_viewer_ids",
+    vec![]
 );
 param!(UseXdsForUas, bool, "rust_home_mixer_use_xds_for_uas", true);
 param!(

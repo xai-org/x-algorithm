@@ -2,6 +2,7 @@ mod debias;
 pub mod dpp_model;
 pub mod value_model;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::error;
@@ -15,6 +16,7 @@ use crate::embedding_store::EmbeddingStore;
 use crate::metrics::PARAMS_RESOLVED;
 use crate::params::*;
 use crate::ranking_config::RankingConfig;
+use crate::sid_client::SidClient;
 use dpp_model::EmbeddingMemo;
 use value_model::ValueModelOutput;
 
@@ -22,6 +24,7 @@ use value_model::ValueModelOutput;
 pub struct DppContext {
     pub store: Arc<EmbeddingStore>,
     pub config: DppConfig,
+    pub sid: Option<SidClient>,
 }
 
 #[derive(Clone, Default)]
@@ -62,12 +65,23 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
                     size => Some(SlidingWindow {
                         size: size as usize,
                         half_distance: p.get(DppWindowHalfDistance),
+                        sid_lambda: p.get(DppWindowSidLambda).clamp(0.0, 1.0),
                     }),
                 };
             }
             (None, Some(overrides)) => apply_dpp_overrides(&mut dpp.config, overrides),
             (None, None) => {}
         }
+
+        let history_l1 = match (&dpp.sid, dpp.config.window) {
+            (Some(sid), Some(window)) if window.sid_lambda > 0.0 => {
+                let ids: Vec<u64> = dpp_model::window_history(&req, window.size)
+                    .map(|item| item.tweet_id)
+                    .collect();
+                sid.l1_codes(&ids).await
+            }
+            _ => HashMap::new(),
+        };
 
         let config = ctx.config.clone();
         return tokio::task::spawn_blocking(move || {
@@ -80,7 +94,8 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
             );
             let served_pre_dpp = served_pre_dpp_scores(&req, value_model.as_ref());
             let mut memo = EmbeddingMemo::default();
-            let served = dpp_model::rank_with_memo(&req, &served_pre_dpp, &dpp, &mut memo);
+            let served =
+                dpp_model::rank_with_memo(&req, &served_pre_dpp, &dpp, &history_l1, &mut memo);
             ranked_candidates(&req, served, value_model.as_ref())
         })
         .await

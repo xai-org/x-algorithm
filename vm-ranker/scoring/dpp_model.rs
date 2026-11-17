@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use half::f16;
 use log::info;
 use rand::Rng;
-use xai_vm_ranker_proto::{RankCandidate, RankRequest};
+use xai_vm_ranker_proto::{DppHistoryItem, RankCandidate, RankRequest};
 
 use super::DppContext;
 use crate::dpp::{self, DppInput};
@@ -97,6 +97,7 @@ fn build_dpp_inputs(
                 embedding,
                 norm,
                 embedding_missing,
+                l1: c.semantic_ids.first().copied(),
             }
         })
         .collect()
@@ -116,6 +117,7 @@ fn build_seed_input(req: &RankRequest, ctx: &DppContext) -> Option<DppInput> {
                 embedding,
                 norm,
                 embedding_missing: false,
+                l1: None,
             })
         }
         None => {
@@ -127,12 +129,7 @@ fn build_seed_input(req: &RankRequest, ctx: &DppContext) -> Option<DppInput> {
     }
 }
 
-fn build_history_inputs(
-    req: &RankRequest,
-    size: usize,
-    ctx: &DppContext,
-    memo: &mut EmbeddingMemo,
-) -> Vec<DppInput> {
+pub fn window_history(req: &RankRequest, size: usize) -> impl Iterator<Item = &DppHistoryItem> {
     let now_ms = req
         .viewer
         .as_ref()
@@ -157,6 +154,16 @@ fn build_history_inputs(
         .chunk_by(|a, b| a.served_time_ms == b.served_time_ms)
         .flat_map(|response| response.iter().rev())
         .take(size)
+}
+
+fn build_history_inputs(
+    req: &RankRequest,
+    size: usize,
+    ctx: &DppContext,
+    history_l1: &HashMap<u64, i32>,
+    memo: &mut EmbeddingMemo,
+) -> Vec<DppInput> {
+    window_history(req, size)
         .map(|item| {
             let (embedding, embedding_missing) = memo.resolve(item.tweet_id, ctx);
             DppInput {
@@ -165,26 +172,34 @@ fn build_history_inputs(
                 norm: l2_norm(&embedding),
                 embedding,
                 embedding_missing,
+                l1: history_l1.get(&item.tweet_id).copied(),
             }
         })
         .collect()
 }
 
 pub fn rank(req: &RankRequest, scores: &[Option<f64>], ctx: &DppContext) -> Vec<f64> {
-    rank_with_memo(req, scores, ctx, &mut EmbeddingMemo::default())
+    rank_with_memo(
+        req,
+        scores,
+        ctx,
+        &HashMap::new(),
+        &mut EmbeddingMemo::default(),
+    )
 }
 
 pub fn rank_with_memo(
     req: &RankRequest,
     scores: &[Option<f64>],
     ctx: &DppContext,
+    history_l1: &HashMap<u64, i32>,
     memo: &mut EmbeddingMemo,
 ) -> Vec<f64> {
     let inputs = build_dpp_inputs(req, scores, ctx, memo);
     let seed = build_seed_input(req, ctx);
     let history = match ctx.config.window {
         Some(window) => {
-            let history = build_history_inputs(req, window.size, ctx, memo);
+            let history = build_history_inputs(req, window.size, ctx, history_l1, memo);
             DPP_WINDOW_HISTORY_ITEMS.observe(history.len() as f64);
             history
         }
@@ -258,7 +273,6 @@ mod tests {
     use super::*;
     use crate::dpp::{DppConfig, SlidingWindow};
     use crate::embedding_store::EmbeddingStore;
-    use xai_vm_ranker_proto::DppHistoryItem;
 
     #[test]
     fn greedy_order_scores_reach_the_served_candidates() {
@@ -299,13 +313,14 @@ mod tests {
                     greedy_order,
                     window,
                 },
+                sid: None,
             };
             let mut memo = EmbeddingMemo::default();
             for (id, embedding) in embeddings {
                 let embedding = embedding.iter().map(|&x| f16::from_f32(x)).collect();
                 memo.0.insert(id, (Arc::new(embedding), false));
             }
-            rank_with_memo(req, &scores, &ctx, &mut memo)
+            rank_with_memo(req, &scores, &ctx, &HashMap::new(), &mut memo)
         };
 
         let recent = req(60_000);
@@ -314,6 +329,7 @@ mod tests {
         let window = SlidingWindow {
             size: 1,
             half_distance: 5.0,
+            ..Default::default()
         };
         assert_eq!(served(&recent, true, Some(window)), [9.0, 5.0, 10.0]);
         assert_eq!(
@@ -354,8 +370,10 @@ mod tests {
                 window: Some(SlidingWindow {
                     size: 3,
                     half_distance: 1.0,
+                    ..Default::default()
                 }),
             },
+            sid: None,
         };
         let basis = |i: usize| {
             let mut v = vec![f16::ZERO; 16];
@@ -377,9 +395,59 @@ mod tests {
                 &req,
                 &[Some(10.0), Some(5.0), Some(9.0), Some(1.0)],
                 &ctx,
+                &HashMap::new(),
                 &mut memo
             ),
             [5.0, 9.0, 10.0, 1.0]
         );
+    }
+
+    #[test]
+    fn same_l1_as_the_post_above_is_penalized_when_its_sid_is_known() {
+        let req = RankRequest {
+            request_timestamp_ms: 1_060_000,
+            candidates: [(1, 7), (2, 8), (3, 7)]
+                .map(|(tweet_id, l1)| RankCandidate {
+                    tweet_id,
+                    semantic_ids: vec![l1, 0],
+                    ..Default::default()
+                })
+                .to_vec(),
+            dpp_history: vec![DppHistoryItem {
+                tweet_id: 20,
+                served_time_ms: 1_000_000,
+                carousel: false,
+            }],
+            ..Default::default()
+        };
+        let ctx = DppContext {
+            store: Arc::new(EmbeddingStore::in_process(4)),
+            config: DppConfig {
+                top_k: 3,
+                theta: 0.5,
+                max_selected_rank: 10,
+                debug_viewer_id: 0,
+                greedy_order: true,
+                window: Some(SlidingWindow {
+                    size: 1,
+                    half_distance: 0.0,
+                    sid_lambda: 1.0,
+                }),
+            },
+            sid: None,
+        };
+        let served = |history_l1: &HashMap<u64, i32>| {
+            let mut memo = EmbeddingMemo::default();
+            for (i, id) in [1, 2, 3, 20].into_iter().enumerate() {
+                let mut v = vec![f16::ZERO; 4];
+                v[i] = f16::ONE;
+                memo.0.insert(id, (Arc::new(v), false));
+            }
+            let scores = [Some(10.0), Some(9.0), Some(5.0)];
+            rank_with_memo(&req, &scores, &ctx, history_l1, &mut memo)
+        };
+
+        assert_eq!(served(&HashMap::from([(20, 7)])), [9.0, 10.0, 5.0]);
+        assert_eq!(served(&HashMap::new()), [10.0, 9.0, 5.0]);
     }
 }

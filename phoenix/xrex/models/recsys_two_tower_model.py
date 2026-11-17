@@ -177,6 +177,50 @@ def score_over_slots(
     return total.astype(jnp.bfloat16)
 
 
+INT8_GEMM_FAST_MIN_ROWS = 32
+
+
+def int8_dot_padded(users: jax.Array, posts: jax.Array, pad_rows: int) -> jax.Array:
+    b = users.shape[0]
+    if b < INT8_GEMM_FAST_MIN_ROWS <= pad_rows:
+        users = jnp.zeros((pad_rows, users.shape[1]), users.dtype).at[:b].set(users)
+    acc = jax.lax.dot_general(
+        users, posts, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
+    )
+    return acc[:b]
+
+
+def strided_dataset_top_k(
+    scores: jax.Array,
+    dataset_ranges: jax.Array,
+    dataset_capacities: tuple[int, ...],
+    top_k: int,
+    axis_name: str,
+    num_shards: int,
+    shard_top_k: typing.Callable[[jax.Array, int], tuple[jax.Array, jax.Array]],
+) -> tuple[tuple[jax.Array, jax.Array], ...]:
+    rows_local = scores.shape[1]
+    shard = jax.lax.axis_index(axis_name)
+    results = []
+    for d, capacity in enumerate(dataset_capacities):
+        width = min(-(-capacity // num_shards), rows_local)
+        start = (dataset_ranges[d, 0] - shard + num_shards - 1) // num_shards
+        end = (dataset_ranges[d, 1] - shard + num_shards - 1) // num_shards
+        window_start = jnp.minimum(start, rows_local - width)
+        window = jax.lax.dynamic_slice_in_dim(scores, window_start, width, axis=1)
+        row = window_start + jnp.arange(width, dtype=jnp.int32)
+        masked = jnp.where(
+            ((row >= start) & (row < end))[None, :], window, jnp.finfo(scores.dtype).min
+        )
+        shard_scores, shard_rows = shard_top_k(masked, top_k)
+        shard_rows = shard_rows + window_start + shard * rows_local
+        all_scores = jax.lax.all_gather(shard_scores, axis_name, axis=1, tiled=True)
+        all_rows = jax.lax.all_gather(shard_rows, axis_name, axis=1, tiled=True)
+        merged, picked = jax.lax.top_k(all_scores.astype(jnp.float32), min(top_k, capacity))
+        results.append((jnp.take_along_axis(all_rows, picked, axis=1), merged))
+    return tuple(results)
+
+
 class RecsysCandidateTower(hk.Module):
     config: RecsysCandidateModelConfig
     sharding_context: ShardingContext
@@ -2295,6 +2339,8 @@ class RecsysTwoTowerModel(hk.Module):
         dataset_capacities: tuple[int, ...] | None = None,
         mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
         query_head_weights: tuple[float, ...] | None = None,
+        int8_score_pad_rows: int = 0,
+        shard_local_top_k: bool = False,
     ) -> tuple[tuple[jax.Array, jax.Array], ...]:
         saxis = "expert"
 
@@ -2440,6 +2486,21 @@ class RecsysTwoTowerModel(hk.Module):
 
         if post_scales is not None:
 
+            def _int8_dot_scores(
+                post_q8: jax.Array, user_embedding: jax.Array, scales: jax.Array
+            ) -> jax.Array:
+                uf = user_embedding.astype(jnp.float32)
+                us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
+                uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
+
+                def _int8_dot(p, _):
+                    acc = int8_dot_padded(uq, p, int8_score_pad_rows)
+                    return (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
+                        jnp.bfloat16
+                    )
+
+                return _over_slots(_int8_dot, post_q8, None)
+
             @shard_map_unless_manual(
                 mesh=mesh,
                 in_specs=(P(saxis), P(), P(saxis), P(), side_spec, side_spec),
@@ -2476,21 +2537,42 @@ class RecsysTwoTowerModel(hk.Module):
                     return jax.lax.all_to_all(
                         scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
                     )
-                uf = user_embedding.astype(jnp.float32)
-                us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
-                uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
-
-                def _int8_dot(p, _):
-                    acc = jax.lax.dot_general(
-                        uq, p, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
-                    )
-                    return (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
-                        jnp.bfloat16
-                    )
-
-                scores = _over_slots(_int8_dot, post_q8, None)
+                scores = _int8_dot_scores(post_q8, user_embedding, scales)
                 return jax.lax.all_to_all(
                     scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
+                )
+
+            if shard_local_top_k:
+                assert (
+                    not use_mol
+                    and dataset_capacities is not None
+                    and isinstance(dataset_ranges, jax.Array)
+                    and len(dataset_capacities) == len(target_dataset_types)
+                    and eligible_mask is None
+                    and not use_topic_filter
+                    and not skip_dataset_mask
+                ), "shard_local_top_k needs dot scoring, dataset_capacities and no per-post filter"
+
+                @shard_map_unless_manual(
+                    mesh=mesh,
+                    in_specs=(P(saxis), P(), P(saxis), P()),
+                    out_specs=tuple((P(), P()) for _ in dataset_capacities),
+                    check_vma=False,
+                )
+                def shard_top_k_int8(post_q8, user_embedding, scales, ranges):
+                    scores = _int8_dot_scores(post_q8, _trim_eval_users(user_embedding), scales)
+                    return strided_dataset_top_k(
+                        scores,
+                        ranges,
+                        dataset_capacities,
+                        top_k,
+                        saxis,
+                        mesh.shape[saxis],
+                        local_top_k,
+                    )
+
+                return shard_top_k_int8(
+                    post_embeddings, user_representation, post_scales, dataset_ranges
                 )
 
             all_scores = compute_top_k_int8(
@@ -2501,6 +2583,7 @@ class RecsysTwoTowerModel(hk.Module):
                 *side_args,
             )
         else:
+            assert not shard_local_top_k, "shard_local_top_k needs the int8 post table"
             all_scores = compute_top_k(
                 post_embeddings, user_representation, mol_scorer if use_mol else (), *side_args
             )

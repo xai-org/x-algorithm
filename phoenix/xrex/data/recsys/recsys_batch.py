@@ -176,6 +176,57 @@ def _apply_candidate_negative_filter(
     return np.ones(actions.shape[0], dtype=np.bool_)
 
 
+_LD_NON_QUALIFYING_ACTIONS = (
+    "ClientTweetRecapDwelled",
+    "ClientTweetRecapNotDwelled",
+    "ClientTweetReport",
+    "ClientTweetNotInterestedIn",
+    "ClientTweetSeeFewer",
+    "ClientTweetBlockAuthor",
+    "ClientTweetMuteAuthor",
+    "ClientTweetMuteConversation",
+    "ClientTweetNotRelevant",
+    "ServerTweetReport",
+    "ServerProfileUnfollow",
+    "ServerProfileBlock",
+    "ServerTweetUnfav",
+    "ServerTweetUnreply",
+    "ServerTweetUnquote",
+    "ServerTweetUnretweet",
+    "ClientTweetUnfollowAuthor",
+    "ClientTweetUnbookmark",
+)
+_LD_CLICK_ACTIONS = (
+    "ClientTweetClick",
+    "ClientQuotedTweetClick",
+    "ClientTweetPhotoExpand",
+    "ClientQuotedTweetPhotoExpand",
+    "ServerTweetPostUnexplored",
+)
+_LD_DWELL_THRESHOLD_SECS = 10.0
+
+
+def _drop_click_only_long_dwell(
+    actions: npt.NDArray[np.bool_],
+    continuous_actions: npt.NDArray[np.float32],
+    candidate_mask: npt.NDArray[np.bool_],
+) -> None:
+    vocab = actions.shape[-1]
+    qualifying = np.ones(vocab, dtype=np.bool_)
+    excluded = [action_type_map[a] for a in _LD_NON_QUALIFYING_ACTIONS + _LD_CLICK_ACTIONS]
+    qualifying[[i for i in excluded if i < vocab]] = False
+    rows, cols = np.nonzero(candidate_mask)
+    cand = actions[rows, cols]
+    dwell_secs = continuous_actions[rows, cols, 1]
+    keep = (
+        cand[:, action_type_map["ClientTweetVideoQualityView"]]
+        | cand[:, action_type_map["ClientQuotedTweetVideoQualityView"]]
+        | ((dwell_secs >= _LD_DWELL_THRESHOLD_SECS) & (cand & qualifying).any(axis=-1))
+    )
+    ld = action_type_map["ClientTweetRecapDwelled"]
+    actions[rows, cols, ld] = cand[:, ld] & keep
+
+
 POST_CATEGORICAL_FEATURE_SIZE = 0 if len(CategoricalFeature) == 0 else max(CategoricalFeature) + 1
 POST_BOOL_FEATURE_SIZE = 0 if len(BoolFeature) == 0 else max(BoolFeature) + 1
 POST_FLOAT_FEATURE_SIZE = 0 if len(FloatFeature) == 0 else max(FloatFeature) + 1
@@ -477,6 +528,8 @@ class RecsysFeaturesBatch(TypedDict):
     user_id_list_hashes: NotRequired[npt.NDArray[np.int32]]
     user_id_list_mask: NotRequired[npt.NDArray[np.bool_]]
     packing_layout: NotRequired[SequencePackedLayout | None]
+    dwell_cread_power: NotRequired[npt.NDArray[np.float32] | None]
+    dwell_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
 
 
 LEXICAL_TEXT_COLUMN = "lexicalTextSeq"
@@ -809,6 +862,7 @@ def from_record_batch(
     global_post_sids: np.ndarray | None = None,
     sid_num_levels: int = 0,
     compute_post_unexplored_label: bool = False,
+    ld_label_exclude_clicks: bool = False,
     zero_stale_post_14d_candidate_counts: bool = False,
     stale_post_30d: bool = False,
     search_negative_clear_word_match: bool = False,
@@ -917,6 +971,9 @@ def from_record_batch(
         continuous_actions = alloc.zeros(
             (batch_size, seq_len, num_continuous_actions), dtype=np.float32
         )
+
+    if ld_label_exclude_clicks:
+        _drop_click_only_long_dwell(actions, continuous_actions, new_event_mask)
 
     value_labels = _read_value_labels(
         record_batch, (batch_size, actions.shape[1]), aux_value_events

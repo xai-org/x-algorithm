@@ -243,6 +243,7 @@ def _make_dataset(
                 global_ids_file_path=_global_ids_file_path,
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
+                ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -526,6 +527,7 @@ MODEL_CFGS = {
             "head_names": ["home", "ld"],
             "head_dataset_mapping": {"HOME": 0, "HOME_COLD": 0, "HOME_HOT": 0},
             "checkpoint_dataset_names": ["HOME"],
+            "ld_label_exclude_clicks": True,
         },
         user_vocab_size=0,
         item_vocab_size=0,
