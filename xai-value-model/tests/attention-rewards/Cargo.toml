@@ -1,0 +1,14 @@
+[package]
+name = "attention-rewards-public-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+md5 = "0.8"
+rustc-hash = "2"
+
+[workspace]
