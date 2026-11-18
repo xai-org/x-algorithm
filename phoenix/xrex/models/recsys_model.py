@@ -54,6 +54,9 @@ from xrex.data.recsys.constants import (
 from xrex.data.recsys.feature_config import (
     ADS_COUNT_BUCKETS,
     ADS_PRODUCT_KEY_TABLE_SIZE,
+    DPA_SID_CODEBOOK_SIZE,
+    DPA_SID_LEVEL_NAMES,
+    DPA_SID_NUM_LEVELS,
     ENGAGEMENT_COUNT_BUCKET_MAP,
     BoolFeature,
     CategoricalFeature,
@@ -209,6 +212,8 @@ _DPA_PRODUCT_KEY_SLOTS: list[int] = [
     Int64Feature.firstDpaProductKeyHash2.value,
 ]
 
+_DPA_SID_LEVEL_SLOTS: list[int] = [Int64Feature[name].value for name in DPA_SID_LEVEL_NAMES]
+
 POST_AGE_MAX_MINUTES = 4800
 
 
@@ -317,9 +322,25 @@ def packed_history_users(layout: SequencePackedLayout) -> tuple[jax.Array, int]:
     return jnp.clip(users, 0, num_users - 1).astype(jnp.int32), num_users
 
 
-CREAD_REQUEST_DECODE_HEAD = "dwell-time-cread"
-CREAD_DECODE_POWER_KEY = "dwell_cread_power"
-CREAD_DECODE_SCALE_KEY = "dwell_cread_scale"
+CREAD_REQUEST_DECODE_PREFIXES: dict[str, str] = {
+    "dwell-time-cread": "dwell",
+    "dwell-time-cread-immersive": "immersive_dwell",
+    "home-video-continuation-cread": "video_continuation",
+    "home-profile-visit-secs-cread": "profile_visit",
+}
+CREAD_SERVE_POWER_MAX = 4.0
+
+
+def cread_request_decode_keys(metric_name: str) -> tuple[str, str]:
+    prefix = CREAD_REQUEST_DECODE_PREFIXES[metric_name]
+    return f"{prefix}_cread_power", f"{prefix}_cread_scale"
+
+
+def cread_decode_from_request_enabled(model_config: Any) -> bool:
+    return bool(
+        getattr(model_config, "cread_decode_from_request", False)
+        or getattr(model_config, "dwell_cread_decode_from_request", False)
+    )
 
 
 def packed_candidate_users(layout: SequencePackedLayout) -> jax.Array:
@@ -337,34 +358,44 @@ def packed_candidate_users(layout: SequencePackedLayout) -> jax.Array:
     return jnp.clip(users, 0, num_users - 1).astype(jnp.int32)
 
 
-def cread_request_decode_avals(batch: Any) -> dict[str, jax.ShapeDtypeStruct]:
+def cread_request_decode_heads(model_config: Any) -> list[Any]:
+    cread_heads = [lc for lc in model_config.continuous_action_losses if lc.loss_type == "cread"]
+    if getattr(model_config, "cread_decode_from_request", False):
+        heads = [lc for lc in cread_heads if lc.metric_name in CREAD_REQUEST_DECODE_PREFIXES]
+        names = [lc.metric_name for lc in heads]
+        if not heads or len(set(names)) != len(names):
+            raise ValueError(
+                "cread_decode_from_request needs at least one CREAD head named in "
+                f"{sorted(CREAD_REQUEST_DECODE_PREFIXES)} and no duplicate names, found {names}"
+            )
+        return heads
+    if getattr(model_config, "dwell_cread_decode_from_request", False):
+        heads = [lc for lc in cread_heads if lc.metric_name == "dwell-time-cread"]
+        if len(heads) != 1:
+            raise ValueError(
+                "dwell_cread_decode_from_request needs exactly one 'dwell-time-cread' "
+                f"CREAD head, found {len(heads)}"
+            )
+        return heads
+    return []
+
+
+def cread_request_decode_avals(batch: Any, model_config: Any) -> dict[str, jax.ShapeDtypeStruct]:
     shape = tuple(batch["user_hashes"].shape[:2])
     return {
         key: jax.ShapeDtypeStruct(shape, jnp.float32)
-        for key in (CREAD_DECODE_POWER_KEY, CREAD_DECODE_SCALE_KEY)
+        for head in cread_request_decode_heads(model_config)
+        for key in cread_request_decode_keys(head.metric_name)
     }
-
-
-def cread_request_decode_head(model_config: Any) -> Any:
-    heads = [
-        lc
-        for lc in model_config.continuous_action_losses
-        if lc.metric_name == CREAD_REQUEST_DECODE_HEAD and lc.loss_type == "cread"
-    ]
-    if len(heads) != 1:
-        raise ValueError(
-            f"dwell_cread_decode_from_request needs exactly one {CREAD_REQUEST_DECODE_HEAD!r} "
-            f"CREAD head, found {len(heads)}"
-        )
-    return heads[0]
 
 
 def cread_request_decode_fills(model_config: Any) -> dict[str, float]:
-    head = cread_request_decode_head(model_config)
-    return {
-        CREAD_DECODE_POWER_KEY: float(head.cread_serve_power),
-        CREAD_DECODE_SCALE_KEY: float(head.cread_serve_scale),
-    }
+    fills = {}
+    for head in cread_request_decode_heads(model_config):
+        power_key, scale_key = cread_request_decode_keys(head.metric_name)
+        fills[power_key] = float(head.cread_serve_power)
+        fills[scale_key] = float(head.cread_serve_scale)
+    return fills
 
 
 def recent_positive_history_mask(
@@ -524,8 +555,11 @@ class ContinuousActionLossConfig(Config):
 
         if self.loss_type == "cread":
             _ = self.cread_threshold_values
-            if not 0.0 < self.cread_serve_power <= 1.0:
-                raise ValueError(f"cread_serve_power ({self.cread_serve_power}) must be in (0, 1]")
+            if not 0.0 < self.cread_serve_power <= CREAD_SERVE_POWER_MAX:
+                raise ValueError(
+                    f"cread_serve_power ({self.cread_serve_power}) must be in "
+                    f"(0, {CREAD_SERVE_POWER_MAX}]"
+                )
             if not 0.0 < self.cread_huber_delta_sec < self.norm_config.norm_scale:
                 raise ValueError(
                     f"cread_huber_delta_sec ({self.cread_huber_delta_sec}) must be in "
@@ -1412,6 +1446,7 @@ class RecsysAggregatedModelConfig(Config):
 
     recent_positive_value_scale: float = 1.0
     dwell_cread_decode_from_request: bool = False
+    cread_decode_from_request: bool = False
     recent_positive_window_secs: int = 900
     recent_positive_last_n: int = 5
     recent_positive_last_n_cap_secs: int = 7200
@@ -1497,6 +1532,7 @@ class RecsysAggregatedModelConfig(Config):
     dpa_product_table_size: int = ADS_PRODUCT_KEY_TABLE_SIZE
 
     enable_dpa_input_embedding: bool = False
+    enable_dpa_sid_feat: bool = False
 
     user_features: UserFeaturesConfig = UserFeaturesConfig()
 
@@ -3617,23 +3653,26 @@ class RecsysAggregatedModel(hk.Module):
 
     def _request_cread_decode(
         self, batch: RecsysFeaturesBatch, layout: SequencePackedLayout
-    ) -> tuple[jax.Array, jax.Array] | None:
-        if not self.config.dwell_cread_decode_from_request:
+    ) -> dict[str, tuple[jax.Array, jax.Array]] | None:
+        heads = cread_request_decode_heads(self.config)
+        if not heads:
             return None
-        cread_request_decode_head(self.config)
-        power = batch.get(CREAD_DECODE_POWER_KEY)
-        scale = batch.get(CREAD_DECODE_SCALE_KEY)
-        if power is None or scale is None:
-            raise ValueError(
-                "dwell_cread_decode_from_request needs the "
-                f"{CREAD_DECODE_POWER_KEY} and {CREAD_DECODE_SCALE_KEY} batch inputs "
-                "(served by --backend=native)"
-            )
+        inputs = typing.cast(dict[str, Any], batch)
         users = packed_candidate_users(layout)
-        return (
-            jnp.take_along_axis(cast_jax(power).astype(jnp.float32), users, axis=1),
-            jnp.take_along_axis(cast_jax(scale).astype(jnp.float32), users, axis=1),
-        )
+        decode = {}
+        for head in heads:
+            power_key, scale_key = cread_request_decode_keys(head.metric_name)
+            power, scale = inputs.get(power_key), inputs.get(scale_key)
+            if power is None or scale is None:
+                raise ValueError(
+                    f"per-request decode of {head.metric_name!r} needs the {power_key} and "
+                    f"{scale_key} batch inputs (served by --backend=native)"
+                )
+            decode[head.metric_name] = (
+                jnp.take_along_axis(cast_jax(power).astype(jnp.float32), users, axis=1),
+                jnp.take_along_axis(cast_jax(scale).astype(jnp.float32), users, axis=1),
+            )
+        return decode
 
     @hk.transparent
     def _decode_cread(
@@ -3686,7 +3725,7 @@ class RecsysAggregatedModel(hk.Module):
         inputs: jax.Array,
         product_surface: jax.Array | None = None,
         purchase_value_features: jax.Array | None = None,
-        cread_decode: tuple[jax.Array, jax.Array] | None = None,
+        cread_decode: dict[str, tuple[jax.Array, jax.Array]] | None = None,
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
         self.cread_logits: dict[str, jax.Array] = {}
         unembeddings = self._get_continuous_unembedding()
@@ -3748,9 +3787,7 @@ class RecsysAggregatedModel(hk.Module):
                 c: ContinuousActionLossConfig, head_logits: jax.Array
             ) -> jax.Array:
                 if c.loss_type == "cread":
-                    request_decode = (
-                        cread_decode if c.metric_name == CREAD_REQUEST_DECODE_HEAD else None
-                    )
+                    request_decode = (cread_decode or {}).get(c.metric_name or "")
                     return self._decode_cread(inputs, c, request_decode)
                 out = self._apply_activation(head_logits, c.activation)
                 if c.output_cap > 0:
@@ -4082,6 +4119,44 @@ class RecsysAggregatedModel(hk.Module):
         return candidate_embeddings + emb.astype(candidate_embeddings.dtype)
 
     @hk.transparent
+    def _maybe_add_dpa_sid_embedding(
+        self,
+        candidate_embeddings: jax.Array,
+        recsys_features_batch: RecsysFeaturesBatch,
+    ) -> jax.Array:
+        _config = self.config
+        if not _config.enable_dpa_sid_feat:
+            return candidate_embeddings
+        width = _config.emb_table_width
+        table = get_parameter(
+            "dpa_sid_embedding",
+            [DPA_SID_NUM_LEVELS, DPA_SID_CODEBOOK_SIZE + 1, width],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(),
+            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(width),
+            rms_clip_axes=(-3, -2, -1),
+        )
+        raw_i64 = recsys_features_batch["candidate_seq"].get("int64_features")
+        if raw_i64 is None:
+            return candidate_embeddings
+        values = cast_jax(raw_i64)
+        if values.shape[-1] <= max(_DPA_SID_LEVEL_SLOTS):
+            return candidate_embeddings
+        assert values.shape[:2] == candidate_embeddings.shape[:2], (
+            f"dpa sid shape {values.shape} must match candidate embeddings "
+            f"{candidate_embeddings.shape[:2]}"
+        )
+        table = table.at[:, 0, :].set(0.0)
+        codes = jnp.clip(
+            values[:, :, _DPA_SID_LEVEL_SLOTS].astype(jnp.int32), 0, DPA_SID_CODEBOOK_SIZE
+        )
+        emb = jnp.zeros(candidate_embeddings.shape, dtype=jnp.float32)
+        for level in range(DPA_SID_NUM_LEVELS):
+            emb = emb + jnp.take(table[level], codes[..., level], axis=0)
+        return candidate_embeddings + emb.astype(candidate_embeddings.dtype)
+
+    @hk.transparent
     def build_inputs(
         self,
         recsys_features_batch: RecsysFeaturesBatch,
@@ -4094,6 +4169,9 @@ class RecsysAggregatedModel(hk.Module):
         if _config.feature_prep_enabled:
             assert not _config.enable_dpa_input_embedding, (
                 "enable_dpa_input_embedding is not implemented for the feature_prep path"
+            )
+            assert not _config.enable_dpa_sid_feat, (
+                "enable_dpa_sid_feat is not implemented for the feature_prep path"
             )
             fp = _config.feature_prep
             scale_multiplier = fp.scale_config.input_scale(fp.emb_size)
@@ -4375,6 +4453,9 @@ class RecsysAggregatedModel(hk.Module):
             candidate_embeddings = self._maybe_add_dpa_input_embedding(
                 candidate_embeddings, recsys_features_batch
             )
+            candidate_embeddings = self._maybe_add_dpa_sid_embedding(
+                candidate_embeddings, recsys_features_batch
+            )
             if _config.has_side_inputs:
                 history_embeddings, candidate_embeddings = self._add_side_inputs(
                     recsys_features_batch, history_embeddings, candidate_embeddings, layout=layout
@@ -4555,6 +4636,9 @@ class RecsysAggregatedModel(hk.Module):
             candidate_embeddings = self._maybe_add_dpa_input_embedding(
                 candidate_embeddings, recsys_features_batch
             )
+            candidate_embeddings = self._maybe_add_dpa_sid_embedding(
+                candidate_embeddings, recsys_features_batch
+            )
             if _config.has_side_inputs:
                 history_embeddings, candidate_embeddings = self._add_side_inputs(
                     recsys_features_batch, history_embeddings, candidate_embeddings
@@ -4605,7 +4689,7 @@ class RecsysAggregatedModel(hk.Module):
         act_l2_mask: jax.Array | None = None,
         with_aux_value_heads: bool = False,
         purchase_value_features: jax.Array | None = None,
-        cread_decode: tuple[jax.Array, jax.Array] | None = None,
+        cread_decode: dict[str, tuple[jax.Array, jax.Array]] | None = None,
     ) -> tuple[jax.Array, ...]:
         _debug_dir = self.config.model_config.debug_tensor_dump_output_folder
         dump_to_file(_debug_dir, "input_embeddings", input_embeddings)
@@ -5955,8 +6039,8 @@ class RecsysAggregatedModel(hk.Module):
             )
         else:
             assert candidate_start_offset is not None
-            if self.config.dwell_cread_decode_from_request:
-                raise ValueError("dwell_cread_decode_from_request needs use_seqpack")
+            if cread_decode_from_request_enabled(self.config):
+                raise ValueError("per-request CREAD decode needs use_seqpack")
 
             if self.config.pad_candidates_to_128:
                 input_embeddings, padding_mask, product_surface, targets, *_ = (

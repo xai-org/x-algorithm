@@ -335,6 +335,34 @@ fn oon_applies(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) 
     }
 }
 
+fn class_factor_score(
+    weights: &ValueModelWeights,
+    ctx: &QueryScoringContext,
+    candidate: &CandidateScoringInputs,
+    score: f64,
+) -> Option<f64> {
+    if weights.multiplicative {
+        return None;
+    }
+    let (factors, level) = if candidate.in_network? {
+        let level = if oon_applies(weights, candidate) {
+            ctx.effective_oon_weight
+        } else {
+            1.0
+        };
+        (ctx.in_network_factors?, level)
+    } else {
+        (ctx.oon_factors?, 1.0)
+    };
+    let dwell_time = apply(candidate.phoenix_scores.dwell_time, weights.cont_dwell_time);
+    let dwell_time = if score >= NEGATIVE_SCORES_OFFSET && dwell_time.is_finite() {
+        dwell_time.clamp(0.0, score)
+    } else {
+        0.0
+    };
+    Some(level * (factors.engagement * (score - dwell_time) + factors.dwell_time * dwell_time))
+}
+
 pub fn post_fusion_multipliers(
     weights: &ValueModelWeights,
     ctx: &QueryScoringContext,
@@ -443,7 +471,13 @@ where
     let scores = adjusted
         .iter()
         .zip(&multipliers)
-        .map(|(&s, m)| m.apply(s))
+        .zip(candidates)
+        .map(
+            |((&s, m), c)| match class_factor_score(weights, ctx, c, s) {
+                Some(class_score) => class_score * m.author_diversity,
+                None => m.apply(s),
+            },
+        )
         .collect();
     ValueScores { weighted, scores }
 }
@@ -458,6 +492,7 @@ fn add_exploration_bonus(weighted: f64, bonus: f64, weights: &ValueModelWeights)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inputs::ClassFactors;
     use crate::phoenix_scores::PhoenixScores;
 
     #[test]
@@ -484,6 +519,7 @@ mod tests {
         };
         let ctx = QueryScoringContext {
             effective_oon_weight: 0.75,
+            ..Default::default()
         };
 
         let mutual_original = CandidateScoringInputs {
@@ -597,6 +633,207 @@ mod tests {
             );
         }
         assert!((fuse_heads(&weights, &candidates[0]) - weighted_mutual_original).abs() < 1e-12);
+    }
+
+    fn class_factor_weights() -> ValueModelWeights {
+        ValueModelWeights {
+            favorite: 2.0,
+            cont_dwell_time: 0.1,
+            report: -100.0,
+            oon_rescore_in_network_replies_retweets: true,
+            ..Default::default()
+        }
+    }
+
+    fn class_factor_candidate(
+        in_network: Option<bool>,
+        favorite: f64,
+        dwell_secs: Option<f64>,
+    ) -> CandidateScoringInputs {
+        CandidateScoringInputs {
+            phoenix_scores: PhoenixScores {
+                favorite_score: Some(favorite),
+                dwell_time: dwell_secs,
+                ..Default::default()
+            },
+            in_network,
+            ..Default::default()
+        }
+    }
+
+    fn assert_scores(got: &[f64], want: &[f64]) {
+        assert_eq!(got.len(), want.len());
+        for (i, (got, want)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "candidate {i}: got {got} want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_factors_scale_dwell_time_and_engagement_separately() {
+        let weights = class_factor_weights();
+        let ctx = QueryScoringContext {
+            effective_oon_weight: 0.75,
+            oon_factors: ClassFactors::new(0.6, 0.9),
+            in_network_factors: ClassFactors::new(1.2, 0.7),
+        };
+        let reply = CandidateScoringInputs {
+            is_reply: true,
+            ..class_factor_candidate(Some(true), 0.2, Some(4.0))
+        };
+        let reported = |in_network, report| CandidateScoringInputs {
+            phoenix_scores: PhoenixScores {
+                report_score: Some(report),
+                dwell_time: Some(4.0),
+                ..Default::default()
+            },
+            in_network: Some(in_network),
+            ..Default::default()
+        };
+        let candidates = [
+            class_factor_candidate(Some(false), 0.2, Some(4.0)),
+            class_factor_candidate(Some(true), 0.2, Some(4.0)),
+            reply,
+            class_factor_candidate(Some(false), 0.2, None),
+            class_factor_candidate(None, 0.2, Some(4.0)),
+            reported(false, 0.003),
+            reported(true, 0.003),
+            reported(false, 0.05),
+        ];
+
+        let offset = 0.001;
+        let engagement = 2.0 * 0.2 + offset;
+        let dwell_time = 0.1 * 4.0;
+        let capped = 0.4 - 100.0 * 0.003 + offset;
+        let negative = (0.4 - 100.0 * 0.05 + 100.0) / 102.0 * offset;
+        let want = [
+            0.6 * engagement + 0.9 * dwell_time,
+            1.2 * engagement + 0.7 * dwell_time,
+            0.75 * (1.2 * engagement + 0.7 * dwell_time),
+            0.6 * engagement,
+            engagement + dwell_time,
+            0.9 * capped,
+            0.7 * capped,
+            0.6 * negative,
+        ];
+        let got = compute_value_scores(&weights, &ctx, &candidates);
+        assert_scores(&got.scores, &want);
+        assert!((got.weighted[0] - (engagement + dwell_time)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn neutral_class_factors_match_the_single_oon_factor() {
+        let weights = ValueModelWeights {
+            enable_author_diversity: true,
+            author_diversity_decay: 0.5,
+            author_diversity_floor: 0.25,
+            ..class_factor_weights()
+        };
+        let single = QueryScoringContext {
+            effective_oon_weight: 0.75,
+            ..Default::default()
+        };
+        let neutral = QueryScoringContext {
+            oon_factors: ClassFactors::new(0.75, 0.75),
+            in_network_factors: ClassFactors::new(1.0, 1.0),
+            ..single.clone()
+        };
+        let retweet = CandidateScoringInputs {
+            is_retweet: true,
+            ..class_factor_candidate(Some(true), 0.3, Some(8.0))
+        };
+        let negative = CandidateScoringInputs {
+            phoenix_scores: PhoenixScores {
+                report_score: Some(0.05),
+                dwell_time: Some(4.0),
+                ..Default::default()
+            },
+            in_network: Some(false),
+            ..Default::default()
+        };
+        let candidates = [
+            class_factor_candidate(Some(false), 0.2, Some(4.0)),
+            class_factor_candidate(Some(false), 0.1, Some(9.0)),
+            class_factor_candidate(Some(true), 0.2, Some(4.0)),
+            retweet,
+            class_factor_candidate(Some(false), 0.2, None),
+            class_factor_candidate(None, 0.2, Some(4.0)),
+            negative,
+        ];
+        let want = compute_value_scores(&weights, &single, &candidates);
+        let got = compute_value_scores(&weights, &neutral, &candidates);
+        assert_scores(&got.scores, &want.scores);
+        assert!(want.scores[1] < 0.75 * want.weighted[1]);
+    }
+
+    #[test]
+    fn class_factors_use_a_cached_weighted_score() {
+        let weights = class_factor_weights();
+        let ctx = QueryScoringContext {
+            effective_oon_weight: 0.75,
+            oon_factors: ClassFactors::new(0.6, 0.9),
+            in_network_factors: None,
+        };
+        let cached = CandidateScoringInputs {
+            weighted_score: Some(1.0),
+            ..class_factor_candidate(Some(false), 0.2, Some(4.0))
+        };
+        let in_network = CandidateScoringInputs {
+            weighted_score: Some(1.0),
+            ..class_factor_candidate(Some(true), 0.2, Some(4.0))
+        };
+        let got = compute_value_scores(&weights, &ctx, &[cached, in_network]);
+        assert_scores(&got.scores, &[0.6 * (1.0 - 0.4) + 0.9 * 0.4, 1.0]);
+        assert_scores(&got.weighted, &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn class_factors_are_ignored_in_multiplicative_and_pre_offset_modes() {
+        let ctx = QueryScoringContext {
+            effective_oon_weight: 0.75,
+            oon_factors: ClassFactors::new(0.6, 0.9),
+            in_network_factors: ClassFactors::new(1.2, 0.7),
+        };
+        let single = QueryScoringContext {
+            effective_oon_weight: 0.75,
+            ..Default::default()
+        };
+        let candidates = [
+            class_factor_candidate(Some(false), 0.2, Some(4.0)),
+            class_factor_candidate(Some(true), 0.2, Some(4.0)),
+        ];
+        for weights in [
+            ValueModelWeights {
+                multiplicative: true,
+                ..class_factor_weights()
+            },
+            ValueModelWeights {
+                multiplier_pre_offset: true,
+                ..class_factor_weights()
+            },
+        ] {
+            let want = compute_value_scores(&weights, &single, &candidates);
+            let got = compute_value_scores(&weights, &ctx, &candidates);
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn class_factors_reject_invalid_values() {
+        assert_eq!(
+            ClassFactors::new(0.6, 0.9),
+            Some(ClassFactors {
+                engagement: 0.6,
+                dwell_time: 0.9
+            })
+        );
+        assert!(ClassFactors::new(0.0, 0.0).is_some());
+        assert_eq!(ClassFactors::new(-1.0, 0.9), None);
+        assert_eq!(ClassFactors::new(0.6, -1.0), None);
+        assert_eq!(ClassFactors::new(f64::NAN, 0.9), None);
+        assert_eq!(ClassFactors::new(0.6, f64::INFINITY), None);
     }
 
     #[test]

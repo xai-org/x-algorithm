@@ -56,5 +56,6 @@ class KafkaConsumerConfig(KafkaConfig):
     fetch_max_bytes: int = Field(default=50 * 1024 * 1024)
     fetch_min_bytes: int = Field(default=1024 * 128)
     max_poll_records: int = Field(default=500)
+    max_poll_interval_ms: int = Field(default=300000)
     prefetching_threshold: int = 256
     request_timeout_ms: int = Field(default=30000)

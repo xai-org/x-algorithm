@@ -45,6 +45,8 @@ mod confidence_path_tests;
 mod replay_tests;
 #[cfg(test)]
 mod safety_audit_tests;
+#[cfg(test)]
+mod test_account_path_tests;
 
 use xai_abuse_proto::enforcement as abuse_proto;
 
@@ -688,6 +690,18 @@ async fn run_enforcement_inner(
         record_seen_bands(ctx, score, facts.entity_type, None, control.factory);
     } else if let Some(rules) = seen_rules {
         record_seen_bands(ctx, score, facts.entity_type, Some(rules), false);
+    }
+    if [
+        safety_checks::GIZMODUCK_TEST_USER.id,
+        safety_checks::TEST_ACCOUNT.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let Some(kind) = safety_checks::test_account_signal_kind(&facts)
+    {
+        extra.insert("test_account_signal".into(), kind.into());
+        metrics::TEST_ACCOUNT_SKIPS_TOTAL
+            .with_label_values(&[kind])
+            .inc();
     }
     extra.insert("matched_rule_id".into(), rule_id);
 
@@ -2547,8 +2561,11 @@ async fn finish_state(
         backfill.spawn_settings_refresh();
     }
 
+    let gd = connect_gizmoduck(&cfg).await?;
+
     let state = Arc::new(AppState {
         ais_client,
+        gd,
         dynamic_config,
         rules_cache: Arc::new(rules_cache),
         dedup_cache,
@@ -2568,6 +2585,42 @@ async fn finish_state(
     });
 
     Ok((state, cfg))
+}
+
+async fn connect_gizmoduck(cfg: &Config) -> Result<Option<gizmoduck::GizmoduckCoreClient>> {
+    let policy = cfg.test_account_policy()?;
+    let (domains, roles, networks) = policy.sizes();
+    info!(
+        email_domains = domains,
+        roles, networks, "test-account policy loaded"
+    );
+    let connected =
+        gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
+            zone: cfg.gizmoduck_zone.clone(),
+            ca_cert_path: cfg
+                .strato_ca_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into()),
+            client_cert_path: cfg
+                .strato_client_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into()),
+            client_key_path: cfg
+                .strato_client_key_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into()),
+            client_id: cfg.gizmoduck_client_id.clone(),
+        })
+        .await
+        .context("failed to create gizmoduck get-V2 fed-grpc client");
+    match connected {
+        Ok(gd) => Ok(Some(gd.with_policy(policy))),
+        Err(e) if !cfg.kafka_consumer_enabled => {
+            warn!("{e:#}; POST /api/action will refuse suspends");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) -> Router {
@@ -3108,27 +3161,10 @@ pub async fn start_kafka_consumers(
         }
     }
 
-    let ca = cfg
-        .strato_ca_cert_path
+    let gd = state
+        .gd
         .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into());
-    let crt = cfg
-        .strato_client_cert_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into());
-    let key = cfg
-        .strato_client_key_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into());
-    let gd = gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
-        zone: cfg.gizmoduck_zone.clone(),
-        ca_cert_path: ca,
-        client_cert_path: crt,
-        client_key_path: key,
-        client_id: cfg.gizmoduck_client_id.clone(),
-    })
-    .await
-    .context("failed to create gizmoduck get-V2 fed-grpc client")?;
+        .context("no gizmoduck get-V2 fed-grpc client; the consumers can't decide without it")?;
 
     #[allow(deprecated)]
     let cred_hpr = Arc::new(

@@ -104,6 +104,20 @@ lazy_static! {
             &["status"])
             .unwrap();
 
+            pub static ref GIZMODUCK_LOGIN_EMAIL_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_gizmoduck_login_email_total",
+            "Found gizmoduck users by login e-mail state.",
+            &["state"])
+            .unwrap();
+
+            pub static ref TEST_ACCOUNT_SKIPS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_test_account_skips_total",
+            "Decisions skipped because the account is a test account.",
+            &["kind"])
+            .unwrap();
+
                     pub static ref GIZMODUCK_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_gizmoduck_core_latency_seconds",
@@ -465,6 +479,8 @@ pub fn init() {
     let _ = &*KAFKA_MESSAGE_LATENCY;
     let _ = &*USER_ACTIVE_SECONDS;
     let _ = &*GIZMODUCK_CHECK_TOTAL;
+    let _ = &*GIZMODUCK_LOGIN_EMAIL_TOTAL;
+    let _ = &*TEST_ACCOUNT_SKIPS_TOTAL;
     let _ = &*GIZMODUCK_LATENCY;
     let _ = &*STRATO_RETRIES;
     let _ = &*RETRY_ATTEMPTS;

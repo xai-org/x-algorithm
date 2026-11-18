@@ -6,13 +6,13 @@ use log::warn;
 use xai_feature_switches::{AuthorRulesEvaluator, Params};
 use xai_value_model::{
     compute_value_scores, set_user_video_continuation, weighted_terms, CandidateScoringInputs,
-    PhoenixScores, QueryScoringContext, ValueModelWeights, ValueScores,
+    ClassFactors, PhoenixScores, QueryScoringContext, ValueModelWeights, ValueScores,
 };
 use xai_vm_ranker_proto::{HeadContribution, RankRequest};
 
 use crate::metrics::{
     AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM, SAMPLED_CANDIDATES,
-    VALUE_MODEL_FALLBACK, VALUE_MODEL_REQUESTS, VALUE_MODEL_STAGE,
+    VALUE_MODEL_CLASS_FACTORS, VALUE_MODEL_FALLBACK, VALUE_MODEL_REQUESTS, VALUE_MODEL_STAGE,
 };
 use crate::params::*;
 use crate::ranking_config::snowflake_creation_ms;
@@ -127,10 +127,20 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
     )
 }
 
+fn class_factors(engagement: f64, dwell_time: f64, single: f64) -> Option<ClassFactors> {
+    let configured = |factor: f64| factor.is_finite() && factor >= 0.0;
+    if !configured(engagement) && !configured(dwell_time) {
+        return None;
+    }
+    let or_single = |factor: f64| if configured(factor) { factor } else { single };
+    ClassFactors::new(or_single(engagement), or_single(dwell_time))
+}
+
 pub fn scoring_context(req: &RankRequest, params: &Params) -> QueryScoringContext {
     if req.topic_request {
         return QueryScoringContext {
             effective_oon_weight: params.get(TopicOonWeightFactor),
+            ..Default::default()
         };
     }
     let now_ms = req
@@ -144,12 +154,25 @@ pub fn scoring_context(req: &RankRequest, params: &Params) -> QueryScoringContex
     let is_eligible_new_user = account_age_secs
         .is_some_and(|age| age < params.get(NewUserAgeThresholdSecs))
         && req.viewer_following_count >= NEW_USER_MIN_FOLLOWING;
+    if is_eligible_new_user {
+        return QueryScoringContext {
+            effective_oon_weight: params.get(NewUserOonWeightFactor),
+            ..Default::default()
+        };
+    }
+    let oon_weight = params.get(OonWeightFactor);
     QueryScoringContext {
-        effective_oon_weight: if is_eligible_new_user {
-            params.get(NewUserOonWeightFactor)
-        } else {
-            params.get(OonWeightFactor)
-        },
+        effective_oon_weight: oon_weight,
+        oon_factors: class_factors(
+            params.get(OonEngagementWeightFactor),
+            params.get(OonDwellTimeWeightFactor),
+            oon_weight,
+        ),
+        in_network_factors: class_factors(
+            params.get(InNetworkEngagementWeightFactor),
+            params.get(InNetworkDwellTimeWeightFactor),
+            1.0,
+        ),
     }
 }
 
@@ -172,6 +195,16 @@ fn compute_or_fallback(
     let params = params.ok_or_else(|| Fallback::new("no_config", ""))?;
     let weights = weights_from_params(params, req.viewer_id);
     let ctx = scoring_context(req, params);
+    if !weights.multiplicative && !weights.multiplier_pre_offset {
+        for (class, factors) in [
+            ("oon", ctx.oon_factors),
+            ("in_network", ctx.in_network_factors),
+        ] {
+            if factors.is_some() {
+                VALUE_MODEL_CLASS_FACTORS.with_label_values(&[class]).inc();
+            }
+        }
+    }
     let mut inputs = candidate_inputs(req, &weights);
     if weights.user_video_continuation != 0.0 {
         set_user_video_continuation(&mut inputs);

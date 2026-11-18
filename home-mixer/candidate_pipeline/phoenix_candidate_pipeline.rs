@@ -133,6 +133,7 @@ use crate::side_effects::response_diversity_stats_side_effect::ResponseDiversity
 use crate::side_effects::retrieval_candidates_kafka_side_effect::RetrievalCandidatesKafkaSideEffect;
 use crate::side_effects::scored_stats_side_effect::ScoredStatsSideEffect;
 use crate::side_effects::serendipity_stats_side_effect::SerendipityStatsSideEffect;
+use crate::side_effects::teacher_score_side_effect::TeacherScoreSideEffect;
 use crate::sources::cached_posts_source::CachedPostsSource;
 use crate::sources::phoenix_moe_source::PhoenixMOESource;
 use crate::sources::phoenix_source::PhoenixSource;
@@ -260,6 +261,8 @@ impl PhoenixCandidatePipeline {
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
         phoenix_request_cache_redis_atla_client: Arc<dyn RedisClient + Send + Sync>,
         phoenix_request_cache_redis_pdxa_client: Arc<dyn RedisClient + Send + Sync>,
+        teacher_cache_redis_atla_client: Arc<dyn RedisClient + Send + Sync>,
+        teacher_cache_redis_pdxa_client: Arc<dyn RedisClient + Send + Sync>,
         impression_bloom_filter_client: Arc<dyn ImpressionBloomFilterClient>,
         ip_client: Arc<GeoIpLocationClient>,
         user_demographics_client: Arc<dyn UserDemographicsClient>,
@@ -523,7 +526,7 @@ impl PhoenixCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, PostCandidate>>>> =
             Arc::new(vec![
                 Box::new(PhoenixExperimentsSideEffect::new(
-                    phoenix_client,
+                    phoenix_client.clone(),
                     phoenix_kafka_client,
                     logged_scored_candidates_kafka_client,
                     redis_client.clone(),
@@ -543,6 +546,11 @@ impl PhoenixCandidatePipeline {
                 Box::new(PhoenixRequestCacheSideEffect::new(
                     phoenix_request_cache_redis_atla_client,
                     phoenix_request_cache_redis_pdxa_client,
+                )),
+                Box::new(TeacherScoreSideEffect::new(
+                    phoenix_client,
+                    teacher_cache_redis_atla_client,
+                    teacher_cache_redis_pdxa_client,
                 )),
             ]);
 
@@ -586,6 +594,7 @@ impl PhoenixCandidatePipeline {
             strato_vf_client,
             redis_client,
             (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
+            (teacher_cache_redis_atla_client, teacher_cache_redis_pdxa_client),
             phoenix_kafka_client,
             logged_scored_candidates_kafka_client,
             reranking_kafka_client,
@@ -714,6 +723,7 @@ impl PhoenixCandidatePipeline {
                 ) as Arc<dyn RedisClient + Send + Sync>
             },
             super::shared_phoenix_request_cache_redis_clients(),
+            super::teacher_cache_redis_clients(),
             async {
                 Arc::new(
                     ProdKafkaPublisherClient::new(PHOENIX_SCORES_TOPIC, KafkaCluster::Aiml).await,
@@ -971,6 +981,8 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
+            teacher_cache_redis_atla_client,
+            teacher_cache_redis_pdxa_client,
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,
@@ -1082,6 +1094,8 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
+            Arc::new(MockRedisClient::default()),
+            Arc::new(MockRedisClient::default()),
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,

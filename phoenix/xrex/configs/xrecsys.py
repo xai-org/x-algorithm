@@ -844,6 +844,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             ads_late_window_heads=mparams.get("ads_late_window_heads", False),
             serve_late_window_composed=mparams.get("serve_late_window_composed", False),
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
+            enable_dpa_sid_feat=mparams.get("enable_dpa_sid_feat", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
             pad_candidates_to_128=mparams.get("pad_candidates_to_128", True),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),

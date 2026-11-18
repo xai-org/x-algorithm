@@ -198,7 +198,7 @@ pub struct AllowlistFacts {
     pub ttl_secs: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct GizmoduckFacts {
     pub present: bool,
     pub suspended: bool,
@@ -209,6 +209,48 @@ pub struct GizmoduckFacts {
     pub verified_type: Option<String>,
     pub is_affiliate: bool,
     pub user_type: Option<String>,
+    #[serde(default)]
+    pub test_user_status: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub login_email: Option<String>,
+    #[serde(default)]
+    pub email_confirmed: Option<EmailConfirmedState>,
+    #[serde(default, skip_serializing)]
+    pub creation_ip: Option<String>,
+    #[serde(default)]
+    pub test_signal: Option<crate::safety_checks::TestAccountSignal>,
+}
+
+impl std::fmt::Debug for GizmoduckFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = |v: bool| if v { "<set>" } else { "<none>" };
+        f.debug_struct("GizmoduckFacts")
+            .field("present", &self.present)
+            .field("suspended", &self.suspended)
+            .field("deactivated", &self.deactivated)
+            .field("labels", &self.labels)
+            .field("is_blue_verified", &self.is_blue_verified)
+            .field("verified_type", &self.verified_type)
+            .field("is_affiliate", &self.is_affiliate)
+            .field("user_type", &self.user_type)
+            .field("test_user_status", &self.test_user_status)
+            .field("roles", &self.roles.len())
+            .field("login_email", &set(self.login_email.is_some()))
+            .field("email_confirmed", &self.email_confirmed)
+            .field("creation_ip", &set(self.creation_ip.is_some()))
+            .field("test_signal", &self.test_signal)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmailConfirmedState {
+    Grandfathered,
+    Excused,
+    Unconfirmed,
+    Confirmed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -417,7 +459,7 @@ fn reconstruct_user_signals(map: &BTreeMap<String, String>) -> UserFacts {
             is_blue_verified: parse_bool(map.get("gizmoduck_is_blue_verified")),
             verified_type: parse_dbg_opt_string(map.get("gizmoduck_verified_type")),
             is_affiliate: parse_bool(map.get("gizmoduck_is_affiliate")),
-            user_type: None,
+            ..Default::default()
         }
     } else {
         GizmoduckFacts::default()
@@ -514,6 +556,67 @@ mod tests {
         };
         let f = ScoreFacts::from_score(&s);
         assert!(f.labels.is_empty());
+    }
+
+    #[test]
+    fn account_details_never_leave_the_lookup() {
+        let plain = GizmoduckFacts {
+            present: true,
+            labels: vec!["SpamHighRecall".into()],
+            ..Default::default()
+        };
+        let detailed = GizmoduckFacts {
+            test_user_status: Some("Temporary".into()),
+            roles: vec!["qa_test_role".into()],
+            login_email: Some("someone@test.example.com".into()),
+            email_confirmed: Some(EmailConfirmedState::Confirmed),
+            creation_ip: Some("203.0.113.9".into()),
+            test_signal: Some(crate::safety_checks::TestAccountSignal::EmailDomain),
+            ..plain.clone()
+        };
+        let facts = |entity: EntityType, user: &GizmoduckFacts| {
+            let account = UserFacts {
+                user: user.clone(),
+                ..Default::default()
+            };
+            Facts {
+                entity_type: entity,
+                entity_id: 7,
+                user_id: 7,
+                topic: "t".into(),
+                score: ScoreFacts::from_score(&ScoreResult::default()),
+                entity: match entity {
+                    EntityType::User => EntityFacts::User(account),
+                    EntityType::Post => EntityFacts::Post(PostFacts {
+                        author_id: 7,
+                        author: account,
+                        ..Default::default()
+                    }),
+                },
+                uas: None,
+            }
+        };
+        for entity in [EntityType::User, EntityType::Post] {
+            let with = facts(entity, &detailed);
+            assert_eq!(
+                with.to_additional_info_map(),
+                facts(entity, &plain).to_additional_info_map(),
+                "{entity:?}"
+            );
+            let shown = format!(
+                "{:?} {} {:?}",
+                with.to_additional_info_map(),
+                serde_json::to_string(&detailed).unwrap(),
+                with.user()
+            );
+            for secret in ["someone", "test.example.com", "203.0.113", "qa_test_role"] {
+                assert!(!shown.contains(secret), "{secret} in {shown}");
+            }
+        }
+        let old: GizmoduckFacts =
+            serde_json::from_str(r#"{"present":true,"suspended":false,"deactivated":false,"labels":[],"is_blue_verified":false,"verified_type":null,"is_affiliate":false,"user_type":null}"#)
+                .unwrap();
+        assert!(old.roles.is_empty() && old.login_email.is_none() && old.test_signal.is_none());
     }
 
     #[test]
@@ -703,7 +806,7 @@ mod tests {
                     is_blue_verified: false,
                     verified_type: Some("Business".into()),
                     is_affiliate: false,
-                    user_type: None,
+                    ..Default::default()
                 },
                 cred: CredFacts {
                     is_high: Some(false),

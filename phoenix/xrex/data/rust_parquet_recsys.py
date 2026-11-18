@@ -33,13 +33,17 @@ from xrex.data.parquet_recsys import (
 from xrex.data.parquet_recsys_metadata import (
     DataPosition,
     batch_path,
+    file_rows,
+    iceberg_index,
     is_file,
+    is_iceberg_path,
     is_object_store_path,
     load_batch_manifest,
     load_valid_batches_metadata,
     parquet_file,
     parse_date_bound,
     resolve_time_range,
+    stamp_data_file,
 )
 
 rank_logger = logging.getLogger("rank")
@@ -277,7 +281,7 @@ def _row_counter(
 
     @functools.cache
     def row_counts(bid: int) -> tuple[int, ...]:
-        return tuple(parquet_file(batch_path(topic_dir, p, bid)).metadata.num_rows for p in parts)
+        return tuple(file_rows(topic_dir, p, bid) for p in parts)
 
     return row_counts
 
@@ -664,7 +668,7 @@ class RustParquetDataset(PhoenixDataset):
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
             return super().get_data_position()
-        return self._position
+        return stamp_data_file(self._position, self.path)
 
     def _counts_steps_from_manifest(self) -> bool:
         return self.python_reader_reason() is not None and super()._counts_steps_from_manifest()
@@ -1017,6 +1021,8 @@ class RustParquetDataset(PhoenixDataset):
                 if is_object_store_path(root)
                 else {}
             )
+            if is_iceberg_path(root):
+                o2 = dict(iceberg=iceberg_index(root, refresh=False))
             return RecordBatchProvider(
                 topic_dir=root,
                 batch_size=batch_size * shards_per_partition,

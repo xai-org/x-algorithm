@@ -21,6 +21,7 @@ fn view(query: &ScoredPostsQuery) -> JetfuelView {
     JetfuelView {
         client_app_id: i64::from(query.client_app_id),
         client_version: query.client_version.clone(),
+        user_agent: query.user_agent.clone(),
         locale: query.language_code.clone(),
         country_code: query.country_code.clone(),
         user_id: (query.user_id != 0).then_some(query.user_id),

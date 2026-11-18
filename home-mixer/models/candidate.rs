@@ -643,4 +643,38 @@ mod tests {
         assert_eq!(from_skipped.in_network, Some(false));
         assert_eq!(from_skipped.quoted_tweet_id, None);
     }
+
+    #[test]
+    fn phoenix_score_nulls_are_omitted_and_still_deserialize() {
+        let scored = PostCandidate {
+            tweet_id: 1,
+            phoenix_scores: PhoenixScores {
+                favorite_score: Some(0.5),
+                reply_score: Some(0.0),
+                ..Default::default()
+            },
+            served_type: Some(xai_home_mixer_proto::ServedType::ForYouPhoenixRetrieval),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&scored).unwrap();
+        let heads = value["phoenix_scores"].as_object().unwrap();
+        assert_eq!(heads.get("favorite_score"), Some(&serde_json::json!(0.5)));
+        assert_eq!(heads.get("reply_score"), Some(&serde_json::json!(0.0)));
+        assert!(!heads.contains_key("vqv_score"));
+        assert!(!heads.contains_key("dwell_time"));
+
+        let roundtrip: PostCandidate = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip.phoenix_scores.favorite_score, Some(0.5));
+        assert_eq!(roundtrip.phoenix_scores.reply_score, Some(0.0));
+        assert_eq!(roundtrip.phoenix_scores.vqv_score, None);
+
+        let mut legacy = serde_json::to_value(&scored).unwrap();
+        let heads = legacy["phoenix_scores"].as_object_mut().unwrap();
+        heads.insert("vqv_score".into(), serde_json::Value::Null);
+        heads.insert("dwell_time".into(), serde_json::Value::Null);
+        let from_legacy: PostCandidate = serde_json::from_value(legacy).unwrap();
+        assert_eq!(from_legacy.phoenix_scores.favorite_score, Some(0.5));
+        assert_eq!(from_legacy.phoenix_scores.vqv_score, None);
+        assert_eq!(from_legacy.phoenix_scores.dwell_time, None);
+    }
 }

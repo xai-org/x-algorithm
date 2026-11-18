@@ -1,12 +1,14 @@
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use cel::Program;
+use serde::{Deserialize, Serialize};
 use xai_abuse_enforcement_types::action_control::{ActionControlRecord, FollowerSkipView};
 pub use xai_abuse_enforcement_types::action_control::{
     SafetyCheckView, SafetyChecksByEntity, SafetyChecksStatus,
 };
 
-use crate::facts::{EntityType, Facts};
+use crate::facts::{EmailConfirmedState, EntityType, Facts, GizmoduckFacts};
 use crate::rules::{CompiledRules, EvalError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +97,7 @@ pub fn status(entity: EntityType, rules: &CompiledRules) -> SafetyChecksStatus {
     let leading: Vec<_> = rules
         .leading_skips()
         .into_iter()
-        .filter(|r| r.id != FOLLOWER_CEILING.id)
+        .filter(|r| !SERVICE_ONLY.contains(&r.id))
         .collect();
     let mut problems = Vec::new();
     let mut views = Vec::with_capacity(list.len());
@@ -166,6 +168,221 @@ static FOLLOWER_CEILING_COUNT: LazyLock<f64> =
 
 pub(crate) const PRE_CEILING: &[&str] =
     &["post_in_allowlist", "user_in_allowlist", "user_not_found"];
+
+pub const GIZMODUCK_TEST_USER: SafetyCheck = SafetyCheck {
+    id: "gizmoduck_test_user",
+    reason: "test_user_skipped",
+    when: "gizmoduck marks the account as a temporary or permanent test account",
+};
+
+pub const TEST_ACCOUNT: SafetyCheck = SafetyCheck {
+    id: "test_account",
+    reason: "test_user_skipped",
+    when: "the account matches the service's test-account policy",
+};
+
+const SERVICE_ONLY: &[&str] = &[FOLLOWER_CEILING.id, GIZMODUCK_TEST_USER.id, TEST_ACCOUNT.id];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestAccountSignal {
+    TestUserStatus,
+    Role,
+    EmailDomain,
+    CreationCidr,
+}
+
+impl TestAccountSignal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TestUserStatus => "test_user_status",
+            Self::Role => "test_role",
+            Self::EmailDomain => "test_email_domain",
+            Self::CreationCidr => "test_creation_cidr",
+        }
+    }
+
+    fn check(self) -> &'static SafetyCheck {
+        match self {
+            Self::TestUserStatus => &GIZMODUCK_TEST_USER,
+            Self::Role | Self::EmailDomain | Self::CreationCidr => &TEST_ACCOUNT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestAccountPolicy {
+    email_domains: Vec<String>,
+    roles: Vec<String>,
+    creation_cidrs: Vec<IpNet>,
+}
+
+impl TestAccountPolicy {
+                pub fn new(
+        email_domains: &[String],
+        roles: &[String],
+        creation_cidrs: &[String],
+    ) -> Result<Self, String> {
+        let entries = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let email_domains = entries(email_domains)
+            .into_iter()
+            .map(|d| {
+                let valid = d.is_ascii()
+                    && !d.starts_with('.')
+                    && !d.ends_with('.')
+                    && d.contains('.')
+                    && d.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                if valid {
+                    Ok(d.to_ascii_lowercase())
+                } else {
+                    Err(format!(
+                        "test-account e-mail domain `{d}` is not a domain name"
+                    ))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let creation_cidrs = entries(creation_cidrs)
+            .iter()
+            .map(|c| IpNet::parse(c))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            email_domains,
+            roles: entries(roles),
+            creation_cidrs,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.email_domains.is_empty() && self.roles.is_empty() && self.creation_cidrs.is_empty()
+    }
+
+            pub fn sizes(&self) -> (usize, usize, usize) {
+        (
+            self.email_domains.len(),
+            self.roles.len(),
+            self.creation_cidrs.len(),
+        )
+    }
+
+            pub fn signal(&self, user: &GizmoduckFacts) -> Option<TestAccountSignal> {
+        if is_test_status(user) {
+            return Some(TestAccountSignal::TestUserStatus);
+        }
+        if user.roles.iter().any(|r| self.roles.contains(r)) {
+            return Some(TestAccountSignal::Role);
+        }
+        if user.email_confirmed == Some(EmailConfirmedState::Confirmed)
+            && let Some(domain) = user.login_email.as_deref().and_then(email_domain)
+            && self.email_domains.contains(&domain)
+        {
+            return Some(TestAccountSignal::EmailDomain);
+        }
+        if let Some(ip) = user.creation_ip.as_deref().and_then(parse_ip)
+            && self.creation_cidrs.iter().any(|net| net.contains(ip))
+        {
+            return Some(TestAccountSignal::CreationCidr);
+        }
+        None
+    }
+}
+
+fn is_test_status(user: &GizmoduckFacts) -> bool {
+    matches!(
+        user.test_user_status.as_deref(),
+        Some("Temporary" | "Permanent")
+    )
+}
+
+fn email_domain(email: &str) -> Option<String> {
+    let (local, domain) = email.trim().split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some(domain.to_ascii_lowercase())
+}
+
+fn parse_ip(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(s);
+    s.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpNet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("test-account creation network `{s}` is not an IP network");
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p.parse::<u8>().map_err(|_| bad())?)),
+            None => (s, None),
+        };
+        let addr: IpAddr = addr.parse().map_err(|_| bad())?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+            return Err(bad());
+        }
+        let (addr, prefix) = match addr {
+            IpAddr::V6(v6) if prefix >= 96 => match v6.to_ipv4_mapped() {
+                Some(v4) => (IpAddr::V4(v4), prefix - 96),
+                None => (addr, prefix),
+            },
+            _ => (addr, prefix),
+        };
+        Ok(Self { addr, prefix })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn test_account_stop(facts: &Facts) -> Option<&'static SafetyCheck> {
+    test_account_check(facts.user())
+}
+
+pub fn test_account_check(user: &GizmoduckFacts) -> Option<&'static SafetyCheck> {
+    if is_test_status(user) {
+        return Some(&GIZMODUCK_TEST_USER);
+    }
+    user.test_signal.map(TestAccountSignal::check)
+}
+
+pub fn test_account_signal_kind(facts: &Facts) -> Option<&'static str> {
+    let user = facts.user();
+    if is_test_status(user) {
+        return Some(TestAccountSignal::TestUserStatus.as_str());
+    }
+    user.test_signal.map(TestAccountSignal::as_str)
+}
 
 pub fn ceiling_stops(facts: &Facts, page_driven: bool) -> bool {
     match facts.cred().follower_count {
@@ -269,6 +486,9 @@ pub fn first_page_stop(
         && PRE_CEILING.contains(&check.id)
     {
         return listed;
+    }
+    if let Some(check) = test_account_stop(facts) {
+        return Ok(Some(check));
     }
     if ceiling_stops(facts, true) {
         return Ok(Some(&FOLLOWER_CEILING));
@@ -982,5 +1202,374 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(skips(Some(0), Some(false)).harsher_than(today).len(), 2);
+    }
+
+    fn policy() -> TestAccountPolicy {
+        TestAccountPolicy::new(
+            &[" Test.Example.com ".into(), String::new()],
+            &["qa_test_role".into(), "test_role".into()],
+            &["203.0.113.0/24".into(), "2001:db8:a::/48".into()],
+        )
+        .unwrap()
+    }
+
+    fn account(
+        email: Option<&str>,
+        state: Option<EmailConfirmedState>,
+        ip: Option<&str>,
+        roles: &[&str],
+        status: Option<&str>,
+    ) -> GizmoduckFacts {
+        GizmoduckFacts {
+            present: true,
+            login_email: email.map(str::to_owned),
+            email_confirmed: state,
+            creation_ip: ip.map(str::to_owned),
+            roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+            test_user_status: status.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn email_signal(email: &str, state: Option<EmailConfirmedState>) -> Option<TestAccountSignal> {
+        policy().signal(&account(Some(email), state, None, &[], None))
+    }
+
+    #[test]
+    fn a_test_status_matches_with_any_policy() {
+        for p in [TestAccountPolicy::default(), policy()] {
+            for (status, want) in [
+                (Some("Temporary"), Some(TestAccountSignal::TestUserStatus)),
+                (Some("Permanent"), Some(TestAccountSignal::TestUserStatus)),
+                (Some("None"), None),
+                (Some("Unknown(7)"), None),
+                (Some("temporary"), None),
+                (None, None),
+            ] {
+                assert_eq!(
+                    p.signal(&account(None, None, None, &[], status)),
+                    want,
+                    "{status:?}"
+                );
+            }
+        }
+        assert!(TestAccountPolicy::default().is_empty());
+    }
+
+    #[test]
+    fn a_role_matches_only_exactly() {
+        let p = policy();
+        let role = |r: &[&str]| p.signal(&account(None, None, None, r, None));
+        assert_eq!(role(&["x", "test_role"]), Some(TestAccountSignal::Role));
+        assert_eq!(role(&["qa_test_role"]), Some(TestAccountSignal::Role));
+        for miss in [
+            "qa_test",
+            "qa_test_role_x",
+            "QA_Test_Role",
+            " qa_test_role",
+            "",
+        ] {
+            assert_eq!(role(&[miss]), None, "{miss:?}");
+        }
+        assert_eq!(role(&[]), None);
+    }
+
+    #[test]
+    fn only_a_confirmed_address_at_the_exact_domain_matches() {
+        use EmailConfirmedState::*;
+        let yes = Some(TestAccountSignal::EmailDomain);
+        assert_eq!(email_signal("a@test.example.com", Some(Confirmed)), yes);
+        assert_eq!(email_signal("A.B+c@TEST.EXAMPLE.COM", Some(Confirmed)), yes);
+        assert_eq!(email_signal("  a@test.example.com\t", Some(Confirmed)), yes);
+        for state in [Some(Unconfirmed), Some(Excused), Some(Grandfathered), None] {
+            assert_eq!(email_signal("a@test.example.com", state), None, "{state:?}");
+        }
+        for evasion in [
+            "a@eviltest.example.com",
+            "a@sub.test.example.com",
+            "a@test.example.com.evil.test",
+            "a@test.example.co",
+            "a@test.example.com.",
+            "test.example.com@evil.test",
+            "a@evil.test@test.example.com",
+            "@test.example.com",
+            "a@",
+            "test.example.com",
+            "<redacted>",
+            "a@test.ex\u{430}mple.com",
+            "a@test.example.com\u{200b}",
+            "",
+        ] {
+            assert_eq!(email_signal(evasion, Some(Confirmed)), None, "{evasion:?}");
+        }
+        assert_eq!(
+            policy().signal(&account(None, Some(Confirmed), None, &[], None)),
+            None,
+            "no address"
+        );
+    }
+
+    #[test]
+    fn networks_match_at_their_edges_only() {
+        let ip = |s: &str| policy().signal(&account(None, None, Some(s), &[], None));
+        let yes = Some(TestAccountSignal::CreationCidr);
+        for inside in [
+            "203.0.113.0",
+            "203.0.113.255",
+            " 203.0.113.9 ",
+            "::ffff:203.0.113.9",
+            "[::ffff:203.0.113.9]",
+            "2001:db8:a::1",
+            "2001:db8:a:ffff:ffff:ffff:ffff:ffff",
+            "[2001:db8:a::1]",
+        ] {
+            assert_eq!(ip(inside), yes, "{inside}");
+        }
+        for outside in [
+            "203.0.112.255",
+            "203.0.114.0",
+            "2001:db8:9:ffff:ffff:ffff:ffff:ffff",
+            "2001:db8:b::",
+            "::203.0.113.9",
+            "203.0.113",
+            "203.0.113.9:443",
+            "203.0.113.9/24",
+            "not an ip",
+            "",
+        ] {
+            assert_eq!(ip(outside), None, "{outside}");
+        }
+    }
+
+    #[test]
+    fn network_parsing() {
+        let net = |s: &str| IpNet::parse(s);
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(net("0.0.0.0/0").unwrap().contains(v4("198.51.100.1")));
+        assert!(!net("0.0.0.0/0").unwrap().contains(v4("2001:db8::1")));
+        assert!(net("::/0").unwrap().contains(v4("2001:db8::1")));
+        let host = net("198.51.100.7").unwrap();
+        assert!(host.contains(v4("198.51.100.7")) && !host.contains(v4("198.51.100.8")));
+        assert_eq!(
+            net("::ffff:203.0.113.0/120").unwrap(),
+            net("203.0.113.0/24").unwrap(),
+            "an IPv4-mapped network is the IPv4 network"
+        );
+        assert!(
+            net("203.0.113.77/24").unwrap().contains(v4("203.0.113.1")),
+            "host bits in the network address are ignored"
+        );
+        for bad in [
+            "203.0.113.0/33",
+            "2001:db8::/129",
+            "203.0.113.0/",
+            "/24",
+            "x/8",
+            "203.0.113.0/-1",
+        ] {
+            assert!(net(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bad_configuration_is_refused() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        for domain in [
+            "@test.example.com",
+            "test",
+            ".test.example.com",
+            "test.example.com.",
+            "a b.com",
+            "t\u{e9}st.example.com",
+        ] {
+            assert!(
+                TestAccountPolicy::new(&s(&[domain]), &[], &[]).is_err(),
+                "{domain}"
+            );
+        }
+        assert!(TestAccountPolicy::new(&[], &[], &s(&["203.0.113.0/40"])).is_err());
+        let p = TestAccountPolicy::new(&s(&["", " "]), &s(&[" ", ""]), &s(&[""])).unwrap();
+        assert!(p.is_empty(), "blank entries are ignored");
+        assert_eq!(policy().sizes(), (1, 2, 2));
+    }
+
+    #[test]
+    fn signals_are_reported_in_order() {
+        let p = policy();
+        let all = account(
+            Some("a@test.example.com"),
+            Some(EmailConfirmedState::Confirmed),
+            Some("203.0.113.1"),
+            &["qa_test_role"],
+            Some("Permanent"),
+        );
+        assert_eq!(p.signal(&all), Some(TestAccountSignal::TestUserStatus));
+        let no_status = GizmoduckFacts {
+            test_user_status: None,
+            ..all.clone()
+        };
+        assert_eq!(p.signal(&no_status), Some(TestAccountSignal::Role));
+        let no_role = GizmoduckFacts {
+            roles: Vec::new(),
+            ..no_status
+        };
+        assert_eq!(p.signal(&no_role), Some(TestAccountSignal::EmailDomain));
+        let no_email = GizmoduckFacts {
+            login_email: None,
+            ..no_role
+        };
+        assert_eq!(p.signal(&no_email), Some(TestAccountSignal::CreationCidr));
+    }
+
+    fn test_account_facts(entity: EntityType, a: Author, user: GizmoduckFacts) -> Facts {
+        let mut f = author_facts(entity, a, &[]);
+        *f.user_mut() = user;
+        f
+    }
+
+    fn by_signal(signal: TestAccountSignal) -> GizmoduckFacts {
+        GizmoduckFacts {
+            present: true,
+            test_signal: Some(signal),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_page_path_stops_test_accounts_after_allowlist_and_not_found() {
+        let c = follower_ceiling() as i64;
+        let test = GizmoduckFacts {
+            present: true,
+            test_user_status: Some("Temporary".into()),
+            ..Default::default()
+        };
+        for entity in BOTH {
+            for s in [AuthorSkips::default(), skips(Some(0), Some(false))] {
+                let stop = |a: Author, user: GizmoduckFacts| {
+                    first_page_stop(entity, &test_account_facts(entity, a, user), s)
+                        .unwrap()
+                        .map(|c| c.id)
+                };
+                assert_eq!(
+                    stop(with_followers(1), test.clone()),
+                    Some("gizmoduck_test_user")
+                );
+                assert_eq!(
+                    stop(
+                        with_followers(1),
+                        by_signal(TestAccountSignal::TestUserStatus)
+                    ),
+                    Some("gizmoduck_test_user")
+                );
+                for signal in [
+                    TestAccountSignal::Role,
+                    TestAccountSignal::EmailDomain,
+                    TestAccountSignal::CreationCidr,
+                ] {
+                    assert_eq!(
+                        stop(with_followers(c), by_signal(signal)),
+                        Some("test_account"),
+                        "{entity:?} {signal:?}: before the ceiling"
+                    );
+                }
+                let allowlisted = Author {
+                    allowlisted: true,
+                    ..with_followers(1)
+                };
+                assert_eq!(stop(allowlisted, test.clone()), Some("user_in_allowlist"));
+                assert_eq!(
+                    stop(
+                        with_followers(1),
+                        GizmoduckFacts {
+                            present: false,
+                            ..test.clone()
+                        }
+                    ),
+                    Some("user_not_found")
+                );
+                assert_eq!(
+                    stop(with_followers(1), by_signal_none()),
+                    None,
+                    "{entity:?} {s:?}"
+                );
+            }
+        }
+    }
+
+    fn by_signal_none() -> GizmoduckFacts {
+        GizmoduckFacts {
+            present: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_rules_path_stops_test_accounts_after_allowlist_and_not_found() {
+        let rules = compiled(BAKED_USER);
+        let c = follower_ceiling() as i64;
+        let decide = |a: Author, user: GizmoduckFacts, labels: &[&str]| {
+            let mut f = test_account_facts(EntityType::User, a, user);
+            f.score.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+            crate::rules::decide_with_id(&rules, &f).unwrap()
+        };
+        let suspend = ["anchor_campaign_suspend"];
+        let (d, id) = decide(with_followers(1), by_signal_none(), &suspend);
+        assert!(matches!(d, crate::decision::Decision::Act(_)), "{d:?}");
+        assert_eq!(id, "anchor_campaign_suspend");
+        for (user, want_id, want_reason) in [
+            (
+                GizmoduckFacts {
+                    present: true,
+                    test_user_status: Some("Permanent".into()),
+                    ..Default::default()
+                },
+                "gizmoduck_test_user",
+                "test_user_skipped",
+            ),
+            (
+                by_signal(TestAccountSignal::Role),
+                "test_account",
+                "test_user_skipped",
+            ),
+        ] {
+            for followers in [1, c] {
+                let (d, id) = decide(with_followers(followers), user.clone(), &suspend);
+                assert_eq!(id, want_id);
+                assert_eq!(d, crate::decision::Decision::Skip(want_reason.into()));
+            }
+            let allowlisted = Author {
+                allowlisted: true,
+                ..with_followers(1)
+            };
+            assert_eq!(
+                decide(allowlisted, user.clone(), &suspend).1,
+                "user_in_allowlist"
+            );
+        }
+    }
+
+                #[test]
+    fn test_account_checks_leave_the_comparison_alone() {
+        assert!(status(EntityType::User, &compiled(BAKED_USER)).ok);
+        assert!(status(EntityType::Post, &compiled(BAKED_POST)).ok);
+        for check in [GIZMODUCK_TEST_USER, TEST_ACCOUNT] {
+            let rule = format!(
+                "  - id: {}\n    when: user.deactivated\n    then:\n      kind: skip\n      reason: {}\n\n",
+                check.id, check.reason
+            );
+            for before in ["user_in_allowlist", "high_follower_count"] {
+                let st = edited_user(|y| {
+                    let (s, _) = rule_block(y, before);
+                    format!("{}{}{}", &y[..s], rule, &y[s..])
+                });
+                assert!(st.ok, "{} before {before}: {:?}", check.id, st.problems);
+            }
+            assert!(
+                !USER_CHECKS
+                    .iter()
+                    .chain(POST_CHECKS)
+                    .any(|c| c.id == check.id)
+            );
+        }
     }
 }

@@ -22,15 +22,35 @@ impl CandidateScoringInputs {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClassFactors {
+    pub engagement: f64,
+    pub dwell_time: f64,
+}
+
+impl ClassFactors {
+    pub fn new(engagement: f64, dwell_time: f64) -> Option<Self> {
+        let valid = |f: f64| f.is_finite() && f >= 0.0;
+        (valid(engagement) && valid(dwell_time)).then_some(Self {
+            engagement,
+            dwell_time,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryScoringContext {
     pub effective_oon_weight: f64,
+    pub oon_factors: Option<ClassFactors>,
+    pub in_network_factors: Option<ClassFactors>,
 }
 
 impl Default for QueryScoringContext {
     fn default() -> Self {
         Self {
             effective_oon_weight: 1.0,
+            oon_factors: None,
+            in_network_factors: None,
         }
     }
 }

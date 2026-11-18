@@ -105,6 +105,24 @@ const PDXA_PHOENIX_REQUEST_CACHE_EDS: &str = "xdstp://discovery-pdxa/envoy.confi
 
 type SharedRedisClient = Arc<dyn RedisClient + Send + Sync>;
 
+const ATLA_TEACHER_CACHE_EDS: &str = "xdstp://discovery-atla/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.home-teacher-scores-cache.prod.cache:redis";
+const PDXA_TEACHER_CACHE_EDS: &str = "xdstp://discovery-pdxa/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.home-teacher-scores-cache.prod.cache:redis";
+
+pub(crate) async fn teacher_cache_redis_clients() -> (SharedRedisClient, SharedRedisClient) {
+    let (atla, pdxa) = tokio::join!(
+        XdsRedisClient::new(XdsRedisConfig {
+            eds_resource_name: ATLA_TEACHER_CACHE_EDS.into(),
+        }),
+        XdsRedisClient::new(XdsRedisConfig {
+            eds_resource_name: PDXA_TEACHER_CACHE_EDS.into(),
+        }),
+    );
+    (
+        Arc::new(atla.expect("Failed to create xDS Redis client for atla teacher cache")),
+        Arc::new(pdxa.expect("Failed to create xDS Redis client for pdxa teacher cache")),
+    )
+}
+
 async fn phoenix_request_cache_redis_client(
     eds_resource_name: &str,
     datacenter: &str,

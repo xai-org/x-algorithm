@@ -80,12 +80,14 @@ class Video(BaseModel):
     preview_image: bytes | None = None
     shot_key_frames: list[bytes] = Field(default_factory=lambda: [])
     ranked_key_frames: list[bytes] = Field(default_factory=lambda: [])
+    sharp_frames: list[bytes] = Field(default_factory=lambda: [])
 
     @field_serializer(
         "frames",
         "motion_reveal_frames",
         "shot_key_frames",
         "ranked_key_frames",
+        "sharp_frames",
         when_used="json",
     )
     def serialize_frames(self, value: list[bytes]) -> list[str]:
@@ -105,6 +107,7 @@ class Video(BaseModel):
         "motion_reveal_frames",
         "shot_key_frames",
         "ranked_key_frames",
+        "sharp_frames",
         mode="before",
     )
     @classmethod

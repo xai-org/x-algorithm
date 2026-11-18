@@ -192,8 +192,8 @@ mod tests {
     };
     use xai_user_debias::{arrow as seq, debiased_probability, FEATURE_DIM};
     use xai_value_model::{
-        compute_value_scores, CandidateScoringInputs, QueryScoringContext, ValueModelWeights,
-        NEGATIVE_SCORES_OFFSET,
+        compute_value_scores, CandidateScoringInputs, ClassFactors, QueryScoringContext,
+        ValueModelWeights, NEGATIVE_SCORES_OFFSET,
     };
     use xai_vm_ranker_proto::experiment::RequestPayload;
     use xai_vm_ranker_proto::{PhoenixScores, RankCandidate, ViewerContext};
@@ -215,6 +215,21 @@ rust_home_mixer:
     rust_home_mixer_oon_weight_factor:
       type: double
       default: 0.75
+    rust_home_mixer_cont_dwell_time_weight:
+      type: double
+      default: 0.1
+    rust_home_mixer_oon_engagement_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_oon_dwell_time_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_in_network_engagement_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_in_network_dwell_time_weight_factor:
+      type: double
+      default: -1.0
     rust_home_mixer_vm_ranker_user_debias_enabled:
       type: boolean
       default: false
@@ -230,6 +245,17 @@ rust_home_mixer:
       values:
         rust_home_mixer_vm_ranker_user_debias_enabled: true
         rust_home_mixer_vm_ranker_user_debias_alpha: 1.0
+    - description: "class factor arm"
+      query: "[country eq FR]"
+      values:
+        rust_home_mixer_oon_engagement_weight_factor: 0.6
+        rust_home_mixer_oon_dwell_time_weight_factor: 0.9
+        rust_home_mixer_in_network_engagement_weight_factor: 1.2
+        rust_home_mixer_in_network_dwell_time_weight_factor: 0.7
+    - description: "out-of-network dwell-time factor only"
+      query: "[country eq JP]"
+      values:
+        rust_home_mixer_oon_dwell_time_weight_factor: 0.9
 "#;
 
     const HEAD_NAMES: [&str; 20] = [
@@ -285,6 +311,7 @@ rust_home_mixer:
     fn scoring_context() -> QueryScoringContext {
         QueryScoringContext {
             effective_oon_weight: 0.75,
+            ..Default::default()
         }
     }
 
@@ -623,5 +650,97 @@ rust_home_mixer_author_exploration:
         let got = ranked[0].score;
         assert!((got - expected).abs() < 1e-12, "got {got} want {expected}");
         assert!(got < raw, "debiased {got} should be below raw {raw}");
+    }
+
+    #[test]
+    fn class_factors_come_from_config_and_fall_back_to_the_single_factor() {
+        let context = |country: &str, topic_request: bool| {
+            let req = RankRequest {
+                topic_request,
+                ..request(Vec::new(), country)
+            };
+            value_model::scoring_context(&req, &config().resolve(&viewer(country)))
+        };
+
+        assert_eq!(context("US", false), scoring_context());
+        assert_eq!(
+            context("FR", false),
+            QueryScoringContext {
+                effective_oon_weight: 0.75,
+                oon_factors: ClassFactors::new(0.6, 0.9),
+                in_network_factors: ClassFactors::new(1.2, 0.7),
+            }
+        );
+        assert_eq!(
+            context("JP", false),
+            QueryScoringContext {
+                effective_oon_weight: 0.75,
+                oon_factors: ClassFactors::new(0.75, 0.9),
+                in_network_factors: None,
+            }
+        );
+        let topic = context("FR", true);
+        assert_eq!(topic.oon_factors, None);
+        assert_eq!(topic.in_network_factors, None);
+    }
+
+    #[tokio::test]
+    async fn class_factors_rescale_the_dwell_time_term() {
+        let with_dwell_time = |tweet_id, in_network, weighted_score| RankCandidate {
+            phoenix_scores: Some(PhoenixScores {
+                favorite_score: Some(0.2),
+                dwell_time: Some(4.0),
+                ..Default::default()
+            }),
+            weighted_score,
+            ..candidate(tweet_id, tweet_id, 0.2, None, in_network, 1.0)
+        };
+        let candidates = vec![
+            with_dwell_time(1, false, None),
+            with_dwell_time(2, true, None),
+        ];
+        let engagement = 2.0 * 0.2 + NEGATIVE_SCORES_OFFSET;
+        let dwell_time = 0.1 * 4.0;
+
+        let scores = |candidates: Vec<RankCandidate>, country: &'static str| async move {
+            rank(
+                request(candidates, country),
+                context(config(), DebiasModels::default()),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.score)
+            .collect::<Vec<f64>>()
+        };
+        let assert_close = |got: &[f64], want: &[f64]| {
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want) {
+                assert!((got - want).abs() < 1e-12, "got {got} want {want}");
+            }
+        };
+
+        assert_close(
+            &scores(candidates.clone(), "US").await,
+            &[0.75 * (engagement + dwell_time), engagement + dwell_time],
+        );
+        assert_close(
+            &scores(candidates, "FR").await,
+            &[
+                0.6 * engagement + 0.9 * dwell_time,
+                1.2 * engagement + 0.7 * dwell_time,
+            ],
+        );
+        let cached = vec![
+            with_dwell_time(1, false, Some(1.0)),
+            with_dwell_time(2, true, Some(1.0)),
+        ];
+        assert_close(
+            &scores(cached, "FR").await,
+            &[
+                0.6 * (1.0 - dwell_time) + 0.9 * dwell_time,
+                1.2 * (1.0 - dwell_time) + 0.7 * dwell_time,
+            ],
+        );
     }
 }

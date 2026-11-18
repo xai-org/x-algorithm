@@ -105,6 +105,7 @@ class MediaHydrationConfig(BaseModel):
     max_workers: int = 4
     max_post_count: int = 9
     video_max_frames: int = 20
+    video_sharp_frames: bool = False
     video_max_frames_light: int = 2
     video_tile_size: int = 448
     image_tile_size: int = 448
@@ -138,6 +139,7 @@ class GroxKafkaLoaderConfig(BaseModel):
     prefetching_threshold: int = 256
     prefetching_batch_size: int = 1024
     max_qps_per_partition: int | None = None
+    commit_interval_sec: float = 5.0
 
 
 class GrpcServerConfig(BaseModel):

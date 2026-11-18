@@ -113,6 +113,7 @@ impl QueryBuilder {
             user_roles: viewer_data.roles.clone(),
             datacenter: self.datacenter.clone(),
             has_phone_number: viewer_data.has_phone_number,
+            subscription_level: viewer_data.subscription_level,
             resurrection_time_ms,
             product: request_type.to_string(),
             now_ms: std::time::SystemTime::now()

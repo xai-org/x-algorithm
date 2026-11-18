@@ -153,8 +153,14 @@ use crate::feature_config::constants::{
     ADS_PRODUCT_KEY_HASH_BIAS, ADS_PRODUCT_KEY_HASH_BIAS_2, ADS_PRODUCT_KEY_HASH_MODULUS,
     ADS_PRODUCT_KEY_HASH_SCALE, ADS_PRODUCT_KEY_HASH_SCALE_2, ADS_PRODUCT_KEY_TABLE_SIZE,
 };
+#[cfg(recsys_dpa_sid)]
+use crate::feature_config::constants::{DPA_SID_CODEBOOK_SIZE, DPA_SID_NUM_LEVELS};
 use crate::feature_config::constants::{STALE_POST_14D_TTL_SEC, STALE_POST_30D_TTL_SEC};
 use crate::feature_config::float_feature::MATCHED_WORD_FRACTION_SEQ;
+#[cfg(recsys_dpa_sid)]
+use crate::feature_config::int64_feature::{
+    DPA_SID_LEVEL0, DPA_SID_LEVEL1, DPA_SID_LEVEL2, DPA_SID_LEVEL3, DPA_SID_LEVEL4, DPA_SID_LEVEL5,
+};
 use crate::feature_config::int64_feature::{
     FAV_COUNT_SEQ, FAV_COUNT_SEQ_COLUMN, QUOTE_COUNT_SEQ, QUOTE_COUNT_SEQ_COLUMN, REPLY_COUNT_SEQ,
     REPLY_COUNT_SEQ_COLUMN, REPOST_COUNT_SEQ, REPOST_COUNT_SEQ_COLUMN, VIEW_COUNT_SEQ,
@@ -168,7 +174,7 @@ use crate::feature_config::int64_feature::{FIRST_DPA_PRODUCT_KEY, FIRST_DPA_PROD
 use crate::feature_config::int64_feature::{
     LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ, REQUEST_TIME_SEC_SEQ,
 };
-#[cfg(recsys_time_gap)]
+#[cfg(any(recsys_time_gap, recsys_dpa_sid))]
 use crate::reply::is_reply_width;
 
 pub const PRODUCT_SURFACE_CATEGORICAL_IDX: usize = PRODUCT_SURFACE_SEQ;
@@ -196,6 +202,7 @@ pub mod ad_side {
         LineItem,
         Creative,
         Objective,
+        UrlDomain,
     }
 
     impl std::str::FromStr for Field {
@@ -207,9 +214,10 @@ pub mod ad_side {
                 "line_item" => Ok(Self::LineItem),
                 "creative" => Ok(Self::Creative),
                 "objective" => Ok(Self::Objective),
+                "url_domain" => Ok(Self::UrlDomain),
                 other => Err(format!(
                     "ad-side field {other:?} cannot be served \
-                     (expected campaign|line_item|creative|objective)"
+                     (expected campaign|line_item|creative|objective|url_domain)"
                 )),
             }
         }
@@ -514,6 +522,37 @@ pub fn stamp_time_gap_timestamps(
     }
 }
 
+#[cfg(recsys_dpa_sid)]
+const DPA_SID_SLOTS: [usize; 6] = [
+    DPA_SID_LEVEL0,
+    DPA_SID_LEVEL1,
+    DPA_SID_LEVEL2,
+    DPA_SID_LEVEL3,
+    DPA_SID_LEVEL4,
+    DPA_SID_LEVEL5,
+];
+
+#[cfg(recsys_dpa_sid)]
+const _: () = assert!(DPA_SID_SLOTS.len() as i64 == DPA_SID_NUM_LEVELS);
+
+#[cfg(recsys_dpa_sid)]
+fn stamp_dpa_sid_codes(dest: &mut [i64], n_post_int64: usize, entry_idx: usize, codes: &[i32]) {
+    if codes.len() != DPA_SID_SLOTS.len()
+        || n_post_int64 <= DPA_SID_SLOTS.into_iter().max().unwrap_or(0)
+        || is_reply_width(n_post_int64)
+    {
+        return;
+    }
+    let base = entry_idx * n_post_int64;
+    for (&slot, &code) in DPA_SID_SLOTS.iter().zip(codes) {
+        dest[base + slot] = if code < 0 {
+            0
+        } else {
+            (i64::from(code) + 1).min(DPA_SID_CODEBOOK_SIZE)
+        };
+    }
+}
+
 pub fn compute_local_time(utc_epoch_secs: i64, tz_enum: i16) -> (i16, i16) {
     let offset = if tz_enum > 0 && (tz_enum as usize) < TZ_ENUM_TO_UTC_OFFSET_SECS.len() {
         TZ_ENUM_TO_UTC_OFFSET_SECS[tz_enum as usize]
@@ -582,10 +621,68 @@ pub struct UserFeatures {
     pub installed_apps: Vec<bool>,
 }
 
+pub const CREAD_DECODE_MAX_POWER: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreadDecodeKind {
+    Power,
+    Scale,
+}
+
+const CREAD_DECODE_KEYS: [(&str, CreadDecodeKind); 8] = [
+    ("dwell_cread_power", CreadDecodeKind::Power),
+    ("dwell_cread_scale", CreadDecodeKind::Scale),
+    ("immersive_dwell_cread_power", CreadDecodeKind::Power),
+    ("immersive_dwell_cread_scale", CreadDecodeKind::Scale),
+    ("video_continuation_cread_power", CreadDecodeKind::Power),
+    ("video_continuation_cread_scale", CreadDecodeKind::Scale),
+    ("profile_visit_cread_power", CreadDecodeKind::Power),
+    ("profile_visit_cread_scale", CreadDecodeKind::Scale),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreadDecodeInput(usize);
+
+impl CreadDecodeInput {
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..CREAD_DECODE_KEYS.len()).map(Self)
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        CREAD_DECODE_KEYS
+            .iter()
+            .position(|(k, _)| *k == key)
+            .map(Self)
+    }
+
+    pub fn key(self) -> &'static str {
+        CREAD_DECODE_KEYS[self.0].0
+    }
+
+    pub fn kind(self) -> CreadDecodeKind {
+        CREAD_DECODE_KEYS[self.0].1
+    }
+
+    pub fn accepts(self, value: f32) -> bool {
+        value.is_finite()
+            && value > 0.0
+            && (self.kind() == CreadDecodeKind::Scale || value <= CREAD_DECODE_MAX_POWER)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CreadDecodeOverride {
-    pub power: Option<f32>,
-    pub scale: Option<f32>,
+    values: [Option<f32>; CREAD_DECODE_KEYS.len()],
+}
+
+impl CreadDecodeOverride {
+    pub fn get(&self, input: CreadDecodeInput) -> Option<f32> {
+        self.values[input.0]
+    }
+
+    pub fn set(&mut self, input: CreadDecodeInput, value: f32) {
+        self.values[input.0] = Some(value);
+    }
 }
 
 #[derive(Default)]
@@ -701,6 +798,7 @@ impl InputBuffer {
         &mut self,
         model_config: &ModelConfig,
         candidate_set: &pb::CandidateSet,
+        url_domain_id: impl Fn(&str) -> i64,
     ) {
         use ad_side::Field;
         let fields = &model_config.hash_table.ad_side_fields;
@@ -733,6 +831,9 @@ impl InputBuffer {
                         impressed_time_ms,
                     ),
                     Field::Objective => ad_side::objective(ad.map_or(0, |a| a.line_item_objective)),
+                    Field::UrlDomain => {
+                        ad_side::hash_id(url_domain_id(ad.map_or("", |a| &a.url_domain)))
+                    }
                 };
             }
         }
@@ -1037,6 +1138,17 @@ impl InputBuffer {
                         hash_dpa_product_key_2(raw_key);
                 }
             }
+            #[cfg(recsys_dpa_sid)]
+            stamp_dpa_sid_codes(
+                &mut candidate_int64_features,
+                n_post_int64,
+                j,
+                candidate
+                    .ad_info
+                    .as_ref()
+                    .and_then(|a| a.dpa_product_info.as_ref())
+                    .map_or(&[][..], |info| info.sid_codes.as_slice()),
+            );
             candidate_is_author_followed[j] = candidate.is_author_followed_by_user;
             candidate_is_author_following[j] = candidate
                 .author_info
@@ -2531,15 +2643,22 @@ mod tests {
     fn ad_side_fields_parse_servable_names_only() {
         use ad_side::Field;
         assert_eq!(
-            ad_side::parse_fields(&["objective", "campaign", "creative", "line_item"]),
+            ad_side::parse_fields(&[
+                "objective",
+                "campaign",
+                "creative",
+                "line_item",
+                "url_domain"
+            ]),
             Ok(vec![
                 Field::Objective,
                 Field::Campaign,
                 Field::Creative,
-                Field::LineItem
+                Field::LineItem,
+                Field::UrlDomain
             ])
         );
-        for bad in ["url_domain", "advertiser", ""] {
+        for bad in ["advertiser", "domain", ""] {
             assert!(ad_side::parse_fields(&[bad]).is_err(), "{bad:?}");
         }
     }
@@ -2580,7 +2699,7 @@ mod tests {
                 None,
                 None,
             );
-            input.stamp_candidate_ad_side_ids(model_config, &candidate_set);
+            input.stamp_candidate_ad_side_ids(model_config, &candidate_set, |_| 0);
             input.candidate_ad_side_ids
         };
         let mut model_config = test_history_model_config();
@@ -2612,6 +2731,48 @@ mod tests {
         assert_eq!(stamp(&model_config, one(), served_ms), [5, 2, 0, 0, 0, 0]);
         model_config.hash_table.ad_side_fields.clear();
         assert!(stamp(&model_config, one(), served_ms).is_empty());
+    }
+
+    #[test]
+    fn candidate_url_domain_ids_hash_the_callers_id() {
+        let ad = |tweet_id: u64, url_domain: &str| pb::TweetInfo {
+            tweet_id,
+            author_id: 2000,
+            ad_info: Some(pb::AdInfo {
+                url_domain: url_domain.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let organic = pb::TweetInfo {
+            tweet_id: 1002,
+            author_id: 2001,
+            ..Default::default()
+        };
+        let candidate_set = pb::CandidateSet {
+            candidates: vec![ad(1000, "nike.com"), ad(1001, ""), organic],
+            request_timestamp_ms: Some(1_793_750_400_000),
+            ..Default::default()
+        };
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.ad_side_fields =
+            vec![ad_side::Field::Objective, ad_side::Field::UrlDomain];
+        let mut input = InputBuffer::compute_for_item(
+            &model_config,
+            &None,
+            &candidate_set,
+            None,
+            None,
+            None,
+            None,
+        );
+        input.stamp_candidate_ad_side_ids(&model_config, &candidate_set, |domain| {
+            domain.len() as i64
+        });
+        assert_eq!(
+            input.candidate_ad_side_ids,
+            [0, ad_side::hash_id(8), 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -3258,6 +3419,58 @@ mod tests {
         for slot in [FIRST_DPA_PRODUCT_KEY, FIRST_DPA_PRODUCT_KEY_HASH2] {
             assert_eq!(0, cand.int64_features[n_post_int64 + slot]);
             assert_eq!(0, cand.int64_features[2 * n_post_int64 + slot]);
+        }
+    }
+
+    #[cfg(recsys_dpa_sid)]
+    #[test]
+    fn dpa_sid_codes_stamped_as_code_plus_one() {
+        let mut model_config = test_model_config(1);
+        let n_post_int64 = DPA_SID_SLOTS.into_iter().max().unwrap() + 1;
+        model_config.hash_table.num_post_int64_features = n_post_int64;
+        model_config.candidate_seq_len = 4;
+
+        let candidate = |tweet_id: u64, sid_codes: Option<Vec<i32>>| pb::TweetInfo {
+            tweet_id,
+            author_id: tweet_id + 1000,
+            ad_info: Some(pb::AdInfo {
+                dpa_product_info: sid_codes.map(|sid_codes| pb::DpaProductInfo {
+                    sid_codes,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let candidate_set = pb::CandidateSet {
+            candidates: vec![
+                candidate(1, Some(vec![3, 17, 42, 99, 200, 255])),
+                candidate(2, Some(vec![-1, 0, 1, 255, 256, i32::MAX])),
+                candidate(3, Some(vec![3, 17, 42])),
+                candidate(4, None),
+            ],
+            ..Default::default()
+        };
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        let sids =
+            |j: usize| DPA_SID_SLOTS.map(|slot| cand.int64_features[j * n_post_int64 + slot]);
+        assert_eq!(sids(0), [4, 18, 43, 100, 201, 256]);
+        assert_eq!(sids(1), [0, 1, 2, 256, 256, 256]);
+        assert_eq!(sids(2), [0; 6]);
+        assert_eq!(sids(3), [0; 6]);
+    }
+
+    #[cfg(recsys_dpa_sid)]
+    #[test]
+    fn dpa_sid_codes_skip_narrow_and_reply_width_tables() {
+        let codes = [1, 2, 3, 4, 5, 6];
+        let n = DPA_SID_SLOTS.into_iter().max().unwrap() + 1;
+        assert!(!is_reply_width(n));
+        let reply_width = (n..).find(|&w| is_reply_width(w)).unwrap();
+        for width in [n - 1, reply_width] {
+            let mut values = vec![0i64; width];
+            stamp_dpa_sid_codes(&mut values, width, 0, &codes);
+            assert!(values.iter().all(|&v| v == 0), "width {width}");
         }
     }
 

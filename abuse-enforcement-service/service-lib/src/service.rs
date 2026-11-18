@@ -129,6 +129,7 @@ fn admin_event(
 
 pub struct AppState {
         pub ais_client: AisClient,
+                pub gd: Option<crate::gizmoduck::GizmoduckCoreClient>,
     pub dynamic_config: DynamicConfig,
                 pub rules_cache: std::sync::Arc<crate::rules::RulesCache>,
     pub dedup_cache: Option<crate::dedup_cache::ManhattanDedupCache>,
@@ -501,14 +502,16 @@ pub fn strato_retry_strategy() -> ExponentialBuilder {
     path = "/action",
     tag = "debug",
     security(("BearerAuth" = [])),
-    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer.",
+    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer. An account-ending action on a test account is refused.",
     request_body(
         content = Object,
         description = "ActionIntakeRequest JSON (actorHeader + action + tool), or legacy {\"actionIntakeRequest\": …}",
     ),
     responses(
         (status = 200, description = "AIS responded successfully — body is the raw AIS response", body = Object),
+        (status = 422, description = "AIS rejected the request permanently, or an account-ending action (suspend, deactivation or read-only) names a test account (or no account). Body shape: {\"action\": <reason>}"),
         (status = 500, description = "AIS call failed (network / non-success response). Body shape: {\"action\": <error string>}"),
+        (status = 503, description = "A suspend, deactivation or read-only action whose account couldn't be looked up. Body shape: {\"action\": <reason>}"),
     ),
 )]
 #[tracing::instrument(skip_all)]
@@ -522,17 +525,24 @@ pub async fn handle_action(
     info!("POST /api/action: {payload}");
 
     let (status, result) = match coerce_intake_request(payload) {
-        Ok(req) => match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await
-        {
-            Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
-            Err(e) => {
-                error!(error = format!("{e:#}"), "Action AIS call failed");
-                let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+        Ok(req) => match account_action_refusal(state.gd.as_ref(), &req).await {
+            Some((code, why)) => {
+                warn!(reason = %why, "POST /api/action: account action refused");
+                ("refused", (code, Json(json!({ "action": why }))))
+            }
+            None => {
+                match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await {
+                    Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
+                    Err(e) => {
+                        error!(error = format!("{e:#}"), "Action AIS call failed");
+                        let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
+                            StatusCode::UNPROCESSABLE_ENTITY
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+                    }
+                }
             }
         },
         Err(e) => (
@@ -550,6 +560,68 @@ pub async fn handle_action(
     metrics::HTTP_INFLIGHT.with_label_values(&["action"]).dec();
 
     result
+}
+
+const ACCOUNT_ACTIONS: &[&str] = &[
+    "suspendUser",
+    "suspendUserV2",
+    "deactivateUser",
+    "readOnlyUser",
+];
+
+async fn account_action_refusal(
+    gd: Option<&crate::gizmoduck::GizmoduckCoreClient>,
+    req: &Value,
+) -> Option<(StatusCode, String)> {
+    let (name, action) = req
+        .get("action")?
+        .as_object()?
+        .iter()
+        .find(|(name, _)| ACCOUNT_ACTIONS.contains(&name.as_str()))?;
+    let user_id = action.get("userId").and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    });
+    let Some(user_id) = user_id.filter(|id| *id > 0) else {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{name} has no valid userId"),
+        ));
+    };
+    if crate::test_user::is_test_user_id(user_id) {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test user (test_user_skipped)"),
+        ));
+    }
+    let Some(gd) = gd else {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("can't check user {user_id}: no gizmoduck client"),
+        ));
+    };
+    let user = match gd.fetch_user(user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("can't check user {user_id}: {e:#}"),
+            ));
+        }
+    };
+    if !user.present {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} not found (user_not_found)"),
+        ));
+    }
+    crate::safety_checks::test_account_check(&user).map(|check| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test account ({})", check.reason),
+        )
+    })
 }
 
 #[utoipa::path(
@@ -3181,6 +3253,7 @@ mod tests {
         };
         Arc::new(AppState {
             ais_client: crate::ais_client::AisClient::unconnected(),
+            gd: None,
             dynamic_config,
             rules_cache: Arc::new(crate::rules::RulesCache::new()),
             dedup_cache: None,
@@ -4883,5 +4956,252 @@ mod tests {
             }
         }
         assert!(checked >= 30, "only {checked} operations in the API doc");
+    }
+
+    mod account_action_refusal_tests {
+        use std::collections::HashMap;
+
+        use super::*;
+        use crate::gizmoduck::GizmoduckCoreClient;
+        use crate::gizmoduck::test_support::{AccountShape, FixedUsers};
+        use crate::safety_checks::TestAccountPolicy;
+
+        const PLAIN: i64 = 1_700_200_001;
+        const QA_ROLE: i64 = 1_700_200_002;
+        const QA_MAIL: i64 = 1_700_200_003;
+        const QA_MAIL_UNCONFIRMED: i64 = 1_700_200_004;
+        const NETWORK: i64 = 1_700_200_005;
+        const TEMPORARY: i64 = 1_700_200_006;
+        const TEST_ID: i64 = 2_000_000_001;
+        const NOT_FOUND: i64 = 1_700_200_099;
+
+        fn client(fail: bool) -> GizmoduckCoreClient {
+            let shape = |s: AccountShape, id: i64| (id, s.user(id));
+            let users: HashMap<_, _> = [
+                shape(AccountShape::default(), PLAIN),
+                shape(
+                    AccountShape {
+                        roles: vec!["qa_test_role"],
+                        ..Default::default()
+                    },
+                    QA_ROLE,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(3),
+                        ..Default::default()
+                    },
+                    QA_MAIL,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(2),
+                        ..Default::default()
+                    },
+                    QA_MAIL_UNCONFIRMED,
+                ),
+                shape(
+                    AccountShape {
+                        creation_ip: Some("203.0.113.40"),
+                        ..Default::default()
+                    },
+                    NETWORK,
+                ),
+                shape(
+                    AccountShape {
+                        test_user_status: Some(1),
+                        ..Default::default()
+                    },
+                    TEMPORARY,
+                ),
+            ]
+            .into();
+            GizmoduckCoreClient::from_lookup(Arc::new(FixedUsers {
+                users,
+                fail,
+                ..Default::default()
+            }))
+            .with_policy(
+                TestAccountPolicy::new(
+                    &["test.example.com".into()],
+                    &["qa_test_role".into()],
+                    &["203.0.113.0/24".into()],
+                )
+                .unwrap(),
+            )
+        }
+
+                fn act(name: &str, user_id: Value) -> Value {
+            json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {name: {"userId": user_id, "perm": false}},
+                "tool": "RtpPlugin",
+            })
+        }
+
+        fn suspend(user_id: Value) -> Value {
+            act("suspendUser", user_id)
+        }
+
+        async fn refusal(gd: Option<&GizmoduckCoreClient>, req: Value) -> Option<StatusCode> {
+            account_action_refusal(gd, &req).await.map(|(code, _)| code)
+        }
+
+        #[test]
+        fn the_guarded_actions_are_the_account_ending_ones_in_the_ais_schema() {
+            assert_eq!(
+                ACCOUNT_ACTIONS,
+                [
+                    "suspendUser",
+                    "suspendUserV2",
+                    "deactivateUser",
+                    "readOnlyUser"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_accounts_are_refused() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                for id in [QA_ROLE, QA_MAIL, NETWORK, TEMPORARY, TEST_ID] {
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id}"
+                    );
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id.to_string()))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id} as a string"
+                    );
+                }
+            }
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(NOT_FOUND))).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: an account gizmoduck doesn't return"
+                );
+            }
+            let (_, why) = account_action_refusal(Some(&gd), &act("suspendUserV2", json!(QA_ROLE)))
+                .await
+                .unwrap();
+            assert!(why.contains("test_user_skipped"), "{why}");
+            assert!(!why.contains("qa_test_role"), "{why}");
+        }
+
+        #[tokio::test]
+        async fn ordinary_accounts_and_other_actions_pass() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(PLAIN))).await,
+                    None,
+                    "{name}"
+                );
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(QA_MAIL_UNCONFIRMED))).await,
+                    None,
+                    "{name}"
+                );
+            }
+            let label = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {"entityRef": {"userId": QA_ROLE}}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(None, label).await,
+                None,
+                "only account-ending actions are checked"
+            );
+            assert_eq!(
+                refusal(None, act("unsuspendUser", json!(QA_ROLE))).await,
+                None,
+                "lifting a suspension is not checked"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_account_action_that_cant_be_checked_is_refused() {
+            for &name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&client(true)), act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: failed lookup"
+                );
+                assert_eq!(
+                    refusal(None, act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: no client"
+                );
+                for bad in [json!(null), json!("x"), json!(0), json!(-5), json!(1.5)] {
+                    assert_eq!(
+                        refusal(Some(&client(false)), act(name, bad.clone())).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {bad}"
+                    );
+                }
+                let no_id = json!({
+                    "actorHeader": {"plugin": {"pluginId": "p"}},
+                    "action": {name: {}},
+                    "tool": "RtpPlugin",
+                });
+                assert_eq!(
+                    refusal(Some(&client(false)), no_id).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: no userId"
+                );
+            }
+            let two = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {}, "suspendUserV2": {"userId": QA_ROLE}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(Some(&client(false)), two).await,
+                Some(StatusCode::UNPROCESSABLE_ENTITY),
+                "an account action beside another variant"
+            );
+        }
+
+                                #[tokio::test]
+        async fn the_handler_refuses_before_any_ais_call() {
+            let state = test_state(json!({}), None, None).await;
+            let mut with_gd = Arc::try_unwrap(test_state(json!({}), None, None).await)
+                .ok()
+                .unwrap();
+            with_gd.gd = Some(client(false));
+            let with_gd = Arc::new(with_gd);
+            let legacy = json!({ "actionIntakeRequest": suspend(json!(QA_ROLE)) });
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(legacy)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let v2 = act("suspendUserV2", json!(QA_MAIL));
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(v2)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body["action"].as_str().unwrap().contains("test account"),
+                "{body}"
+            );
+            let (code, _) =
+                response(handle_action(State(state), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no client on the state"
+            );
+            let (code, _) =
+                response(handle_action(State(with_gd), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a plain account reaches AIS"
+            );
+        }
     }
 }

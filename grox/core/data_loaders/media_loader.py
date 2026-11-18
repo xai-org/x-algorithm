@@ -722,6 +722,7 @@ class MediaLoader:
             include_combined_video_bytes=False,
             enable_motion_reveal=enable_motion_reveal,
             max_duration=max_duration,
+            sharp_frames=grox_config.media_hydration.video_sharp_frames,
         )
         times = [frame.time_sec for frame in video_data.frames]
         frames = [frame.frame for frame in video_data.frames]
@@ -781,6 +782,7 @@ class MediaLoader:
             motion_reveal_frames=video_data.motion_reveal_frames,
             shot_key_frames=shot_key_frames,
             ranked_key_frames=ranked_key_frames,
+            sharp_frames=[frame.frame for frame in video_data.sharp_frames],
         )
 
     @classmethod

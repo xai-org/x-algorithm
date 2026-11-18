@@ -31,6 +31,14 @@ lazy_static! {
         &["stage"]
     )
     .unwrap();
+    pub static ref VALUE_MODEL_CLASS_FACTORS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_value_model_class_factors_total",
+            "Value-model requests scored with separate dwell-time and engagement factors, by the class the factors apply to (oon, in_network)"
+        ),
+        &["class"]
+    )
+    .unwrap();
     pub static ref USER_DEBIAS_REQUESTS: IntCounterVec = register_int_counter_vec!(
         Opts::new(
             "vm_ranker_user_debias_requests_total",

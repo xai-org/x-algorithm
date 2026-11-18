@@ -17,6 +17,7 @@ import jax
 import numpy as np
 
 from xai_checkpointing.tree_util import tree_to_dict
+from xrex.data.recsys.ad_side_ids import parse_ad_side_fields
 from xrex.data.recsys.ads_late_window import compose_late_engagement_log_probs
 from xrex.models.model_utils import unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
@@ -103,8 +104,41 @@ REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
         "candidate_seq.post_sids",
         "dwell_cread_power",
         "dwell_cread_scale",
+        "immersive_dwell_cread_power",
+        "immersive_dwell_cread_scale",
+        "video_continuation_cread_power",
+        "video_continuation_cread_scale",
+        "profile_visit_cread_power",
+        "profile_visit_cread_scale",
     }
 )
+
+ADS_COUNT_BUCKETS_KEY = "candidate_seq.ads_count_buckets"
+AD_SIDE_IDS_KEY = "candidate_seq.ad_side_ids"
+
+
+class SideInputs(NamedTuple):
+    ads_count_features: bool
+    ad_side_fields: tuple[str, ...]
+
+    @staticmethod
+    def of(model_config: Any, *, two_tower: bool) -> SideInputs:
+        if two_tower:
+            return SideInputs(False, ())
+        ads_counts = int(getattr(model_config, "ads_counts_emb_dim", 0) or 0) > 0
+        fields: tuple[str, ...] = ()
+        if int(getattr(model_config, "ad_side_ids_emb_dim", 0) or 0) > 0:
+            fields = parse_ad_side_fields(model_config.ad_side_fields)
+        return SideInputs(ads_counts, fields)
+
+    @property
+    def request_keys(self) -> frozenset[str]:
+        keys = set(REQUEST_BATCH_KEYS)
+        if self.ads_count_features:
+            keys.add(ADS_COUNT_BUCKETS_KEY)
+        if self.ad_side_fields:
+            keys.add(AD_SIDE_IDS_KEY)
+        return frozenset(keys)
 
 
 def _template_fill(key: str, value: Any) -> bool | int | float:
@@ -580,19 +614,25 @@ def _batch_avals(
                 np.uint16,
             )
 
-    if packed and getattr(model_config, "dwell_cread_decode_from_request", False):
-        from xrex.models.recsys_model import cread_request_decode_avals
+    from xrex.models.recsys_model import (
+        cread_decode_from_request_enabled,
+        cread_request_decode_avals,
+    )
 
-        batch.update(cread_request_decode_avals(batch))
+    if packed and cread_decode_from_request_enabled(model_config):
+        batch.update(cread_request_decode_avals(batch, model_config))
 
     return batch
 
 
 def _request_fills(model_config: Any) -> dict[str, float]:
-    if not getattr(model_config, "dwell_cread_decode_from_request", False):
-        return {}
-    from xrex.models.recsys_model import cread_request_decode_fills
+    from xrex.models.recsys_model import (
+        cread_decode_from_request_enabled,
+        cread_request_decode_fills,
+    )
 
+    if not cread_decode_from_request_enabled(model_config):
+        return {}
     return cread_request_decode_fills(model_config)
 
 
@@ -904,6 +944,7 @@ def _input_spec(
     retrieval_inputs: list[tuple[str, str, Any, str]] | None = None,
     page_decode_avals: PageDecodeInputs | None = None,
     request_fills: Mapping[str, float] | None = None,
+    request_keys: frozenset[str] = REQUEST_BATCH_KEYS,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
@@ -927,7 +968,7 @@ def _input_spec(
         key = keystr(path)
         if key.startswith("packing_layout."):
             spec.append({"kind": "packing_layout", "key": key, **_aval_entry(leaf)})
-        elif key in REQUEST_BATCH_KEYS:
+        elif key in request_keys:
             entry = {"kind": "batch", "key": key, "source": "request"}
             if request_fills and key in request_fills:
                 entry["fill"] = request_fills[key]
@@ -1145,11 +1186,7 @@ def build_bundle(
             "StableHLO bundle export supports ranking (RecsysAggregatedModelConfig) and "
             f"retrieval (RecsysTwoTowerModelConfig) only, got {type(model_config).__name__}"
         )
-    if not two_tower and model_config.ad_side_ids_emb_dim:
-        raise NotImplementedError(
-            "StableHLO bundle export does not support ad_side_ids_emb_dim > 0; "
-            "serve with the JAX backend"
-        )
+    side_inputs = SideInputs.of(model_config, two_tower=two_tower)
     if mesh_devices < 1:
         raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")
     retrieval = _retrieval_export(trainer, dataset_capacities, mesh_devices) if two_tower else None
@@ -1342,6 +1379,7 @@ def build_bundle(
             retrieval_inputs,
             page_decode_avals,
             _request_fills(export_cfg.model_config),
+            request_keys=side_inputs.request_keys,
         )
         if len(spec) != len(exported.in_avals):
             raise AssertionError(
@@ -1482,6 +1520,7 @@ def _prep_spec(
     dataset = export_cfg.dataset
     model_config = export_cfg.model_config
     features = _token_feature_config(model_config, two_tower=two_tower)
+    side_inputs = SideInputs.of(model_config, two_tower=two_tower)
     ht = dataset.hash_table
     hk = ht.hash_keys
     batch = _batch_avals(export_cfg, 1, packed=False, two_tower=two_tower)
@@ -1537,6 +1576,8 @@ def _prep_spec(
         "enable_stale_post_30d": bool(
             getattr(getattr(features, "feature_prep", None), "enable_stale_post_30d", False)
         ),
+        "ads_count_features": side_inputs.ads_count_features,
+        "ad_side_fields": list(side_inputs.ad_side_fields),
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,
         "sid_num_levels": _leaf_width(hist, "post_sids", 2),

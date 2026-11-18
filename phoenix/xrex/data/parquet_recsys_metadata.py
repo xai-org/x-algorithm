@@ -8,21 +8,27 @@ import json
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import NotRequired, TypedDict
-from urllib.parse import urlsplit
+from typing import Any, NamedTuple, NotRequired, TypedDict
+from urllib.parse import parse_qsl, urlsplit
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from xrex import settings
+from xrex.data import rust_ext
 
 logger = logging.getLogger("rank")
 
 _OBJECT_STORE_SCHEMES = ("s3://", "s3a://", "s3n://", "o2://")
+ICEBERG_SCHEME = "iceberg://"
+_ICEBERG_REFRESH_S = 60.0
+_VALID_BATCHES_SUFFIX = "/.valid_batches.json"
 
 DATE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DATE_TIME_FORMATS = (DATE_TIME_FORMAT, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d")
@@ -53,10 +59,84 @@ class DataPosition(TypedDict):
     rows_in_file: NotRequired[int]
     copy_roots: NotRequired[dict[str, DataPosition | None]]
     dataset_path: NotRequired[str | None]
+    data_file: NotRequired[str]
 
 
 def is_object_store_path(path: str) -> bool:
     return path.startswith(_OBJECT_STORE_SCHEMES)
+
+
+def is_iceberg_path(path: str) -> bool:
+    return path.startswith(ICEBERG_SCHEME)
+
+
+class IcebergTopic(NamedTuple):
+    table: str
+    partitions: int
+    origin_ms: int | None
+    metadata_location: str | None
+
+
+def parse_iceberg_path(path: str) -> IcebergTopic:
+    parts = urlsplit(path)
+    options = dict(parse_qsl(parts.query, keep_blank_values=True))
+    unknown = set(options) - {"partitions", "origin", "metadata"}
+    if parts.scheme != "iceberg" or not parts.netloc or parts.path or unknown:
+        raise ValueError(
+            f"{path!r} is not iceberg://catalog.namespace.table?partitions=N[&origin=DATE]"
+        )
+    if not options.get("partitions", "").isdecimal() or int(options["partitions"]) <= 0:
+        raise ValueError(f"{path!r} needs partitions=N: the table's files are read N to a batch id")
+    origin = options.get("origin")
+    return IcebergTopic(
+        table=parts.netloc,
+        partitions=int(options["partitions"]),
+        origin_ms=None if origin is None else int(parse_date_time(origin).timestamp() * 1000),
+        metadata_location=options.get("metadata"),
+    )
+
+
+_iceberg_indexes: dict[str, Any] = {}
+_iceberg_lock = threading.Lock()
+
+
+def iceberg_index(topic_dir: str, refresh: bool = True) -> Any:
+    topic_dir = topic_dir.rstrip("/")
+    with _iceberg_lock:
+        index = _iceberg_indexes.get(topic_dir)
+        if index is None:
+            topic = parse_iceberg_path(topic_dir)
+            index = rust_ext.load("xai_recsys_parquet_reader").IcebergIndex(
+                table=topic.table,
+                num_partitions=topic.partitions,
+                origin_ms=topic.origin_ms,
+                catalogs=settings.ICEBERG_CATALOGS or None,
+                metadata_location=topic.metadata_location,
+            )
+            _iceberg_indexes[topic_dir] = index
+            return index
+    if refresh:
+        try:
+            index.refresh(_ICEBERG_REFRESH_S)
+        except OSError as e:
+            logger.warning("Keeping the last listing of %s: %s", topic_dir, e)
+    return index
+
+
+def _iceberg_manifest(topic_dir: str) -> BatchManifest:
+    topic_dir = topic_dir.rstrip("/")
+    index = iceberg_index(topic_dir, refresh=False)
+    shape = (index.num_batches, index.num_partitions)
+    cached = _manifest_cache.get(topic_dir)
+    if cached is not None and cached[0] == shape and cached[1] is not None:
+        return cached[1]
+    manifest = BatchManifest(
+        first_batch=0,
+        rows=np.frombuffer(index.rows(0, shape[0]), dtype="<i8").reshape(shape),
+        min_ts=np.frombuffer(index.min_timestamps(0, shape[0]), dtype="<i8").reshape(shape),
+    )
+    _manifest_cache[topic_dir] = (shape, manifest)
+    return manifest
 
 
 @functools.cache
@@ -77,11 +157,23 @@ def _filesystem(path: str) -> tuple[pafs.FileSystem | None, str]:
 
 
 def parquet_file(path: str) -> pq.ParquetFile:
+    if is_iceberg_path(path):
+        topic_dir, _, data_file = path.partition("#")
+        index = iceberg_index(topic_dir, refresh=False)
+        return pq.ParquetFile(pa.BufferReader(index.read_file(data_file)))
     fs, p = _filesystem(path)
     return pq.ParquetFile(p, filesystem=fs)
 
 
+def file_rows(topic_dir: str, partition_id: int, batch_id: int) -> int:
+    if is_iceberg_path(topic_dir):
+        return int(_iceberg_manifest(topic_dir).rows[batch_id, partition_id])
+    return parquet_file(batch_path(topic_dir, partition_id, batch_id)).metadata.num_rows
+
+
 def is_file(path: str) -> bool:
+    if is_iceberg_path(path):
+        return "#" in path or path.endswith(_VALID_BATCHES_SUFFIX)
     fs, p = _filesystem(path)
     if fs is None:
         return os.path.isfile(p)
@@ -115,10 +207,39 @@ def _file_stamp(path: str) -> tuple[int, int] | None:
 
 
 def batch_path(topic_dir: str, partition_id: int, batch_id: int) -> str:
+    if is_iceberg_path(topic_dir):
+        topic_dir = topic_dir.rstrip("/")
+        index = iceberg_index(topic_dir, refresh=False)
+        return f"{topic_dir}#{index.file_path(partition_id, batch_id)}"
     sub_dir = str(batch_id // BATCHES_PER_SUBDIR)
     return os.path.join(
         topic_dir, f"partition={partition_id}", sub_dir, f"batch_{batch_id}.parquet"
     )
+
+
+def stamp_data_file(position: DataPosition | None, path: str | None) -> DataPosition | None:
+    if position is None or path is None or not is_iceberg_path(path):
+        return position
+    index = iceberg_index(path, refresh=False)
+    batch_id = position["last_batch_id"]
+    if batch_id >= index.num_batches:
+        return position
+    return {**position, "data_file": index.file_path(0, batch_id)}
+
+
+def _check_data_file(position: DataPosition, path: str) -> None:
+    saved = position.get("data_file")
+    if saved is None:
+        return
+    index = iceberg_index(path)
+    batch_id = position["last_batch_id"]
+    now = index.file_path(0, batch_id) if batch_id < index.num_batches else None
+    if now != saved:
+        raise ValueError(
+            f"The data position was reading {saved} at batch id {batch_id} of {path}, which now "
+            f"has {now} there: files it counted were removed or rewritten, so batch ids moved. "
+            "Set reset_data_position=True (load= only) to read from the start"
+        )
 
 
 def check_resume_path(position: DataPosition | None, path: str | None, allow_change: bool) -> None:
@@ -126,11 +247,14 @@ def check_resume_path(position: DataPosition | None, path: str | None, allow_cha
         return
     saved = position.get("dataset_path")
     if saved is None or saved.rstrip("/") == path.rstrip("/"):
+        if is_iceberg_path(path):
+            _check_data_file(position, path)
         return
     batch_id = position["last_batch_id"]
     try:
-        if os.path.samefile(batch_path(saved, 0, batch_id), batch_path(path, 0, batch_id)):
-            return
+        if not is_iceberg_path(saved) and not is_iceberg_path(path):
+            if os.path.samefile(batch_path(saved, 0, batch_id), batch_path(path, 0, batch_id)):
+                return
     except OSError:
         pass
     raise ValueError(
@@ -141,6 +265,16 @@ def check_resume_path(position: DataPosition | None, path: str | None, allow_cha
 
 
 def load_valid_batches_metadata(path: str) -> ValidBatchesMetadata | None:
+    if is_iceberg_path(path):
+        index = iceberg_index(path.removesuffix(_VALID_BATCHES_SUFFIX))
+        if index.num_batches == 0:
+            logger.warning("%s has no batch id with a file in each of its partitions", path)
+            return None
+        return ValidBatchesMetadata(
+            min_valid_batch=0,
+            max_valid_batch=index.num_batches - 1,
+            num_partitions=index.num_partitions,
+        )
     try:
         data = json.loads(_read_text(path))
         return ValidBatchesMetadata(
@@ -252,6 +386,8 @@ _manifest_cache: dict[str, tuple[tuple[int, int], BatchManifest | None]] = {}
 
 
 def load_batch_manifest(topic_dir: str) -> BatchManifest | None:
+    if is_iceberg_path(topic_dir):
+        return _iceberg_manifest(topic_dir)
     path = os.path.join(topic_dir, BATCH_MANIFEST_FILENAME)
     stamp = _file_stamp(path)
     if stamp is None:
@@ -330,6 +466,8 @@ def remaining_steps_from_manifest(
 def _batch_timestamps(
     topic_dir: str, min_batch: int, max_batch: int
 ) -> _FooterTimestamps | list[int]:
+    if is_iceberg_path(topic_dir):
+        return _iceberg_manifest(topic_dir).batch_timestamps(min_batch, max_batch)
     footer = _FooterTimestamps(topic_dir, min_batch, max_batch)
     if len(footer) == 0:
         return footer

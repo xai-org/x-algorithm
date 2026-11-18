@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 
 from aiokafka import AIOKafkaConsumer
+from aiokafka.abc import ConsumerRebalanceListener
 from aiokafka.coordinator.assignors.sticky.sticky_assignor import (
     StickyPartitionAssignor,
 )
@@ -19,9 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 class KafkaConsumer:
-    def __init__(self, config: KafkaConsumerConfig):
+    def __init__(
+        self,
+        config: KafkaConsumerConfig,
+        listener: ConsumerRebalanceListener | None = None,
+    ):
         self.config: KafkaConsumerConfig = config
         self.group_id: str = config.group_id
+        self._listener = listener
         self._consumer: AIOKafkaConsumer | None = None
 
     @property
@@ -109,6 +115,7 @@ class KafkaConsumer:
                 fetch_max_bytes=config.fetch_max_bytes,
                 fetch_min_bytes=config.fetch_min_bytes,
                 max_poll_records=config.max_poll_records,
+                max_poll_interval_ms=config.max_poll_interval_ms,
                 partition_assignment_strategy=[StickyPartitionAssignor],
             )
         elif auth_mode in ("GSSAPI", "SCRAM"):
@@ -133,6 +140,7 @@ class KafkaConsumer:
                 fetch_max_bytes=config.fetch_max_bytes,
                 fetch_min_bytes=config.fetch_min_bytes,
                 max_poll_records=config.max_poll_records,
+                max_poll_interval_ms=config.max_poll_interval_ms,
             )
         else:
             consumer = AIOKafkaConsumer(
@@ -147,8 +155,11 @@ class KafkaConsumer:
                 fetch_max_bytes=config.fetch_max_bytes,
                 fetch_min_bytes=config.fetch_min_bytes,
                 max_poll_records=config.max_poll_records,
+                max_poll_interval_ms=config.max_poll_interval_ms,
                 request_timeout_ms=config.request_timeout_ms,
             )
+        if self._listener is not None:
+            consumer.subscribe([config.topic], listener=self._listener)
         await consumer.start()
         self._consumer = consumer
 

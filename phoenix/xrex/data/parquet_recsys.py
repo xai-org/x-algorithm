@@ -22,17 +22,20 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pyarrow.parquet import ParquetFile
 
 from xai_configlib import configclass
 from xrex.configs.config import Dataset
 from xrex.data import conversion_labels
 from xrex.data.parquet_recsys_metadata import (
     DataPosition,
+    is_file,
+    is_iceberg_path,
     load_batch_manifest,
+    parquet_file,
     parse_date_bound,
     parse_date_time,
     remaining_steps_from_manifest,
+    stamp_data_file,
 )
 from xrex.data.parquet_recsys_metadata import (
     batch_path as _batch_path,
@@ -43,7 +46,7 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
-from xrex.data.recsys import ad_fields_sidecar, reply_features, sidecar
+from xrex.data.recsys import ad_fields_sidecar, iceberg_layout, reply_features, sidecar
 from xrex.data.recsys import ad_side_ids as ad_side
 from xrex.data.recsys import id_list_features as id_lists
 from xrex.data.recsys.array_allocator import ArrayAllocator
@@ -328,7 +331,7 @@ class RowSplitRecordBatchIterator:
 
 
 def _resolve_file_path(base_path: str, file_entry: str) -> str:
-    if os.path.isabs(file_entry):
+    if os.path.isabs(file_entry) or is_iceberg_path(file_entry):
         return file_entry
     return os.path.join(base_path, file_entry)
 
@@ -918,7 +921,8 @@ class InterleavingRecordBatchProvider:
         if metadata_path is not None:
             if topic_dir is None:
                 topic_dir = str(Path(metadata_path).parent)
-            topic_dir = os.path.abspath(topic_dir)
+            if not is_iceberg_path(topic_dir):
+                topic_dir = os.path.abspath(topic_dir)
             self._topic_dir = topic_dir
         self._path = str(Path(index_path).parent) if index_path else topic_dir or ""
         self._batch_size = batch_size
@@ -1191,7 +1195,7 @@ class InterleavingRecordBatchProvider:
 
         def _impl():
             try:
-                pf = ParquetFile(path)
+                pf = parquet_file(path)
                 holder = LazyRecordBatchIterator(
                     pf,
                     self._batch_size * self._shards_per_partition,
@@ -1340,7 +1344,7 @@ class InterleavingRecordBatchProvider:
         path = _resolve_file_path(self._path, file)
         try:
             holder = LazyRecordBatchIterator(
-                ParquetFile(path),
+                parquet_file(path),
                 _SHUFFLE_READ_CHUNK_ROWS,
                 path,
                 self._conversion_delay_columns,
@@ -1704,7 +1708,7 @@ class InterleavingRecordBatchProvider:
                     file_path: str,
                 ) -> tuple[LazyRecordBatchIterator | None, pa.RecordBatch | None]:
                     try:
-                        pf = pq.ParquetFile(file_path)
+                        pf = parquet_file(file_path)
                         holder = LazyRecordBatchIterator(
                             pf,
                             self._batch_size,
@@ -2323,6 +2327,9 @@ class PhoenixDataset(Dataset):
         topic_dir = self.path
         metadata_path = str(Path(topic_dir) / ".valid_batches.json")
         index_path = str(Path(topic_dir) / ".index")
+        if is_iceberg_path(topic_dir):
+            metadata_path = os.path.join(topic_dir, ".valid_batches.json")
+            self._check_iceberg_readable(metadata_path)
         conversion_delay_columns = self._conversion_delay_columns()
 
         min_timestamp_ms: int | None = None
@@ -2335,7 +2342,7 @@ class PhoenixDataset(Dataset):
         shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
         shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
 
-        if os.path.isfile(metadata_path):
+        if is_file(metadata_path):
             rank_logger.info(f"Using metadata mode: {metadata_path}")
             rb_provider = InterleavingRecordBatchProvider(
                 metadata_path=metadata_path,
@@ -2400,9 +2407,27 @@ class PhoenixDataset(Dataset):
         self._rb_provider = rb_provider
         return rb_provider.get_record_batches()
 
+    def _check_iceberg_readable(self, metadata_path: str) -> None:
+        meta = _load_valid_batches_metadata(metadata_path)
+        if meta is not None and meta["num_partitions"] != self.num_kafka_partitions:
+            raise ValueError(
+                f"num_kafka_partitions={self.num_kafka_partitions}, but {self.path} is read as "
+                f"{meta['num_partitions']} partitions: make them equal"
+            )
+        sidecars = {
+            "use_conversion_labels": self.use_conversion_labels,
+            "id_list_sidecar_root": self.id_list_sidecar_root is not None,
+            "ad_fields_sidecar_root": self.ad_fields_sidecar_root is not None,
+        }
+        if any(sidecars.values()):
+            raise ValueError(
+                f"{[name for name, on in sidecars.items() if on]} join sidecar files by a "
+                f"dump's batch file paths, which the Iceberg table {self.path} does not have"
+            )
+
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
-            return self._rb_provider.get_position()
+            return stamp_data_file(self._rb_provider.get_position(), self.path)
         return None
 
     def make(
@@ -2486,6 +2511,8 @@ class PhoenixDataset(Dataset):
                     skip_rows=skip_rows,
                     resume_position=resume_position,
                 ):
+                    if is_iceberg_path(self.path):
+                        record_batch = iceberg_layout.dump_layout(record_batch)
                     if record_batch.num_rows * 2 < batch_size:
                         rank_logger.warning(
                             "Skipping record batch that doesn't contain enough rows"

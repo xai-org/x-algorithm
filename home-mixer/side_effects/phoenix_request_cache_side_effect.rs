@@ -26,12 +26,12 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 const MAX_SERVED_SLATE_POSTS: usize = 64;
 const SLATE_WRITES_METRIC: &str = "ServedSlateCacheSideEffect.slate_writes";
 
-fn encode_cache_value<T: Message>(message: &T) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_cache_value<T: Message>(message: &T) -> Result<Vec<u8>, String> {
     zstd::encode_all(message.encode_to_vec().as_slice(), ZSTD_COMPRESSION_LEVEL)
         .map_err(|e| format!("zstd compression failed: {e}"))
 }
 
-fn product_surface(query: &ScoredPostsQuery) -> ProductSurface {
+pub(crate) fn product_surface(query: &ScoredPostsQuery) -> ProductSurface {
     if query.in_network_only {
         ProductSurface::HomeTimelineRankedFollowing
     } else {
@@ -39,7 +39,7 @@ fn product_surface(query: &ScoredPostsQuery) -> ProductSurface {
     }
 }
 
-async fn write_to_both_dcs(
+pub(crate) async fn write_to_both_dcs(
     atla_client: &dyn RedisClient,
     pdxa_client: &dyn RedisClient,
     entries: Vec<(String, Vec<u8>)>,
@@ -130,6 +130,10 @@ pub fn request_level_cache_key(prediction_request_id: u64) -> String {
 
 pub fn candidate_cache_key(prediction_request_id: u64, post_id: u64) -> String {
     format!("{KEY_PREFIX}_{prediction_request_id}_{post_id}")
+}
+
+pub fn teacher_cache_key(prediction_request_id: u64) -> String {
+    format!("{KEY_PREFIX}_{prediction_request_id}_teacher")
 }
 
 #[async_trait]

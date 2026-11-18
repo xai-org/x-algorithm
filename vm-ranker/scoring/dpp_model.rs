@@ -296,7 +296,7 @@ mod tests {
                 .map(|tweet_id| DppHistoryItem {
                     tweet_id,
                     served_time_ms: 1_000_000,
-                    carousel: false,
+                    ..Default::default()
                 })
                 .to_vec(),
             ..Default::default()
@@ -344,7 +344,7 @@ mod tests {
         let item = |tweet_id, served_time_ms| DppHistoryItem {
             tweet_id,
             served_time_ms,
-            carousel: false,
+            ..Default::default()
         };
         let mut dpp_history: Vec<DppHistoryItem> = (21..=25).map(|id| item(id, t2)).collect();
         dpp_history.extend((11..=15).map(|id| item(id, t2 - 60_000)));
@@ -416,7 +416,7 @@ mod tests {
             dpp_history: vec![DppHistoryItem {
                 tweet_id: 20,
                 served_time_ms: 1_000_000,
-                carousel: false,
+                ..Default::default()
             }],
             ..Default::default()
         };

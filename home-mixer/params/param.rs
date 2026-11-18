@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-16T16:00:37Z
+// mirrored from config feature-switch defaults; last sync 2026-11-17T16:00:33Z
 use xai_feature_switches::param;
 
 param!(
@@ -496,7 +496,7 @@ param!(
     ShareViaCopyLinkWeight,
     f64,
     "rust_home_mixer_share_via_copy_link_weight",
-    0.0
+    20.0
 );
 param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.05);
 param!(QuoteWeight, f64, "rust_home_mixer_quote_weight", 5.0);
@@ -1109,6 +1109,36 @@ param!(
     vec![]
 );
 param!(
+    AdsPageScoreKeepPct,
+    Vec<u64>,
+    "rust_home_mixer_ads_page_score_keep_pct",
+    vec![]
+);
+param!(
+    AdsPageScoreSpacing,
+    Vec<u64>,
+    "rust_home_mixer_ads_page_score_spacing",
+    vec![]
+);
+param!(
+    AdsPageScoreLowThreshold,
+    f64,
+    "rust_home_mixer_ads_page_score_low_threshold",
+    0.0
+);
+param!(
+    AdsPageScoreHighThreshold,
+    f64,
+    "rust_home_mixer_ads_page_score_high_threshold",
+    0.0
+);
+param!(
+    AdsPageScoreTopK,
+    u32,
+    "rust_home_mixer_ads_page_score_top_k",
+    20
+);
+param!(
     EnableAdsOnlyTimeline,
     bool,
     "rust_home_mixer_enable_ads_only_timeline",
@@ -1217,6 +1247,43 @@ param!(
     u64,
     "rust_home_mixer_phoenix_request_cache_side_effect_ttl_seconds",
     10800
+);
+param!(
+    EnableTeacherScoreSideEffect,
+    bool,
+    "rust_home_mixer_enable_teacher_score_side_effect",
+    false
+);
+param!(
+    TeacherPhoenixCluster,
+    String,
+    "rust_home_mixer_teacher_phoenix_cluster",
+    ""
+);
+param!(
+    TeacherSampleBps,
+    u32,
+    "rust_home_mixer_teacher_sample_bps",
+    0
+);
+param!(TeacherTopK, usize, "rust_home_mixer_teacher_top_k", 64);
+param!(
+    TeacherActionIndices,
+    Vec<u64>,
+    "rust_home_mixer_teacher_action_indices",
+    vec![]
+);
+param!(
+    TeacherTimeoutMs,
+    u64,
+    "rust_home_mixer_teacher_timeout_ms",
+    2000
+);
+param!(
+    TeacherTtlSeconds,
+    u64,
+    "rust_home_mixer_teacher_ttl_seconds",
+    3000
 );
 
 param!(

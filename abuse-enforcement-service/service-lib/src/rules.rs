@@ -292,19 +292,18 @@ pub fn decide_with_id(
     rules: &CompiledRules,
     facts: &Facts,
 ) -> Result<(Decision, String), EvalError> {
-    use crate::safety_checks::{FOLLOWER_CEILING, PRE_CEILING, ceiling_stops};
+    use crate::safety_checks::{FOLLOWER_CEILING, PRE_CEILING, ceiling_stops, test_account_stop};
     let decided = decide_by_rules(rules, facts);
-    if !ceiling_stops(facts, false) {
+    let stop = test_account_stop(facts)
+        .or_else(|| ceiling_stops(facts, false).then_some(&FOLLOWER_CEILING));
+    let Some(check) = stop else {
         return decided;
-    }
+    };
     match decided {
         Ok((decision @ Decision::Skip(_), id)) if PRE_CEILING.contains(&id.as_str()) => {
             Ok((decision, id))
         }
-        _ => Ok((
-            Decision::Skip(FOLLOWER_CEILING.reason.to_owned()),
-            FOLLOWER_CEILING.id.to_owned(),
-        )),
+        _ => Ok((Decision::Skip(check.reason.to_owned()), check.id.to_owned())),
     }
 }
 

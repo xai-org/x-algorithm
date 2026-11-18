@@ -77,7 +77,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for UpdateServedHistorySideEffect {
     }
 }
 
-fn request_type(query: &ScoredPostsQuery) -> RequestType {
+pub(crate) fn request_type(query: &ScoredPostsQuery) -> RequestType {
     if query.is_polling {
         return RequestType::POLLING;
     }

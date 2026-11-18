@@ -58,6 +58,7 @@ class FloatFeature(enum.IntEnum):
 class Int64Feature(enum.IntEnum):
     clientAppIdSeq = 0
     promotedIdSeq = 1
+    dpaSidLevel0 = 3
     favCountSeq = 5
     replyCountSeq = 6
     repostCountSeq = 7
@@ -70,10 +71,29 @@ class Int64Feature(enum.IntEnum):
     webConvTimeOnSiteMeasuredMsSeq = 14
     requestTimeSecSeq = 15
     latestHistoryImpressionTimeSecSeq = 16
+    dpaSidLevel1 = 17
+    dpaSidLevel2 = 18
+    dpaSidLevel3 = 19
+    dpaSidLevel4 = 20
+    dpaSidLevel5 = 21
 
+
+DPA_SID_NUM_LEVELS = 6
+DPA_SID_CODEBOOK_SIZE = 256
+DPA_SID_LEVEL_NAMES: tuple[str, ...] = tuple(
+    f"dpaSidLevel{level}" for level in range(DPA_SID_NUM_LEVELS)
+)
+assert {n for n in Int64Feature.__members__ if n.startswith("dpaSidLevel")} == set(
+    DPA_SID_LEVEL_NAMES
+)
 
 COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset(
-    {"firstDpaProductKeyHash2", "requestTimeSecSeq", "latestHistoryImpressionTimeSecSeq"}
+    {
+        "firstDpaProductKeyHash2",
+        "requestTimeSecSeq",
+        "latestHistoryImpressionTimeSecSeq",
+        *DPA_SID_LEVEL_NAMES,
+    }
 )
 
 
@@ -168,6 +188,7 @@ OPTIONAL_COLUMNS: list[str] = [
     "semanticIdSeq",
     "sampleWeight",
     "firstDpaProductKey",
+    "dpaSidCodesSeq",
     "authorFollowerCountSeq",
     "inReplyToPostIdSeq",
     "sample_source",

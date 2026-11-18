@@ -3,11 +3,12 @@ use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::*;
 use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
+use crate::side_effects::update_served_history_side_effect::request_type as served_request_type;
 use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
 use xai_vm_ranker_proto as pb;
 use xai_vm_ranker_proto::experiment::PostTopics;
-use xai_x_thrift::served_history::{EntityIdType, ServedHistory};
+use xai_x_thrift::served_history::{EntityIdType, RequestType as ServedRequestType, ServedHistory};
 
 const DPP_VALUE_MODEL_ID: &str = "dpp";
 
@@ -73,6 +74,7 @@ impl RequestShape {
             } else {
                 Vec::new()
             },
+            request_type: proto_request_type(served_request_type(query)),
             ..Default::default()
         };
         if self.debias || self.history_topics || self.post_topics {
@@ -155,12 +157,19 @@ fn dpp_history(query: &ScoredPostsQuery) -> Vec<pb::DppHistoryItem> {
                         tweet_id,
                         served_time_ms,
                         carousel,
+                        request_type: proto_request_type(response.request_type),
                     });
                 }
             }
         }
     }
     history
+}
+
+fn proto_request_type(request_type: ServedRequestType) -> i32 {
+    pb::ServedRequestType::try_from(request_type.0)
+        .unwrap_or_default()
+        .into()
 }
 
 fn viewer_context_proto(inputs: &FsRecipientInputs) -> pb::ViewerContext {
@@ -291,11 +300,17 @@ mod tests {
         }
     }
 
-    fn pin(tweet_id: u64, age_secs: i64, carousel: bool) -> pb::DppHistoryItem {
+    fn pin(
+        tweet_id: u64,
+        age_secs: i64,
+        carousel: bool,
+        request_type: ServedRequestType,
+    ) -> pb::DppHistoryItem {
         pb::DppHistoryItem {
             tweet_id,
             served_time_ms: NOW_MS - age_secs * 1_000,
             carousel,
+            request_type: proto_request_type(request_type),
         }
     }
 
@@ -304,8 +319,21 @@ mod tests {
         let history = vec![response(30, ServedRequestType::INITIAL, vec![tweet(0, 10)])];
 
         let for_you = build(&query("true", "200", history.clone()));
-        assert_eq!(for_you.dpp_history, vec![pin(10, 30, false)]);
+        assert_eq!(
+            for_you.dpp_history,
+            vec![pin(10, 30, false, ServedRequestType::INITIAL)]
+        );
         assert_eq!(for_you.request_timestamp_ms, NOW_MS as u64);
+        assert_eq!(for_you.request_type(), pb::ServedRequestType::Initial);
+
+        let polling = ScoredPostsQuery {
+            is_polling: true,
+            ..query("true", "200", history.clone())
+        };
+        assert_eq!(
+            build(&polling).request_type(),
+            pb::ServedRequestType::Polling
+        );
 
         let ranked_following = ScoredPostsQuery {
             request_type: RequestType::RankedFollowing,
@@ -346,14 +374,15 @@ mod tests {
 
         assert_eq!(
             build(&query("true", "200", history)).dpp_history,
-            vec![
-                pin(100, 30, false),
-                pin(101, 30, false),
-                pin(102, 30, false),
-                pin(77, 30, false),
-                pin(21, 30, true),
-                pin(22, 30, true),
+            [
+                (100, false),
+                (101, false),
+                (102, false),
+                (77, false),
+                (21, true),
+                (22, true),
             ]
+            .map(|(id, carousel)| pin(id, 30, carousel, ServedRequestType::INITIAL))
         );
     }
 
@@ -376,10 +405,10 @@ mod tests {
         assert_eq!(
             build(&query("true", "200", history)).dpp_history,
             vec![
-                pin(500, 10, false),
-                pin(10, 10, false),
-                pin(20, 60, false),
-                pin(30, 3_600, false),
+                pin(500, 10, false, ServedRequestType::POLLING),
+                pin(10, 10, false, ServedRequestType::POLLING),
+                pin(20, 60, false, ServedRequestType::INITIAL),
+                pin(30, 3_600, false, ServedRequestType::OLDER),
             ]
         );
 
@@ -392,7 +421,14 @@ mod tests {
             .collect();
         let newest_first: Vec<pb::DppHistoryItem> = (0..10i64)
             .flat_map(|page| {
-                (0..25).map(move |i| pin((page * 100 + i) as u64, (page + 1) * 10, false))
+                (0..25).map(move |i| {
+                    pin(
+                        (page * 100 + i) as u64,
+                        (page + 1) * 10,
+                        false,
+                        ServedRequestType::OLDER,
+                    )
+                })
             })
             .collect();
         assert_eq!(newest_first.len(), 250);

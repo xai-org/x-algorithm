@@ -72,6 +72,7 @@ from xrex.data.recsys.sequence_packing import (
 )
 from xrex.data.retrieval_dataset import RetrievalDataset
 from xrex.data.rust_kafka_recsys import RustKafkaDataset
+from xrex.data.rust_parquet_recsys import RustParquetDataset
 from xrex.data.streaming.kafkaloader import PhoenixKafkaDataset, report_training_metrics
 from xrex.eval.eval_utils import report_forward_eval_results
 from xrex.eval.metrics_recsys import merge_report_extras
@@ -127,6 +128,21 @@ _DATA_POSITION_FILENAME = "data_position.json"
 _CONFIG_FILENAME = "config.json"
 _FORWARD_ONLY_PROGRESS_FILENAME = "forward_only_progress.json"
 _FORWARD_ONLY_PROGRESS_EVERY_S = 60.0
+
+
+def follow_data_end_dataset(dataset: typing.Any) -> typing.Any:
+    if not isinstance(dataset, PhoenixDataset) or isinstance(dataset, PhoenixKafkaDataset):
+        return dataset
+    if isinstance(dataset, RustParquetDataset) and dataset.python_reader_reason() is None:
+        return dataset
+    if dataset.shuffle_mode == ShuffleMode.NONE and dataset.shuffle_window_time_slices == 0:
+        return replace(
+            dataset,
+            shuffle_mode=ShuffleMode.BLOCK_SHUFFLE,
+            shuffle_window_time_slices=1,
+            block_shuffle_block_time_slices=1,
+        )
+    return dataset
 
 
 @dataclass(frozen=True)
@@ -586,7 +602,7 @@ class RecsysTrainer(Trainer):
                 "use_row_emb=False and num_microbatch=1"
             )
         if self.follow_data_end:
-            self._validate_follow_data_end()
+            self._prepare_follow_data_end()
 
     state: RecsysTrainingState = field(init=False, repr=False, compare=False)
     _pending_shmem_ckpt_write_s: float | None = field(default=None, init=False, repr=False)
@@ -1405,6 +1421,16 @@ class RecsysTrainer(Trainer):
             path,
         )
         return res[0], int(progress["elapsed_samples"]), res[2]
+
+    def _prepare_follow_data_end(self) -> None:
+        dataset = follow_data_end_dataset(self.dataset)
+        if dataset is not self.dataset:
+            rank_logger.info(
+                "follow_data_end with shuffle_mode=none: reading in time order as "
+                "block_shuffle with 1-slice windows and blocks"
+            )
+            self.dataset = dataset
+        self._validate_follow_data_end()
 
     def _validate_follow_data_end(self) -> None:
         dataset = self.dataset

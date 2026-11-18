@@ -1,6 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use tonic::async_trait;
 use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 
@@ -19,7 +19,7 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for InNetworkCandidateHyd
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Result<Vec<bool>, String> {
-        let followed_ids: HashSet<u64> = query
+        let followed_ids: FxHashSet<u64> = query
             .user_features
             .followed_user_ids
             .iter()

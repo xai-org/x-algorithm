@@ -4,7 +4,7 @@ mod proto;
 mod scoring;
 mod weights;
 
-pub use inputs::{CandidateScoringInputs, QueryScoringContext};
+pub use inputs::{CandidateScoringInputs, ClassFactors, QueryScoringContext};
 pub use phoenix_scores::PhoenixScores;
 pub use scoring::{
     PostFusionMultiplier, ValueScores, apply_cold_start_decisions, author_pool_counts,

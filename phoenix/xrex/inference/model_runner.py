@@ -71,7 +71,11 @@ from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
-from xrex.models.recsys_model import RecsysAggregatedModelConfig, cread_request_decode_avals
+from xrex.models.recsys_model import (
+    RecsysAggregatedModelConfig,
+    cread_decode_from_request_enabled,
+    cread_request_decode_avals,
+)
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.models.topic_categories import (
     NUM_TOPIC_INT32S,
@@ -4054,8 +4058,8 @@ class RankingModelRunner(
                     np.uint16,
                 )
 
-        if self.using_seqpack and self.model_config.dwell_cread_decode_from_request:
-            init_data.update(cread_request_decode_avals(init_data))
+        if self.using_seqpack and cread_decode_from_request_enabled(self.model_config):
+            init_data.update(cread_request_decode_avals(init_data, self.model_config))
 
         return rng, init_data
 

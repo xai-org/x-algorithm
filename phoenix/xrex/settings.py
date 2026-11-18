@@ -51,6 +51,7 @@ OBJECT_STORE_CREDENTIALS_DIR: str = os.environ.get(
 DATASET_OBJECT_STORE_ENDPOINT: str = os.environ.get(
     "XREX_DATASET_OBJECT_STORE_ENDPOINT", "http://object-store.example.invalid"
 )
+ICEBERG_CATALOGS: str = os.environ.get("XREX_ICEBERG_CATALOGS", "")
 GCS_CREDENTIALS_DIR: str = os.environ.get("XREX_GCS_CREDENTIALS_DIR", ".credentials/gcs")
 
 GCS_MIRROR_BUCKET: str = os.environ.get("XREX_GCS_MIRROR_BUCKET", "")

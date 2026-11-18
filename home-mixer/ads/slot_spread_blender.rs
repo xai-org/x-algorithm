@@ -78,6 +78,7 @@ fn blend(
         return (posts_to_feed_items(scored_posts), 0);
     }
 
+    let load = load.for_page(&scored_posts);
     let spacing = load
         .spacing
         .unwrap_or_else(|| compute_spacing(&ads).requested);

@@ -47,6 +47,9 @@ from xrex.data.recsys.feature_config import (
     AUTHOR_NSFW_BIT,
     BOOL_FEATURES,
     CATEGORICAL_FEATURES,
+    DPA_SID_CODEBOOK_SIZE,
+    DPA_SID_LEVEL_NAMES,
+    DPA_SID_NUM_LEVELS,
     FLOAT_FEATURES,
     INT64_FEATURES,
     NUM_ADS_COUNT_FEATURES,
@@ -530,6 +533,12 @@ class RecsysFeaturesBatch(TypedDict):
     packing_layout: NotRequired[SequencePackedLayout | None]
     dwell_cread_power: NotRequired[npt.NDArray[np.float32] | None]
     dwell_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
+    immersive_dwell_cread_power: NotRequired[npt.NDArray[np.float32] | None]
+    immersive_dwell_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
+    video_continuation_cread_power: NotRequired[npt.NDArray[np.float32] | None]
+    video_continuation_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
+    profile_visit_cread_power: NotRequired[npt.NDArray[np.float32] | None]
+    profile_visit_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
 
 
 LEXICAL_TEXT_COLUMN = "lexicalTextSeq"
@@ -707,6 +716,43 @@ def _extend_page_record_fields(post_seq: PostSeq, shape: tuple[int, int]) -> dic
     for key, values in fields.items():
         values[:, : post_seq[key].shape[1]] = post_seq[key]
     return fields
+
+
+def _attach_dpa_sid_levels(
+    record_batch: pa.RecordBatch,
+    batch_size: int,
+    seq_len: int,
+    raw_int64_columns: tuple[dict[str, npt.NDArray], ...],
+) -> None:
+    if "dpaSidCodesSeq" not in record_batch.schema.names:
+        return
+    col = record_batch.column("dpaSidCodesSeq")
+    inner = getattr(col.type, "value_type", None)
+    if not (
+        pa.types.is_fixed_size_list(col.type)
+        and inner is not None
+        and pa.types.is_fixed_size_list(inner)
+        and pa.types.is_integer(inner.value_type)
+        and inner.list_size == DPA_SID_NUM_LEVELS
+        and col.type.list_size == seq_len
+        and len(col) == batch_size
+    ):
+        raise ValueError(
+            f"dpaSidCodesSeq must have shape ({batch_size}, {seq_len}, "
+            f"{DPA_SID_NUM_LEVELS}) with integer codes, got {col.type}"
+        )
+    levels = _list_values(col)
+    values = _list_values(levels)
+    shape = (batch_size, seq_len, DPA_SID_NUM_LEVELS)
+    codes = values.fill_null(0).to_numpy(zero_copy_only=False).reshape(shape)
+    valid = values.is_valid().to_numpy(zero_copy_only=False).reshape(shape) & (codes >= 0)
+    stored = np.clip(codes, 0, DPA_SID_CODEBOOK_SIZE - 1).astype(np.int64) + 1
+    stored = np.where(valid, stored, 0)
+    stored[levels.is_null().to_numpy(zero_copy_only=False).reshape(batch_size, seq_len)] = 0
+    stored[col.is_null().to_numpy(zero_copy_only=False)] = 0
+    for level, name in enumerate(DPA_SID_LEVEL_NAMES):
+        for raw in raw_int64_columns:
+            raw[name] = stored[:, :, level]
 
 
 def _extract_feature_columns(
@@ -1157,6 +1203,13 @@ def from_record_batch(
     cand_raw_int64 = _extract_feature_columns(
         record_batch, POST_INT64_FEATURE_LIST, batch_size, np.int64, alloc=alloc
     )
+    if not reply_parent_mode:
+        _attach_dpa_sid_levels(
+            record_batch,
+            batch_size,
+            impression_timestamps_ms.shape[1],
+            (hist_raw_int64, cand_raw_int64),
+        )
 
     _timezone_enum = hist_raw_categorical.get(
         "timezoneSeq",

@@ -245,6 +245,30 @@ param!(
     0.75
 );
 param!(
+    OonEngagementWeightFactor,
+    f64,
+    "rust_home_mixer_oon_engagement_weight_factor",
+    -1.0
+);
+param!(
+    OonDwellTimeWeightFactor,
+    f64,
+    "rust_home_mixer_oon_dwell_time_weight_factor",
+    -1.0
+);
+param!(
+    InNetworkEngagementWeightFactor,
+    f64,
+    "rust_home_mixer_in_network_engagement_weight_factor",
+    -1.0
+);
+param!(
+    InNetworkDwellTimeWeightFactor,
+    f64,
+    "rust_home_mixer_in_network_dwell_time_weight_factor",
+    -1.0
+);
+param!(
     NewUserAgeThresholdSecs,
     u64,
     "rust_home_mixer_new_user_age_threshold_secs",

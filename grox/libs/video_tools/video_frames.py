@@ -21,6 +21,10 @@ from video_tools.image import (
 logger = logging.getLogger(__name__)
 
 _MOTION_REVEAL_DENSE_SAMPLES = 48
+_SHARP_WINDOW_SEC = 0.5
+_SHARP_MAX_FRAMES_PER_WINDOW = 60
+_SHARP_GRAY_WIDTH = 320
+_SHARP_GRAY_MAX_HEIGHT = 960
 
 
 class VideoFrame(BaseModel):
@@ -33,6 +37,7 @@ class VideoData(BaseModel):
     combined_bytes: bytes | None = None
     total_duration: float | None = None
     motion_reveal_frames: list[bytes] = Field(default_factory=list)
+    sharp_frames: list[VideoFrame] = Field(default_factory=list)
 
 
 class VideoFramesExtractor:
@@ -46,6 +51,7 @@ class VideoFramesExtractor:
         include_combined_video_bytes: bool = True,
         enable_motion_reveal: bool = False,
         max_duration: float | None = None,
+        sharp_frames: bool = False,
     ) -> VideoData:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -58,6 +64,7 @@ class VideoFramesExtractor:
             include_combined_video_bytes,
             enable_motion_reveal,
             max_duration,
+            sharp_frames,
         )
 
     @classmethod
@@ -70,6 +77,7 @@ class VideoFramesExtractor:
         include_combined_video_bytes: bool = True,
         enable_motion_reveal: bool = False,
         max_duration: float | None = None,
+        sharp_frames: bool = False,
     ) -> VideoData:
         logger.info(f"Extracting maximum {max_frames} frames from video")
 
@@ -87,6 +95,17 @@ class VideoFramesExtractor:
                 total_duration = min(total_duration, max_duration)
             sample_times = cls._sample_frames(total_duration, max_frames)
             frames = cls._extract_frames_at_times(container, sample_times)
+            sharp: list[VideoFrame] = []
+            if sharp_frames:
+                try:
+                    sharp = cls._extract_sharpest_frames(
+                        container, total_duration, len(sample_times)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to extract sharp frames; continuing with sampled frames only",
+                        exc_info=True,
+                    )
 
             reveal_input = frames
             if enable_motion_reveal and frames and total_duration > 0:
@@ -118,6 +137,8 @@ class VideoFramesExtractor:
 
         for frame in frames:
             frame.frame = cls._process_frame(frame.frame, tile_size, enable_clahe)
+        for frame in sharp:
+            frame.frame = cls._process_frame(frame.frame, tile_size)
         logger.info(f"Extracted {len(frames)} frames")
         combined_bytes = (
             cls.get_video_bytes([frame.frame for frame in frames])
@@ -129,6 +150,7 @@ class VideoFramesExtractor:
             combined_bytes=combined_bytes,
             total_duration=total_duration,
             motion_reveal_frames=motion_reveal_frames,
+            sharp_frames=sharp,
         )
 
     @classmethod
@@ -153,6 +175,51 @@ class VideoFramesExtractor:
             times.append(jittered)
         times.append(round(total_duration + random.uniform(-jitter, 0), 3))
         return times
+
+    @classmethod
+    def _extract_sharpest_frames(
+        cls, container: InputContainer, total_duration: float, count: int
+    ) -> list[VideoFrame]:
+        span = max(total_duration - _SHARP_WINDOW_SEC, 0.0)
+        starts = [0.0] if count == 1 else [i * span / (count - 1) for i in range(count)]
+        video_stream = next(s for s in container.streams if s.type == "video")
+        time_base = cls._get_video_time_base(container, video_stream)
+        out = []
+        for start in starts:
+            container.seek(int(start / time_base), stream=video_stream)
+            best, best_score, best_time, scored = None, -1.0, start, 0
+            for frame in container.decode(video=0):
+                if frame.pts is None or frame.pts * time_base < start:
+                    continue
+                if best is not None and (
+                    frame.pts * time_base >= start + _SHARP_WINDOW_SEC
+                    or scored == _SHARP_MAX_FRAMES_PER_WINDOW
+                ):
+                    break
+                width = max(
+                    1,
+                    min(
+                        _SHARP_GRAY_WIDTH,
+                        frame.width * _SHARP_GRAY_MAX_HEIGHT // frame.height,
+                    ),
+                )
+                small = frame.to_ndarray(
+                    width=width,
+                    height=max(1, frame.height * width // frame.width),
+                    format="gray",
+                )
+                score = cv2.Laplacian(small, cv2.CV_64F).var()
+                scored += 1
+                if score > best_score:
+                    best, best_score, best_time = frame, score, frame.pts * time_base
+            ret, jpeg = (
+                cv2.imencode(".jpeg", best.to_ndarray(format="bgr24"))
+                if best is not None
+                else (False, None)
+            )
+            if ret:
+                out.append(VideoFrame(time_sec=best_time, frame=jpeg.tobytes()))
+        return out
 
     @classmethod
     def _extract_frames_at_times(
