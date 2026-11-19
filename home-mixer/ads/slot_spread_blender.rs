@@ -98,7 +98,14 @@ fn blend(
     }
 
     let shown = n.min(RESULT_SIZE - slot_count);
-    let slots = load.thin(spread_slots(slot_count, spacing, shown));
+    let slots = if load.even_spread {
+        match load.kept_count(slot_count) {
+            0 => Vec::new(),
+            kept => spread_slots(kept, spacing, shown),
+        }
+    } else {
+        load.thin(spread_slots(slot_count, spacing, shown))
+    };
     let overflow = if slot_count >= capacity || slots.len() < slot_count {
         AdDropReason::SpacingCap
     } else {

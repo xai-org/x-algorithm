@@ -50,10 +50,7 @@ impl PhoenixScorer {
         }
 
         if let Some(decider) = &query.decider {
-            let is_prod = matches!(
-                configured_cluster,
-                PhoenixCluster::Experiment1Fou | PhoenixCluster::Experiment2Fou
-            );
+            let is_prod = is_prod_cluster(&configured_cluster);
             if is_prod {
                 if decider.enabled("override_qf_use_experiment2_fou") {
                     return PhoenixCluster::Experiment2Fou;
@@ -66,6 +63,13 @@ impl PhoenixScorer {
 
         configured_cluster
     }
+}
+
+pub(crate) fn is_prod_cluster(cluster: &PhoenixCluster) -> bool {
+    matches!(
+        cluster,
+        PhoenixCluster::Experiment1Fou | PhoenixCluster::Experiment2Fou
+    )
 }
 
 #[async_trait]

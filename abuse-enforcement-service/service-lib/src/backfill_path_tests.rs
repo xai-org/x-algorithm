@@ -1186,6 +1186,7 @@ async fn lifting_a_skip_a_running_backfill_reads_needs_the_confirm() {
             reason: "lift the follower skip".into(),
             expected_version: (!renamed).then_some(1),
             confirm: confirm.map(Into::into),
+            confirm_follower_limit: None,
             updated_by: None,
             confidence: None,
             evidence: None,
@@ -1193,7 +1194,7 @@ async fn lifting_a_skip_a_running_backfill_reads_needs_the_confirm() {
             rows: None,
             admit_unlisted_labels: None,
             rollout_bp: None,
-            follower_threshold: Some(Some(0)),
+            follower_threshold: Some(Some(Account::BetweenLimits.followers() as u32 + 1)),
             skip_high_credibility: None,
         };
         let save = |req| {
@@ -1236,6 +1237,28 @@ async fn a_run_stops_at_the_follower_ceiling() {
     assert_eq!(t.status, "very_high_follower_count");
     assert!(t.ais.is_empty() && run_tickets == 0);
     let (t, run_tickets) = b.run_backfill(&bb1(Account::JustBelowTopLimit)).await;
-    assert_eq!(t.status, "success");
-    assert_eq!(run_tickets, 1);
+    assert_eq!(t.status, "high_follower_count");
+    assert_eq!(run_tickets, 0);
+
+    let above = Account::AboveTopLimit.followers() as u32;
+    for (limit, want, tickets) in [
+        (above + 1, "success", 1),
+        (above, "very_high_follower_count", 0),
+    ] {
+        let raised = action_control::ActionControlRecord {
+            follower_threshold: Some(limit),
+            ..record(BB1.0, None, None, ControlMode::Rules, vec![])
+        };
+        let b = bed(run_config(false, 10), vec![raised]).await;
+        put_running(
+            &b.backfill_store,
+            RUN,
+            BB1.0,
+            vec![SUSPEND],
+            vec![LevelRow::Missing],
+        );
+        let (t, run_tickets) = b.run_backfill(&bb1(Account::AboveTopLimit)).await;
+        assert_eq!(t.status, want, "limit {limit}");
+        assert_eq!(run_tickets, tickets, "limit {limit}");
+    }
 }

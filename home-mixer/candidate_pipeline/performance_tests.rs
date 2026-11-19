@@ -397,6 +397,7 @@ impl Fixture {
                             ),
                         },
                         strato_client: Arc::new(MockStratoClient::default()),
+                        safety_label_client: Arc::new(MockTweetSafetyLabelClient),
                     })
                 }
                 _ => {}

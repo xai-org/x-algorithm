@@ -42,7 +42,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
     load_global_ids_from_parquet_file,
 )
-from xrex.data.recsys import id_list_features, reply_features
+from xrex.data.recsys import id_list_features, long_term_author_profile, reply_features
 from xrex.data.recsys.ad_side_ids import AD_SIDE_FIELD_COLUMNS
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
@@ -1205,6 +1205,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
             )
         if self.id_list_specs:
             optional_columns = [*optional_columns, id_list_features.COLUMN]
+        if self.long_term_author_profile_size > 0:
+            optional_columns = [*optional_columns, *long_term_author_profile.COLUMNS]
         if self.read_ads_engagement_counts:
             optional_columns = [*optional_columns, *ADS_COUNT_COLUMNS, *USER_ADS_COUNT_COLUMNS]
         if self.read_ad_side_ids:
@@ -1282,6 +1284,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             ads_late_window_heads=self.ads_late_window_heads,
             page_records=self.page_records,
             id_list_specs=self.id_list_specs or None,
+            long_term_author_profile_size=self.long_term_author_profile_size,
             history_url_embedding_dim=self.history_url_embedding_dim,
             history_url_embedding_fn=history_url_lookup,
             read_ads_engagement_counts=self.read_ads_engagement_counts,

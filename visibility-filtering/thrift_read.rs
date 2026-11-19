@@ -1,4 +1,5 @@
 use std::io::{self, BufRead};
+use std::ops::Range;
 use thrift::protocol::{TFieldIdentifier, TInputProtocol, TType};
 use thrift::{ProtocolErrorKind, TConfiguration};
 use xai_strato::strato_thrift::MValProtocol;
@@ -55,25 +56,7 @@ fn skip_till_depth(
         ));
     }
     match field_type {
-        TType::String => {
-            let size = proto.read_i32()?;
-            let len = usize::try_from(size).map_err(|_| {
-                thrift::new_protocol_error(
-                    ProtocolErrorKind::NegativeSize,
-                    format!("Negative byte array size: {size}"),
-                )
-            })?;
-            if len > TConfiguration::DEFAULT_STRING_LIMIT {
-                return Err(thrift::new_protocol_error(
-                    ProtocolErrorKind::SizeLimit,
-                    format!(
-                        "Byte array size {len} exceeds maximum allowed size of {}",
-                        TConfiguration::DEFAULT_STRING_LIMIT
-                    ),
-                ));
-            }
-            advance(proto, len)
-        }
+        TType::String => string_range(proto).map(|_| ()),
         TType::Struct => {
             proto.read_struct_begin()?;
             loop {
@@ -132,6 +115,28 @@ fn skip_till_depth(
             )),
         },
     }
+}
+
+pub(crate) fn string_range(proto: &mut MValProtocol<'_>) -> thrift::Result<Range<usize>> {
+    let size = proto.read_i32()?;
+    let len = usize::try_from(size).map_err(|_| {
+        thrift::new_protocol_error(
+            ProtocolErrorKind::NegativeSize,
+            format!("Negative byte array size: {size}"),
+        )
+    })?;
+    if len > TConfiguration::DEFAULT_STRING_LIMIT {
+        return Err(thrift::new_protocol_error(
+            ProtocolErrorKind::SizeLimit,
+            format!(
+                "Byte array size {len} exceeds maximum allowed size of {}",
+                TConfiguration::DEFAULT_STRING_LIMIT
+            ),
+        ));
+    }
+    let start = usize::try_from(proto.transport.position()).map_err(|_| end_of_buffer())?;
+    advance(proto, len)?;
+    Ok(start..start + len)
 }
 
 pub(crate) fn skip_elements(

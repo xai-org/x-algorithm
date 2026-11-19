@@ -134,7 +134,7 @@ impl SourceFetch for source::TesTweetState {
 fn tweet_batch<V>(
     tweet_ids: &[u64],
     values: HashMap<u64, anyhow::Result<Bytes>>,
-    decode: fn(&[u8]) -> anyhow::Result<Option<V>>,
+    decode: fn(&Bytes) -> anyhow::Result<Option<V>>,
 ) -> RawHydrationBatch<V> {
     HydrationBatch::from_results_with(tweet_ids.iter().copied(), values, |value| {
         Hydrated::from(value.and_then(|bytes| decode(&bytes)))

@@ -49,6 +49,7 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.recsys import ad_fields_sidecar, iceberg_layout, reply_features, sidecar
 from xrex.data.recsys import ad_side_ids as ad_side
 from xrex.data.recsys import id_list_features as id_lists
+from xrex.data.recsys import long_term_author_profile as author_profile
 from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
@@ -107,6 +108,12 @@ def load_global_ids_from_parquet_file(
     start = time.time()
     rank_logger.info(f"Loading global ids from {file_path}")
 
+    if read_creation_datetime and "created_at" not in pq.read_schema(str(file_path)).names:
+        rank_logger.warning(
+            f"Global ids file {file_path} has no created_at column: global negatives are "
+            "sampled from every post in it, not only those created within 24 hours of the data"
+        )
+        read_creation_datetime = False
     columns = ["post_id", "author_id"]
     if read_creation_datetime:
         columns.append("created_at")
@@ -1917,6 +1924,9 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
     ) is not None:
         padded["user_id_list_hashes"] = pad_array(il)
         padded["user_id_list_mask"] = pad_array(ilm)
+    cast(dict[str, np.ndarray], padded).update(
+        {key: pad_array(arr) for key, arr in author_profile.present(batch_unpadded).items()}
+    )
 
     extras = cast(dict[str, np.ndarray], batch_unpadded)
     padded_dict = cast(dict[str, np.ndarray], padded)
@@ -1998,6 +2008,8 @@ class PhoenixDataset(Dataset):
     id_list_sidecar_root: str | None = None
     id_list_prefer_sidecar: bool = True
     id_list_sidecar_strict: bool = False
+
+    long_term_author_profile_size: int = 0
 
     @property
     def id_list_specs(self) -> tuple[id_lists.IdListFeatureSpec, ...]:
@@ -2503,6 +2515,7 @@ class PhoenixDataset(Dataset):
                         f"{self.ad_fields_sidecar_root!r}"
                     )
                 id_list_fill_logged = False
+                no_recent_global_posts_logged = False
 
                 for record_batch in self._record_batches(
                     batch_size=batch_size,
@@ -2519,6 +2532,7 @@ class PhoenixDataset(Dataset):
                         )
                         continue
 
+                    qualified_indices = None
                     if self.global_post_creation_datetimes is not None:
                         assert self.global_post_ids is not None
                         assert self.global_author_ids is not None
@@ -2534,6 +2548,18 @@ class PhoenixDataset(Dataset):
                         rank_logger.info(
                             f"Only select {len(qualified_indices)}/{len(self.global_post_ids)} global posts created within 24 hours of the data datetime: {data_datetime}"
                         )
+                        if len(qualified_indices) == 0:
+                            qualified_indices = None
+                            if not no_recent_global_posts_logged:
+                                no_recent_global_posts_logged = True
+                                rank_logger.warning(
+                                    f"No post in {self.global_ids_file_path} was created within "
+                                    f"24 hours of the data datetime {data_datetime}: global "
+                                    "negatives are sampled from the whole snapshot"
+                                )
+                    if qualified_indices is not None:
+                        assert self.global_post_ids is not None
+                        assert self.global_author_ids is not None
                         global_post_ids = self.global_post_ids[qualified_indices]
                         global_author_ids = self.global_author_ids[qualified_indices]
                         global_post_sids = (
@@ -2582,6 +2608,7 @@ class PhoenixDataset(Dataset):
                         id_list_specs=id_list_specs,
                         history_url_embedding_dim=self.history_url_embedding_dim,
                         read_ads_engagement_counts=self.read_ads_engagement_counts,
+                        long_term_author_profile_size=self.long_term_author_profile_size,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
                         read_ad_side_ids=self.read_ad_side_ids,
@@ -2738,6 +2765,8 @@ class PhoenixDataset(Dataset):
         ) is not None:
             batch_shape["user_id_list_hashes"] = jax.ShapeDtypeStruct(il.shape, il.dtype)
             batch_shape["user_id_list_mask"] = jax.ShapeDtypeStruct(ilm.shape, ilm.dtype)
+        for key, arr in author_profile.present(example_data).items():
+            batch_shape[key] = jax.ShapeDtypeStruct(arr.shape, arr.dtype)
 
         return batch_shape
 
@@ -2885,6 +2914,12 @@ class PhoenixDataset(Dataset):
             ids, batch["user_id_list_mask"] = id_lists.empty_arrays(batch_size, specs)
             batch["user_id_list_hashes"] = id_lists.hash_id_lists(
                 ids, specs, self.hash_table.get_item_hash, self.hash_table.get_author_hash
+            )
+        if self.long_term_author_profile_size > 0:
+            cast(dict[str, np.ndarray], batch).update(
+                author_profile.empty(
+                    batch_size, self.long_term_author_profile_size, self.hash_table.get_author_hash
+                )
             )
         return batch
 

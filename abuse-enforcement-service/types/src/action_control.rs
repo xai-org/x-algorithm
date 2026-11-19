@@ -1,6 +1,37 @@
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 7;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 9;
+pub const RAISED_FOLLOWER_LIMIT_RECORD_VERSION: u32 = 9;
+pub const FOLLOWER_CEILING_CHECK: FollowerCeilingCheck = FollowerCeilingCheck {
+    id: "very_high_follower_count",
+    when: "cred.follower_count >= 12345.67",
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct FollowerCeilingCheck {
+    pub id: &'static str,
+    pub when: &'static str,
+}
+
+static FOLLOWER_CEILING_COUNT: LazyLock<u32> = LazyLock::new(|| {
+    let when = FOLLOWER_CEILING_CHECK.when;
+    when.split(">=")
+        .nth(1)
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+        .map(|n| n.ceil() as u32)
+        .unwrap_or_else(|| panic!("`{when}` is not `cred.follower_count >= N`"))
+});
+
+pub fn follower_ceiling() -> u32 {
+    *FOLLOWER_CEILING_COUNT
+}
+
+pub fn stored_off_follower_threshold() -> u32 {
+    follower_ceiling() - 1
+}
+pub const FOLLOWER_THRESHOLD_MAX: u32 = 1_000_000_000;
 pub const POST_LABEL_RECORD_VERSION: u32 = 7;
 pub const SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 6;
 pub const AUTHOR_SKIPS_RECORD_VERSION: u32 = 5;
@@ -463,7 +494,7 @@ pub struct ActionControlRecord {
     pub admit_unlisted_labels: bool,
                         #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_bp: Option<u32>,
-                    #[serde(default, skip_serializing_if = "Option::is_none")]
+                            #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follower_threshold: Option<u32>,
                 #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_high_credibility: Option<bool>,
@@ -512,8 +543,15 @@ impl ActionControlRecord {
         self.actions.iter().any(|a| a.is_post_label())
     }
 
-                            pub fn schema_version(&self) -> u32 {
-        if self.uses_post_label() {
+        pub fn raises_follower_limit(&self) -> bool {
+        self.follower_threshold
+            .is_some_and(|n| n >= follower_ceiling())
+    }
+
+                                    pub fn schema_version(&self) -> u32 {
+        if self.raises_follower_limit() {
+            RAISED_FOLLOWER_LIMIT_RECORD_VERSION
+        } else if self.uses_post_label() {
             POST_LABEL_RECORD_VERSION
         } else if self.uses_suspension_options() {
             SUSPENSION_OPTIONS_RECORD_VERSION
@@ -589,6 +627,8 @@ pub struct ActionControlPutRequest {
     pub expected_version: Option<u64>,
         #[serde(default)]
     pub confirm: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_follower_limit: Option<u32>,
         #[serde(default)]
     pub updated_by: Option<String>,
         #[serde(default)]
@@ -632,7 +672,9 @@ mod keep_or_set {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FollowerSkipView {
             pub today_threshold: u64,
-            pub ceiling: u64,
+                pub ceiling: u64,
+            #[serde(default)]
+    pub max_threshold: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1141,6 +1183,81 @@ mod tests {
                 "and so does an older version bound"
             );
         }
+    }
+
+    #[test]
+    fn a_head_record_with_a_raised_follower_limit_is_refused_by_older_images() {
+        let old = format!(
+            r#"{{"v":5,"entity_type":"post","head":"H","classifier":null,"band":null,"mode":"rows","actions":[],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0,"follower_threshold":{}}}"#,
+            follower_ceiling() - 1
+        );
+        let r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert!(!r.raises_follower_limit());
+        assert_eq!(r.schema_version(), AUTHOR_SKIPS_RECORD_VERSION);
+        assert_eq!(serde_json::to_string(&r).unwrap(), old, "bytes unchanged");
+        let c = follower_ceiling();
+        for n in [c, c * 5 / 2, FOLLOWER_THRESHOLD_MAX] {
+            let mut h = r.clone();
+            h.follower_threshold = Some(n);
+            h.actions = vec![PageAction::PostLabel {
+                label: PostLabelName::parse("SoftNsfw").unwrap(),
+                lifetime: Lifetime::Days30,
+            }];
+            assert!(h.raises_follower_limit());
+            assert_eq!(h.schema_version(), 9);
+            assert_eq!(h.schema_version(), RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+            assert_eq!(
+                RAISED_FOLLOWER_LIMIT_RECORD_VERSION,
+                ACTION_CONTROL_RECORD_VERSION
+            );
+            h.v = h.schema_version();
+            let json = serde_json::to_string(&h).unwrap();
+            assert_eq!(
+                ActionControlRecord::parse_strict(json.as_bytes()).unwrap(),
+                h
+            );
+            assert!(
+                h.v > 8,
+                "a version bound from before raised limits (7 on main, 8 with the liveness cooldown) refuses it"
+            );
+        }
+        assert_eq!(stored_off_follower_threshold(), c - 1);
+        assert_eq!(FOLLOWER_CEILING_CHECK.id, "very_high_follower_count");
+    }
+
+    #[test]
+    fn a_put_carries_the_repeated_follower_limit_only_when_sent() {
+        let base = r#""entity_type":"post","head":"H","mode":"live","reason":"r""#;
+        let parse = |extra: &str| {
+            serde_json::from_str::<ActionControlPutRequest>(&format!("{{{base}{extra}}}"))
+        };
+        let p = parse("").unwrap();
+        assert_eq!(p.confirm_follower_limit, None);
+        assert!(
+            serde_json::to_value(&p)
+                .unwrap()
+                .get("confirm_follower_limit")
+                .is_none(),
+            "left out when not sent, so an older service still parses the request"
+        );
+        let p = parse(r#","follower_threshold":250000,"confirm_follower_limit":250000"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.confirm_follower_limit),
+            (Some(Some(250_000)), Some(250_000))
+        );
+        for bad in [
+            r#","confirm_follower_limit":-1"#,
+            r#","confirm_follower_limit":"250,000""#,
+            r#","confirm_follower_limit":2.5"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let view: FollowerSkipView =
+            serde_json::from_str(r#"{"today_threshold":12,"ceiling":34}"#).unwrap();
+        assert_eq!(
+            view.max_threshold, 0,
+            "an older pod's view reads as no raised limits"
+        );
     }
 
     #[test]

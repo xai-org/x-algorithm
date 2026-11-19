@@ -1,7 +1,7 @@
 use super::article::{ArticleCoverMedia, ArticleMediaEntities};
 use super::post::{PostFacts, ReplyControl};
 use super::tweet::Tweet;
-use super::viewer::{ViewerAccount, ViewerCountry, ViewerLabels};
+use super::viewer::{ViewerAccount, ViewerCountry, ViewerLabels, ViewerMutedKeywords};
 use super::{EdgeFeature, Feature, In, Reads};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::region::allows_country;
@@ -43,6 +43,8 @@ pub enum CompoundLeaf {
     ViewerSuperFollowsAuthor,
     ViewerIsInConversationRootAuthorNetwork,
     ViewerIsBlockedByConversationRootAuthor,
+    ViewerHasMatchingMutedKeyword,
+    ViewerHasMatchingMutedKeywordExcludingFollowed,
     ViewerIsInAllowedCountry,
     ViewerMutesRetweetsFromAuthor,
     ViewerIsFollowedByConversationRootAuthor,
@@ -84,6 +86,16 @@ impl CompoundLeaf {
             Self::ViewerIsBlockedByConversationRootAuthor => {
                 i.run(|In::<ConversationRootAuthorBlocksViewer>(blocked)| blocked)
             }
+            Self::ViewerHasMatchingMutedKeyword => i.run(
+                |(In::<Tweet>(tweet), In::<ViewerMutedKeywords>(keywords))| {
+                    keywords.is_some_and(|keywords| keywords.mutes_from_anyone(&tweet.text))
+                },
+            ),
+            Self::ViewerHasMatchingMutedKeywordExcludingFollowed => i.run(
+                |(In::<Tweet>(tweet), In::<ViewerMutedKeywords>(keywords))| {
+                    keywords.is_some_and(|keywords| keywords.mutes_excluding_followed(&tweet.text))
+                },
+            ),
             Self::ViewerIsInAllowedCountry => i.run(
                 |(In::<ReplyControl>(control), In::<ViewerCountry>(country))| {
                     control.zip(country).is_some_and(|(control, country)| {

@@ -45,6 +45,7 @@ pub(crate) enum RuleId {
     NoNotFollowedBy,
     OnlyPeopleIFollow,
     OnlyPeopleIFollowOutsideCommunity,
+    MutedKeyword,
 
     Pdna,
     Bounce,

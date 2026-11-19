@@ -353,6 +353,7 @@ def _retrieval_offline_kafka_dump(
         num_kafka_partitions=1024,
         include_candidate_post_ids=True,
         date_range=mparams.get("date_range", None),
+        output_vocab_size=mparams["output_vocab_size"],
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),

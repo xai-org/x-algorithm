@@ -1,7 +1,10 @@
+use crate::models::PostText;
 use crate::rules::RequestExperiments;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use strum::VariantArray;
+use xai_core_entities::entities::{GizmoduckMutedKeyword, MuteOption, MuteSurface};
+use xai_post_text::{TweetTokenizer, UserMutes};
 use xai_twittercontext_proto::TwitterContextViewer;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -177,6 +180,7 @@ pub struct ViewerProfile {
     pub mention_filter_is_following: bool,
     pub has_blink_label: bool,
     pub notification_filters: NotificationFilters,
+    pub notification_muted_keywords: NotificationMutedKeywords,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,6 +191,71 @@ pub struct NotificationFilters {
     pub new_users: bool,
     pub not_followed_by: bool,
 }
+
+static TOKENIZER: LazyLock<TweetTokenizer> = LazyLock::new(TweetTokenizer::new);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotificationMutedKeywords(Option<Box<Mutes>>);
+
+#[derive(Clone, Debug)]
+struct Mutes {
+    from_anyone: UserMutes,
+    excluding_followed: UserMutes,
+}
+
+impl NotificationMutedKeywords {
+    pub fn of(keywords: &[GizmoduckMutedKeyword]) -> Self {
+        let (excluding_followed, from_anyone): (Vec<_>, Vec<_>) = keywords
+            .iter()
+            .filter(|keyword| keyword.mute_surfaces.contains(&MuteSurface::Notifications))
+            .partition(|keyword| {
+                keyword
+                    .mute_options
+                    .contains(&MuteOption::ExcludeFollowingAccounts)
+            });
+        if from_anyone.is_empty() && excluding_followed.is_empty() {
+            return Self(None);
+        }
+        Self(Some(Box::new(Mutes {
+            from_anyone: tokenized(&from_anyone),
+            excluding_followed: tokenized(&excluding_followed),
+        })))
+    }
+
+    pub fn mutes_from_anyone(&self, text: &PostText) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|mutes| matches(&mutes.from_anyone, text))
+    }
+
+    pub fn mutes_excluding_followed(&self, text: &PostText) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|mutes| matches(&mutes.excluding_followed, text))
+    }
+}
+
+fn tokenized(keywords: &[&GizmoduckMutedKeyword]) -> UserMutes {
+    UserMutes::new(
+        keywords
+            .iter()
+            .map(|keyword| TOKENIZER.tokenize(&keyword.keyword))
+            .collect(),
+    )
+}
+
+fn matches(mutes: &UserMutes, text: &PostText) -> bool {
+    !mutes.is_empty() && mutes.matches(&TOKENIZER.tokenize(&text.lossy()))
+}
+
+impl PartialEq for Mutes {
+    fn eq(&self, other: &Self) -> bool {
+        self.from_anyone.phrases() == other.from_anyone.phrases()
+            && self.excluding_followed.phrases() == other.excluding_followed.phrases()
+    }
+}
+
+impl Eq for Mutes {}
 
 impl ViewerProfile {
     pub fn is_underage(&self) -> bool {

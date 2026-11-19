@@ -3,7 +3,9 @@ use std::sync::LazyLock;
 
 use cel::Program;
 use serde::{Deserialize, Serialize};
-use xai_abuse_enforcement_types::action_control::{ActionControlRecord, FollowerSkipView};
+use xai_abuse_enforcement_types::action_control::{
+    self as types, ActionControlRecord, FollowerSkipView,
+};
 pub use xai_abuse_enforcement_types::action_control::{
     SafetyCheckView, SafetyChecksByEntity, SafetyChecksStatus,
 };
@@ -158,13 +160,13 @@ pub fn status(entity: EntityType, rules: &CompiledRules) -> SafetyChecksStatus {
 }
 
 pub const FOLLOWER_CEILING: SafetyCheck = SafetyCheck {
-    id: "very_high_follower_count",
+    id: types::FOLLOWER_CEILING_CHECK.id,
     reason: "very_high_follower_count",
-    when: "cred.follower_count >= 12345.67",
+    when: "the account's follower count is at or above the follower ceiling, or the head's raised limit",
 };
 
 static FOLLOWER_CEILING_COUNT: LazyLock<f64> =
-    LazyLock::new(|| followers_in(FOLLOWER_CEILING.when));
+    LazyLock::new(|| f64::from(types::follower_ceiling()));
 
 pub(crate) const PRE_CEILING: &[&str] =
     &["post_in_allowlist", "user_in_allowlist", "user_not_found"];
@@ -385,8 +387,12 @@ pub fn test_account_signal_kind(facts: &Facts) -> Option<&'static str> {
 }
 
 pub fn ceiling_stops(facts: &Facts, page_driven: bool) -> bool {
+    stops_at(facts, page_driven, *FOLLOWER_CEILING_COUNT)
+}
+
+fn stops_at(facts: &Facts, page_driven: bool, ceiling: f64) -> bool {
     match facts.cred().follower_count {
-        Some(n) => n as f64 >= *FOLLOWER_CEILING_COUNT,
+        Some(n) => n as f64 >= ceiling,
         None => page_driven && facts.entity_type == EntityType::Post,
     }
 }
@@ -418,11 +424,12 @@ pub fn follower_skip_view() -> FollowerSkipView {
     FollowerSkipView {
         today_threshold: DEFAULT_FOLLOWER_SKIP.ceil() as u64,
         ceiling: follower_ceiling(),
+        max_threshold: u64::from(types::FOLLOWER_THRESHOLD_MAX),
     }
 }
 
 pub fn follower_ceiling() -> u64 {
-    FOLLOWER_CEILING_COUNT.ceil() as u64
+    u64::from(types::follower_ceiling())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -432,19 +439,26 @@ pub struct AuthorSkips {
 }
 
 impl AuthorSkips {
-    pub fn of(record: &ActionControlRecord) -> Self {
+            pub fn of(record: &ActionControlRecord) -> Self {
         Self {
-            follower_threshold: record.follower_threshold,
+            follower_threshold: record.follower_threshold.map(|n| match n {
+                0 => types::stored_off_follower_threshold(),
+                n => n,
+            }),
             skip_high_credibility: record.skip_high_credibility,
         }
     }
 
-        pub fn follower_floor(self) -> Option<f64> {
+        pub fn follower_floor(self) -> f64 {
         match self.follower_threshold {
-            None => Some(DEFAULT_FOLLOWER_SKIP.ceil()),
-            Some(0) => None,
-            Some(n) => Some(f64::from(n)),
+            None => DEFAULT_FOLLOWER_SKIP.ceil(),
+            Some(0) => f64::from(types::stored_off_follower_threshold()),
+            Some(n) => f64::from(n),
         }
+    }
+
+            pub fn follower_ceiling(self) -> f64 {
+        self.follower_floor().max(*FOLLOWER_CEILING_COUNT)
     }
 
     pub fn skips_high_credibility(self) -> bool {
@@ -453,16 +467,20 @@ impl AuthorSkips {
 
             pub fn harsher_than(self, before: Self) -> Vec<String> {
         let mut why = Vec::new();
-        let floor = |s: Self| s.follower_floor().unwrap_or(f64::INFINITY);
+        let floor = |s: Self| s.follower_floor();
         if floor(self) > floor(before) {
-            let show = |s: Self| {
-                s.follower_floor()
-                    .map_or("off".to_owned(), |n| format!("{}+", n.ceil() as u64))
-            };
+            let show = |s: Self| format!("{}+", s.follower_floor().ceil() as u64);
             why.push(format!(
                 "skips fewer high-follower accounts ({} to {})",
                 show(before),
                 show(self)
+            ));
+        }
+        if self.follower_ceiling() > before.follower_ceiling() {
+            why.push(format!(
+                "raises the follower ceiling ({}+ to {}+), acting on accounts every other head skips",
+                before.follower_ceiling() as u64,
+                self.follower_ceiling() as u64
             ));
         }
         if before.skips_high_credibility() && !self.skips_high_credibility() {
@@ -490,7 +508,7 @@ pub fn first_page_stop(
     if let Some(check) = test_account_stop(facts) {
         return Ok(Some(check));
     }
-    if ceiling_stops(facts, true) {
+    if stops_at(facts, true, skips.follower_ceiling()) {
         return Ok(Some(&FOLLOWER_CEILING));
     }
     listed
@@ -537,11 +555,7 @@ fn first_stop_with(
     }
     let waived = entity == EntityType::Post && facts.score.skip_author_credibility_prechecks;
     let followers = facts.cred().follower_count.unwrap_or(0) as f64;
-    if !waived
-        && skips
-            .follower_floor()
-            .is_some_and(|floor| followers >= floor)
-    {
+    if !waived && followers >= skips.follower_floor() {
         return Ok(Some(&list[floor_at]));
     }
     listed(floor_at + 1..list.len())
@@ -961,40 +975,110 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_threshold_turns_the_follower_skip_off_but_not_the_ceiling() {
+    fn a_stored_zero_threshold_reads_as_one_below_the_ceiling() {
         let d = DEFAULT_FOLLOWER_SKIP.ceil() as i64;
         let c = follower_ceiling() as i64;
+        let stored: ActionControlRecord = serde_json::from_value(serde_json::json!({
+            "v": 5, "entity_type": "post", "head": "h", "mode": "live", "version": 3,
+            "follower_threshold": 0,
+        }))
+        .unwrap();
+        assert_eq!(
+            AuthorSkips::of(&stored).follower_threshold,
+            Some(types::stored_off_follower_threshold())
+        );
+        assert_eq!(i64::from(types::stored_off_follower_threshold()), c - 1);
+        for zero in [skips(Some(0), None), AuthorSkips::of(&stored)] {
+            assert_eq!(zero.follower_floor(), (c - 1) as f64);
+            assert_eq!(zero.follower_ceiling(), c as f64);
+            for entity in BOTH {
+                assert_eq!(
+                    page_stop(entity, with_followers(d), zero),
+                    None,
+                    "{entity:?}"
+                );
+                assert_eq!(
+                    page_stop(entity, with_followers(c - 2), zero),
+                    None,
+                    "{entity:?}"
+                );
+                assert_eq!(
+                    page_stop(entity, with_followers(c - 1), zero),
+                    Some("high_follower_count"),
+                    "{entity:?}: the one count whose decision changes"
+                );
+                assert_eq!(
+                    page_stop(entity, with_followers(c), zero),
+                    Some("very_high_follower_count"),
+                    "{entity:?}"
+                );
+                let cred = Author {
+                    high_cred: true,
+                    ..with_followers(d)
+                };
+                assert_eq!(
+                    page_stop(entity, cred, zero),
+                    Some("pagerank_skipped"),
+                    "{entity:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_raised_limit_moves_the_ceiling_for_that_head_only() {
+        let c = follower_ceiling() as i64;
+        let raised = 250_000_i64;
+        let s = skips(Some(raised as u32), None);
+        assert_eq!(s.follower_ceiling(), raised as f64);
         for entity in BOTH {
-            let off = skips(Some(0), None);
+            for n in [c, c + 1, raised - 1] {
+                assert_eq!(
+                    page_stop(entity, with_followers(n), s),
+                    None,
+                    "{entity:?} {n}"
+                );
+            }
             assert_eq!(
-                page_stop(entity, with_followers(d), AuthorSkips::default()),
-                Some("high_follower_count")
-            );
-            assert_eq!(
-                page_stop(entity, with_followers(d), off),
-                None,
-                "{entity:?}"
-            );
-            assert_eq!(
-                page_stop(entity, with_followers(c - 1), off),
-                None,
-                "{entity:?}"
-            );
-            assert_eq!(
-                page_stop(entity, with_followers(c), off),
+                page_stop(entity, with_followers(raised), s),
                 Some("very_high_follower_count"),
-                "{entity:?}"
+                "{entity:?}: the head's number is the ceiling, same reason"
             );
-            let cred = Author {
-                high_cred: true,
-                ..with_followers(d)
-            };
             assert_eq!(
-                page_stop(entity, cred, off),
-                Some("pagerank_skipped"),
-                "{entity:?}"
+                page_stop(entity, with_followers(c), AuthorSkips::default()),
+                Some("very_high_follower_count"),
+                "{entity:?}: other heads keep the ceiling"
             );
         }
+        let waived = |n: i64| Author {
+            waived: true,
+            ..with_followers(n)
+        };
+        assert_eq!(page_stop(EntityType::Post, waived(c), s), None);
+        assert_eq!(
+            page_stop(EntityType::Post, waived(raised), s),
+            Some("very_high_follower_count"),
+            "the producer waiver can't lift the raised limit"
+        );
+        assert_eq!(
+            page_stop(EntityType::Post, Author::default(), s),
+            Some("very_high_follower_count"),
+            "an unknown count still stops a post"
+        );
+        let top = skips(Some(types::FOLLOWER_THRESHOLD_MAX), None);
+        assert_eq!(
+            page_stop(
+                EntityType::User,
+                with_followers(i64::from(types::FOLLOWER_THRESHOLD_MAX)),
+                top
+            ),
+            Some("very_high_follower_count")
+        );
+        let f = author_facts(EntityType::User, with_followers(c), &[]);
+        assert!(
+            ceiling_stops(&f, false),
+            "the rules always stop at the ceiling"
+        );
     }
 
     #[test]
@@ -1175,7 +1259,25 @@ mod tests {
         assert!(today.harsher_than(today).is_empty());
         assert_eq!(
             skips(Some(0), None).harsher_than(today),
-            [format!("skips fewer high-follower accounts ({d}+ to off)")]
+            [format!(
+                "skips fewer high-follower accounts ({d}+ to {}+)",
+                types::stored_off_follower_threshold()
+            )]
+        );
+        let c = follower_ceiling() as u32;
+        assert_eq!(
+            skips(Some(c * 3), None).harsher_than(today),
+            [
+                format!("skips fewer high-follower accounts ({d}+ to {}+)", c * 3),
+                format!(
+                    "raises the follower ceiling ({c}+ to {}+), acting on accounts every other head skips",
+                    c * 3
+                ),
+            ]
+        );
+        assert_eq!(
+            skips(Some(c), None).harsher_than(today),
+            [format!("skips fewer high-follower accounts ({d}+ to {c}+)")]
         );
         assert_eq!(
             skips(Some(d * 5), None).harsher_than(today),

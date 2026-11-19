@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-17T16:00:33Z
+// mirrored from config feature-switch defaults; last sync 2026-11-18T16:00:39Z
 use xai_feature_switches::param;
 
 param!(
@@ -661,6 +661,18 @@ param!(
     false
 );
 param!(
+    VMRankerSendEngagementIneligible,
+    bool,
+    "rust_home_mixer_vm_ranker_send_engagement_ineligible",
+    false
+);
+param!(
+    EngagementLabelsMaxCandidates,
+    usize,
+    "rust_home_mixer_engagement_labels_max_candidates",
+    200
+);
+param!(
     VMRankerDppHistoryMaxItems,
     usize,
     "rust_home_mixer_vm_ranker_dpp_history_max_items",
@@ -1139,6 +1151,12 @@ param!(
     20
 );
 param!(
+    AdsUserLoadEvenSpread,
+    bool,
+    "rust_home_mixer_ads_user_load_even_spread",
+    false
+);
+param!(
     EnableAdsOnlyTimeline,
     bool,
     "rust_home_mixer_enable_ads_only_timeline",
@@ -1252,32 +1270,13 @@ param!(
     EnableTeacherScoreSideEffect,
     bool,
     "rust_home_mixer_enable_teacher_score_side_effect",
-    false
+    true
 );
-param!(
-    TeacherPhoenixCluster,
-    String,
-    "rust_home_mixer_teacher_phoenix_cluster",
-    ""
-);
-param!(
-    TeacherSampleBps,
-    u32,
-    "rust_home_mixer_teacher_sample_bps",
-    0
-);
-param!(TeacherTopK, usize, "rust_home_mixer_teacher_top_k", 64);
 param!(
     TeacherActionIndices,
     Vec<u64>,
     "rust_home_mixer_teacher_action_indices",
-    vec![]
-);
-param!(
-    TeacherTimeoutMs,
-    u64,
-    "rust_home_mixer_teacher_timeout_ms",
-    2000
+    vec![1, 4, 5, 6, 11, 12, 13, 14, 16, 17, 21, 23, 25, 29, 30, 32, 33, 37, 38, 39, 59]
 );
 param!(
     TeacherTtlSeconds,

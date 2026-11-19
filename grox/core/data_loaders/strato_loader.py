@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+from cachetools import TTLCache
+
 from grox.core.data_loaders.data_types import Post, User
 from strato_http.queries.content_understanding_author_metadata import (
     StratoContentUnderstandingAuthorMetadata,
@@ -61,6 +63,10 @@ class UserStratoLoader:
     strato = StratoContentUnderstandingAuthorMetadata()
     _is_high_page_rank_v2 = StratoIsHighPageRankV2User()
     _is_grey_badge = StratoIsGreyBadgeUser()
+    _high_page_rank_v2_cache: TTLCache[int, HighPageRankUser | None] = TTLCache(
+        maxsize=100_000, ttl=30 * 60
+    )
+    _MISSING = object()
 
     @classmethod
     async def load_user(cls, user_id: int) -> User | None:
@@ -72,7 +78,12 @@ class UserStratoLoader:
 
     @classmethod
     async def fetch_high_page_rank_v2(cls, user_id: int) -> HighPageRankUser | None:
-        return await cls._is_high_page_rank_v2.fetch(user_id)
+        cached = cls._high_page_rank_v2_cache.get(user_id, cls._MISSING)
+        if cached is not cls._MISSING:
+            return cached
+        info = await cls._is_high_page_rank_v2.fetch(user_id)
+        cls._high_page_rank_v2_cache[user_id] = info
+        return info
 
     @classmethod
     async def is_high_page_rank_v2_user(cls, user_id: int) -> bool:

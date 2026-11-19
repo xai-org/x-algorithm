@@ -4,6 +4,9 @@ use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
 use crate::scorers::value_model;
+use crate::scorers::vm_ranker_engagement_labels::{
+    fetch_engagement_ineligible, EngagementIneligible,
+};
 use crate::scorers::vm_ranker_request::RequestShape;
 use crate::side_effects::redis_post_candidate_cache_side_effect::REDIS_TTL_SECONDS;
 use crate::util::post_annotations::fetch_post_topics;
@@ -14,6 +17,7 @@ use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::scorer::Scorer;
 use xai_stats_receiver::global_stats_receiver;
+use xai_visibility_filtering::tweet_safety_label::TweetSafetyLabelClient;
 use xai_vm_ranker_proto::experiment::PostTopics;
 use xai_vm_ranker_proto::{RankRequest, RankResponse, RankedCandidate};
 
@@ -24,6 +28,7 @@ pub struct VMRanker {
     pub xds_client: Option<Arc<dyn VMRankerClient>>,
     pub author_cold_start: AuthorColdStart,
     pub strato_client: Arc<dyn StratoClient + Send + Sync>,
+    pub safety_label_client: Arc<dyn TweetSafetyLabelClient>,
 }
 
 struct LocalScores {
@@ -86,10 +91,7 @@ impl VMRanker {
         candidates: &[PostCandidate],
         weighted: &[f64],
     ) -> Vec<Option<PostTopics>> {
-        let mut order: Vec<usize> = (0..candidates.len()).collect();
-        order.sort_by(|&a, &b| weighted[b].total_cmp(&weighted[a]));
-        order.truncate(query.params.get(PostTopicsMaxCandidates));
-        let source_id = |c: &PostCandidate| c.retweeted_tweet_id.unwrap_or(c.tweet_id);
+        let order = top_by_weighted(weighted, query.params.get(PostTopicsMaxCandidates));
         let ids: Vec<u64> = order.iter().map(|&i| source_id(&candidates[i])).collect();
         let Some(by_id) = fetch_post_topics(
             self.strato_client.as_ref(),
@@ -108,6 +110,34 @@ impl VMRanker {
         }
         topics
     }
+
+    async fn engagement_ineligible(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        weighted: &[f64],
+    ) -> Vec<EngagementIneligible> {
+        let ids = top_by_weighted(weighted, query.params.get(EngagementLabelsMaxCandidates))
+            .into_iter()
+            .map(|i| source_id(&candidates[i]))
+            .collect();
+        let by_id = fetch_engagement_ineligible(self.safety_label_client.as_ref(), ids).await;
+        candidates
+            .iter()
+            .map(|c| by_id.get(&source_id(c)).copied().unwrap_or_default())
+            .collect()
+    }
+}
+
+fn top_by_weighted(weighted: &[f64], limit: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..weighted.len()).collect();
+    order.sort_by(|&a, &b| weighted[b].total_cmp(&weighted[a]));
+    order.truncate(limit);
+    order
+}
+
+fn source_id(candidate: &PostCandidate) -> u64 {
+    candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id)
 }
 
 #[async_trait]
@@ -137,14 +167,25 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             })
             .collect();
 
-        let topics = if shape.sends_post_topics() {
-            self.candidate_topics(query, candidates, &local.weighted)
-                .await
-        } else {
-            Vec::new()
+        let topics = async {
+            if shape.sends_post_topics() {
+                self.candidate_topics(query, candidates, &local.weighted)
+                    .await
+            } else {
+                Vec::new()
+            }
         };
+        let ineligible = async {
+            if shape.sends_engagement_ineligible() {
+                self.engagement_ineligible(query, candidates, &local.weighted)
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
+        let (topics, ineligible) = tokio::join!(topics, ineligible);
         let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let request = shape.build(query, candidates, &scored, &topics);
+        let request = shape.build(query, candidates, &scored, &topics, &ineligible);
         record_request(&cluster);
         if shape.sends_dpp_history() && query.has_cached_posts && !has_recent_served_response(query)
         {

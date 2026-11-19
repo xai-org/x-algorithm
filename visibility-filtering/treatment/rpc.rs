@@ -135,7 +135,7 @@ pub(crate) fn notification_result(
     )
 }
 
-const NOTIFICATION_DROP_REASONS: [(RuleId, NotificationDropReason); 4] = [
+const NOTIFICATION_DROP_REASONS: [(RuleId, NotificationDropReason); 5] = [
     (
         RuleId::SuspendedAuthor,
         NotificationDropReason::ActorSuspended,
@@ -152,6 +152,7 @@ const NOTIFICATION_DROP_REASONS: [(RuleId, NotificationDropReason); 4] = [
         RuleId::ViewerMutesAndDoesNotFollowAuthor,
         NotificationDropReason::RecipientMutesActor,
     ),
+    (RuleId::MutedKeyword, NotificationDropReason::MutedKeyword),
 ];
 
 fn notification_drop_reason(rule: RuleId) -> NotificationDropReason {
@@ -170,6 +171,7 @@ pub(crate) fn notification_reason_label(reason: NotificationDropReason) -> &'sta
         NotificationDropReason::RecipientBlocksActor => "recipient_blocks_actor",
         NotificationDropReason::RecipientMutesActor => "recipient_mutes_actor",
         NotificationDropReason::PostNotFound => "post_not_found",
+        NotificationDropReason::MutedKeyword => "muted_keyword",
     }
 }
 

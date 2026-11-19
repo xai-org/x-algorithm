@@ -16,7 +16,12 @@ import pyarrow.parquet as pq
 from numpy import typing as npt
 
 from xrex.data.recsys import ad_side_ids as ad_side
-from xrex.data.recsys import history_id_lists, id_list_features, reply_features
+from xrex.data.recsys import (
+    history_id_lists,
+    id_list_features,
+    long_term_author_profile,
+    reply_features,
+)
 from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
 from xrex.data.recsys.ads_late_window import (
     ADS_LATE_ENGAGEMENT_COUNTERPART_INDICES,
@@ -530,6 +535,14 @@ class RecsysFeaturesBatch(TypedDict):
     candidate_positions: NotRequired[npt.NDArray[np.int32] | None]
     user_id_list_hashes: NotRequired[npt.NDArray[np.int32]]
     user_id_list_mask: NotRequired[npt.NDArray[np.bool_]]
+    user_long_term_author_hashes: NotRequired[npt.NDArray[np.int32]]
+    user_long_term_author_mask: NotRequired[npt.NDArray[np.bool_]]
+    user_long_term_author_post_counts: NotRequired[npt.NDArray[np.int32]]
+    user_long_term_author_strong_counts: NotRequired[npt.NDArray[np.int32]]
+    user_long_term_author_age_sec: NotRequired[npt.NDArray[np.int32]]
+    user_long_term_author_in_window: NotRequired[npt.NDArray[np.bool_]]
+    user_long_term_author_dwell_post_counts: NotRequired[npt.NDArray[np.int32]]
+    user_long_term_author_avg_dwell_ms: NotRequired[npt.NDArray[np.int32]]
     packing_layout: NotRequired[SequencePackedLayout | None]
     dwell_cread_power: NotRequired[npt.NDArray[np.float32] | None]
     dwell_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
@@ -927,6 +940,7 @@ def from_record_batch(
     aux_value_events: tuple[str, ...] = (),
     read_ad_side_ids: bool = False,
     ad_side_fields: tuple[str, ...] = ad_side.AD_SIDE_DEFAULT_FIELDS,
+    long_term_author_profile_size: int = 0,
 ) -> RecsysFeaturesBatch:
     if read_ads_engagement_counts and (
         num_negatives_per_example or num_global_negatives_per_example
@@ -1246,6 +1260,26 @@ def from_record_batch(
         .reshape(batch_size, -1)
         .astype(np.bool_)
     )
+
+    user_long_term_authors: dict[str, np.ndarray] | None = None
+    if long_term_author_profile_size > 0:
+        request_served_ms = (
+            _col(record_batch, "servedTimeMsSeq", batch_size, np.int64, alloc=alloc)
+            if "servedTimeMsSeq" in record_batch.schema.names
+            else None
+        )
+        user_long_term_authors = long_term_author_profile.read(
+            record_batch,
+            batch_size,
+            long_term_author_profile_size,
+            history_id_lists.request_time_ms(
+                impression_timestamps_ms,
+                request_served_ms,
+                padding_mask & new_event_mask,
+                padding_mask & ~new_event_mask,
+            ),
+            hash_table.get_author_hash,
+        )
 
     user_id_lists: tuple[np.ndarray, np.ndarray] | None = None
     if id_list_specs:
@@ -1868,6 +1902,8 @@ def from_record_batch(
         batch["candidate_positions"] = cand_positions_aligned
     if user_id_lists is not None:
         batch["user_id_list_hashes"], batch["user_id_list_mask"] = user_id_lists
+    if user_long_term_authors is not None:
+        typing.cast(dict[str, np.ndarray], batch).update(user_long_term_authors)
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
         if candidate_negative_filter is not None

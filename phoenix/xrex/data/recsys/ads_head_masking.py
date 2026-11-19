@@ -46,7 +46,7 @@ ADS_FAMILY_METRIC_SLICES: tuple[tuple[Sequence[int], tuple[str, ...]], ...] = (
     (ADS_LATE_WINDOW_TWIN_HEAD_INDICES, ("late_split_no_early",)),
     (ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES, ("late_split_non_clicked_no_early",)),
 )
-ADS_ENGAGEMENT_METRIC_SLICES = ("fresh", "fresh_home_website_clicks", "dpa")
+ADS_ENGAGEMENT_METRIC_SLICES = ("fresh", "fresh_home_website_clicks", "dpa", "fresh_dpa")
 
 
 def head_metric_slices(action_ids: Sequence[int]) -> tuple[str, ...] | None:

@@ -2,7 +2,8 @@ use super::util::MIN_REQUESTED_GAP;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     AdsPageScoreHighThreshold, AdsPageScoreKeepPct, AdsPageScoreLowThreshold, AdsPageScoreSpacing,
-    AdsPageScoreTopK, AdsUserStateKeepPct, AdsUserStateSpacing, ValueModelMode,
+    AdsPageScoreTopK, AdsUserLoadEvenSpread, AdsUserStateKeepPct, AdsUserStateSpacing,
+    ValueModelMode,
 };
 use xai_core_entities::entities::SubscriptionLevel;
 use xai_home_mixer_proto::ScoredPost;
@@ -19,6 +20,7 @@ const PROD_VALUE_MODEL: &str = "weighted";
 pub(crate) struct UserAdLoad {
     pub(crate) keep_rate: f64,
     pub(crate) spacing: Option<usize>,
+    pub(crate) even_spread: bool,
     seed: u64,
     state: Option<&'static str>,
     page: Option<PageScoreTiers>,
@@ -29,6 +31,7 @@ impl Default for UserAdLoad {
         Self {
             keep_rate: 1.0,
             spacing: None,
+            even_spread: false,
             seed: 0,
             state: None,
             page: None,
@@ -114,6 +117,7 @@ impl UserAdLoad {
         }
         let base = Self {
             seed: query.request_id,
+            even_spread: query.params.get(AdsUserLoadEvenSpread),
             page,
             ..Self::default()
         };
@@ -168,6 +172,21 @@ impl UserAdLoad {
             state: Some(label),
             ..self
         }
+    }
+
+    pub(crate) fn kept_count(&self, planned: usize) -> usize {
+        let kept = if self.keep_rate >= 1.0 {
+            planned
+        } else {
+            let expected = planned as f64 * self.keep_rate;
+            let floor = expected.floor();
+            let round_up = unit_hash(self.seed, u64::MAX) < expected - floor;
+            (floor as usize + usize::from(round_up)).min(planned)
+        };
+        if let Some(state) = self.state {
+            record_slots(state, kept, planned - kept);
+        }
+        kept
     }
 
     pub(crate) fn thin(&self, slots: Vec<usize>) -> Vec<usize> {

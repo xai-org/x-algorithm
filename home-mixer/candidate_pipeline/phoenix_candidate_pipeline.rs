@@ -473,6 +473,7 @@ impl PhoenixCandidatePipeline {
             xds_client: xds_vm_ranker_client,
             author_cold_start,
             strato_client: strato_client.clone(),
+            safety_label_client: vf_safety_labels_client.clone(),
         });
         let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
             dispatch: crate::util::egress::PredictionDispatch {
@@ -526,7 +527,7 @@ impl PhoenixCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, PostCandidate>>>> =
             Arc::new(vec![
                 Box::new(PhoenixExperimentsSideEffect::new(
-                    phoenix_client.clone(),
+                    phoenix_client,
                     phoenix_kafka_client,
                     logged_scored_candidates_kafka_client,
                     redis_client.clone(),
@@ -548,7 +549,6 @@ impl PhoenixCandidatePipeline {
                     phoenix_request_cache_redis_pdxa_client,
                 )),
                 Box::new(TeacherScoreSideEffect::new(
-                    phoenix_client,
                     teacher_cache_redis_atla_client,
                     teacher_cache_redis_pdxa_client,
                 )),

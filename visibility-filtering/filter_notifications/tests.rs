@@ -1308,6 +1308,64 @@ async fn a_failed_label_read_fails_a_mention_and_spares_a_quote_and_only_a_follo
 }
 
 #[tokio::test]
+async fn a_muted_keyword_drops_a_mention_and_a_reply_but_not_on_a_failed_post_read() {
+    use crate::models::{PostText, TweetFeatures};
+    use xai_core_entities::entities::{GizmoduckMutedKeyword, MuteSurface};
+    let viewer = GizmoduckUser {
+        mute_settings: Some(GizmoduckMuteSettings {
+            muted_keywords: vec![GizmoduckMutedKeyword {
+                id: 1,
+                keyword: "spoiler".to_owned(),
+                mute_surfaces: vec![MuteSurface::Notifications],
+                mute_options: vec![],
+            }],
+            advanced_notification_filters: GizmoduckAdvancedFilters::default(),
+        }),
+        ..recipient(GizmoduckAdvancedFilters::default())
+    };
+    let muting = || {
+        posts_world()
+            .viewer(RECIPIENT, viewer.clone())
+            .tweet_features(
+                POST,
+                TweetFeatures {
+                    text: PostText::from("a big spoiler"),
+                    ..TweetFeatures::default()
+                },
+            )
+    };
+    for (name, sources, expected) in [
+        (
+            "found",
+            muting(),
+            [
+                Seen::Dropped(DropReason::MutedKeyword),
+                Seen::Dropped(DropReason::MutedKeyword),
+                Seen::Allowed,
+            ],
+        ),
+        (
+            "post",
+            muting().fail_key(Source::TesTweetForVisibility, POST),
+            [Seen::Failed, Seen::Failed, Seen::Failed],
+        ),
+    ] {
+        let (seen, _) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                mention(ACTOR, POST),
+                reply(ACTOR, POST),
+                media_tagged(ACTOR, POST),
+            ],
+        )
+        .await;
+        assert_eq!(seen, Ok(expected.into()), "{name}");
+    }
+}
+
+#[tokio::test]
 async fn only_people_i_follow_exempts_a_post_notification_in_a_community() {
     const COMMUNITY_POST: u64 = 103;
     let mut viewer = recipient(GizmoduckAdvancedFilters::default());

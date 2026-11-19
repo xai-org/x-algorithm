@@ -139,6 +139,20 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![(Role::NonFollower, allow())],
             at: vec![],
         },
+        Row {
+            name: "edit_ahead_of_its_chain",
+            subject: Subject::Post(
+                candidate()
+                    .tweet_id(3)
+                    .with_tweet_features(TweetFeatures {
+                        latest_edit_tweet_id: Some(2),
+                        ..Default::default()
+                    })
+                    .build(),
+            ),
+            expect: vec![(Role::NonFollower, allow())],
+            at: vec![],
+        },
     ]
 }
 

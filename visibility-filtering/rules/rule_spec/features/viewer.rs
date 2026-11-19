@@ -1,6 +1,8 @@
 use super::{Feature, Leaf, Meaning, Reads};
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::{NotificationFilters, PostCandidate, Viewer, ViewerProfile};
+use crate::models::{
+    NotificationFilters, NotificationMutedKeywords, PostCandidate, Viewer, ViewerProfile,
+};
 use crate::params::CountryList;
 use crate::rules::context::At;
 use crate::rules::rule_spec::engine::{Candidate, Engine};
@@ -146,6 +148,23 @@ impl Leaf for NotificationFilterLeaf {
 impl NotificationFilterLeaf {
     pub(in crate::rules) const fn leaf<E: Engine>(self) -> RuleCond<E> {
         RuleCond::Leaf(Predicate::NotificationFilter(self))
+    }
+}
+
+pub(in crate::rules) enum ViewerMutedKeywords {}
+
+impl Feature for ViewerMutedKeywords {
+    const REQUIRED: Hydrators = Hydrators::of(Hydrator::ViewerNotificationFilters);
+    type Value<'a> = Option<&'a NotificationMutedKeywords>;
+}
+
+impl<C: Candidate> Reads<C> for ViewerMutedKeywords {
+    #[inline]
+    fn read<'a>(at: At<'_, 'a, C>) -> Option<&'a NotificationMutedKeywords> {
+        match &at.viewer().viewer {
+            Viewer::LoggedIn { profile, .. } => Some(&profile.notification_muted_keywords),
+            Viewer::LoggedOut => None,
+        }
     }
 }
 

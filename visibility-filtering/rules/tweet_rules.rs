@@ -6,7 +6,7 @@ use crate::params::CountryList;
 use crate::rules::rule_spec::conditions::*;
 use crate::rules::rule_spec::leaves::*;
 use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors, NonFollowers, OnlyAuthor};
-use crate::rules::rule_spec::rule::{all, Rule, UserRule};
+use crate::rules::rule_spec::rule::{all, any, Rule, UserRule};
 use crate::rules::rule_spec::*;
 use xai_core_entities::entities::ConversationControlArm;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
@@ -22,6 +22,19 @@ pub(super) const ONLY_PEOPLE_I_FOLLOW_OUTSIDE_COMMUNITY_DROP_UNSPECIFIED: Rule =
     id: RuleId::OnlyPeopleIFollowOutsideCommunity,
     audience: NonFollowers,
     when: all![ViewerMentionFilterIsFollowing, !TweetIsCommunityTweet],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const MUTED_KEYWORD_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::MutedKeyword,
+    audience: NonAuthors,
+    when: any![
+        ViewerHasMatchingMutedKeyword,
+        all![
+            ViewerHasMatchingMutedKeywordExcludingFollowed,
+            !ViewerFollowsAuthor
+        ]
+    ],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 

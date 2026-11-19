@@ -3,6 +3,7 @@ use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::*;
 use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
+use crate::scorers::vm_ranker_engagement_labels::EngagementIneligible;
 use crate::side_effects::update_served_history_side_effect::request_type as served_request_type;
 use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
@@ -19,16 +20,17 @@ pub(crate) struct RequestShape {
     post_topics: bool,
     dpp_history: bool,
     omit_cached_weighted_score: bool,
+    engagement_ineligible: bool,
 }
 
 impl RequestShape {
     pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
         let omit_cached_weighted_score = query.params.get(ValueModelMode) == "multiplicative";
+        let ranker_reads_heads = !query.has_cached_posts
+            || query.is_under_the_hood_request
+            || omit_cached_weighted_score;
         Self {
-            debias: (!query.has_cached_posts
-                || query.is_under_the_hood_request
-                || omit_cached_weighted_score)
-                && query.params.get(VMRankerSendDebiasInputs),
+            debias: ranker_reads_heads && query.params.get(VMRankerSendDebiasInputs),
             pacing: query.params.get(VMRankerSendPacingInputs),
             history_topics: query.params.get(VMRankerSendHistoryTopics)
                 && query.history_topics.is_some(),
@@ -36,6 +38,8 @@ impl RequestShape {
             dpp_history: query.request_type == RequestType::ForYou
                 && query.params.get(VMRankerSendDppHistory),
             omit_cached_weighted_score,
+            engagement_ineligible: ranker_reads_heads
+                && query.params.get(VMRankerSendEngagementIneligible),
         }
     }
 
@@ -47,18 +51,30 @@ impl RequestShape {
         self.dpp_history
     }
 
+    pub(crate) fn sends_engagement_ineligible(&self) -> bool {
+        self.engagement_ineligible
+    }
+
     pub(crate) fn build(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
         local: &[PostCandidate],
         topics: &[Option<PostTopics>],
+        ineligible: &[EngagementIneligible],
     ) -> pb::RankRequest {
         let proto_candidates = candidates
             .iter()
             .zip(local)
             .enumerate()
-            .map(|(i, (c, local))| self.candidate(c, local, topics.get(i).and_then(Option::as_ref)))
+            .map(|(i, (c, local))| {
+                self.candidate(
+                    c,
+                    local,
+                    topics.get(i).and_then(Option::as_ref),
+                    ineligible.get(i).copied().unwrap_or_default(),
+                )
+            })
             .collect();
         let mut request = pb::RankRequest {
             viewer_id: query.user_id,
@@ -95,6 +111,7 @@ impl RequestShape {
         c: &PostCandidate,
         local: &PostCandidate,
         topics: Option<&PostTopics>,
+        ineligible: EngagementIneligible,
     ) -> pb::RankCandidate {
         let mut out = pb::RankCandidate {
             tweet_id: c.tweet_id,
@@ -116,8 +133,9 @@ impl RequestShape {
             semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()
         };
-        if self.debias || self.pacing || topics.is_some() {
-            out.experiment_payload = candidate_payload(c, self.debias, self.pacing, topics).into();
+        if self.debias || self.pacing || topics.is_some() || ineligible.any() {
+            out.experiment_payload =
+                candidate_payload(c, self.debias, self.pacing, topics, ineligible).into();
         }
         out
     }
@@ -228,6 +246,7 @@ mod tests {
     use super::*;
     use prost::Message;
     use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
+    use xai_vm_ranker_proto::experiment::CandidatePayload;
     use xai_x_thrift::served_history::{
         EntryWithItemIds, ItemIds, RequestType as ServedRequestType,
     };
@@ -259,7 +278,39 @@ mod tests {
     }
 
     fn build(query: &ScoredPostsQuery) -> pb::RankRequest {
-        RequestShape::from_query(query).build(query, &[], &[], &[])
+        RequestShape::from_query(query).build(query, &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn only_flagged_candidates_carry_ineligible_heads() {
+        let query = query("false", "200", Vec::new());
+        let candidates = [PostCandidate::default(), PostCandidate::default()];
+        let ineligible = [
+            EngagementIneligible {
+                reply: true,
+                click: true,
+                ..Default::default()
+            },
+            EngagementIneligible::default(),
+        ];
+
+        let request = RequestShape::from_query(&query).build(
+            &query,
+            &candidates,
+            &candidates,
+            &[],
+            &ineligible,
+        );
+
+        let payload = |i: usize| {
+            CandidatePayload::decode(request.candidates[i].experiment_payload.as_ref()).unwrap()
+        };
+        let flags = |i| {
+            let p = payload(i);
+            (p.reply_ineligible, p.share_ineligible, p.click_ineligible)
+        };
+        assert_eq!(flags(0), (true, false, true));
+        assert_eq!(flags(1), (false, false, false));
     }
 
     fn ids(tweet_id: i64, source_tweet_id: Option<i64>) -> ItemIds {
@@ -467,6 +518,7 @@ mod tests {
             std::slice::from_ref(&candidate),
             std::slice::from_ref(&local),
             &[],
+            &[],
         );
         assert_eq!(req.candidates[0].weighted_score, None);
         let payload = pb::experiment::RequestPayload::decode(req.experiment_payload.as_ref())
@@ -483,7 +535,7 @@ mod tests {
             ..Default::default()
         };
         let control_req =
-            RequestShape::from_query(&control).build(&control, &[candidate], &[local], &[]);
+            RequestShape::from_query(&control).build(&control, &[candidate], &[local], &[], &[]);
         assert_eq!(control_req.candidates[0].weighted_score, Some(99.0));
         assert!(control_req.experiment_payload.is_empty());
     }

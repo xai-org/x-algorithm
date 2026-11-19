@@ -1,6 +1,7 @@
 use crate::hydration::fallback_cache::{Column, FallbackCache};
 use crate::models::{
-    AuthorId, MediaFeature, NsfwFeature, PureCore, ReactionContext, ReplyTo, TweetFeatures, TweetId,
+    AuthorId, MediaFeature, NsfwFeature, PostText, PureCore, ReactionContext, ReplyTo,
+    TweetFeatures, TweetId,
 };
 use std::num::NonZeroU64;
 use xai_core_entities::entities::{PureCoreData, TakedownReason};
@@ -126,6 +127,7 @@ struct Sparse {
 impl CachedTweetRow {
     fn new(tweet: &TweetFeatures) -> Self {
         let TweetFeatures {
+            text: _,
             media:
                 MediaFeature {
                     has_media,
@@ -184,6 +186,7 @@ impl CachedTweetRow {
             reaction_context,
         } = self.sparse.as_deref().cloned().unwrap_or_default();
         TweetFeatures {
+            text: PostText::default(),
             media: MediaFeature {
                 has_media: self.has_media,
                 has_uploaded_media: self.has_uploaded_media,
@@ -324,44 +327,26 @@ mod tests {
             exclusive_conversation_author_id: Some(0),
             ..Default::default()
         };
-        let stale = TweetFeatures {
-            latest_edit_tweet_id: Some(0),
-            ..Default::default()
-        };
-        let engine = RuleEngine::for_tests();
-        for (tweet, expected) in [
-            (
-                exclusive,
-                dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-            ),
-            (
-                stale,
-                dropped(
-                    FilteredReason::UnspecifiedReason,
-                    "stale_tweet/drop/unspecified",
-                ),
-            ),
-        ] {
-            let cached = CachedTweetRow::new(&tweet).features();
-            assert_eq!(cached, tweet);
-            let post = candidate().with_tweet_features(cached).build();
-            assert_eq!(
-                engine
-                    .evaluate(
-                        SafetyLevel::TimelineHome,
-                        &logged_out_viewer(),
-                        &post,
-                        Placement::Standalone,
-                    )
-                    .into_verdict(),
-                expected
-            );
-        }
+        let cached = CachedTweetRow::new(&exclusive).features();
+        assert_eq!(cached, exclusive);
+        let post = candidate().with_tweet_features(cached).build();
+        assert_eq!(
+            RuleEngine::for_tests()
+                .evaluate(
+                    SafetyLevel::TimelineHome,
+                    &logged_out_viewer(),
+                    &post,
+                    Placement::Standalone,
+                )
+                .into_verdict(),
+            dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop")
+        );
     }
 
     #[test]
-    fn a_cached_row_reads_as_its_tweet() {
+    fn a_cached_row_reads_as_its_tweet_without_its_text() {
         let tweet = TweetFeatures {
+            text: PostText::from("post text"),
             media: MediaFeature {
                 has_media: true,
                 has_uploaded_media: true,
@@ -387,7 +372,13 @@ mod tests {
             }),
         };
 
-        assert_eq!(CachedTweetRow::new(&tweet).features(), tweet);
+        assert_eq!(
+            CachedTweetRow::new(&tweet).features(),
+            TweetFeatures {
+                text: PostText::default(),
+                ..tweet.clone()
+            }
+        );
         assert_eq!(
             CachedTweetRow::new(&TweetFeatures::default()).features(),
             TweetFeatures::default()

@@ -1559,6 +1559,7 @@ async fn a_first_page_save_keeps_an_unknown_heads_decisions_admitted() {
                     reason: "log only from the page".into(),
                     expected_version: None,
                     confirm: None,
+                    confirm_follower_limit: None,
                     updated_by: None,
                     confidence: None,
                     evidence: None,
@@ -2214,9 +2215,13 @@ async fn an_account_head_skips_by_its_own_follower_threshold() {
                 "{threshold:?} {account:?}"
             );
             let i = info(&t);
+            let read_as = threshold.map(|n| match n {
+                0 => xai_abuse_enforcement_types::action_control::stored_off_follower_threshold(),
+                n => n,
+            });
             assert_eq!(
                 i.get("action_control_follower_threshold"),
-                threshold.map(|n| n.to_string()).as_ref(),
+                read_as.map(|n| n.to_string()).as_ref(),
             );
             assert_eq!(
                 i.get("action_control_skip_high_credibility"),
@@ -2580,13 +2585,77 @@ async fn the_follower_ceiling_stops_every_decision() {
             assert_eq!(info(&t)["matched_rule_id"], "very_high_follower_count");
             let below = b.run_fresh(&msg(Account::JustBelowTopLimit)).await;
             assert_ne!(below.status, "very_high_follower_count", "{path} {entity}");
-            let acted = !(path == "growthbook rules" && entity == "account");
+            let acted = entity == "post";
             assert_eq!(
                 below.status == "success",
                 acted,
                 "{path} {entity}: {}",
                 below.status
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_raised_follower_limit_moves_the_ceiling_for_that_heads_page_decisions() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let post_head = "SpamEmbeddingPtosDistilled";
+    let post_label = crate::replay_tests::rule_labels(BAKED_POST_RULES)
+        .into_iter()
+        .next()
+        .expect("a post routing label");
+    let user_label = suspend_label();
+    let waived = |mut s: ScoreResult| {
+        s.skip_author_credibility_prechecks = true;
+        s
+    };
+    let post = |account| {
+        waived(message(
+            EntityType::Post,
+            post_head,
+            "clf",
+            &[&post_label],
+            account,
+        ))
+    };
+    let user = |account| waived(bb1(&[&user_label], account));
+    let above = Account::AboveTopLimit.followers() as u32;
+    let hide = vec![PageAction::PostSpamHighRecall {
+        lifetime: Lifetime::Days30,
+    }];
+    for (limit, page_acts) in [(above + 1, true), (above, false)] {
+        let page = vec![
+            with_skips(
+                of_entity(ControlEntity::Post, live(post_head, None, hide.clone())),
+                Some(limit),
+                None,
+            ),
+            with_skips(live(BB1.0, None, vec![SUSPEND]), Some(limit), None),
+        ];
+        let rules = vec![with_skips(
+            of_entity(
+                ControlEntity::Post,
+                record(post_head, None, None, ControlMode::Rules, vec![]),
+            ),
+            Some(limit),
+            None,
+        )];
+        for (path, records) in [("growthbook rules", rules), ("page", page)] {
+            let b = bed(records, false).await;
+            for (entity, msg) in [
+                ("post", &post as &dyn Fn(Account) -> ScoreResult),
+                ("account", &user),
+            ] {
+                let t = b.run_fresh(&msg(Account::AboveTopLimit)).await;
+                let what = format!("{limit} {path} {entity}: {}", t.status);
+                if path == "page" && page_acts {
+                    assert_eq!(t.status, "success", "{what}");
+                    assert!(!t.ais.is_empty(), "{what}");
+                } else {
+                    assert_eq!(t.status, "very_high_follower_count", "{what}");
+                    assert!(t.ais.is_empty() && t.tickets == 0, "{what}");
+                }
+            }
         }
     }
 }

@@ -2635,6 +2635,7 @@ def build_metric_masks(
         masks["fresh_home_website_clicks"] = (
             masks["fresh"] * home_timeline_mask * website_clicks_objective
         )
+        masks["fresh_dpa"] = masks["fresh"] * dpa_mask
 
     if condition_search_relevance_on_prompt:
         prompt_mask = jnp.any(

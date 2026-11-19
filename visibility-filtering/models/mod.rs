@@ -10,7 +10,7 @@ pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet, AuthorProfile};
 pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
 pub use tweet::{
-    ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, ReactionContext,
+    ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, PostText, ReactionContext,
     TweetFeatures,
 };
 pub(crate) use verdict::VerdictAction;
@@ -21,8 +21,8 @@ pub use verdict::{
     Withholding,
 };
 pub use viewer::{
-    ClientCapability, ClientSwitch, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge,
-    ViewerFeatures, ViewerProfile,
+    ClientCapability, ClientSwitch, NotificationFilters, NotificationMutedKeywords,
+    VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
 };
 pub(crate) use viewer::{RequestFacts, RequestViewer};
 

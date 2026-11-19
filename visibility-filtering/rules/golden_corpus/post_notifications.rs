@@ -2,9 +2,9 @@ use super::notifications::{post_kind_cases, recipient};
 use super::{CorpusCase, Judging, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{
-    ArticleLifecycle, AuthorFeatures, CommunityModeration, NotificationKind, NsfwViewerDropReason,
-    Placement, PostCandidate, SafetyLabelType, TweetFeatures, Verdict, ViewerAge, ViewerFeatures,
-    ViewerProfile,
+    ArticleLifecycle, AuthorFeatures, CommunityModeration, NotificationKind,
+    NotificationMutedKeywords, NsfwViewerDropReason, Placement, PostCandidate, PostText,
+    SafetyLabelType, TweetFeatures, Verdict, ViewerAge, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
     allow, candidate, dropped, labeled, logged_out_viewer, no_stated_age_viewer,
@@ -14,7 +14,7 @@ use crate::rules::fixtures::{
 use crate::rules::SafetyLevel;
 use std::num::NonZeroU64;
 use strum::VariantArray;
-use xai_core_entities::entities::TakedownReason;
+use xai_core_entities::entities::{GizmoduckMutedKeyword, MuteOption, MuteSurface, TakedownReason};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
@@ -62,6 +62,19 @@ fn dropped_at_79(
     }
 }
 
+fn dropped_on_mention_and_reply(
+    name: &'static str,
+    role: &'static str,
+    recipient: ViewerFeatures,
+    post: PostCandidate,
+    verdict: Verdict,
+) -> Case {
+    Case {
+        mention_and_reply: verdict,
+        ..shown(name, role, recipient, post)
+    }
+}
+
 fn default_recipient() -> ViewerFeatures {
     recipient(VIEWER_ID, ViewerProfile::default())
 }
@@ -104,6 +117,32 @@ fn takedown(reason: TakedownReason) -> PostCandidate {
     .build()
 }
 
+fn muting(id: u64, keywords: &[(&str, MuteSurface, Option<MuteOption>)]) -> ViewerFeatures {
+    let keywords: Vec<_> = keywords
+        .iter()
+        .map(|&(keyword, surface, option)| GizmoduckMutedKeyword {
+            id: 1,
+            keyword: keyword.to_owned(),
+            mute_surfaces: vec![surface],
+            mute_options: option.into_iter().collect(),
+        })
+        .collect();
+    recipient(
+        id,
+        ViewerProfile {
+            notification_muted_keywords: NotificationMutedKeywords::of(&keywords),
+            ..ViewerProfile::default()
+        },
+    )
+}
+
+fn saying(text: &str) -> CandidateBuilder {
+    tweet(TweetFeatures {
+        text: PostText::from(text),
+        ..TweetFeatures::default()
+    })
+}
+
 fn post_cases() -> Vec<Case> {
     let filters_to_followed = || {
         recipient(
@@ -144,6 +183,17 @@ fn post_cases() -> Vec<Case> {
                 unspecified("stale_tweet/drop/unspecified"),
             )
         },
+        shown(
+            "edit_ahead_of_its_chain",
+            "non_follower",
+            default_recipient(),
+            tweet(TweetFeatures {
+                latest_edit_tweet_id: Some(2),
+                ..TweetFeatures::default()
+            })
+            .tweet_id(3)
+            .build(),
+        ),
         dropped_at_79(
             "protected_author_community_post",
             "follower",
@@ -391,6 +441,82 @@ fn post_cases() -> Vec<Case> {
             "self",
             recipient(AUTHOR_ID, ViewerProfile::default()),
             labeled(SafetyLabelType::RISKY_HIGH_VIZ_REPLY),
+        ),
+        dropped_on_mention_and_reply(
+            "muted_keyword",
+            "non_follower",
+            muting(VIEWER_ID, &[("spoiler", MuteSurface::Notifications, None)]),
+            saying("a big spoiler").build(),
+            unspecified("muted_keyword/drop/unspecified"),
+        ),
+        dropped_on_mention_and_reply(
+            "muted_keyword",
+            "follower",
+            muting(VIEWER_ID, &[("spoiler", MuteSurface::Notifications, None)]),
+            saying("a big spoiler").with_edge(Hydrator::Follows).build(),
+            unspecified("muted_keyword/drop/unspecified"),
+        ),
+        shown(
+            "muted_keyword_inside_a_longer_word",
+            "non_follower",
+            muting(VIEWER_ID, &[("spoiler", MuteSurface::Notifications, None)]),
+            saying("spoilers ahead").build(),
+        ),
+        shown(
+            "muted_keyword",
+            "self",
+            muting(AUTHOR_ID, &[("spoiler", MuteSurface::Notifications, None)]),
+            saying("a big spoiler").build(),
+        ),
+        shown(
+            "muted_keyword_on_home_timeline_only",
+            "non_follower",
+            muting(VIEWER_ID, &[("spoiler", MuteSurface::HomeTimeline, None)]),
+            saying("a big spoiler").build(),
+        ),
+        dropped_on_mention_and_reply(
+            "muted_keyword_excluding_followed",
+            "non_follower",
+            muting(
+                VIEWER_ID,
+                &[(
+                    "spoiler",
+                    MuteSurface::Notifications,
+                    Some(MuteOption::ExcludeFollowingAccounts),
+                )],
+            ),
+            saying("a big spoiler").build(),
+            unspecified("muted_keyword/drop/unspecified"),
+        ),
+        shown(
+            "muted_keyword_excluding_followed",
+            "follower",
+            muting(
+                VIEWER_ID,
+                &[(
+                    "spoiler",
+                    MuteSurface::Notifications,
+                    Some(MuteOption::ExcludeFollowingAccounts),
+                )],
+            ),
+            saying("a big spoiler").with_edge(Hydrator::Follows).build(),
+        ),
+        dropped_on_mention_and_reply(
+            "muted_keyword_excluding_followed_beside_one_that_does_not",
+            "follower",
+            muting(
+                VIEWER_ID,
+                &[
+                    (
+                        "spoiler",
+                        MuteSurface::Notifications,
+                        Some(MuteOption::ExcludeFollowingAccounts),
+                    ),
+                    ("big", MuteSurface::Notifications, None),
+                ],
+            ),
+            saying("a big spoiler").with_edge(Hydrator::Follows).build(),
+            unspecified("muted_keyword/drop/unspecified"),
         ),
     ];
     for (label, by) in [

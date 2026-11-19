@@ -1,6 +1,7 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::content_features;
 use crate::models::query::ScoredPostsQuery;
+use crate::scorers::vm_ranker_engagement_labels::EngagementIneligible;
 use prost::Message;
 use xai_recsys_proto::{ContentFeatures, ProductSurface};
 use xai_vm_ranker_proto as pb;
@@ -40,6 +41,7 @@ pub(crate) fn candidate_payload(
     debias: bool,
     pacing: bool,
     topics: Option<&PostTopics>,
+    ineligible: EngagementIneligible,
 ) -> Vec<u8> {
     let mut payload = CandidatePayload::default();
     if debias {
@@ -56,6 +58,9 @@ pub(crate) fn candidate_payload(
             .and_then(|n| u64::try_from(n).ok());
     }
     payload.topics = topics.cloned();
+    payload.reply_ineligible = ineligible.reply;
+    payload.share_ineligible = ineligible.share;
+    payload.click_ineligible = ineligible.click;
     payload.encode_to_vec()
 }
 

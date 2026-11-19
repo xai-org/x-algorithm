@@ -1935,23 +1935,53 @@ impl ActionControl {
         }
         let skips = crate::safety_checks::follower_skip_view();
         let threshold = req.follower_threshold.flatten().map(u64::from);
-        if threshold.is_some_and(|n| n > 0 && n < skips.today_threshold) {
+        if threshold == Some(0) {
             return bad(
-                "follower_threshold_below_today",
+                "follower_threshold_missing",
                 format!(
-                    "a threshold below today's rule ({} or more followers) isn't supported yet; send 0 to turn the follower skip off, or {} or more",
+                    "state a follower limit: {} or more (the standard skip is {})",
                     skips.today_threshold, skips.today_threshold
                 ),
             );
         }
-        let ceiling = skips.ceiling;
-        if threshold.is_some_and(|n| n >= ceiling) {
+        if threshold.is_some_and(|n| n < skips.today_threshold) {
             return bad(
-                "follower_threshold_too_high",
+                "follower_threshold_below_today",
                 format!(
-                    "follower_threshold must be below {ceiling}, where accounts are always skipped"
+                    "a threshold below today's rule ({} or more followers) isn't supported yet; send {} or more",
+                    skips.today_threshold, skips.today_threshold
                 ),
             );
+        }
+        if threshold.is_some_and(|n| n > skips.max_threshold) {
+            return bad(
+                "follower_threshold_too_high",
+                format!("follower_threshold must be at most {}", skips.max_threshold),
+            );
+        }
+        let raised = threshold.filter(|&n| n >= skips.ceiling);
+        match (raised, req.confirm_follower_limit.map(u64::from)) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return bad(
+                    "confirm_follower_limit_unexpected",
+                    format!(
+                        "confirm_follower_limit goes only with a follower_threshold of {} or more",
+                        skips.ceiling
+                    ),
+                );
+            }
+            (Some(n), repeated) => {
+                if repeated != Some(n) || req.confirm.as_deref() != Some(CONFIRM_WORD) {
+                    return bad(
+                        "follower_limit_unconfirmed",
+                        format!(
+                            "a follower limit of {n} acts on accounts with {} or more followers, which every other head skips; send confirm_follower_limit: {n} and confirm: \"{CONFIRM_WORD}\"",
+                            skips.ceiling
+                        ),
+                    );
+                }
+            }
         }
         if !factory {
             return Ok(());
@@ -2935,7 +2965,7 @@ mod tests {
         );
         store.put_raw(
             "user/h/Newer",
-            br#"{"v":9,"entity_type":"user","head":"Newer","mode":"rules","version":1}"#,
+            br#"{"v":10,"entity_type":"user","head":"Newer","mode":"rules","version":1}"#,
         );
         ac.refresh().await.unwrap();
         assert_eq!(
@@ -3837,6 +3867,7 @@ mod tests {
             reason: "because".into(),
             expected_version: None,
             confirm: Some(CONFIRM_WORD.into()),
+            confirm_follower_limit: None,
             entity_type: ControlEntity::User,
             updated_by: None,
             confidence: None,
@@ -4826,6 +4857,10 @@ mod tests {
         parse_record(v).unwrap()
     }
 
+    fn no_skip() -> u32 {
+        xai_abuse_enforcement_types::action_control::stored_off_follower_threshold()
+    }
+
     fn skips_of(r: &ActionControlRecord) -> (Option<u32>, Option<bool>) {
         (r.follower_threshold, r.skip_high_credibility)
     }
@@ -4835,12 +4870,12 @@ mod tests {
         let more = crate::safety_checks::follower_skip_view().today_threshold as u32 * 3;
         let (ac, store) = loaded(&[]).await;
         let first = ActionControlPutRequest {
-            follower_threshold: Some(Some(0)),
+            follower_threshold: Some(Some(no_skip())),
             skip_high_credibility: Some(Some(false)),
             ..put("H", ControlMode::Recording, vec![])
         };
         let out = set(&ac, first).await.unwrap();
-        assert_eq!(skips_of(&out.view.record), (Some(0), Some(false)));
+        assert_eq!(skips_of(&out.view.record), (Some(no_skip()), Some(false)));
         assert_eq!(out.view.record.v, AUTHOR_SKIPS_RECORD_VERSION);
         assert_eq!(out.harsher_because.len(), 2, "{:?}", out.harsher_because);
 
@@ -4851,7 +4886,7 @@ mod tests {
         set(&ac, leave).await.unwrap();
         assert_eq!(
             skips_of(&stored(&store, "user/h/H")),
-            (Some(0), Some(false))
+            (Some(no_skip()), Some(false))
         );
 
         let change = ActionControlPutRequest {
@@ -4900,9 +4935,15 @@ mod tests {
         assert_eq!(
             trail,
             [
-                (None, (Some(0), Some(false))),
-                (Some((Some(0), Some(false))), (Some(0), Some(false))),
-                (Some((Some(0), Some(false))), (Some(more), Some(false))),
+                (None, (Some(no_skip()), Some(false))),
+                (
+                    Some((Some(no_skip()), Some(false))),
+                    (Some(no_skip()), Some(false))
+                ),
+                (
+                    Some((Some(no_skip()), Some(false))),
+                    (Some(more), Some(false))
+                ),
                 (Some((Some(more), Some(false))), (None, Some(false))),
                 (Some((None, Some(false))), (None, None)),
             ]
@@ -4929,9 +4970,12 @@ mod tests {
                         ..put(head, mode, actions.clone())
                     }
                 };
-            match set(&ac, change(1, Some(Some(0)), None)).await {
+            match set(&ac, change(1, Some(Some(no_skip())), None)).await {
                 Err(SetError::Invalid("confirm_required", msg)) => assert!(
-                    msg.contains(&format!("skips fewer high-follower accounts ({d}+ to off)")),
+                    msg.contains(&format!(
+                        "skips fewer high-follower accounts ({d}+ to {}+)",
+                        no_skip()
+                    )),
                     "{head}: {msg}"
                 ),
                 other => panic!("{head}: {other:?}"),
@@ -4968,7 +5012,7 @@ mod tests {
                 (4, Some(Some(d * 2)), None),
                 (5, Some(None), None),
                 (6, None, Some(Some(true))),
-                (7, Some(Some(0)), None),
+                (7, Some(Some(no_skip())), None),
             ] {
                 let out = set(&ac, change(version, threshold, cred)).await;
                 if version == 7 {
@@ -4989,7 +5033,7 @@ mod tests {
         }
         let to_zero = ActionControlPutRequest {
             confirm: None,
-            follower_threshold: Some(Some(0)),
+            follower_threshold: Some(Some(no_skip())),
             skip_high_credibility: Some(Some(false)),
             ..put("Fresh", ControlMode::Rules, vec![])
         };
@@ -5038,7 +5082,7 @@ mod tests {
             let lift = ActionControlPutRequest {
                 expected_version: Some(1),
                 confirm: None,
-                follower_threshold: Some(Some(0)),
+                follower_threshold: Some(Some(no_skip())),
                 ..put("OldName", ControlMode::Rules, vec![])
             };
             assert_eq!(
@@ -5059,7 +5103,7 @@ mod tests {
         let (ac, store) = loaded(&[]).await;
         let off = ActionControlPutRequest {
             confirm: None,
-            follower_threshold: Some(Some(0)),
+            follower_threshold: Some(Some(no_skip())),
             ..move_put("H", all_rows(ControlMode::Recording, vec![]))
         };
         assert_eq!(
@@ -5072,7 +5116,10 @@ mod tests {
             ..off
         };
         set(&ac, off).await.unwrap();
-        assert_eq!(skips_of(&stored(&store, "user/h/H")), (Some(0), None));
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(no_skip()), None)
+        );
         assert_eq!(stored(&store, "user/h/H").v, AUTHOR_SKIPS_RECORD_VERSION);
         for row in LevelRow::ALL {
             let r = stored(&store, &format!("user/l/H/{}", row.as_str()));
@@ -5087,7 +5134,7 @@ mod tests {
         set(&ac, high).await.unwrap();
         assert_eq!(
             skips_of(&stored(&store, "user/h/H")),
-            (Some(0), None),
+            (Some(no_skip()), None),
             "a row's save leaves the head record alone"
         );
 
@@ -5125,7 +5172,7 @@ mod tests {
         set(&ac, confirmed).await.unwrap();
         assert_eq!(
             skips_of(&stored(&store, "user/h/H")),
-            (Some(0), Some(false)),
+            (Some(no_skip()), Some(false)),
             "the threshold left out is kept"
         );
     }
@@ -5146,14 +5193,32 @@ mod tests {
                 "{below}"
             );
         }
-        assert_eq!(
-            code(set(&ac, at(ceiling)).await),
-            "follower_threshold_too_high"
-        );
-        assert_eq!(
-            code(set(&ac, at(u32::MAX)).await),
-            "follower_threshold_too_high"
-        );
+        match set(&ac, at(0)).await {
+            Err(SetError::Invalid("follower_threshold_missing", msg)) => {
+                assert!(msg.starts_with("state a follower limit"), "{msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let max = xai_abuse_enforcement_types::action_control::FOLLOWER_THRESHOLD_MAX;
+        for over in [max + 1, u32::MAX] {
+            let req = ActionControlPutRequest {
+                confirm_follower_limit: Some(over),
+                ..at(over)
+            };
+            assert_eq!(code(set(&ac, req).await), "follower_threshold_too_high");
+        }
+        for stray in [Some(Some(ceiling - 1)), None, Some(None)] {
+            let req = ActionControlPutRequest {
+                follower_threshold: stray,
+                confirm_follower_limit: Some(ceiling - 1),
+                ..put("H", ControlMode::Recording, vec![])
+            };
+            assert_eq!(
+                code(set(&ac, req).await),
+                "confirm_follower_limit_unexpected",
+                "{stray:?}"
+            );
+        }
         set(&ac, at(ceiling - 1)).await.unwrap();
         let v = |n: u64| ActionControlPutRequest {
             expected_version: Some(n),
@@ -5161,7 +5226,7 @@ mod tests {
         };
         set(&ac, v(1)).await.unwrap();
         let off = ActionControlPutRequest {
-            follower_threshold: Some(Some(0)),
+            follower_threshold: Some(Some(no_skip())),
             ..v(2)
         };
         set(&ac, off).await.unwrap();
@@ -5169,7 +5234,7 @@ mod tests {
         for narrow in [
             ActionControlPutRequest {
                 classifier: Some("c".into()),
-                follower_threshold: Some(Some(0)),
+                follower_threshold: Some(Some(no_skip())),
                 ..put("H2", ControlMode::Recording, vec![])
             },
             ActionControlPutRequest {
@@ -5188,7 +5253,7 @@ mod tests {
         seen_factory(&store, "Factory");
         for factory in [
             ActionControlPutRequest {
-                follower_threshold: Some(Some(0)),
+                follower_threshold: Some(Some(no_skip())),
                 ..move_put("Factory", RowsRequest::default())
             },
             ActionControlPutRequest {
@@ -5209,6 +5274,124 @@ mod tests {
     }
 
                 #[tokio::test]
+    async fn a_raised_follower_limit_needs_the_number_twice_and_the_confirm() {
+        use xai_abuse_enforcement_types::action_control::RAISED_FOLLOWER_LIMIT_RECORD_VERSION;
+        let ceiling = crate::safety_checks::follower_ceiling() as u32;
+        let (ac, store) = loaded(&[]).await;
+        let raise = |n: u32, repeated: Option<u32>, confirm: Option<&str>, version: Option<u64>| {
+            ActionControlPutRequest {
+                expected_version: version,
+                confirm: confirm.map(Into::into),
+                follower_threshold: Some(Some(n)),
+                confirm_follower_limit: repeated,
+                ..put("H", ControlMode::Live, vec![SUSPEND])
+            }
+        };
+        let n = ceiling * 5 / 2;
+        for (repeated, confirm) in [
+            (None, Some(CONFIRM_WORD)),
+            (Some(n), None),
+            (Some(n), Some("enforce")),
+            (Some(n - 1), Some(CONFIRM_WORD)),
+        ] {
+            match set(&ac, raise(n, repeated, confirm, None)).await {
+                Err(SetError::Invalid("follower_limit_unconfirmed", msg)) => assert!(
+                    msg.contains(&format!("{ceiling} or more followers")),
+                    "{msg}"
+                ),
+                other => panic!("{repeated:?} {confirm:?}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            code(set(&ac, raise(ceiling, None, Some(CONFIRM_WORD), None)).await),
+            "follower_limit_unconfirmed",
+            "the ceiling itself counts as raised"
+        );
+
+        let out = set(&ac, raise(n, Some(n), Some(CONFIRM_WORD), None))
+            .await
+            .unwrap();
+        assert!(
+            out.harsher_because
+                .iter()
+                .any(|w| w == &format!("raises the follower ceiling ({ceiling}+ to {n}+), acting on accounts every other head skips")),
+            "{:?}",
+            out.harsher_because
+        );
+        let rec = stored(&store, "user/h/H");
+        assert_eq!(rec.follower_threshold, Some(n));
+        assert_eq!(rec.v, RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+        let rows = store.pkey_rows(MH_PKEY);
+        let (_, bytes) = rows.iter().find(|(k, _)| k == "user/h/H").unwrap();
+        let mut newer: Value = serde_json::from_slice(bytes).unwrap();
+        newer["v"] = (RAISED_FOLLOWER_LIMIT_RECORD_VERSION + 1).into();
+        assert!(
+            parse_record(&serde_json::to_vec(&newer).unwrap()).is_err(),
+            "a reader refuses a record version above its own"
+        );
+
+        let leave = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, leave).await.unwrap();
+        assert!(out.harsher_because.is_empty());
+        assert_eq!(stored(&store, "user/h/H").follower_threshold, Some(n));
+        assert_eq!(
+            stored(&store, "user/h/H").v,
+            RAISED_FOLLOWER_LIMIT_RECORD_VERSION
+        );
+
+        assert_eq!(
+            code(set(&ac, raise(ceiling * 2, None, None, Some(2))).await),
+            "follower_limit_unconfirmed",
+            "lowering a raised limit still sends it twice"
+        );
+        set(
+            &ac,
+            raise(ceiling * 2, Some(ceiling * 2), Some(CONFIRM_WORD), Some(2)),
+        )
+        .await
+        .unwrap();
+
+        let back = ActionControlPutRequest {
+            expected_version: Some(3),
+            confirm: None,
+            follower_threshold: Some(Some(no_skip())),
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, back).await.unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        let rec = stored(&store, "user/h/H");
+        assert_eq!(rec.follower_threshold, Some(no_skip()));
+        assert!(rec.v < RAISED_FOLLOWER_LIMIT_RECORD_VERSION, "{}", rec.v);
+    }
+
+                #[tokio::test]
+    async fn a_stored_zero_threshold_is_rewritten_as_one_below_the_ceiling() {
+        let old = ActionControlRecord {
+            follower_threshold: Some(0),
+            ..live("H", None, None, vec![SUSPEND])
+        };
+        let (ac, store) = loaded(&[old]).await;
+        let r = resolve(&ac, "H", "c", &[]);
+        assert!(r.page_driven());
+        assert_eq!(r.author_skips.follower_threshold, Some(no_skip()));
+        let leave = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, leave).await.unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        assert_eq!(
+            stored(&store, "user/h/H").follower_threshold,
+            Some(no_skip())
+        );
+    }
+
+                #[tokio::test]
     async fn a_decision_takes_the_head_records_skips() {
         let holder = |head: &str| ActionControlRecord {
             follower_threshold: Some(0),
@@ -5224,7 +5407,7 @@ mod tests {
         ])
         .await;
         let want = AuthorSkips {
-            follower_threshold: Some(0),
+            follower_threshold: Some(no_skip()),
             skip_high_credibility: Some(false),
         };
         let r = resolve(&ac, "H", "c", &[]);
@@ -5232,7 +5415,7 @@ mod tests {
         assert_eq!(r.author_skips, want);
         assert!(
             r.info_keys()
-                .contains(&(FOLLOWER_THRESHOLD_KEY.into(), "0".into()))
+                .contains(&(FOLLOWER_THRESHOLD_KEY.into(), no_skip().to_string()))
         );
         assert!(
             r.info_keys()
@@ -5276,7 +5459,7 @@ mod tests {
     async fn the_list_says_the_service_takes_the_skips_and_their_default() {
         let (ac, _) = loaded(&[]).await;
         let list = ac.list(&on(), baked_safety()).await;
-        assert_eq!(list.feature_version, 7);
+        assert_eq!(list.feature_version, 9);
         let view = list.follower_skip.unwrap();
         assert_eq!(view, crate::safety_checks::follower_skip_view());
         assert!(view.today_threshold < view.ceiling);

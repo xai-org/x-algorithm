@@ -1821,6 +1821,8 @@ message AdInfo {
   AdTargeting targeting = 28;
 
   int64 ad_taxonomy_id = 29;
+
+  int64 advertiser_first_delivery_ms = 30;
 }
 
 message AdTargeting {
@@ -2054,6 +2056,7 @@ enum UserActionAggregationType {
   DENSE_WITH_RECENT_IMPRESSIONS = 34;
   IMMERSIVE_LONG_DWELL_GALLERY_3S = 36;
   IMMERSIVE_RECENT_IMPRESSIONS = 37;
+  DENSE_WITH_LONG_DWELL_AUTHOR_PROFILE = 38;
   reserved 33, 35;
 }
 

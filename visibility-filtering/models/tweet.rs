@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::num::NonZeroU64;
 use xai_core_entities::entities::TakedownReason;
+use xai_strato::Bytes;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaFeature {
@@ -26,6 +28,7 @@ pub enum ArticleLifecycle {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TweetFeatures {
+    pub text: PostText,
     pub media: MediaFeature,
     pub takedown_reasons: Vec<TakedownReason>,
     pub nsfw: NsfwFeature,
@@ -37,6 +40,26 @@ pub struct TweetFeatures {
     pub article_id: Option<NonZeroU64>,
     pub narrowcast_place_id: Option<u64>,
     pub reaction_context: Option<ReactionContext>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostText(Bytes);
+
+impl PostText {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    pub fn lossy(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for PostText {
+    fn from(text: &str) -> Self {
+        Self(Bytes::copy_from_slice(text.as_bytes()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +91,7 @@ impl TweetFeatures {
 
     pub fn is_superseded_edit(&self, tweet_id: u64) -> bool {
         self.latest_edit_tweet_id
-            .is_some_and(|latest| latest != tweet_id)
+            .is_some_and(|latest| latest > tweet_id)
     }
 
     pub fn legal_takedown_in(&self, request_country: Option<&str>) -> bool {

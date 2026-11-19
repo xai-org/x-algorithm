@@ -225,6 +225,11 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         FAILS_THE_NOTIFICATION,
     ),
     (
+        "muted_keyword/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
         "not_graduated_user_label/drop/unspecified",
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
