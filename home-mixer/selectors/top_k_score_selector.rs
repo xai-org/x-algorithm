@@ -6,14 +6,91 @@ use xai_candidate_pipeline::selector::{SelectResult, Selector};
 
 pub struct TopKScoreSelector;
 
+const MIN_OON_POSITIVE_ENGAGEMENT_PROBABILITY: f64 = 0.01;
+const MIN_HISTORY_ACTIONS_FOR_OON_RELEVANCE_FLOOR: u64 = 5;
+
+fn has_minimum_oon_affinity(candidate: &PostCandidate) -> bool {
+    let scores = &candidate.phoenix_scores;
+    [
+        scores.favorite_score,
+        scores.reply_score,
+        scores.retweet_score,
+        scores.photo_expand_score,
+        scores.video_open_score,
+        scores.click_score,
+        scores.open_link_score,
+        scores.profile_click_score,
+        scores.vqv_score,
+        scores.share_score,
+        scores.share_via_dm_score,
+        scores.share_via_copy_link_score,
+        scores.dwell_score,
+        scores.quote_score,
+        scores.quoted_click_score,
+        scores.quoted_vqv_score,
+        scores.follow_author_score,
+        scores.post_video_score,
+        scores.grok_analyze_score,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|score| score.is_finite() && score >= MIN_OON_POSITIVE_ENGAGEMENT_PROBABILITY)
+}
+
+fn apply_oon_relevance_floor(
+    query: &ScoredPostsQuery,
+    candidates: Vec<PostCandidate>,
+) -> (Vec<PostCandidate>, Vec<PostCandidate>) {
+    let action_count = query
+        .scoring_sequence
+        .as_ref()
+        .and_then(|sequence| sequence.metadata.as_ref())
+        .map_or(0, |metadata| metadata.length);
+    let sparse_history = action_count < MIN_HISTORY_ACTIONS_FOR_OON_RELEVANCE_FLOOR;
+
+    let fallback_index = if sparse_history {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.in_network == Some(false) && !has_minimum_oon_affinity(candidate)
+            })
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.score
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&right.score.unwrap_or(f64::NEG_INFINITY))
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+    } else {
+        None
+    };
+
+    let mut eligible = Vec::with_capacity(candidates.len());
+    let mut below_floor = Vec::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if candidate.in_network != Some(false)
+            || has_minimum_oon_affinity(&candidate)
+            || fallback_index == Some(index)
+        {
+            eligible.push(candidate);
+        } else {
+            below_floor.push(candidate);
+        }
+    }
+
+    (eligible, below_floor)
+}
+
 impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
     fn select(
         &self,
         query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> SelectResult<PostCandidate> {
-        let mut selected = self.sort(candidates);
-        let non_selected =
+        let (eligible, below_floor) = apply_oon_relevance_floor(query, candidates);
+        let mut selected = self.sort(eligible);
+        let mut non_selected =
             selected.split_off(params::TOP_K_CANDIDATES_TO_SELECT.min(selected.len()));
         if video_carousel::is_enabled(query) {
             selected.extend(video_carousel::top_videos_by_carousel_score(
@@ -23,6 +100,8 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
                 &query.seen_carousel_video_ids,
             ));
         }
+        non_selected.extend(below_floor);
+        non_selected = self.sort(non_selected);
         SelectResult {
             selected,
             non_selected,
@@ -82,6 +161,26 @@ mod tests {
                 ..Default::default()
             },
             ..post(tweet_id, 0.0)
+        }
+    }
+
+    fn query_with_history(action_count: u64) -> ScoredPostsQuery {
+        ScoredPostsQuery {
+            scoring_sequence: Some(xai_recsys_proto::UserActionSequence {
+                metadata: Some(xai_recsys_proto::UserActionSequenceMeta {
+                    length: action_count,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..plain_query()
+        }
+    }
+
+    fn out_of_network_post(tweet_id: u64, score: f64) -> PostCandidate {
+        PostCandidate {
+            in_network: Some(false),
+            ..post(tweet_id, score)
         }
     }
 
@@ -269,6 +368,75 @@ mod tests {
         assert_eq!(tweet_ids(&result.selected), expected);
         assert!(result.non_selected.is_empty());
         assert!(TopKScoreSelector.select(&query, vec![]).is_empty());
+    }
+
+    #[test]
+    fn relevance_floor_drops_low_affinity_oon_posts_for_established_viewers() {
+        let query = query_with_history(MIN_HISTORY_ACTIONS_FOR_OON_RELEVANCE_FLOOR);
+        let candidates = vec![
+            PostCandidate {
+                cold_start_lift_to_rank: Some(0),
+                ..out_of_network_post(1, 0.9)
+            },
+            PostCandidate {
+                phoenix_scores: PhoenixScores {
+                    favorite_score: Some(MIN_OON_POSITIVE_ENGAGEMENT_PROBABILITY),
+                    ..Default::default()
+                },
+                ..out_of_network_post(2, 0.8)
+            },
+            PostCandidate {
+                in_network: Some(true),
+                ..post(3, 0.1)
+            },
+        ];
+
+        let result = TopKScoreSelector.select(&query, candidates);
+
+        assert_eq!(tweet_ids(&result.selected), [2, 3]);
+        assert_eq!(tweet_ids(&result.non_selected), [1]);
+    }
+
+    #[test]
+    fn sparse_history_keeps_only_the_top_scoring_low_affinity_oon_fallback() {
+        let query = query_with_history(MIN_HISTORY_ACTIONS_FOR_OON_RELEVANCE_FLOOR - 1);
+        let candidates = vec![
+            out_of_network_post(1, 0.6),
+            PostCandidate {
+                cold_start_lift_to_rank: Some(0),
+                ..out_of_network_post(2, 0.7)
+            },
+            PostCandidate {
+                in_network: Some(true),
+                ..post(3, 0.1)
+            },
+        ];
+
+        let result = TopKScoreSelector.select(&query, candidates);
+
+        assert_eq!(tweet_ids(&result.selected), [2, 3]);
+        assert_eq!(tweet_ids(&result.non_selected), [1]);
+    }
+
+    #[test]
+    fn missing_or_non_finite_positive_scores_do_not_meet_oon_affinity_floor() {
+        let query = query_with_history(MIN_HISTORY_ACTIONS_FOR_OON_RELEVANCE_FLOOR);
+        let candidates = vec![
+            out_of_network_post(1, 0.9),
+            PostCandidate {
+                phoenix_scores: PhoenixScores {
+                    favorite_score: Some(f64::NAN),
+                    not_interested_score: Some(1.0),
+                    ..Default::default()
+                },
+                ..out_of_network_post(2, 0.8)
+            },
+        ];
+
+        let result = TopKScoreSelector.select(&query, candidates);
+
+        assert!(result.selected.is_empty());
+        assert_eq!(tweet_ids(&result.non_selected), [1, 2]);
     }
 
     #[test]

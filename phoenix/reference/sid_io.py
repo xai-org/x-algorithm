@@ -87,6 +87,8 @@ def save_codebook_npz(
         num_centroids=np.array(K, dtype=np.int32),
         embedding_dim=np.array(D, dtype=np.int32),
         training_size=np.array(n_train, dtype=np.int64),
+        model_type=np.array("rq_emeans"),
+        epochs=np.array(n_iters, dtype=np.int32),
         iters=np.array(n_iters, dtype=np.int32),
         seed=np.array(seed, dtype=np.int32),
     )
@@ -137,11 +139,12 @@ def save_codebook_safetensors(
     M, K, D = codebooks.shape
     tensors = {"stages": codebooks.astype(np.float32)}
     metadata = {
-        "model_type": "rq_kmeans",
+        "model_type": "rq_emeans",
         "num_levels": str(M),
         "num_centroids": str(K),
         "embedding_dim": str(D),
         "training_size": str(n_train),
+        "epochs": str(n_iters),
         "iters": str(n_iters),
         "seed": str(seed),
     }

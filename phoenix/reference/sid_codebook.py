@@ -84,6 +84,40 @@ def _kmeans_iter(residual, centroids, K: int):
     return new_centroids, assigns
 
 
+@partial(jax.jit, static_argnames=("K",))
+def _emeans_batch_update(residual, centroids, ema_counts, ema_sums, weights, alpha, K: int):
+    mesh = get_mesh()
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(_DATA_SPEC, _REP_SPEC, _DATA_SPEC),
+        out_specs=(_REP_SPEC, _REP_SPEC, _ASSIGN_SPEC),
+        **_CHECK_KW,
+    )
+    def update_batch(res, cent, batch_weights):
+        c_sq = jnp.sum(cent * cent, axis=1)
+        x_sq = jnp.sum(res * res, axis=1, keepdims=True)
+        dists = x_sq + c_sq[None, :] - 2.0 * res @ cent.T
+        assigns = jnp.argmin(dists, axis=1).astype(jnp.int32)
+        weighted_residual = res * batch_weights[:, None]
+        partial_sums = jax.ops.segment_sum(weighted_residual, assigns, num_segments=K)
+        partial_counts = jax.ops.segment_sum(batch_weights, assigns, num_segments=K)
+        total_sums = jax.lax.psum(partial_sums, axis_name="data")
+        total_counts = jax.lax.psum(partial_counts, axis_name="data")
+        return total_sums, total_counts, assigns
+
+    batch_sums, batch_counts, assigns = update_batch(residual, centroids, weights)
+    new_counts = (1.0 - alpha) * ema_counts + alpha * batch_counts
+    new_sums = (1.0 - alpha) * ema_sums + alpha * batch_sums
+    new_centroids = jnp.where(
+        new_counts[:, None] > 0,
+        new_sums / jnp.maximum(new_counts[:, None], 1e-12),
+        centroids,
+    )
+    return new_centroids, new_counts, new_sums, assigns
+
+
 @jax.jit
 def _update_residual(residual, centroids, assigns):
     mesh = get_mesh()
@@ -130,6 +164,213 @@ def _pad_to_multiple(arr: np.ndarray, multiple: int) -> tuple[np.ndarray, int]:
     return np.concatenate([arr, tail], axis=0), pad
 
 
+def _emeans_batch_size(n: int, k: int, epochs: int, dim: int) -> int:
+    constant = 0.0044 if dim <= 16 else 0.035134
+    batch = constant * k**0.134749 * n**0.876473 * epochs**0.813344
+    return min(n, max(1, int(round(batch))))
+
+
+def _emeans_alpha0(n: int, k: int, batch_size: int, epochs: int) -> float:
+    alpha0 = 0.824 * k**-0.46 * batch_size**0.90 * n**-0.45 * epochs**-0.11
+    return min(1.0, alpha0)
+
+
+def _emeans_step_size(alpha0: float, update: int, total_updates: int) -> float:
+    if total_updates <= 1:
+        return alpha0
+    progress = update / (total_updates - 1)
+    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+    return alpha0 * (0.1 + 0.9 * cosine)
+
+
+def _split_dead_codes(
+    codebooks: np.ndarray,
+    ema_counts: np.ndarray,
+    ema_sums: np.ndarray,
+    batch: np.ndarray,
+    assignments: np.ndarray,
+    rng: np.random.RandomState,
+    threshold: float,
+) -> int:
+    dead_codes = np.flatnonzero(ema_counts < threshold)
+    total_revived = 0
+
+    for dead in dead_codes:
+        donors = np.flatnonzero(ema_counts >= 2.0 * threshold)
+        if donors.size == 0:
+            break
+        donor_weights = ema_counts[donors].astype(np.float64)
+        donor_weights /= donor_weights.sum()
+        donor = int(rng.choice(donors, p=donor_weights))
+        donor_count = float(ema_counts[donor])
+
+        donor_points = batch[assignments == donor]
+        if len(donor_points) >= 2:
+            point_indices = rng.choice(len(donor_points), size=2, replace=False)
+            codebooks[donor], codebooks[dead] = donor_points[point_indices]
+        else:
+            direction = rng.normal(size=codebooks.shape[1]).astype(np.float32)
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm == 0:
+                direction[0] = 1.0
+                direction_norm = 1.0
+            scale = max(float(np.std(batch)), 1e-6) * 1e-2
+            offset = direction * (scale / direction_norm)
+            center = codebooks[donor].copy()
+            codebooks[donor] = center - offset
+            codebooks[dead] = center + offset
+
+        split_count = donor_count * 0.5
+        ema_counts[donor] = split_count
+        ema_counts[dead] = split_count
+        ema_sums[donor] = codebooks[donor] * split_count
+        ema_sums[dead] = codebooks[dead] * split_count
+        total_revived += 1
+
+    return total_revived
+
+
+def train_rq_emeans(
+    embeddings: np.ndarray,
+    num_levels: int,
+    num_centroids: int,
+    num_epochs: int = 5,
+    seed: int = 42,
+) -> np.ndarray:
+    if embeddings.ndim != 2 or embeddings.shape[0] == 0 or embeddings.shape[1] == 0:
+        raise ValueError("embeddings must be a non-empty [N, D] array")
+    if num_levels < 1 or num_epochs < 1:
+        raise ValueError("num_levels and num_epochs must be at least 1")
+    if num_centroids < 1 or embeddings.shape[0] < num_centroids:
+        raise ValueError("num_centroids must be positive and no greater than the dataset size")
+
+    mesh = get_mesh()
+    n_devices = len(mesh.devices)
+    n, dim = embeddings.shape
+    embeddings_f32 = embeddings.astype(np.float32, copy=False)
+    padded, pad = _pad_to_multiple(embeddings_f32, n_devices)
+    residual = _put_sharded(padded)
+    valid_weights = np.zeros(len(padded), dtype=np.float32)
+    valid_weights[:n] = 1.0
+    valid_weights_sharded = _put_sharded(valid_weights)
+    rng = np.random.RandomState(seed)
+
+    batch_size = _emeans_batch_size(n, num_centroids, num_epochs, dim)
+    alpha0 = _emeans_alpha0(n, num_centroids, batch_size, num_epochs)
+    batches_per_epoch = int(np.ceil(n / batch_size))
+    total_updates = num_epochs * batches_per_epoch
+    padded_batch_size = batch_size + (-batch_size) % n_devices
+    revival_threshold = (
+        max(1e-6, batch_size / num_centroids * 1e-3) if dim > 2 else 0.0
+    )
+
+    log.info(
+        "RQ-e-means: %d vectors (padded by %d), dim=%d, levels=%d, K=%d, %d device(s)",
+        n,
+        pad,
+        dim,
+        num_levels,
+        num_centroids,
+        n_devices,
+    )
+    log.info(
+        "  epochs=%d batch=%d alpha0=%.4f revival_threshold=%.4g",
+        num_epochs,
+        batch_size,
+        alpha0,
+        revival_threshold,
+    )
+
+    codebooks = []
+    for layer in range(num_levels):
+        layer_start = time.time()
+        update = 0
+        init_indices = rng.choice(n, size=num_centroids, replace=False)
+        init_centroids = np.asarray(jax.device_get(residual[init_indices])).astype(np.float32)
+        centroids = _put_replicated(init_centroids)
+        initial_count = np.full(num_centroids, 1e-10, dtype=np.float32)
+        ema_counts = _put_replicated(initial_count)
+        ema_sums = _put_replicated(init_centroids * initial_count[:, None])
+
+        for epoch in range(num_epochs):
+            order = rng.permutation(n)
+            for start in range(0, n, batch_size):
+                batch_indices = order[start : start + batch_size]
+                actual_size = len(batch_indices)
+                padded_indices = np.pad(
+                    batch_indices,
+                    (0, padded_batch_size - actual_size),
+                    mode="edge",
+                )
+                batch_residual = residual[padded_indices]
+                weights = np.zeros(padded_batch_size, dtype=np.float32)
+                weights[:actual_size] = batch_size / actual_size
+                centroids, ema_counts, ema_sums, assignments = _emeans_batch_update(
+                    batch_residual,
+                    centroids,
+                    ema_counts,
+                    ema_sums,
+                    _put_sharded(weights),
+                    jnp.asarray(_emeans_step_size(alpha0, update, total_updates)),
+                    num_centroids,
+                )
+                update += 1
+
+                if revival_threshold > 0 and update % 5 == 0:
+                    batch_np = np.asarray(jax.device_get(batch_residual))[:actual_size]
+                    assignments_np = np.asarray(jax.device_get(assignments))[:actual_size]
+                    centroids_np = np.asarray(jax.device_get(centroids)).copy()
+                    counts_np = np.asarray(jax.device_get(ema_counts)).copy()
+                    sums_np = np.asarray(jax.device_get(ema_sums)).copy()
+                    revived = _split_dead_codes(
+                        centroids_np,
+                        counts_np,
+                        sums_np,
+                        batch_np,
+                        assignments_np,
+                        rng,
+                        revival_threshold,
+                    )
+                    if revived:
+                        centroids = _put_replicated(centroids_np)
+                        ema_counts = _put_replicated(counts_np)
+                        ema_sums = _put_replicated(sums_np)
+                        log.info(
+                            "  layer %d update %d: split %d dead codes",
+                            layer,
+                            update,
+                            revived,
+                        )
+
+            if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
+                log.info(
+                    "  layer %d epoch %d/%d (%.1fs)",
+                    layer,
+                    epoch + 1,
+                    num_epochs,
+                    time.time() - layer_start,
+                )
+
+        centroids, _, _, assignments = _emeans_batch_update(
+            residual,
+            centroids,
+            _put_replicated(np.zeros(num_centroids, dtype=np.float32)),
+            _put_replicated(np.zeros((num_centroids, dim), dtype=np.float32)),
+            valid_weights_sharded,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            num_centroids,
+        )
+        centroids.block_until_ready()
+        codebooks.append(np.asarray(jax.device_get(centroids)))
+
+        if layer < num_levels - 1:
+            residual = _update_residual(residual, centroids, assignments)
+            residual.block_until_ready()
+        log.info("  layer %d done in %.1fs", layer, time.time() - layer_start)
+
+    return np.stack(codebooks, axis=0)
+
+
 def _put_sharded(arr: np.ndarray) -> jax.Array:
     mesh = get_mesh()
     return jax.device_put(arr, NamedSharding(mesh, _DATA_SPEC))
@@ -147,6 +388,7 @@ def train_rq_kmeans(
     n_iters: int,
     seed: int = 42,
 ) -> np.ndarray:
+    """Train residual codebooks with full-batch Lloyd updates."""
     mesh = get_mesh()
     n_devices = len(mesh.devices)
 
@@ -495,18 +737,18 @@ def train_rqvae(
 
         else:
             if step == warmup_steps:
-                log.info("  warmup done. Initializing codebooks via k-means on latent space...")
+                log.info("  warmup done. Initializing codebooks via e-means on latent space...")
                 init_size = min(N, 500_000)
                 init_idx = rng.choice(N, init_size, replace=False)
                 init_emb = emb_f32[init_idx]
                 init_latents = np.asarray(
                     jax.device_get(_mlp_forward(enc_params, jnp.array(init_emb)))
                 )
-                codebooks = train_rq_kmeans(
+                codebooks = train_rq_emeans(
                     init_latents,
                     num_levels,
                     num_centroids,
-                    n_iters=10,
+                    num_epochs=5,
                     seed=seed,
                 )
                 ema_counts = np.ones((num_levels, num_centroids), dtype=np.float32)
@@ -706,11 +948,11 @@ def cmd_train(args):
     log.info("training on %d vectors, dim=%d", len(embs), embs.shape[1])
 
     t0 = time.time()
-    codebooks = train_rq_kmeans(
+    codebooks = train_rq_emeans(
         embs,
         num_levels=args.num_levels,
         num_centroids=args.num_centroids,
-        n_iters=args.iters,
+        num_epochs=args.epochs,
         seed=args.seed,
     )
     log.info("training done in %.1fs", time.time() - t0)
@@ -718,9 +960,9 @@ def cmd_train(args):
     out = Path(args.codebook_out)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix == ".safetensors":
-        save_codebook_safetensors(out, codebooks, args.iters, args.seed, len(embs))
+        save_codebook_safetensors(out, codebooks, args.epochs, args.seed, len(embs))
     else:
-        save_codebook_npz(out, codebooks, args.iters, args.seed, len(embs))
+        save_codebook_npz(out, codebooks, args.epochs, args.seed, len(embs))
 
     evaluate_codebook(codebooks, embs, max_eval=min(100_000, len(embs)), seed=args.seed)
 
@@ -798,19 +1040,26 @@ def cmd_evaluate_vae(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="JAX RQ-KMeans / RQ-VAE codebook trainer")
+    ap = argparse.ArgumentParser(description="JAX RQ-e-means / RQ-VAE codebook trainer")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_train = sub.add_parser("train", help="Train RQ-KMeans codebook (vanilla Lloyd's)")
+    p_train = sub.add_parser("train", help="Train a fixed-embedding RQ-e-means codebook")
     p_train.add_argument("--training-data", required=True, help=".npy embeddings, [N, D] float32")
     p_train.add_argument("--codebook-out", required=True, help="Output .npz path")
     p_train.add_argument("--sample-size", type=int, default=None, help="Subsample training data")
     p_train.add_argument("--num-levels", type=int, default=6)
     p_train.add_argument("--num-centroids", type=int, default=256)
-    p_train.add_argument("--iters", type=int, default=25)
+    p_train.add_argument(
+        "--epochs",
+        "--iters",
+        dest="epochs",
+        type=int,
+        default=5,
+        help="Training epochs (default: 5; --iters is a compatibility alias)",
+    )
     p_train.add_argument("--seed", type=int, default=42)
 
-    p_eval = sub.add_parser("evaluate", help="Evaluate RQ-KMeans codebook quality")
+    p_eval = sub.add_parser("evaluate", help="Evaluate RQ-e-means codebook quality")
     p_eval.add_argument("--codebook", required=True, help=".npz")
     p_eval.add_argument("--training-data", required=True, help=".npy")
     p_eval.add_argument("--eval-size", type=int, default=100_000)

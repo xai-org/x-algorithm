@@ -23,7 +23,11 @@ impl PostFusionMultiplier {
     }
 
     pub fn apply(&self, score: f64) -> f64 {
-        score * self.author_diversity * self.oon
+        if score < NEGATIVE_SCORES_OFFSET {
+            score
+        } else {
+            score * self.author_diversity * self.oon
+        }
     }
 }
 
@@ -496,6 +500,22 @@ mod tests {
     use crate::phoenix_scores::PhoenixScores;
 
     #[test]
+    fn post_fusion_multipliers_preserve_negative_scores() {
+        let multiplier = PostFusionMultiplier {
+            author_diversity: 0.5,
+            oon: 0.75,
+        };
+        let negative_score = NEGATIVE_SCORES_OFFSET * 0.5;
+        let positive_score = NEGATIVE_SCORES_OFFSET + 0.5;
+
+        assert_eq!(multiplier.apply(negative_score), negative_score);
+        assert_eq!(
+            multiplier.apply(positive_score),
+            positive_score * multiplier.author_diversity * multiplier.oon
+        );
+    }
+
+    #[test]
     fn hand_computed_parity() {
         let weights = ValueModelWeights {
             favorite: 2.0,
@@ -610,7 +630,7 @@ mod tests {
             weighted_mutual_original,
             weighted_ineligible_video_oon * 0.75,
             weighted_eligible_video_same_author * diversity_second_from_author,
-            weighted_reported_reply * 0.75,
+            weighted_reported_reply,
         ];
         let expected_weighted = [
             weighted_mutual_original,
