@@ -8,6 +8,7 @@ import com.twitter.botmaker.ASTNode;
 import com.twitter.botmaker.Context;
 import com.twitter.botmaker.compiler.ActionLevel;
 import com.twitter.botmaker.compiler.BotMakerFunction;
+import com.twitter.botmaker.compiler.exceptions.FunctionFailure;
 import com.twitter.botmaker.compiler.exceptions.SemanticCheckFailure;
 import com.twitter.botmaker.compiler.types.Type;
 import com.twitter.botmaker.function.FunctionNode2;
@@ -55,7 +56,30 @@ public class ElementAtIndex extends FunctionNode2<Runtime, List<Object>, Long> {
 
   @Override
   protected Object apply(Context<Runtime> context, List<Object> list, Long index) {
-    return list.get(index.intValue());
+    if (list == null) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException("ElementAtIndex() called on null list"));
+    }
+    if (index == null) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException("ElementAtIndex() requires a non-null index"));
+    }
+    int i = index.intValue();
+    if (i < 0 || i >= list.size()) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException(
+              String.format(
+                  "ElementAtIndex() index out of range: index=%d size=%d",
+                  i,
+                  list.size())));
+    }
+    return list.get(i);
   }
 
 }
