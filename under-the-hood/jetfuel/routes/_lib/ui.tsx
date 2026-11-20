@@ -45,3 +45,11 @@ export const Body = ({ t, mod = "" }: { t: Localized | string; mod?: string }) =
 );
 
 export const SectionTitle = ({ t }: { t: Localized }) => <Text t={t} mod={`${textPrimary} text-xl font-bold`} />;
+
+export const SwitchIndicator = ({ on }: { on: boolean }) => (
+	<View
+		mod={`flex-row items-center w-12 h-7 px-0.5 rounded-full shrink-0 ${on ? "justify-end bg-green-500" : "justify-start light:bg-gray-300 dark:bg-zinc-700 dim:bg-gray-600"}`}
+	>
+		<View mod="w-6 h-6 rounded-full bg-white" />
+	</View>
+);

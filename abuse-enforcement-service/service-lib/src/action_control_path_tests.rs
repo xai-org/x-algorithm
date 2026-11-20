@@ -2717,7 +2717,7 @@ async fn a_permanent_policy_suspend_reaches_ais_as_set_and_upgrades_a_suspended_
             r#"[{"kind":"suspend","permanent":true,"policy":"Cse"}]"#
         );
         assert!(
-            t.dedup_calls.iter().any(|c| c.contains("class=4")),
+            t.dedup_calls.iter().any(|c| c.contains("class=5")),
             "{:?}",
             t.dedup_calls
         );

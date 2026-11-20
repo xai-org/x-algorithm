@@ -3,7 +3,13 @@ import { isProd, page, ResponseCode, t } from "@serving";
 import { backgroundPrimary, textPrimary, textSecondary } from "../../../ui/themes";
 import previewTrace from "../../logged_out/cards/under_the_hood/previewTrace.json";
 import { decodeTrace, parseTrace, previewAllowed } from "../../logged_out/cards/under_the_hood/traceBody";
-import { latency, stageList, traceTitle } from "../../logged_out/cards/under_the_hood/traceView";
+import {
+	latency,
+	stageList,
+	TRACE_SETTINGS_ROUTE,
+	TRACE_SETTINGS_SWITCH,
+	traceTitle,
+} from "../../logged_out/cards/under_the_hood/traceView";
 
 const T = t.Object({
 	t: t.Optional(t.String()),
@@ -33,7 +39,14 @@ export default page("logged_in.under_the_hood.trace", T, async (ctx) => {
 						<Nav to=":back" mod="w-10 h-10 items-center justify-center rounded-full">
 							<Icon key="arrow_left" size={20} mod={textPrimary} />
 						</Nav>
-						<Text t={traceTitle()} mod={`${textPrimary} text-lg font-bold ml-2 flex-1 w-min-0`} numberOfLines={1} truncate="end" />
+						<View mod="flex-row flex-1 w-min-0 items-center ml-2">
+							<Text t={traceTitle()} mod={`${textPrimary} text-lg font-bold shrink w-min-0`} numberOfLines={1} truncate="end" />
+							{fs.isTrue(TRACE_SETTINGS_SWITCH) ? (
+								<Nav to={TRACE_SETTINGS_ROUTE} mod="w-10 h-10 items-center justify-center rounded-full shrink-0">
+									<Icon key="settings_stroke" size={20} mod={textPrimary} />
+								</Nav>
+							) : null}
+						</View>
 						<Text t={latency(trace.latencyUs)} mod={`text-sm leading-5 shrink-0 px-2 ${textSecondary}`} numberOfLines={1} />
 					</View>
 				}

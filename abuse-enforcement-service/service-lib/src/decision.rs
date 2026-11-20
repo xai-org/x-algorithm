@@ -26,6 +26,9 @@ pub enum ActionSpec {
 impl ActionSpec {
     pub fn dedup_action_class(&self) -> u8 {
         match self {
+            ActionSpec::SuspendUser { policy, .. } if is_cse_policy(policy) => {
+                crate::dedup_cache::CLASS_SUSPEND_CSE
+            }
             ActionSpec::SuspendUser { perm: true, .. } => {
                 crate::dedup_cache::CLASS_SUSPEND_PERMANENT
             }
@@ -38,4 +41,12 @@ impl ActionSpec {
             }
         }
     }
+
+    pub fn is_permanent_cse_suspension(&self) -> bool {
+        matches!(self, ActionSpec::SuspendUser { perm: true, policy } if is_cse_policy(policy))
+    }
+}
+
+pub fn is_cse_policy(policy: &str) -> bool {
+    policy.eq_ignore_ascii_case(crate::action_control::SuspensionPolicy::Cse.as_str())
 }

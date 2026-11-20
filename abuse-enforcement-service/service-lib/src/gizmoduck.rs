@@ -264,6 +264,11 @@ fn facts_of(user: &User) -> GizmoduckFacts {
             .filter(|ip| !ip.is_empty())
             .map(str::to_owned),
         test_signal: None,
+        permanently_suspended: safety
+            .suspension_details
+            .as_ref()
+            .and_then(|d| d.permanently_suspended)
+            .unwrap_or(false),
     }
 }
 
@@ -819,5 +824,33 @@ mod tests {
         });
         let client = GizmoduckCoreClient::from_lookup(users).with_policy(policy());
         assert!(client.fetch_user(UID).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_lookup_reads_whether_a_suspension_is_permanent() {
+        let suspended = |permanently: Option<bool>| {
+            let mut user = AccountShape::default().user(UID);
+            user.safety = Some(xai_x_thrift::user::Safety {
+                suspended: Some(true),
+                suspension_details: permanently.map(|p| xai_x_thrift::user::SuspensionDetails {
+                    permanently_suspended: Some(p),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            user
+        };
+        for (permanently, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let users = Arc::new(FixedUsers {
+                users: [(UID, suspended(permanently))].into(),
+                ..Default::default()
+            });
+            let facts = GizmoduckCoreClient::from_lookup(users)
+                .fetch_user(UID)
+                .await
+                .unwrap();
+            assert!(facts.suspended);
+            assert_eq!(facts.permanently_suspended, expected, "{permanently:?}");
+        }
     }
 }

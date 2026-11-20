@@ -46,6 +46,8 @@ mod replay_tests;
 #[cfg(test)]
 mod safety_audit_tests;
 #[cfg(test)]
+mod suspend_order_path_tests;
+#[cfg(test)]
 mod test_account_path_tests;
 
 use xai_abuse_proto::enforcement as abuse_proto;
@@ -57,7 +59,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::dedup_cache::{DedupCheck, DedupKey, DedupSlot};
+use crate::dedup_cache::{DedupCheck, DedupKey, DedupSlot, SlotHolder};
 use anyhow::{Context, Result};
 use axum::Router;
 
@@ -159,6 +161,28 @@ struct DecisionContext {
                 global_dry_run: bool,
             run: Option<Arc<backfill::BackfillRunRecord>>,
                 run_nonce: i64,
+        slot: Option<DecisionSlot>,
+}
+
+#[derive(Clone)]
+struct DecisionSlot {
+    cache: Arc<dyn DedupSlot>,
+    key: DedupKey,
+    claim_nonce: Option<u64>,
+            displaced_in_flight_suspend: Option<u8>,
+}
+
+impl std::fmt::Debug for DecisionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionSlot")
+            .field("key", &self.key)
+            .field("claim_nonce", &self.claim_nonce)
+            .field(
+                "displaced_in_flight_suspend",
+                &self.displaced_in_flight_suspend,
+            )
+            .finish()
+    }
 }
 
 impl DecisionContext {
@@ -384,15 +408,156 @@ fn strip_redundant_suspends(
 ) -> Vec<decision::ActionSpec> {
     let is_suspend =
         |s: &decision::ActionSpec| matches!(s, decision::ActionSpec::SuspendUser { .. });
-    let has_perm = specs
+    let outranks_temporary = specs
         .iter()
-        .any(|s| matches!(s, decision::ActionSpec::SuspendUser { perm: true, .. }));
-    if !user.suspended || has_perm || !specs.iter().any(is_suspend) {
+        .any(|s| s.dedup_action_class() > dedup_cache::CLASS_SUSPEND);
+    if !user.suspended || outranks_temporary || !specs.iter().any(is_suspend) {
         return Vec::new();
     }
     let (stripped, kept) = std::mem::take(specs).into_iter().partition(is_suspend);
     *specs = kept;
     stripped
+}
+
+const ALREADY_PERMANENTLY_SUSPENDED: &str = "already_permanently_suspended";
+
+const ALREADY_CSE_SUSPENDED: &str = "already_cse_suspended";
+
+const PERMANENT_SEEN_IN: &str = "permanent_suspension_seen_in";
+const PERMANENT_SEEN_IN_GIZMODUCK: &str = "gizmoduck";
+const PERMANENT_SEEN_IN_DEDUP: &str = "dedup";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outranking {
+                    Gizmoduck,
+            Dedup(u8),
+}
+
+impl Outranking {
+    fn drops(self, spec: &decision::ActionSpec) -> bool {
+        if !matches!(spec, decision::ActionSpec::SuspendUser { .. }) {
+            return false;
+        }
+        match self {
+            Outranking::Gizmoduck => !spec.is_permanent_cse_suspension(),
+            Outranking::Dedup(class) => spec.dedup_action_class() < class,
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Outranking::Dedup(dedup_cache::CLASS_SUSPEND_CSE) => ALREADY_CSE_SUSPENDED,
+            _ => ALREADY_PERMANENTLY_SUSPENDED,
+        }
+    }
+
+    fn seen_in(self) -> &'static str {
+        match self {
+            Outranking::Gizmoduck => PERMANENT_SEEN_IN_GIZMODUCK,
+            Outranking::Dedup(_) => PERMANENT_SEEN_IN_DEDUP,
+        }
+    }
+}
+
+fn drop_outranked_suspends(
+    specs: &mut Vec<decision::ActionSpec>,
+    by: Outranking,
+    extra: &mut BTreeMap<String, String>,
+    dry_run: bool,
+    facts: &Facts,
+    score: &abuse_proto::ScoreResult,
+) -> Option<abuse_proto::DecisionOutcome> {
+    let before = specs.len();
+    specs.retain(|s| !by.drops(s));
+    if specs.len() == before {
+        return None;
+    }
+    let (status, seen_in) = (by.status(), by.seen_in());
+    metrics::SUSPEND_ORDER_TOTAL
+        .with_label_values(&[status, seen_in])
+        .inc();
+    extra.insert(PERMANENT_SEEN_IN.into(), seen_in.into());
+    info!(
+        user_id = facts.user_id,
+        status, seen_in, "a stronger suspension of the account outranks this one; dropping it"
+    );
+    specs
+        .is_empty()
+        .then(|| skip_outcome(status.into(), dry_run, facts, score))
+}
+
+const AWAIT_STRONGER: Duration = Duration::from_secs(5);
+const AWAIT_WEAKER: Duration = Duration::from_secs(2);
+const SLOT_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspendOrder {
+    Proceed,
+        Outranked(u8),
+}
+
+async fn order_suspends(
+    slot: &DecisionSlot,
+    specs: &[decision::ActionSpec],
+    user_id: i64,
+) -> SuspendOrder {
+    let Some(mine) = specs
+        .iter()
+        .filter(|s| matches!(s, decision::ActionSpec::SuspendUser { .. }))
+        .map(decision::ActionSpec::dedup_action_class)
+        .max()
+    else {
+        return SuspendOrder::Proceed;
+    };
+    let key = DedupKey::entity(EntityType::User, user_id);
+    let own_key = key == slot.key;
+    let own_nonce = slot.claim_nonce.filter(|_| own_key);
+    let displaced = slot.displaced_in_flight_suspend.filter(|_| own_key);
+    let started = tokio::time::Instant::now();
+    let mut waited = false;
+    loop {
+        let other = match slot.cache.holder(&key, own_nonce).await {
+            Some(SlotHolder::Outcome(class))
+                if class > mine && class >= dedup_cache::CLASS_SUSPEND_PERMANENT =>
+            {
+                return SuspendOrder::Outranked(class);
+            }
+            Some(SlotHolder::Claim(class))
+                if class >= dedup_cache::CLASS_SUSPEND && class != mine =>
+            {
+                Some(class)
+            }
+            Some(SlotHolder::Own) => displaced.filter(|&class| class < mine),
+            _ => None,
+        };
+        let Some(other) = other else {
+            if waited {
+                metrics::SUSPEND_ORDER_TOTAL
+                    .with_label_values(&["waited", ""])
+                    .inc();
+            }
+            return SuspendOrder::Proceed;
+        };
+        let budget = if other > mine {
+            AWAIT_STRONGER
+        } else {
+            AWAIT_WEAKER
+        };
+        if started.elapsed() >= budget {
+            warn!(
+                user_id,
+                class = mine,
+                other_class = other,
+                "another decision's suspension of this account is still in flight; sending"
+            );
+            metrics::SUSPEND_ORDER_TOTAL
+                .with_label_values(&["wait_timeout", ""])
+                .inc();
+            return SuspendOrder::Proceed;
+        }
+        waited = true;
+        tokio::time::sleep(SLOT_POLL).await;
+    }
 }
 
 fn incoming_dedup_class(
@@ -418,6 +583,7 @@ fn incoming_dedup_class(
         .unwrap_or(dedup_cache::CLASS_NONE)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(dry_run, uas))]
 async fn run_enforcement_inner(
     ctx: &EnforcementCtx,
@@ -428,6 +594,7 @@ async fn run_enforcement_inner(
     pinned_global_dry_run: bool,
     extra: &mut BTreeMap<String, String>,
     run: Option<(&backfill::BackfillRunRecord, i64)>,
+    slot: Option<&DecisionSlot>,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let user_id = score.user_id;
     let (entity_type, entity_id) = Facts::resolve_target(score);
@@ -738,6 +905,18 @@ async fn run_enforcement_inner(
                     score,
                 ));
             }
+            if facts.user().permanently_suspended
+                && let Some(outcome) = drop_outranked_suspends(
+                    &mut specs,
+                    Outranking::Gizmoduck,
+                    extra,
+                    dry_run,
+                    &facts,
+                    score,
+                )
+            {
+                return Ok(outcome);
+            }
             if control.page_driven() {
                 let account = facts.user();
                 let upgrades = control.page_actions.iter().any(|a| {
@@ -745,6 +924,9 @@ async fn run_enforcement_inner(
                         a,
                         action_control::PageAction::Suspend {
                             permanent: true,
+                            ..
+                        } | action_control::PageAction::Suspend {
+                            policy: action_control::SuspensionPolicy::Cse,
                             ..
                         }
                     )
@@ -886,6 +1068,22 @@ async fn run_enforcement_inner(
                     &facts,
                     score,
                 ));
+            }
+
+            if !dry_run
+                && let Some(slot) = slot
+                && let SuspendOrder::Outranked(class) =
+                    order_suspends(slot, &specs, facts.user_id).await
+                && let Some(outcome) = drop_outranked_suspends(
+                    &mut specs,
+                    Outranking::Dedup(class),
+                    extra,
+                    dry_run,
+                    &facts,
+                    score,
+                )
+            {
+                return Ok(outcome);
             }
 
             if let Some(outcome) = final_checks(
@@ -1436,6 +1634,7 @@ async fn run_enforcement(
         decision.global_dry_run,
         &mut extra,
         run.map(|r| (r, decision.run_nonce)),
+        decision.slot.as_ref(),
     )
     .await;
     let finish = |status: String| async move {
@@ -1753,6 +1952,7 @@ impl ScoreResultProcessor {
             global_dry_run: self.ctx.dynamic_config.is_dry_run(),
             run,
             run_nonce: backfill_claims::new_claim_nonce(),
+            slot: None,
         };
 
         let incoming_class = decision.control.incoming_dedup_class(|| {
@@ -1763,7 +1963,8 @@ impl ScoreResultProcessor {
             decision.would_dedup_held = self.dedup_cache.peek(&dedup_key, incoming_class).await;
             None
         } else {
-            match self
+            let mut displaced_in_flight_suspend = None;
+            let claim_nonce = match self
                 .dedup_cache
                 .try_insert(&dedup_key, incoming_class)
                 .await
@@ -1771,8 +1972,12 @@ impl ScoreResultProcessor {
                 DedupCheck::New { claim_nonce } => claim_nonce,
                 DedupCheck::ClassBypass {
                     held_class,
+                    held_in_flight,
                     claim_nonce,
                 } => {
+                    displaced_in_flight_suspend = (held_in_flight
+                        && held_class >= dedup_cache::CLASS_SUSPEND)
+                        .then_some(held_class);
                     info!(
                         incoming_class,
                         held_class, "dedup: class bypass (incoming outranks held entry)"
@@ -1813,7 +2018,14 @@ impl ScoreResultProcessor {
                     );
                     return Ok("dedup_skipped".into());
                 }
-            }
+            };
+            decision.slot = Some(DecisionSlot {
+                cache: self.dedup_cache.clone(),
+                key: dedup_key.clone(),
+                claim_nonce,
+                displaced_in_flight_suspend,
+            });
+            claim_nonce
         };
 
         let outcome = match run_enforcement(&self.ctx, score, topic, &decision).await {
@@ -5996,6 +6208,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6025,6 +6238,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6047,6 +6261,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await
@@ -6074,6 +6289,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6095,6 +6311,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await
@@ -6121,6 +6338,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await

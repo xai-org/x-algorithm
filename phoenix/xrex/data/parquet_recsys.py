@@ -55,6 +55,7 @@ from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
     NUM_ADS_COUNT_FEATURES,
+    NUM_ADS_CTR_FEATURES,
     NUM_USER_INSTALLED_APPS,
     PAGE_RECORD_COLUMNS,
     POST_INT64_FEATURE_SIZE,
@@ -1844,6 +1845,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 padded[key] = pad_array(value_labels)
         if (ads_counts := post_seq.get("ads_count_buckets")) is not None:
             padded["ads_count_buckets"] = pad_array(ads_counts)
+        if (ads_ctr := post_seq.get("ads_ctr_buckets")) is not None:
+            padded["ads_ctr_buckets"] = pad_array(ads_ctr)
         if (ad_side := post_seq.get("ad_side_ids")) is not None:
             padded["ad_side_ids"] = pad_array(ad_side)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
@@ -1990,6 +1993,7 @@ class PhoenixDataset(Dataset):
     ads_late_window_heads: bool = False
     page_records: bool = False
     read_ads_engagement_counts: bool = False
+    read_ads_ctr_features: bool = False
     read_ad_side_ids: bool = False
     ad_side_fields: str = "campaign,line_item,creative"
     ad_fields_sidecar_root: str | None = None
@@ -2608,6 +2612,7 @@ class PhoenixDataset(Dataset):
                         id_list_specs=id_list_specs,
                         history_url_embedding_dim=self.history_url_embedding_dim,
                         read_ads_engagement_counts=self.read_ads_engagement_counts,
+                        read_ads_ctr_features=self.read_ads_ctr_features,
                         long_term_author_profile_size=self.long_term_author_profile_size,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
@@ -2905,6 +2910,10 @@ class PhoenixDataset(Dataset):
         if self.read_ads_engagement_counts:
             batch["candidate_seq"]["ads_count_buckets"] = np.zeros(
                 (batch_size, candidate_seq_len, NUM_ADS_COUNT_FEATURES), dtype=np.uint8
+            )
+        if self.read_ads_ctr_features:
+            batch["candidate_seq"]["ads_ctr_buckets"] = np.zeros(
+                (batch_size, candidate_seq_len, NUM_ADS_CTR_FEATURES), dtype=np.uint8
             )
         if self.read_ad_side_ids:
             batch["candidate_seq"]["ad_side_ids"] = np.zeros(

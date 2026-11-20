@@ -66,6 +66,7 @@ class UserStratoLoader:
     _high_page_rank_v2_cache: TTLCache[int, HighPageRankUser | None] = TTLCache(
         maxsize=100_000, ttl=30 * 60
     )
+    _grey_badge_cache: TTLCache[int, bool] = TTLCache(maxsize=100_000, ttl=30 * 60)
     _MISSING = object()
 
     @classmethod
@@ -92,7 +93,12 @@ class UserStratoLoader:
 
     @classmethod
     async def is_grey_badge_user(cls, user_id: int) -> bool:
-        return await cls._is_grey_badge.fetch(user_id)
+        cached = cls._grey_badge_cache.get(user_id, cls._MISSING)
+        if cached is not cls._MISSING:
+            return cached
+        result = bool(await cls._is_grey_badge.fetch(user_id))
+        cls._grey_badge_cache[user_id] = result
+        return result
 
 
 class UserRecentPostsLoader:

@@ -62,6 +62,53 @@ pub fn emit(pipeline: &str, start: Instant, result_size: usize) {
     });
 }
 
+#[derive(Clone, Copy)]
+pub struct SummaryFork {
+    stage: PipelineStage,
+    start: Option<Instant>,
+}
+
+pub fn fork(stage: PipelineStage) -> SummaryFork {
+    let mut start = None;
+    with_active(|summary| start = Some(summary.start));
+    SummaryFork { stage, start }
+}
+
+impl SummaryFork {
+    pub async fn capture<F: Future>(self, fut: F) -> (F::Output, Option<StageTrace>) {
+        let Some(start) = self.start else {
+            return (fut.await, None);
+        };
+        let mut summary = PipelineSummary {
+            start,
+            trace: PipelineTrace::default(),
+        };
+        summary.stage_mut(self.stage);
+        ACTIVE
+            .scope(RefCell::new(Some(summary)), async {
+                let output = fut.await;
+                let stage = ACTIVE.with(|active| {
+                    active
+                        .borrow_mut()
+                        .take()
+                        .and_then(|summary| summary.trace.stages.into_iter().next())
+                });
+                (output, stage)
+            })
+            .await
+    }
+
+    pub fn merge(self, captured: Option<StageTrace>) {
+        if let Some(captured) = captured {
+            with_active(|summary| {
+                let stage = summary.stage_mut(self.stage);
+                stage.components.extend(captured.components);
+                stage.nested.extend(captured.nested);
+            });
+        }
+    }
+}
+
 pub struct StageStats {
     stage: PipelineStage,
     start: Instant,

@@ -55,6 +55,13 @@ lazy_static! {
             "Bypass claims lost to a concurrent claimant at nonce verification.")
             .unwrap();
 
+                            pub static ref SUSPEND_ORDER_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_suspend_order_total",
+            "Suspensions ordered against another suspension of the same account.",
+            &["outcome", "seen_in"])
+            .unwrap();
+
             pub static ref POST_LABEL_READ_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_post_label_read_total",
@@ -473,6 +480,7 @@ pub fn init() {
     let _ = &*DEDUP_WRITE_FENCED_TOTAL;
     let _ = &*DEDUP_DISPLACED_RESTORED_TOTAL;
     let _ = &*DEDUP_BYPASS_CLAIM_LOST_TOTAL;
+    let _ = &*SUSPEND_ORDER_TOTAL;
     let _ = &*POST_LABEL_READ_TOTAL;
     let _ = &*STRATO_LATENCY;
     let _ = &*AIS_LATENCY;

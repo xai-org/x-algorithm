@@ -6,7 +6,7 @@ use crate::params::{
 };
 use crate::scorers::phoenix_scorer::{is_prod_cluster, PhoenixScorer};
 use crate::side_effects::phoenix_request_cache_side_effect::{
-    encode_cache_value, product_surface, teacher_cache_key, write_to_both_dcs,
+    encode_cache_value, product_surface, teacher_cache_key,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,18 +21,13 @@ use xai_stats_receiver::global_stats_receiver;
 const CALLS_METRIC: &str = "TeacherScoreSideEffect.calls";
 
 pub struct TeacherScoreSideEffect {
-    teacher_cache_atla_client: Arc<dyn RedisClient>,
-    teacher_cache_pdxa_client: Arc<dyn RedisClient>,
+    teacher_cache_client: Arc<dyn RedisClient>,
 }
 
 impl TeacherScoreSideEffect {
-    pub fn new(
-        teacher_cache_atla_client: Arc<dyn RedisClient>,
-        teacher_cache_pdxa_client: Arc<dyn RedisClient>,
-    ) -> Self {
+    pub fn new(teacher_cache_client: Arc<dyn RedisClient>) -> Self {
         Self {
-            teacher_cache_atla_client,
-            teacher_cache_pdxa_client,
+            teacher_cache_client,
         }
     }
 }
@@ -163,17 +158,15 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for TeacherScoreSideEffect {
             record_call("empty");
             return Ok(());
         }
-        let entries = vec![(
-            teacher_cache_key(prediction_request_id),
-            encode_cache_value(&entry)?,
-        )];
-        let written = write_to_both_dcs(
-            self.teacher_cache_atla_client.as_ref(),
-            self.teacher_cache_pdxa_client.as_ref(),
-            entries,
-            params.get(TeacherTtlSeconds),
-        )
-        .await;
+        let written = self
+            .teacher_cache_client
+            .set_ex(
+                teacher_cache_key(prediction_request_id),
+                encode_cache_value(&entry)?,
+                params.get(TeacherTtlSeconds),
+            )
+            .await
+            .map_err(|e| e.to_string());
         record_call(if written.is_ok() {
             "written"
         } else {

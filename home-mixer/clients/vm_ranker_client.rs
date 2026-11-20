@@ -50,11 +50,13 @@ pub enum VMRankerCluster {
 }
 
 impl VMRankerCluster {
+    pub fn host(&self) -> &'static str {
+        self.get_str("host")
+            .expect("every variant must have a host")
+    }
+
     pub fn endpoint(&self) -> String {
-        let host = self
-            .get_str("host")
-            .expect("every variant must have a host");
-        format!("https://xai-vm-ranker-{host}.twitter.biz:443")
+        format!("https://xai-vm-ranker-{}.twitter.biz:443", self.host())
     }
 
     pub fn xds_eds_resource(&self, authority: &str) -> String {

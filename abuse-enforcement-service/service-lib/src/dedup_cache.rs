@@ -13,6 +13,7 @@ pub(crate) const CLASS_LABEL: u8 = 1;
 pub(crate) const CLASS_CHALLENGE: u8 = 2;
 pub(crate) const CLASS_SUSPEND: u8 = 3;
 pub(crate) const CLASS_SUSPEND_PERMANENT: u8 = 4;
+pub(crate) const CLASS_SUSPEND_CSE: u8 = 5;
 
 pub(crate) fn is_duplicate(incoming_class: u8, held: &HeldMeta) -> bool {
     incoming_class <= held.class
@@ -36,7 +37,7 @@ pub(crate) fn held_entry_meta(raw: &[u8]) -> HeldMeta {
     let json_bytes = zstd::decode_all(raw).unwrap_or_else(|_| raw.to_vec());
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&json_bytes) else {
         return HeldMeta {
-            class: CLASS_SUSPEND_PERMANENT,
+            class: CLASS_SUSPEND_CSE,
             kind: HeldKind::Outcome,
             nonce: None,
             displaced: None,
@@ -56,12 +57,12 @@ pub(crate) fn held_entry_meta(raw: &[u8]) -> HeldMeta {
         _ => None,
     };
     let class = if let Some(c) = v.get("acted_class").and_then(serde_json::Value::as_u64) {
-        c.min(CLASS_SUSPEND_PERMANENT as u64) as u8
+        c.min(CLASS_SUSPEND_CSE as u64) as u8
     } else {
         match v.get("status").and_then(serde_json::Value::as_str) {
-            Some("success") => CLASS_SUSPEND_PERMANENT,
+            Some("success") => CLASS_SUSPEND_CSE,
             Some(_) => CLASS_NONE,
-            None => CLASS_SUSPEND_PERMANENT,
+            None => CLASS_SUSPEND_CSE,
         }
     };
     HeldMeta {
@@ -104,6 +105,14 @@ fn fences_write(
             (writer_nonce.is_none() || meta.nonce != writer_nonce)
                 && carried_class(meta, now_secs) > writer_class
         }
+    }
+}
+
+fn holder_of(meta: &HeldMeta, own_nonce: Option<u64>) -> SlotHolder {
+    match meta.kind {
+        HeldKind::Placeholder if own_nonce.is_some() && meta.nonce == own_nonce => SlotHolder::Own,
+        HeldKind::Placeholder => SlotHolder::Claim(meta.class),
+        HeldKind::Outcome => SlotHolder::Outcome(meta.class),
     }
 }
 
@@ -196,11 +205,20 @@ enum SlotView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupCheck {
         New { claim_nonce: Option<u64> },
-                ClassBypass {
+                        ClassBypass {
         held_class: u8,
+        held_in_flight: bool,
         claim_nonce: Option<u64>,
     },
         Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotHolder {
+    Empty,
+        Own,
+        Claim(u8),
+        Outcome(u8),
 }
 
 struct StoredEntry {
@@ -300,15 +318,18 @@ impl ManhattanDedupCache {
                     }
                     _ => None,
                 };
+                let held_in_flight = meta.kind == HeldKind::Placeholder;
                 match self.claim(&pkey, incoming_class, displaced).await {
                     None => DedupCheck::ClassBypass {
                         held_class: meta.class,
+                        held_in_flight,
                         claim_nonce: None,
                     },
                     Some(nonce) => {
                         if self.verify_claim(&pkey, nonce).await {
                             DedupCheck::ClassBypass {
                                 held_class: meta.class,
+                                held_in_flight,
                                 claim_nonce: Some(nonce),
                             }
                         } else {
@@ -445,7 +466,7 @@ impl ManhattanDedupCache {
         claim_nonce: Option<u64>,
     ) {
         let pkey = key.pkey();
-        if acted_class < CLASS_SUSPEND_PERMANENT {
+        if acted_class < CLASS_SUSPEND_CSE {
             match self.slot_view(&pkey).await {
                 SlotView::Held(meta) => {
                     let now = now_secs();
@@ -561,6 +582,18 @@ impl ManhattanDedupCache {
         }
     }
 
+                    pub async fn holder(&self, key: &DedupKey, own_nonce: Option<u64>) -> Option<SlotHolder> {
+        match self.store.get(&key.pkey()).await {
+            Ok(Some(entry)) => Some(holder_of(&held_entry_meta(&entry.bytes), own_nonce)),
+            Ok(None) => Some(SlotHolder::Empty),
+            Err(e) => {
+                warn!("Manhattan dedup holder read failed: {e}");
+                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();
+                None
+            }
+        }
+    }
+
                     pub async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8> {
         let pkey = key.pkey();
         match self.store.get(&pkey).await {
@@ -582,6 +615,7 @@ impl ManhattanDedupCache {
 pub trait DedupSlot: Send + Sync {
     async fn try_insert(&self, key: &DedupKey, incoming_class: u8) -> DedupCheck;
     async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8>;
+    async fn holder(&self, key: &DedupKey, own_nonce: Option<u64>) -> Option<SlotHolder>;
     async fn update(&self, key: &DedupKey, value: &[u8], acted_class: u8, claim_nonce: Option<u64>);
     async fn update_skip(
         &self,
@@ -600,6 +634,9 @@ impl DedupSlot for ManhattanDedupCache {
     }
     async fn peek(&self, key: &DedupKey, incoming_class: u8) -> Option<u8> {
         ManhattanDedupCache::peek(self, key, incoming_class).await
+    }
+    async fn holder(&self, key: &DedupKey, own_nonce: Option<u64>) -> Option<SlotHolder> {
+        ManhattanDedupCache::holder(self, key, own_nonce).await
     }
     async fn update(
         &self,
@@ -696,6 +733,7 @@ pub(crate) mod test_support {
                     slots.insert(key, (incoming, true, Some(nonce)));
                     DedupCheck::ClassBypass {
                         held_class: held,
+                        held_in_flight: placeholder,
                         claim_nonce: Some(nonce),
                     }
                 }
@@ -721,6 +759,16 @@ pub(crate) mod test_support {
             let out = held.filter(|h| incoming <= *h);
             self.log(format!("peek(class={incoming})={out:?}"));
             out
+        }
+
+                        async fn holder(&self, key: &DedupKey, own: Option<u64>) -> Option<SlotHolder> {
+            let slots = self.slots.lock().unwrap();
+            Some(match slots.get(key) {
+                None => SlotHolder::Empty,
+                Some(&(_, true, nonce)) if own.is_some() && nonce == own => SlotHolder::Own,
+                Some(&(class, true, _)) => SlotHolder::Claim(class),
+                Some(&(class, false, _)) => SlotHolder::Outcome(class),
+            })
         }
 
         async fn update(&self, key: &DedupKey, _v: &[u8], class: u8, n: Option<u64>) {
@@ -780,6 +828,7 @@ mod tests {
             CLASS_CHALLENGE,
             CLASS_SUSPEND,
             CLASS_SUSPEND_PERMANENT,
+            CLASS_SUSPEND_CSE,
         ] {
             let entry = serde_json::json!({ "status": "success", "acted_class": class });
             assert_eq!(held_action_class(&zstd_json(entry.clone())), class);
@@ -788,7 +837,7 @@ mod tests {
         let entry = serde_json::json!({ "acted_class": 200 });
         assert_eq!(
             held_action_class(entry.to_string().as_bytes()),
-            CLASS_SUSPEND_PERMANENT
+            CLASS_SUSPEND_CSE
         );
         let claim = serde_json::json!({ "ts": 1, "acted_class": CLASS_LABEL });
         assert_eq!(held_action_class(claim.to_string().as_bytes()), CLASS_LABEL);
@@ -799,7 +848,7 @@ mod tests {
         let legacy_success = serde_json::json!({ "status": "success", "topic": "t" });
         assert_eq!(
             held_action_class(&zstd_json(legacy_success)),
-            CLASS_SUSPEND_PERMANENT
+            CLASS_SUSPEND_CSE
         );
         let legacy_skip = serde_json::json!({ "status": "dedup_skipped" });
         assert_eq!(held_action_class(&zstd_json(legacy_skip)), CLASS_NONE);
@@ -808,9 +857,9 @@ mod tests {
         let legacy_claim = serde_json::json!({ "ts": 12345 });
         assert_eq!(
             held_action_class(legacy_claim.to_string().as_bytes()),
-            CLASS_SUSPEND_PERMANENT
+            CLASS_SUSPEND_CSE
         );
-        assert_eq!(held_action_class(b"\x02not json"), CLASS_SUSPEND_PERMANENT);
+        assert_eq!(held_action_class(b"\x02not json"), CLASS_SUSPEND_CSE);
     }
 
     #[test]
@@ -826,7 +875,7 @@ mod tests {
         let meta = held_entry_meta(legacy_claim.to_string().as_bytes());
         assert_eq!(
             (meta.class, meta.kind),
-            (CLASS_SUSPEND_PERMANENT, HeldKind::Placeholder)
+            (CLASS_SUSPEND_CSE, HeldKind::Placeholder)
         );
         assert_eq!(meta.nonce, None);
         let acted = serde_json::json!({ "status": "success", "acted_class": CLASS_LABEL });
@@ -836,7 +885,7 @@ mod tests {
         let meta = held_entry_meta(&zstd_json(legacy_success));
         assert_eq!(
             (meta.class, meta.kind),
-            (CLASS_SUSPEND_PERMANENT, HeldKind::Outcome)
+            (CLASS_SUSPEND_CSE, HeldKind::Outcome)
         );
         let legacy_skip = serde_json::json!({ "status": "high_follower_count" });
         let meta = held_entry_meta(&zstd_json(legacy_skip));
@@ -844,7 +893,7 @@ mod tests {
         let meta = held_entry_meta(b"\x02not json");
         assert_eq!(
             (meta.class, meta.kind),
-            (CLASS_SUSPEND_PERMANENT, HeldKind::Outcome)
+            (CLASS_SUSPEND_CSE, HeldKind::Outcome)
         );
     }
 
@@ -1099,6 +1148,7 @@ mod tests {
         {
             DedupCheck::ClassBypass {
                 held_class: CLASS_LABEL,
+                held_in_flight: false,
                 claim_nonce: Some(n),
             } => n,
             other => panic!("expected a bypass over the label, got {other:?}"),
@@ -1293,5 +1343,46 @@ mod tests {
         assert!(store.bytes("post:9/labels:NsfwHighPrecision").is_some());
         let other = DedupKey::entity(EntityType::Post, 10);
         assert_eq!(cache.peek(&other, CLASS_LABEL).await, None);
+    }
+
+                #[tokio::test]
+    async fn the_holder_read_tells_own_claims_foreign_claims_and_outcomes_apart() {
+        let store = Arc::new(MemStore::default());
+        let cache = ManhattanDedupCache::with_store(store.clone(), TTL, SKIP_TTL);
+        let key = DedupKey::entity(EntityType::User, USER);
+        assert_eq!(cache.holder(&key, None).await, Some(SlotHolder::Empty));
+
+        let DedupCheck::New { claim_nonce: temp } = cache.try_insert(&key, CLASS_SUSPEND).await
+        else {
+            panic!("the slot is empty");
+        };
+        assert_eq!(cache.holder(&key, temp).await, Some(SlotHolder::Own));
+        assert_eq!(
+            cache.holder(&key, None).await,
+            Some(SlotHolder::Claim(CLASS_SUSPEND))
+        );
+
+        let perm = match cache.try_insert(&key, CLASS_SUSPEND_PERMANENT).await {
+            DedupCheck::ClassBypass {
+                held_class: CLASS_SUSPEND,
+                held_in_flight: true,
+                claim_nonce,
+            } => claim_nonce,
+            other => panic!("expected a bypass over the in-flight claim, got {other:?}"),
+        };
+        assert_eq!(
+            cache.holder(&key, temp).await,
+            Some(SlotHolder::Claim(CLASS_SUSPEND_PERMANENT))
+        );
+        let acted = zstd_json(serde_json::json!({
+            "status": "success", "acted_class": CLASS_SUSPEND_PERMANENT
+        }));
+        cache
+            .update(&key, &acted, CLASS_SUSPEND_PERMANENT, perm)
+            .await;
+        assert_eq!(
+            cache.holder(&key, temp).await,
+            Some(SlotHolder::Outcome(CLASS_SUSPEND_PERMANENT))
+        );
     }
 }

@@ -3,6 +3,7 @@ use crate::models::candidate::{PostCandidate, SlateContext};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
+use crate::scorers::phoenix_scorer::record_ranker_vm_rank;
 use crate::scorers::value_model;
 use crate::scorers::vm_ranker_engagement_labels::{
     fetch_engagement_ineligible, EngagementIneligible,
@@ -167,37 +168,46 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             })
             .collect();
 
-        let topics = async {
-            if shape.sends_post_topics() {
-                self.candidate_topics(query, candidates, &local.weighted)
-                    .await
-            } else {
-                Vec::new()
+        let response = match candidates.first().and_then(|c| c.ranker_vm_rank.clone()) {
+            Some(ranked) => {
+                record_ranker_vm_rank("used");
+                ranked.response.clone()
             }
-        };
-        let ineligible = async {
-            if shape.sends_engagement_ineligible() {
-                self.engagement_ineligible(query, candidates, &local.weighted)
-                    .await
-            } else {
-                Vec::new()
-            }
-        };
-        let (topics, ineligible) = tokio::join!(topics, ineligible);
-        let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let request = shape.build(query, candidates, &scored, &topics, &ineligible);
-        record_request(&cluster);
-        if shape.sends_dpp_history() && query.has_cached_posts && !has_recent_served_response(query)
-        {
-            record_dpp_history_stale_cached();
-        }
-
-        let response = match self.rank(query, cluster, request).await {
-            Ok(resp) => resp,
-            Err(msg) => {
-                tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
-                record_fallback("rpc_error", candidates.len());
-                return scored.into_iter().map(Ok).collect();
+            None => {
+                let topics = async {
+                    if shape.sends_post_topics() {
+                        self.candidate_topics(query, candidates, &local.weighted)
+                            .await
+                    } else {
+                        Vec::new()
+                    }
+                };
+                let ineligible = async {
+                    if shape.sends_engagement_ineligible() {
+                        self.engagement_ineligible(query, candidates, &local.weighted)
+                            .await
+                    } else {
+                        Vec::new()
+                    }
+                };
+                let (topics, ineligible) = tokio::join!(topics, ineligible);
+                let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
+                let request = shape.build(query, candidates, &scored, &topics, &ineligible);
+                record_request(&cluster);
+                if shape.sends_dpp_history()
+                    && query.has_cached_posts
+                    && !has_recent_served_response(query)
+                {
+                    record_dpp_history_stale_cached();
+                }
+                match self.rank(query, cluster, request).await {
+                    Ok(resp) => resp,
+                    Err(msg) => {
+                        tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
+                        record_fallback("rpc_error", candidates.len());
+                        return scored.into_iter().map(Ok).collect();
+                    }
+                }
             }
         };
 

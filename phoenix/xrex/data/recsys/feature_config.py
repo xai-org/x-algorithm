@@ -119,6 +119,8 @@ ADS_COUNT_FAMILIES: tuple[str, ...] = (
 ADS_COUNT_WINDOWS: tuple[str, ...] = ("1h", "3h", "12h", "24h", "3d", "7d", "14d", "28d")
 NUM_ADS_COUNT_FEATURES = 168
 ADS_COUNT_BUCKETS = 33
+NUM_ADS_CTR_FEATURES = 24
+ADS_CTR_BUCKETS = 16
 
 
 CATEGORICAL_FEATURES: list[str] = [f.name for f in CategoricalFeature]

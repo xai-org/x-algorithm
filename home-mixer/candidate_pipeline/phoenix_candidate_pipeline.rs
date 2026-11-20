@@ -261,8 +261,7 @@ impl PhoenixCandidatePipeline {
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
         phoenix_request_cache_redis_atla_client: Arc<dyn RedisClient + Send + Sync>,
         phoenix_request_cache_redis_pdxa_client: Arc<dyn RedisClient + Send + Sync>,
-        teacher_cache_redis_atla_client: Arc<dyn RedisClient + Send + Sync>,
-        teacher_cache_redis_pdxa_client: Arc<dyn RedisClient + Send + Sync>,
+        teacher_cache_redis_client: Arc<dyn RedisClient + Send + Sync>,
         impression_bloom_filter_client: Arc<dyn ImpressionBloomFilterClient>,
         ip_client: Arc<GeoIpLocationClient>,
         user_demographics_client: Arc<dyn UserDemographicsClient>,
@@ -548,10 +547,7 @@ impl PhoenixCandidatePipeline {
                     phoenix_request_cache_redis_atla_client,
                     phoenix_request_cache_redis_pdxa_client,
                 )),
-                Box::new(TeacherScoreSideEffect::new(
-                    teacher_cache_redis_atla_client,
-                    teacher_cache_redis_pdxa_client,
-                )),
+                Box::new(TeacherScoreSideEffect::new(teacher_cache_redis_client)),
             ]);
 
         PhoenixCandidatePipeline {
@@ -594,7 +590,7 @@ impl PhoenixCandidatePipeline {
             strato_vf_client,
             redis_client,
             (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
-            (teacher_cache_redis_atla_client, teacher_cache_redis_pdxa_client),
+            teacher_cache_redis_client,
             phoenix_kafka_client,
             logged_scored_candidates_kafka_client,
             reranking_kafka_client,
@@ -723,7 +719,7 @@ impl PhoenixCandidatePipeline {
                 ) as Arc<dyn RedisClient + Send + Sync>
             },
             super::shared_phoenix_request_cache_redis_clients(),
-            super::teacher_cache_redis_clients(),
+            super::teacher_cache_redis_client(),
             async {
                 Arc::new(
                     ProdKafkaPublisherClient::new(PHOENIX_SCORES_TOPIC, KafkaCluster::Aiml).await,
@@ -981,8 +977,7 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
-            teacher_cache_redis_atla_client,
-            teacher_cache_redis_pdxa_client,
+            teacher_cache_redis_client,
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,
@@ -1094,7 +1089,6 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
-            Arc::new(MockRedisClient::default()),
             Arc::new(MockRedisClient::default()),
             impression_bloom_filter_client,
             ip_client,

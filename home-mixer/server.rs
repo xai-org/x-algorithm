@@ -114,6 +114,7 @@ impl QueryBuilder {
             datacenter: self.datacenter.clone(),
             has_phone_number: viewer_data.has_phone_number,
             subscription_level: viewer_data.subscription_level,
+            follower_count: viewer_data.follower_count,
             resurrection_time_ms,
             product: request_type.to_string(),
             now_ms: std::time::SystemTime::now()

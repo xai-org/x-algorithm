@@ -411,13 +411,13 @@ def page_serve_weighted_score(
     vqv_w = jnp.where(
         video_duration_ms.astype(jnp.float32) > weight("min_video_duration_ms"), vqv, 0.0
     )
+    vqv_term = vqv_w * head(an.CLIENT_TWEET_VIDEO_QUALITY_VIEW)
     engage = (
         favorite * head(an.SERVER_TWEET_FAV)
         + reply * head(an.SERVER_TWEET_REPLY)
         + retweet * head(an.SERVER_TWEET_RETWEET)
         + click * head(an.CLIENT_TWEET_CLICK)
         + profile_click * head(an.CLIENT_TWEET_CLICK_PROFILE)
-        + vqv_w * head(an.CLIENT_TWEET_VIDEO_QUALITY_VIEW)
         + share * head(an.CLIENT_TWEET_SHARE)
         + share_via_dm * head(an.CLIENT_TWEET_CLICK_SEND_VIA_DIRECT_MESSAGE)
         + share_via_copy_link * head(an.CLIENT_TWEET_SHARE_VIA_COPY_LINK)
@@ -429,7 +429,7 @@ def page_serve_weighted_score(
         ..., recsys_pb2.ContinuousActionName.DWELL_TIME
     ].astype(jnp.float32)
     not_dwelled_p = head(an.CLIENT_TWEET_RECAP_NOT_DWELLED)
-    raw_add = engage + dwell_term + not_dwelled * not_dwelled_p
+    raw_add = engage + vqv_term + dwell_term + not_dwelled * not_dwelled_p
 
     use_mult = _row_or_default(multiplicative, 0.0) > 0.5
     exp = _row_or_default(power_exponent, 0.0)
@@ -440,7 +440,7 @@ def page_serve_weighted_score(
         jnp.power((not_dwelled_p + off).clip(min=1e-6), exp),
     )
     engage_b = engage + _row_or_default(engage_bias, 0.0)
-    time = 1.0 + jnp.maximum(dwell_term, 0.0)
+    time = 1.0 + jnp.maximum(dwell_term, 0.0) + jnp.maximum(vqv_term, 0.0)
     raw_mul = jnp.where(engage_b >= 0.0, skip * engage_b * time, engage_b)
     raw = jnp.where(use_mult, raw_mul, raw_add)
 
@@ -458,7 +458,9 @@ def page_serve_weighted_score(
         + jnp.maximum(not_dwelled, 0.0)
     )
     add_negative = -(not_interested + report + jnp.minimum(not_dwelled, 0.0))
-    mul_positive = add_positive - jnp.maximum(not_dwelled, 0.0) + _row_or_default(engage_bias, 0.0)
+    mul_positive = (
+        add_positive - jnp.maximum(not_dwelled, 0.0) - vqv + _row_or_default(engage_bias, 0.0)
+    )
     mul_negative = -(not_interested + report)
     positive_sum = jnp.where(use_mult, mul_positive, add_positive)
     negative_sum = jnp.where(use_mult, mul_negative, add_negative)

@@ -75,9 +75,30 @@ impl ValueLevel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ValueTarget {
-    pub event: ValueEvent,
-    pub level: ValueLevel,
+pub enum AppValueEvent {
+    Purchase,
+    AddToCart,
+    LevelAchieved,
+    TutorialComplete,
+    SignUp,
+}
+
+impl AppValueEvent {
+    pub const fn clickhouse_name(self) -> &'static str {
+        match self {
+            Self::Purchase => "PURCHASE",
+            Self::AddToCart => "ADD_TO_CART",
+            Self::LevelAchieved => "LEVEL_ACHIEVED",
+            Self::TutorialComplete => "TUTORIAL_COMPLETE",
+            Self::SignUp => "SIGN_UP",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueTarget {
+    Web(ValueEvent, ValueLevel),
+    App(AppValueEvent),
 }
 
 impl ValueTarget {
@@ -85,35 +106,43 @@ impl ValueTarget {
     pub const PURCHASE_VT: ValueTarget = Self::new(ValueEvent::Purchase, ValueLevel::ViewThrough);
 
     pub const fn new(event: ValueEvent, level: ValueLevel) -> Self {
-        Self { event, level }
+        Self::Web(event, level)
     }
 
-    pub const ALL: [ValueTarget; 6] = [
+    pub const ALL_TARGETS: [ValueTarget; 11] = [
         Self::PURCHASE_CT,
         Self::PURCHASE_VT,
         Self::new(ValueEvent::ContentView, ValueLevel::ClickThrough),
         Self::new(ValueEvent::AddToCart, ValueLevel::ClickThrough),
         Self::new(ValueEvent::ContentView, ValueLevel::ViewThrough),
         Self::new(ValueEvent::AddToCart, ValueLevel::ViewThrough),
+        Self::App(AppValueEvent::Purchase),
+        Self::App(AppValueEvent::AddToCart),
+        Self::App(AppValueEvent::LevelAchieved),
+        Self::App(AppValueEvent::TutorialComplete),
+        Self::App(AppValueEvent::SignUp),
     ];
-
-    pub const PUBLISHED: [ValueTarget; 6] = Self::ALL;
 
     pub const REQUIRED: [ValueTarget; 2] = [Self::PURCHASE_CT, Self::PURCHASE_VT];
 
     pub const fn target_definition(self) -> &'static str {
-        match (self.event, self.level) {
-            (ValueEvent::Purchase, ValueLevel::ClickThrough) => "web_ct_purchase",
-            (ValueEvent::Purchase, ValueLevel::ViewThrough) => "web_vt_purchase",
-            (ValueEvent::ContentView, ValueLevel::ClickThrough) => "web_ct_content_view",
-            (ValueEvent::ContentView, ValueLevel::ViewThrough) => "web_vt_content_view",
-            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => "web_ct_add_to_cart",
-            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => "web_vt_add_to_cart",
+        match self {
+            Self::Web(ValueEvent::Purchase, ValueLevel::ClickThrough) => "web_ct_purchase",
+            Self::Web(ValueEvent::Purchase, ValueLevel::ViewThrough) => "web_vt_purchase",
+            Self::Web(ValueEvent::ContentView, ValueLevel::ClickThrough) => "web_ct_content_view",
+            Self::Web(ValueEvent::ContentView, ValueLevel::ViewThrough) => "web_vt_content_view",
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ClickThrough) => "web_ct_add_to_cart",
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ViewThrough) => "web_vt_add_to_cart",
+            Self::App(AppValueEvent::Purchase) => "app_purchase",
+            Self::App(AppValueEvent::AddToCart) => "app_add_to_cart",
+            Self::App(AppValueEvent::LevelAchieved) => "app_level_achieved",
+            Self::App(AppValueEvent::TutorialComplete) => "app_tutorial_complete",
+            Self::App(AppValueEvent::SignUp) => "app_sign_up",
         }
     }
 
     pub fn from_target_definition(name: &str) -> Option<ValueTarget> {
-        Self::ALL
+        Self::ALL_TARGETS
             .into_iter()
             .find(|target| target.target_definition() == name)
     }
@@ -127,26 +156,52 @@ impl ValueTarget {
     }
 
     fn field(self, b: &PurchaseValueBaseline) -> &f64 {
-        match (self.event, self.level) {
-            (ValueEvent::Purchase, ValueLevel::ClickThrough) => &b.mean_value_usd_28d,
-            (ValueEvent::Purchase, ValueLevel::ViewThrough) => &b.mean_value_usd_28d_vt,
-            (ValueEvent::ContentView, ValueLevel::ClickThrough) => &b.mean_content_view_usd_28d,
-            (ValueEvent::ContentView, ValueLevel::ViewThrough) => &b.mean_content_view_usd_28d_vt,
-            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => &b.mean_add_to_cart_usd_28d,
-            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => &b.mean_add_to_cart_usd_28d_vt,
+        match self {
+            Self::Web(ValueEvent::Purchase, ValueLevel::ClickThrough) => &b.mean_value_usd_28d,
+            Self::Web(ValueEvent::Purchase, ValueLevel::ViewThrough) => &b.mean_value_usd_28d_vt,
+            Self::Web(ValueEvent::ContentView, ValueLevel::ClickThrough) => {
+                &b.mean_content_view_usd_28d
+            }
+            Self::Web(ValueEvent::ContentView, ValueLevel::ViewThrough) => {
+                &b.mean_content_view_usd_28d_vt
+            }
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ClickThrough) => {
+                &b.mean_add_to_cart_usd_28d
+            }
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ViewThrough) => {
+                &b.mean_add_to_cart_usd_28d_vt
+            }
+            Self::App(AppValueEvent::Purchase) => &b.mean_app_purchase_usd_28d,
+            Self::App(AppValueEvent::AddToCart) => &b.mean_app_add_to_cart_usd_28d,
+            Self::App(AppValueEvent::LevelAchieved) => &b.mean_app_level_achieved_usd_28d,
+            Self::App(AppValueEvent::TutorialComplete) => &b.mean_app_tutorial_complete_usd_28d,
+            Self::App(AppValueEvent::SignUp) => &b.mean_app_sign_up_usd_28d,
         }
     }
 
     fn field_mut(self, b: &mut PurchaseValueBaseline) -> &mut f64 {
-        match (self.event, self.level) {
-            (ValueEvent::Purchase, ValueLevel::ClickThrough) => &mut b.mean_value_usd_28d,
-            (ValueEvent::Purchase, ValueLevel::ViewThrough) => &mut b.mean_value_usd_28d_vt,
-            (ValueEvent::ContentView, ValueLevel::ClickThrough) => &mut b.mean_content_view_usd_28d,
-            (ValueEvent::ContentView, ValueLevel::ViewThrough) => {
+        match self {
+            Self::Web(ValueEvent::Purchase, ValueLevel::ClickThrough) => &mut b.mean_value_usd_28d,
+            Self::Web(ValueEvent::Purchase, ValueLevel::ViewThrough) => {
+                &mut b.mean_value_usd_28d_vt
+            }
+            Self::Web(ValueEvent::ContentView, ValueLevel::ClickThrough) => {
+                &mut b.mean_content_view_usd_28d
+            }
+            Self::Web(ValueEvent::ContentView, ValueLevel::ViewThrough) => {
                 &mut b.mean_content_view_usd_28d_vt
             }
-            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => &mut b.mean_add_to_cart_usd_28d,
-            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => &mut b.mean_add_to_cart_usd_28d_vt,
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ClickThrough) => {
+                &mut b.mean_add_to_cart_usd_28d
+            }
+            Self::Web(ValueEvent::AddToCart, ValueLevel::ViewThrough) => {
+                &mut b.mean_add_to_cart_usd_28d_vt
+            }
+            Self::App(AppValueEvent::Purchase) => &mut b.mean_app_purchase_usd_28d,
+            Self::App(AppValueEvent::AddToCart) => &mut b.mean_app_add_to_cart_usd_28d,
+            Self::App(AppValueEvent::LevelAchieved) => &mut b.mean_app_level_achieved_usd_28d,
+            Self::App(AppValueEvent::TutorialComplete) => &mut b.mean_app_tutorial_complete_usd_28d,
+            Self::App(AppValueEvent::SignUp) => &mut b.mean_app_sign_up_usd_28d,
         }
     }
 }
@@ -162,7 +217,7 @@ pub fn ct_mean(baseline: &PurchaseValueBaseline) -> Option<f64> {
 pub fn is_valid_baseline(baseline: &PurchaseValueBaseline) -> bool {
     baseline.impression_id > 0
         && baseline.advertiser_account_id > 0
-        && ValueTarget::ALL
+        && ValueTarget::ALL_TARGETS
             .iter()
             .any(|target| target.mean(baseline).is_some())
 }
@@ -236,7 +291,7 @@ mod tests {
         assert_eq!(bytes[2], 0x10);
         assert_eq!(bytes[4], 0x19);
         assert_eq!(bytes.len(), 5 + 8);
-        for (i, target) in ValueTarget::ALL.iter().enumerate() {
+        for (i, target) in ValueTarget::ALL_TARGETS.iter().enumerate() {
             let mut b = PurchaseValueBaseline::default();
             target.set_mean(&mut b, 1.0);
             let bytes = b.encode_to_vec();
@@ -244,10 +299,10 @@ mod tests {
             assert_eq!(bytes[0], ((3 + i as u8) << 3) | 1, "{target:?} tag");
         }
         let mut full = baseline(1_900_000_000_000_000_000, 4_503_599_700_000_000);
-        for target in ValueTarget::ALL {
+        for target in ValueTarget::ALL_TARGETS {
             target.set_mean(&mut full, 12.5);
         }
-        assert_eq!(full.encode_to_vec().len(), 73);
+        assert_eq!(full.encode_to_vec().len(), 118);
         let decoded = PurchaseValueBaseline::decode(full.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, full);
     }
@@ -277,7 +332,7 @@ mod tests {
 
     #[test]
     fn target_table_round_trips_names_and_fields() {
-        for target in ValueTarget::ALL {
+        for target in ValueTarget::ALL_TARGETS {
             assert_eq!(
                 ValueTarget::from_target_definition(target.target_definition()),
                 Some(target)
@@ -294,12 +349,7 @@ mod tests {
         assert!(
             ValueTarget::REQUIRED
                 .iter()
-                .all(|t| ValueTarget::PUBLISHED.contains(t))
-        );
-        assert!(
-            ValueTarget::PUBLISHED
-                .iter()
-                .all(|t| ValueTarget::ALL.contains(t))
+                .all(|t| ValueTarget::ALL_TARGETS.contains(t))
         );
         assert_eq!(ValueEvent::Purchase.conversion_type(), 2);
         assert_eq!(ValueEvent::AddToCart.conversion_type(), 12);
@@ -313,6 +363,20 @@ mod tests {
         for usd in [0.0, -1.0, MAX_EVENT_USD + 0.01, f64::NAN, f64::INFINITY] {
             assert!(!is_countable_usd(usd), "{usd}");
         }
+    }
+
+    #[test]
+    fn a_baseline_with_only_an_app_mean_is_valid() {
+        assert_eq!(ValueTarget::from_target_definition("app_install"), None);
+        let mut app_only = PurchaseValueBaseline {
+            impression_id: 1,
+            advertiser_account_id: 2,
+            ..Default::default()
+        };
+        assert!(!is_valid_baseline(&app_only));
+        ValueTarget::App(AppValueEvent::Purchase).set_mean(&mut app_only, 7.5);
+        assert!(is_valid_baseline(&app_only));
+        assert_eq!(ct_mean(&app_only), None);
     }
 
     #[test]

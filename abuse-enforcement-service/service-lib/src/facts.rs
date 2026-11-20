@@ -221,6 +221,8 @@ pub struct GizmoduckFacts {
     pub creation_ip: Option<String>,
     #[serde(default)]
     pub test_signal: Option<crate::safety_checks::TestAccountSignal>,
+    #[serde(default)]
+    pub permanently_suspended: bool,
 }
 
 impl std::fmt::Debug for GizmoduckFacts {
@@ -241,6 +243,7 @@ impl std::fmt::Debug for GizmoduckFacts {
             .field("email_confirmed", &self.email_confirmed)
             .field("creation_ip", &set(self.creation_ip.is_some()))
             .field("test_signal", &self.test_signal)
+            .field("permanently_suspended", &self.permanently_suspended)
             .finish()
     }
 }
@@ -366,6 +369,9 @@ fn emit_user_signals(m: &mut BTreeMap<String, String>, s: &UserFacts) {
             "gizmoduck_is_affiliate".into(),
             s.user.is_affiliate.to_string(),
         );
+        if s.user.permanently_suspended {
+            m.insert("gizmoduck_permanently_suspended".into(), "true".into());
+        }
     }
 
     m.insert("cred_is_high".into(), fmt_opt_dbg(s.cred.is_high.as_ref()));
@@ -459,6 +465,7 @@ fn reconstruct_user_signals(map: &BTreeMap<String, String>) -> UserFacts {
             is_blue_verified: parse_bool(map.get("gizmoduck_is_blue_verified")),
             verified_type: parse_dbg_opt_string(map.get("gizmoduck_verified_type")),
             is_affiliate: parse_bool(map.get("gizmoduck_is_affiliate")),
+            permanently_suspended: parse_bool(map.get("gizmoduck_permanently_suspended")),
             ..Default::default()
         }
     } else {

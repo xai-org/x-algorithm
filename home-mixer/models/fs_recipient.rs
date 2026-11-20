@@ -17,6 +17,7 @@ pub struct FsRecipientInputs {
     pub datacenter: String,
     pub has_phone_number: bool,
     pub subscription_level: Option<SubscriptionLevel>,
+    pub follower_count: Option<i64>,
     pub resurrection_time_ms: Option<i64>,
     pub product: String,
     pub now_ms: i64,
@@ -51,6 +52,7 @@ impl FsRecipientInputs {
                 "subscription_level",
                 self.subscription_level.map(|level| level.as_str()),
             )
+            .custom_opt_i64("follower_count", self.follower_count)
             .custom_string("product", &self.product)
             .custom_opt_i64("user_resurrected_date", user_resurrected_date)
             .custom_opt_i64("days_since_resurrection", days_since_resurrection)
@@ -76,6 +78,7 @@ mod tests {
             datacenter: "atla".to_string(),
             has_phone_number: false,
             subscription_level,
+            follower_count: None,
             resurrection_time_ms: None,
             product: "for_you".to_string(),
             now_ms: 0,

@@ -10,6 +10,11 @@ use xai_proto::engagement_counter::PostEngagers;
 use xai_recsys_proto::SAFETY_BIT_AUTHOR_NSFW;
 use xai_visibility_filtering::models as vf;
 
+#[derive(Clone, Debug)]
+pub struct RankerVmRank {
+    pub response: xai_vm_ranker_proto::RankResponse,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PostCandidate {
     pub tweet_id: u64,
@@ -48,6 +53,8 @@ pub struct PostCandidate {
     pub page_decode_slot: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub page_decode_prob: Option<f64>,
+    #[serde(skip)]
+    pub ranker_vm_rank: Option<Arc<RankerVmRank>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub page_rl_exploration_prob: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

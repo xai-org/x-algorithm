@@ -327,13 +327,18 @@ def _sequence_reads(
             )
         columns[p_read] = names
         rows = bulk + (n // pps) * batch_size
-        for p in range(pps):
-            while f_of[p] + 1 < len(bids):
-                end = starts[p][f_of[p]] + row_counts(bids[f_of[p]])[p]
-                if rows < end:
-                    break
-                starts[p].append(end)
+        while True:
+            f = min(f_of)
+            if f + 1 >= len(bids):
+                break
+            lagging = [p for p in range(pps) if f_of[p] == f]
+            sizes = row_counts(bids[f])
+            passed = [p for p in lagging if rows >= starts[p][f] + sizes[p]]
+            for p in passed:
+                starts[p].append(starts[p][f] + sizes[p])
                 f_of[p] += 1
+            if len(passed) < len(lagging):
+                break
         if record_batch.num_rows * 2 < batch_size // shards_per_partition:
             rank_logger.warning("Skipping record batch that doesn't contain enough rows")
             continue

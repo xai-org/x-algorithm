@@ -104,9 +104,49 @@ pub fn is_video_card_type(card_type: i32) -> bool {
     }
 }
 
+impl HistorySourceInfo {
+    pub fn of(event_times_ms: impl IntoIterator<Item = i64>) -> Self {
+        let mut length = 0u32;
+        let mut span: Option<(u64, u64)> = None;
+        for ms in event_times_ms {
+            length += 1;
+            if ms > 0 {
+                let ms = ms as u64;
+                span = Some(span.map_or((ms, ms), |(lo, hi)| (lo.min(ms), hi.max(ms))));
+            }
+        }
+        Self {
+            length,
+            first_event_ms: span.map(|(lo, _)| lo),
+            last_event_ms: span.map(|(_, hi)| hi),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_counts_every_entry_and_spans_the_positive_times() {
+        assert_eq!(
+            HistorySourceInfo::of([5_000, 0, 2_000, -1, 9_000]),
+            HistorySourceInfo {
+                length: 5,
+                first_event_ms: Some(2_000),
+                last_event_ms: Some(9_000),
+            }
+        );
+        assert_eq!(
+            HistorySourceInfo::of([0, 0]),
+            HistorySourceInfo {
+                length: 2,
+                first_event_ms: None,
+                last_event_ms: None,
+            }
+        );
+        assert_eq!(HistorySourceInfo::of([]), HistorySourceInfo::default());
+    }
 
     #[test]
     fn test_language_code_string_to_enum() {

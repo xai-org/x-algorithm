@@ -854,6 +854,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             add_history_web_conv_value=mparams.get("add_history_web_conv_value", False),
             wallclock_recency=mparams.get("wallclock_recency", False),
             ads_counts_emb_dim=mparams.get("ads_counts_emb_dim", 0),
+            ads_ctr_emb_dim=mparams.get("ads_ctr_emb_dim", 0),
             ad_side_ids_emb_dim=mparams.get("ad_side_ids_emb_dim", 0),
             ad_side_fields=mparams.get("ad_side_fields", ",".join(AD_SIDE_DEFAULT_FIELDS)),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),

@@ -1,12 +1,14 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixMOESource, PhoenixMOEMaxResults, PhoenixMoeColdStartMaxResults,
-    PhoenixRetrievalMOEInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
+    EnablePhoenixMOESource, EnableVideoCarouselMoeSource, PhoenixMOEMaxResults,
+    PhoenixMoeColdStartMaxResults, PhoenixRetrievalMOEInferenceClusterId,
+    PhoenixXdsRetrievalMaxRetries,
 };
 use crate::sources::sid_source::sid_source_enabled;
 use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
+use crate::util::video_carousel;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
@@ -24,7 +26,9 @@ pub struct PhoenixMOESource {
 #[async_trait]
 impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.params.get(EnablePhoenixMOESource)
+        (query.params.get(EnablePhoenixMOESource)
+            || (query.params.get(EnableVideoCarouselMoeSource)
+                && video_carousel::is_enabled(query)))
             && !sid_source_enabled(query)
             && (!query.is_topic_request() || query.is_bulk_topic_request())
             && !query.in_network_only

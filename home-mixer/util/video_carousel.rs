@@ -1,15 +1,18 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
-    EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
-    VideoCarouselImmersiveVqvWeight, VideoCarouselNotInterestedWeight,
-    VideoCarouselOpenTimesImmersiveDwellWeight, VideoCarouselVideoContinuationWeight,
-    VideoCarouselVideoOpenWeight, VideoCarouselWeightedScoreWeight,
+    EnablePhoenixMOESource, EnableVideoCarousel, EnableVideoCarouselMoeSource,
+    VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS, VideoCarouselImmersiveVqvWeight,
+    VideoCarouselNotInterestedWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
+    VideoCarouselVideoContinuationWeight, VideoCarouselVideoOpenWeight,
+    VideoCarouselWeightedScoreWeight,
 };
+use crate::sources::sid_source::sid_source_enabled;
 use crate::util::video_carousel_ctr_model::CtrModel;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
+use xai_home_mixer_proto as pb;
 
 const MAX_VERTICAL_ASPECT_RATIO: f32 = 1.0;
 
@@ -18,6 +21,20 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
         && query.params.get(EnableVideoCarousel)
         && query.video_carousel_eligible
         && !query.is_bottom_request
+}
+
+pub(crate) fn moe_source_is_carousel_only(query: &ScoredPostsQuery) -> bool {
+    query.params.get(EnableVideoCarouselMoeSource)
+        && !query.params.get(EnablePhoenixMOESource)
+        && !sid_source_enabled(query)
+}
+
+pub(crate) fn only_from_moe_source(candidate: &PostCandidate) -> bool {
+    !candidate.retrieval_sources.is_empty()
+        && candidate
+            .retrieval_sources
+            .iter()
+            .all(|source| source.served_type == pb::ServedType::ForYouPhoenixRetrievalMoe)
 }
 
 pub(crate) fn was_seen(seen: &HashSet<u64>, candidate: &PostCandidate) -> bool {

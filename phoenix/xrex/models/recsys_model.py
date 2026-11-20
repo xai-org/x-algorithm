@@ -53,6 +53,7 @@ from xrex.data.recsys.constants import (
 )
 from xrex.data.recsys.feature_config import (
     ADS_COUNT_BUCKETS,
+    ADS_CTR_BUCKETS,
     ADS_PRODUCT_KEY_TABLE_SIZE,
     DPA_SID_CODEBOOK_SIZE,
     DPA_SID_LEVEL_NAMES,
@@ -1382,12 +1383,18 @@ class RecsysAggregatedModelConfig(Config):
 
     @property
     def has_side_inputs(self) -> bool:
-        return bool(self.ads_counts_emb_dim or self.wallclock_recency or self.ad_side_ids_emb_dim)
+        return bool(
+            self.ads_counts_emb_dim
+            or self.ads_ctr_emb_dim
+            or self.wallclock_recency
+            or self.ad_side_ids_emb_dim
+        )
 
     def validate_side_inputs(self) -> None:
         if self.has_side_inputs and self.feature_prep_enabled:
             raise ValueError(
-                "ads_counts_emb_dim / wallclock_recency / ad_side_ids_emb_dim need feature_prep off"
+                "ads_counts_emb_dim / ads_ctr_emb_dim / wallclock_recency / "
+                "ad_side_ids_emb_dim need feature_prep off"
             )
         if self.ad_side_ids_emb_dim:
             parse_ad_side_fields(self.ad_side_fields)
@@ -1440,6 +1447,7 @@ class RecsysAggregatedModelConfig(Config):
     use_seqpack: bool = False
 
     ads_counts_emb_dim: int = 0
+    ads_ctr_emb_dim: int = 0
     ad_side_ids_emb_dim: int = 0
     ad_side_fields: str = ",".join(AD_SIDE_DEFAULT_FIELDS)
     wallclock_recency: bool = False
@@ -3950,6 +3958,29 @@ class RecsysAggregatedModel(hk.Module):
             if pad > 0:
                 emb = jnp.pad(emb, ((0, 0), (0, pad), (0, 0)))
             candidate_embeddings = add(candidate_embeddings, emb, "ads_counts_proj")
+
+        if cfg.ads_ctr_emb_dim > 0:
+            ctr = batch["candidate_seq"].get("ads_ctr_buckets")
+            assert ctr is not None, (
+                "ads_ctr_emb_dim needs the dataset flag read_ads_ctr_features=True"
+            )
+            ctr = cast_jax(ctr).astype(jnp.int32)
+            num_feats = ctr.shape[-1]
+            dim = cfg.ads_ctr_emb_dim
+            table = get_parameter(
+                "ads_ctr_table",
+                shape=[num_feats * ADS_CTR_BUCKETS, dim],
+                init=hk.initializers.VarianceScaling(scale, mode="fan_out"),
+                dtype=f32,
+                pspec=P(),
+            )
+            offsets = jnp.arange(num_feats, dtype=jnp.int32) * ADS_CTR_BUCKETS
+            emb = jnp.take(table, ctr + offsets, axis=0).astype(DTYPE_BY_NAME[cfg.fprop_dtype])
+            emb = emb.reshape(*emb.shape[:-2], num_feats * dim)
+            pad = candidate_embeddings.shape[1] - emb.shape[1]
+            if pad > 0:
+                emb = jnp.pad(emb, ((0, 0), (0, pad), (0, 0)))
+            candidate_embeddings = add(candidate_embeddings, emb, "ads_ctr_proj")
 
         if cfg.ad_side_ids_emb_dim > 0:
             ids = batch["candidate_seq"].get("ad_side_ids")

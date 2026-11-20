@@ -12,9 +12,21 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
         query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> SelectResult<PostCandidate> {
+        let (carousel_only, candidates): (Vec<_>, Vec<_>) =
+            if video_carousel::moe_source_is_carousel_only(query) {
+                candidates
+                    .into_iter()
+                    .partition(video_carousel::only_from_moe_source)
+            } else {
+                (Vec::new(), candidates)
+            };
         let mut selected = self.sort(candidates);
-        let non_selected =
+        let mut non_selected =
             selected.split_off(params::TOP_K_CANDIDATES_TO_SELECT.min(selected.len()));
+        non_selected.extend(carousel_only.into_iter().map(|candidate| PostCandidate {
+            score: None,
+            ..candidate
+        }));
         if video_carousel::is_enabled(query) {
             selected.extend(video_carousel::top_videos_by_carousel_score(
                 &non_selected,
@@ -41,9 +53,10 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::candidate::PhoenixScores;
+    use crate::models::candidate::{PhoenixScores, RetrievalSource};
     use std::collections::HashSet;
     use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
+    use xai_home_mixer_proto as pb;
 
     fn carousel_query(video_open_weight: &str, immersive_vqv_weight: &str) -> ScoredPostsQuery {
         let mut results = FeatureSwitches::new(vec![])
@@ -177,6 +190,38 @@ mod tests {
 
         let (_, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
         assert_eq!(tweet_ids(extras), vec![106]);
+    }
+
+    #[test]
+    fn moe_posts_are_carousel_only_unless_the_source_is_on_for_home() {
+        let mut query = carousel_query("1.0", "0.0");
+        let fs = query.params.0.as_mut().unwrap();
+        fs.override_fs(
+            "rust_home_mixer_enable_video_carousel_moe_source".to_string(),
+            "true",
+        );
+        let moe = RetrievalSource::from_served_type(pb::ServedType::ForYouPhoenixRetrievalMoe);
+        let mut candidates = candidates();
+        candidates.push(PostCandidate {
+            score: Some(1000.0),
+            retrieval_sources: vec![moe],
+            ..video(201, 0.99)
+        });
+
+        let result = TopKScoreSelector.select(&query, candidates.clone());
+        let (top_k, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
+        assert!(!tweet_ids(top_k).contains(&201));
+        assert_eq!((extras[0].tweet_id, extras[0].score), (201, None));
+
+        let fs = query.params.0.as_mut().unwrap();
+        fs.override_fs(
+            "rust_home_mixer_enable_phoenix_moe_source".to_string(),
+            "true",
+        );
+        assert_eq!(
+            TopKScoreSelector.select(&query, candidates).selected[0].tweet_id,
+            201
+        );
     }
 
     fn plain_query() -> ScoredPostsQuery {

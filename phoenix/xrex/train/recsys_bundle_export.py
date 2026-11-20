@@ -114,28 +114,33 @@ REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
 )
 
 ADS_COUNT_BUCKETS_KEY = "candidate_seq.ads_count_buckets"
+ADS_CTR_BUCKETS_KEY = "candidate_seq.ads_ctr_buckets"
 AD_SIDE_IDS_KEY = "candidate_seq.ad_side_ids"
 
 
 class SideInputs(NamedTuple):
     ads_count_features: bool
     ad_side_fields: tuple[str, ...]
+    ads_ctr_features: bool = False
 
     @staticmethod
     def of(model_config: Any, *, two_tower: bool) -> SideInputs:
         if two_tower:
             return SideInputs(False, ())
         ads_counts = int(getattr(model_config, "ads_counts_emb_dim", 0) or 0) > 0
+        ads_ctr = int(getattr(model_config, "ads_ctr_emb_dim", 0) or 0) > 0
         fields: tuple[str, ...] = ()
         if int(getattr(model_config, "ad_side_ids_emb_dim", 0) or 0) > 0:
             fields = parse_ad_side_fields(model_config.ad_side_fields)
-        return SideInputs(ads_counts, fields)
+        return SideInputs(ads_counts, fields, ads_ctr)
 
     @property
     def request_keys(self) -> frozenset[str]:
         keys = set(REQUEST_BATCH_KEYS)
         if self.ads_count_features:
             keys.add(ADS_COUNT_BUCKETS_KEY)
+        if self.ads_ctr_features:
+            keys.add(ADS_CTR_BUCKETS_KEY)
         if self.ad_side_fields:
             keys.add(AD_SIDE_IDS_KEY)
         return frozenset(keys)
@@ -1577,6 +1582,7 @@ def _prep_spec(
             getattr(getattr(features, "feature_prep", None), "enable_stale_post_30d", False)
         ),
         "ads_count_features": side_inputs.ads_count_features,
+        "ads_ctr_features": side_inputs.ads_ctr_features,
         "ad_side_fields": list(side_inputs.ad_side_fields),
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,

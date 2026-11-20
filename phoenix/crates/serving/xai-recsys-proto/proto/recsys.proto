@@ -200,6 +200,8 @@ message PredictNextActionsRequest {
   bool hydrate_history_url_embeddings = 27;
 
   ScoreCacheInfo score_cache = 28;
+
+  VmRankSpec vmRank = 29;
 }
 
 message ScoreCacheInfo {
@@ -223,6 +225,11 @@ message PurchaseValueBaseline {
   double mean_add_to_cart_usd_28d = 6;
   double mean_content_view_usd_28d_vt = 7;
   double mean_add_to_cart_usd_28d_vt = 8;
+  double mean_app_purchase_usd_28d = 9;
+  double mean_app_add_to_cart_usd_28d = 10;
+  double mean_app_level_achieved_usd_28d = 11;
+  double mean_app_tutorial_complete_usd_28d = 12;
+  double mean_app_sign_up_usd_28d = 13;
 }
 
 message PageDecodeParams {
@@ -273,6 +280,17 @@ message PageDecodeResult {
   repeated float pickedProbs = 2;
 
   repeated float pickedScores = 3;
+}
+
+message VmRankSpec {
+  string vmRankerHost = 1;
+  float eta = 2;
+  float priorTau = 3;
+}
+
+message VmRankResult {
+  bytes rankResponse = 1;
+  string error = 2;
 }
 
 message ConvAssetIds {
@@ -436,6 +454,8 @@ message CandidateDistributionSet {
   string intermediateTensorsPath = 4;
 
   PageDecodeResult pageDecodeResult = 5;
+
+  VmRankResult vmRankResult = 6;
 }
 
 message ScoredCandidates {
@@ -1823,6 +1843,8 @@ message AdInfo {
   int64 ad_taxonomy_id = 29;
 
   int64 advertiser_first_delivery_ms = 30;
+
+  EngagementCounts viewer_ad_engagement_counts = 31;
 }
 
 message AdTargeting {
@@ -2057,6 +2079,7 @@ enum UserActionAggregationType {
   IMMERSIVE_LONG_DWELL_GALLERY_3S = 36;
   IMMERSIVE_RECENT_IMPRESSIONS = 37;
   DENSE_WITH_LONG_DWELL_AUTHOR_PROFILE = 38;
+  IMMERSIVE_LONG_DWELL_HOME_POSITIVES = 39;
   reserved 33, 35;
 }
 
@@ -2065,6 +2088,23 @@ message UserActionAggregationResponse {
   repeated UserActionSequence sequences = 2;
   repeated UserActionAggregationType aggregation_types = 3;
   repeated bytes columnar_sequences = 4;
+  repeated RawHistoryInfo raw_histories = 5;
+}
+
+message RawHistoryInfo {
+  uint32 length = 1;
+  optional uint64 first_engagement_time_ms = 2;
+  optional uint64 last_engagement_time_ms = 3;
+  optional uint64 first_added_time_ms = 4;
+  optional uint64 last_added_time_ms = 5;
+  optional HistorySourceInfo chad_ad_history = 6;
+  optional HistorySourceInfo web_conversions = 7;
+}
+
+message HistorySourceInfo {
+  uint32 length = 1;
+  optional uint64 first_event_ms = 2;
+  optional uint64 last_event_ms = 3;
 }
 
 service UserActionAggregationService {

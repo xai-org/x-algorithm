@@ -43,6 +43,7 @@ from xrex.data.recsys.feature_config import (
     ADS_COUNT_BUCKETS,
     ADS_COUNT_FAMILIES,
     ADS_COUNT_WINDOWS,
+    ADS_CTR_BUCKETS,
     ADS_PRODUCT_KEY_HASH_BIAS,
     ADS_PRODUCT_KEY_HASH_BIAS_2,
     ADS_PRODUCT_KEY_HASH_MODULUS,
@@ -58,6 +59,7 @@ from xrex.data.recsys.feature_config import (
     FLOAT_FEATURES,
     INT64_FEATURES,
     NUM_ADS_COUNT_FEATURES,
+    NUM_ADS_CTR_FEATURES,
     STALE_POST_14D_TTL_SEC,
     STALE_POST_30D_TTL_SEC,
     BoolFeature,
@@ -154,14 +156,10 @@ EMBEDDING_CONFIG = {
 EmbeddingType = Literal["v1", "v3", "v5", "v6", "v8"]
 
 HISTORY_URL_ID_COLUMN = "webConvUrlIdSeq"
+HISTORY_RANKED_URL_ID_COLUMNS = ("webConvUrlIdRankedSeq", "webConvUrlId2Seq", "webConvUrlId3Seq")
 
-HistoryUrlEmbeddingFn = Callable[
-    [
-        npt.NDArray[np.int64],
-        npt.NDArray[np.bool_],
-        npt.NDArray[np.int64],
-        npt.NDArray[np.float16],
-    ],
+EmbeddingLookupFn = Callable[
+    [npt.NDArray[np.int64], npt.NDArray[np.bool_], npt.NDArray[np.float16]],
     None,
 ]
 
@@ -419,6 +417,7 @@ class PostSeq(TypedDict):
     post_creation_ts_sec: npt.NDArray[np.int32]
     post_sids: npt.NDArray[np.uint16] | None
     ads_count_buckets: NotRequired[npt.NDArray[np.uint8]]
+    ads_ctr_buckets: NotRequired[npt.NDArray[np.uint8]]
     ad_side_ids: NotRequired[npt.NDArray[np.int32]]
     rl_served_slot: NotRequired[npt.NDArray[np.int32]]
     rl_weighted_score: NotRequired[npt.NDArray[np.float32]]
@@ -849,12 +848,58 @@ USER_ADS_COUNT_COLUMNS: tuple[str, ...] = tuple(
 )
 assert len(ADS_COUNT_COLUMNS) + len(USER_ADS_COUNT_COLUMNS) == NUM_ADS_COUNT_FEATURES
 
+ADS_CTR_COUNT_PAIRS: tuple[tuple[str, str], ...] = tuple(
+    (f"{level}ClickCount{window}Seq", f"{level}ViewCount{window}Seq")
+    for level in ("ads", "userAdvertiser", "userAd")
+    for window in ADS_COUNT_WINDOWS
+)
+assert len(ADS_CTR_COUNT_PAIRS) == NUM_ADS_CTR_FEATURES
+
 
 def ads_count_bucket(counts: npt.ArrayLike) -> npt.NDArray[np.uint8]:
     x = np.asarray(counts, dtype=np.float64)
     out = np.zeros(x.shape, dtype=np.uint8)
     nz = x > 0
     out[nz] = np.minimum(np.floor(np.log2(x[nz])) + 1, ADS_COUNT_BUCKETS - 1).astype(np.uint8)
+    return out
+
+
+def ads_ctr_bucket(clicks: npt.ArrayLike, views: npt.ArrayLike) -> npt.NDArray[np.uint8]:
+    c = np.asarray(clicks, dtype=np.int64)
+    v = np.asarray(views, dtype=np.int64)
+    out = np.zeros(np.broadcast_shapes(c.shape, v.shape), dtype=np.uint8)
+    has_views = v > 0
+    out[has_views & (c <= 0)] = 1
+    pos = has_views & (c > 0)
+    if np.any(pos):
+        bps = np.maximum(c[pos] * 10_000 // v[pos], 1)
+        out[pos] = np.minimum(2 + np.floor(np.log2(bps)), ADS_CTR_BUCKETS - 1).astype(np.uint8)
+    return out
+
+
+def read_ads_ctr_buckets(
+    record_batch: pa.RecordBatch, batch_size: int, num_slots: int
+) -> npt.NDArray[np.uint8]:
+    out = np.zeros((batch_size, num_slots, NUM_ADS_CTR_FEATURES), dtype=np.uint8)
+    names = set(record_batch.schema.names)
+    zeros = np.zeros((batch_size, num_slots), dtype=np.int64)
+
+    def _seq(col: str) -> npt.NDArray[np.int64] | None:
+        if col not in names:
+            return None
+        values = _list_values(record_batch.column(col)).fill_null(0)
+        values = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1)
+        width = min(values.shape[1], num_slots)
+        padded = zeros.copy()
+        padded[:, :width] = values[:, :width]
+        return padded
+
+    for j, (click_col, view_col) in enumerate(ADS_CTR_COUNT_PAIRS):
+        views = _seq(view_col)
+        if views is None:
+            continue
+        clicks = _seq(click_col)
+        out[:, :, j] = ads_ctr_bucket(zeros if clicks is None else clicks, views)
     return out
 
 
@@ -932,21 +977,28 @@ def from_record_batch(
     page_records: bool = False,
     id_list_specs: typing.Sequence[id_list_features.IdListFeatureSpec] | None = None,
     history_url_embedding_dim: int = 0,
-    history_url_embedding_fn: HistoryUrlEmbeddingFn | None = None,
+    history_url_embedding_fn: EmbeddingLookupFn | None = None,
+    candidate_embedding_fn: EmbeddingLookupFn | None = None,
     dump_keep_rate_per_10000: int | None = None,
     read_ads_engagement_counts: bool = False,
+    read_ads_ctr_features: bool = False,
     *,
     alloc: ArrayAllocator,
     aux_value_events: tuple[str, ...] = (),
     read_ad_side_ids: bool = False,
     ad_side_fields: tuple[str, ...] = ad_side.AD_SIDE_DEFAULT_FIELDS,
     long_term_author_profile_size: int = 0,
+    history_url_id_columns: tuple[str, ...] = (HISTORY_URL_ID_COLUMN,),
 ) -> RecsysFeaturesBatch:
     if read_ads_engagement_counts and (
         num_negatives_per_example or num_global_negatives_per_example
     ):
         raise ValueError(
             "read_ads_engagement_counts aligns count slots with candidates; negatives are unsupported"
+        )
+    if read_ads_ctr_features and (num_negatives_per_example or num_global_negatives_per_example):
+        raise ValueError(
+            "read_ads_ctr_features aligns CTR slots with candidates; negatives are unsupported"
         )
     if read_ad_side_ids and (num_negatives_per_example or num_global_negatives_per_example):
         raise ValueError(
@@ -1143,6 +1195,10 @@ def from_record_batch(
     embedding_raw: npt.NDArray[np.float32] | None = None
     embedding_dim: int = 0
 
+    if candidate_embedding_fn is not None and (
+        embedding_type is None or offline_embedding_table is not None
+    ):
+        raise ValueError("candidate_embedding_fn needs embedding_type and no offline table")
     if embedding_type is not None:
         col_name, embedding_dim = EMBEDDING_CONFIG[embedding_type]
         if offline_embedding_table is not None:
@@ -1150,7 +1206,7 @@ def from_record_batch(
                 f"offline embedding table dim {offline_embedding_table.dim} != "
                 f"{embedding_type} dim {embedding_dim}"
             )
-        elif col_name in record_batch.schema.names:
+        elif candidate_embedding_fn is None and col_name in record_batch.schema.names:
             try:
                 embedding_raw = _read_embedding_seq(
                     record_batch.column(col_name),
@@ -1433,12 +1489,17 @@ def from_record_batch(
         else None
     )
 
-    url_columns: tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_]] | None = None
+    url_columns: list[tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_]] | None] = []
     history_url: tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_]] | None = None
     if history_url_embedding_fn is not None and history_url_embedding_dim > 0:
-        history_url = (alloc.zeros(hist_shape_2d, np.int64), alloc.zeros(hist_shape_2d, np.bool_))
-        if HISTORY_URL_ID_COLUMN in record_batch.schema.names:
-            url_columns = _nullable_i64_col(record_batch, HISTORY_URL_ID_COLUMN, batch_size, alloc)
+        url_shape = (*hist_shape_2d, len(history_url_id_columns))
+        history_url = (alloc.zeros(url_shape, np.int64), alloc.zeros(url_shape, np.bool_))
+        url_columns = [
+            _nullable_i64_col(record_batch, name, batch_size, alloc)
+            if name in record_batch.schema.names
+            else None
+            for name in history_url_id_columns
+        ]
 
     candidate_embedding: npt.NDArray[np.float32] | None = None
     if embedding_type is not None and embedding_dim > 0:
@@ -1461,9 +1522,11 @@ def from_record_batch(
 
             history_post_ids[*hslice] = tweet_ids[*dslice]
             history_auth_ids[*hslice] = author_ids[*dslice]
-            if history_url is not None and url_columns is not None:
-                for dst, src in zip(history_url, url_columns, strict=True):
-                    dst[*hslice] = src[*dslice]
+            if history_url is not None:
+                for k, column in enumerate(url_columns):
+                    if column is not None:
+                        for dst, src in zip(history_url, column, strict=True):
+                            dst[*hslice, k] = src[*dslice]
             if history_post_sids is not None and semantic_ids_full_raw is not None:
                 _src = semantic_ids_full_raw[*dslice]
                 _w = min(_src.shape[-1], history_post_sids.shape[-1])
@@ -1751,14 +1814,18 @@ def from_record_batch(
             user_int64=user_features["user_int64_features"],
         )
 
+    if candidate_embedding_fn is not None and candidate_embedding is not None:
+        candidate_embedding_fn(
+            candidate_post_ids[..., None],
+            (candidate_post_ids != 0)[..., None],
+            candidate_embedding,
+        )
+
     history_url_embedding: npt.NDArray[np.float16] | None = None
     if history_url_embedding_dim > 0:
         history_url_embedding = alloc.zeros((*hist_shape_2d, history_url_embedding_dim), np.float16)
         if history_url_embedding_fn is not None and history_url is not None:
-            serve_time_ms = impression_timestamps_ms.max(
-                axis=1, initial=0, where=new_event_mask & padding_mask
-            )
-            history_url_embedding_fn(*history_url, serve_time_ms, history_url_embedding)
+            history_url_embedding_fn(*history_url, history_url_embedding)
 
     history_seq = PostSeq(
         impr_ts=history_impr_ts,
@@ -1875,6 +1942,10 @@ def from_record_batch(
     rank_logger.debug(f"from_record_batch took: {time.time() - start}")
     if read_ads_engagement_counts:
         candidate_seq_with_negatives["ads_count_buckets"] = read_ads_count_buckets(
+            record_batch, batch_size, max_candidate_post_action_pairs
+        )
+    if read_ads_ctr_features:
+        candidate_seq_with_negatives["ads_ctr_buckets"] = read_ads_ctr_buckets(
             record_batch, batch_size, max_candidate_post_action_pairs
         )
     if candidate_ad_side is not None:

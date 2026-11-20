@@ -41,6 +41,8 @@ pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
 }
 
 pub const WEB_CONV_URL_ID_COLUMN: &str = "webConvUrlId";
+pub const WEB_CONV_RANKED_URL_ID_COLUMNS: [&str; 3] =
+    ["webConvUrlIdRanked", "webConvUrlId2", "webConvUrlId3"];
 
 pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
     ids.filter(|ids| {
@@ -266,7 +268,53 @@ pub mod ads_counts {
     ];
     pub const PER_GROUP: usize = COUNTERS.len() * WINDOWS_SECS.len();
     pub const NUM_FEATURES: usize = 3 * PER_GROUP;
+    pub const CTR_NUM_FEATURES: usize = 3 * WINDOWS_SECS.len();
     pub const NUM_BUCKETS: usize = 33;
+    pub const NUM_CTR_BUCKETS: usize = 16;
+    pub const VIEW_COUNTER: i32 = 1;
+    pub const CLICK_COUNTER: i32 = 2;
+
+    pub fn ctr_bucket(clicks: u32, views: u32) -> u8 {
+        if views == 0 {
+            0
+        } else if clicks == 0 {
+            1
+        } else {
+            let bps = (clicks as u64 * 10_000 / views as u64).max(1);
+            (2 + bps.ilog2() as u8).min((NUM_CTR_BUCKETS - 1) as u8)
+        }
+    }
+
+    fn count_in(counts: &pb::EngagementCounts, counter: i32, window_secs: u32) -> Option<u32> {
+        if !counts.present {
+            return None;
+        }
+        if !counts.collected_actions.is_empty() && !counts.collected_actions.contains(&counter) {
+            return None;
+        }
+        let col = counts.window_secs.iter().position(|s| *s == window_secs)?;
+        Some(
+            counts
+                .rows
+                .iter()
+                .find(|r| r.action == counter)
+                .and_then(|r| r.counts.get(col).copied())
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn fill_ctr(counts: Option<&pb::EngagementCounts>, out: &mut [u8]) {
+        let Some(c) = counts.filter(|c| c.present) else {
+            return;
+        };
+        for (w, secs) in WINDOWS_SECS.iter().enumerate() {
+            let Some(views) = count_in(c, VIEW_COUNTER, *secs) else {
+                continue;
+            };
+            let clicks = count_in(c, CLICK_COUNTER, *secs).unwrap_or(0);
+            out[w] = ctr_bucket(clicks, views);
+        }
+    }
 
     pub fn bucket(count: u32) -> u8 {
         (u32::BITS - count.leading_zeros()) as u8
@@ -292,6 +340,19 @@ pub mod ads_counts {
                     .unwrap_or(0);
                 out[f * WINDOWS_SECS.len() + w] = bucket(count);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod ctr_tests {
+        use super::*;
+
+        #[test]
+        fn ctr_bucket_marks_zero_click_and_missing() {
+            assert_eq!(ctr_bucket(0, 0), 0);
+            assert_eq!(ctr_bucket(0, 84), 1);
+            assert_eq!(ctr_bucket(1, 10_000), 2);
+            assert_eq!(ctr_bucket(1, 1), 15);
         }
     }
 }
@@ -731,9 +792,11 @@ pub struct InputBuffer {
     pub user_conversion_history_hashes: Vec<i32>,
     pub candidate_account_hashes: Vec<i32>,
     pub candidate_ads_count_buckets: Vec<u8>,
+    pub candidate_ads_ctr_buckets: Vec<u8>,
     pub candidate_ad_side_ids: Vec<i32>,
     pub history_post_ids: Vec<i64>,
     pub history_web_conv_url_ids: Vec<(u32, i64)>,
+    pub history_web_conv_ranked_url_ids: Vec<(u32, i64)>,
     pub history_semantic_ids: Vec<u16>,
     pub candidate_semantic_ids: Vec<u16>,
     pub num_history: usize,
@@ -792,6 +855,37 @@ impl InputBuffer {
             user_row.copy_from_slice(&user);
         }
         self.candidate_ads_count_buckets = out;
+    }
+
+    pub fn stamp_ads_ctr_buckets(
+        &mut self,
+        model_config: &ModelConfig,
+        candidate_set: &pb::CandidateSet,
+    ) {
+        use ads_counts::{CTR_NUM_FEATURES, WINDOWS_SECS, fill_ctr};
+        if !model_config.hash_table.ads_ctr_features {
+            return;
+        }
+        let c = model_config.candidate_seq_len;
+        let mut out = vec![0u8; c * CTR_NUM_FEATURES];
+        for (row, candidate) in out
+            .chunks_exact_mut(CTR_NUM_FEATURES)
+            .zip(candidate_set.candidates.iter())
+        {
+            let ad = candidate.ad_info.as_ref();
+            let (ad_row, rest) = row.split_at_mut(WINDOWS_SECS.len());
+            let (advertiser_row, user_ad_row) = rest.split_at_mut(WINDOWS_SECS.len());
+            fill_ctr(ad.and_then(|a| a.engagement_counts.as_ref()), ad_row);
+            fill_ctr(
+                ad.and_then(|a| a.viewer_advertiser_engagement_counts.as_ref()),
+                advertiser_row,
+            );
+            fill_ctr(
+                ad.and_then(|a| a.viewer_ad_engagement_counts.as_ref()),
+                user_ad_row,
+            );
+        }
+        self.candidate_ads_ctr_buckets = out;
     }
 
     pub fn stamp_candidate_ad_side_ids(
@@ -898,14 +992,16 @@ impl InputBuffer {
                 Some(row)
             })
             .collect();
-        self.history_web_conv_url_ids.retain_mut(|(row, _)| {
+        let remap = |(row, _): &mut (u32, i64)| {
             let r = *row as usize;
             let kept = keep.get(r).copied().unwrap_or(false);
             if kept {
                 *row = new_row[r];
             }
             kept
-        });
+        };
+        self.history_web_conv_url_ids.retain_mut(remap);
+        self.history_web_conv_ranked_url_ids.retain_mut(remap);
         self.num_history = self.num_history.saturating_sub(removed);
         removed
     }
@@ -1668,9 +1764,11 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             candidate_ads_count_buckets: Vec::new(),
+            candidate_ads_ctr_buckets: Vec::new(),
             candidate_ad_side_ids: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids: Vec::new(),
+            history_web_conv_ranked_url_ids: Vec::new(),
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
@@ -1837,9 +1935,11 @@ impl InputBuffer {
                     user_conversion_history_hashes,
                     candidate_account_hashes,
                     candidate_ads_count_buckets: Vec::new(),
+                    candidate_ads_ctr_buckets: Vec::new(),
                     candidate_ad_side_ids: Vec::new(),
                     history_post_ids: vec![0i64; history_seq_len],
                     history_web_conv_url_ids: Vec::new(),
+                    history_web_conv_ranked_url_ids: Vec::new(),
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
                     candidate_semantic_ids,
                     num_history: 0,
@@ -1868,7 +1968,10 @@ impl InputBuffer {
         let col_quote_count = typed_column::<Int64Array>(&batch, QUOTE_COUNT_SEQ_COLUMN);
         let col_view_count = typed_column::<Int64Array>(&batch, VIEW_COUNT_SEQ_COLUMN);
         let col_web_conv_url_id = typed_column::<Int64Array>(&batch, WEB_CONV_URL_ID_COLUMN);
+        let col_web_conv_ranked_url_ids =
+            WEB_CONV_RANKED_URL_ID_COLUMNS.map(|name| typed_column::<Int64Array>(&batch, name));
         let mut history_web_conv_url_ids = Vec::new();
+        let mut history_web_conv_ranked_url_ids = Vec::new();
         let col_web_conv_tracking_integration =
             typed_column::<Int32Array>(&batch, WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN);
         let col_web_conv_time_on_site = [
@@ -1972,6 +2075,19 @@ impl InputBuffer {
                 && url_id.value(row_idx) != 0
             {
                 history_web_conv_url_ids.push((valid_entry_count as u32, url_id.value(row_idx)));
+            }
+            let first_url = history_web_conv_ranked_url_ids.len();
+            for col in col_web_conv_ranked_url_ids.iter().flatten() {
+                if col.is_null(row_idx) || col.value(row_idx) == 0 {
+                    continue;
+                }
+                let url_id = col.value(row_idx);
+                if !history_web_conv_ranked_url_ids[first_url..]
+                    .iter()
+                    .any(|&(_, id)| id == url_id)
+                {
+                    history_web_conv_ranked_url_ids.push((valid_entry_count as u32, url_id));
+                }
             }
 
             stamp_engagement_counts(
@@ -2146,9 +2262,11 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             candidate_ads_count_buckets: Vec::new(),
+            candidate_ads_ctr_buckets: Vec::new(),
             candidate_ad_side_ids: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids,
+            history_web_conv_ranked_url_ids,
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
@@ -2342,6 +2460,7 @@ mod tests {
                 enable_stale_post: false,
                 enable_stale_post_30d: false,
                 ads_count_features: false,
+                ads_ctr_features: false,
                 ad_side_fields: Vec::new(),
             },
             history_seq_len: 4,
@@ -3238,6 +3357,41 @@ mod tests {
             vec![(0, -1_392_645_021_888_827_343), (2, 7)]
         );
         assert!(compute(&without_column).history_web_conv_url_ids.is_empty());
+
+        let mut columns = with_column.columns().to_vec();
+        let mut fields: Vec<Field> = with_column
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        for (name, values) in [
+            (
+                WEB_CONV_RANKED_URL_ID_COLUMNS[0],
+                vec![Some(5i64), Some(6), Some(8), Some(7)],
+            ),
+            (
+                WEB_CONV_RANKED_URL_ID_COLUMNS[1],
+                vec![Some(5i64), None, None, Some(9)],
+            ),
+            (
+                WEB_CONV_RANKED_URL_ID_COLUMNS[2],
+                vec![Some(0i64), None, None, Some(10)],
+            ),
+        ] {
+            fields.push(Field::new(name, DataType::Int64, true));
+            columns.push(Arc::new(Int64Array::from(values)));
+        }
+        let with_ranked = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let buf = compute(&with_ranked);
+        assert_eq!(
+            buf.history_web_conv_url_ids,
+            vec![(0, -1_392_645_021_888_827_343), (2, 7)]
+        );
+        assert_eq!(
+            buf.history_web_conv_ranked_url_ids,
+            vec![(0, 5), (1, 8), (2, 7), (2, 9), (2, 10)]
+        );
     }
 
     #[test]
