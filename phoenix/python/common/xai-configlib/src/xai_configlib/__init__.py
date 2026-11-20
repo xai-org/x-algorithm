@@ -363,11 +363,13 @@ def replace_recursive(
                 new_dcls = dataclasses.replace(new_dcls, **{name: new_val})
         elif isinstance(attr, list):
             new_list = []
+            elem_types = get_args(_unwrap_optional(ty_hints[name]))
+            elem_type = elem_types[0] if elem_types else Any
             for i, item in enumerate(attr):
                 item_path = path + (str(i),)
                 if item_path[-len(key_path) :] == key_path:
-                    new_list.append(value)
-                    used.append(path)
+                    new_list.append(value if elem_type is Any else cast_type(elem_type, value))
+                    used.append(item_path)
                 elif dataclasses.is_dataclass(item):
                     new_item = replace_recursive(item, item_path, key_path, value, used)
                     new_list.append(new_item)
@@ -377,11 +379,13 @@ def replace_recursive(
                 new_dcls = dataclasses.replace(new_dcls, **{name: new_list})
         elif isinstance(attr, dict):
             new_dict: dict[str, Any] = {}
+            elem_types = get_args(_unwrap_optional(ty_hints[name]))
+            elem_type = elem_types[1] if len(elem_types) == 2 else Any
             for k, item in attr.items():
-                item_path = path + (k,)
+                item_path = path + (str(k),)
                 if item_path[-len(key_path) :] == key_path:
-                    new_dict[k] = value
-                    used.append(path)
+                    new_dict[k] = value if elem_type is Any else cast_type(elem_type, value)
+                    used.append(item_path)
                 elif dataclasses.is_dataclass(item):
                     new_item = replace_recursive(item, item_path, key_path, value, used)
                     new_dict[k] = new_item
