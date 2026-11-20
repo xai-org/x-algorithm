@@ -28,7 +28,9 @@ import com.twitter.botmaker.runtime.Runtime;
     },
     name = {"Slice", "Substring"},
     returnType = "String",
-    description = "Returns a substring or a sublist",
+    description =
+        "Returns a substring or a sublist."
+            + " Throws an exception if the requested range is invalid.",
     actionLevel = ActionLevel.NO_ACTION,
     examples = {
         "Slice(\"teststringteststring\", 1)",
@@ -74,10 +76,14 @@ public class Slice extends FunctionNode2O1<Runtime, Object, Long, Long> {
   protected Object apply(
       Context<Runtime> context, Object input, Long beginIndex, Long endIndex) {
     if (input instanceof String) {
-      return ((String) input).substring(beginIndex.intValue(), endIndex.intValue());
+      String string = (String) input;
+      validateRange(beginIndex, endIndex, string.length());
+      return string.substring(beginIndex.intValue(), endIndex.intValue());
     } else if (input instanceof List) {
+      List list = (List) input;
+      validateRange(beginIndex, endIndex, list.size());
       return Collections.unmodifiableList(new ArrayList<>(
-          ((List) input).subList(beginIndex.intValue(), endIndex.intValue())));
+          list.subList(beginIndex.intValue(), endIndex.intValue())));
     } else {
       throw new IllegalArgumentException(mkErrorMessage(input.getClass()));
     }
@@ -93,6 +99,16 @@ public class Slice extends FunctionNode2O1<Runtime, Object, Long, Long> {
       return apply(context, list, beginIndex, Long.valueOf(list.size()));
     } else {
       throw new IllegalArgumentException(mkErrorMessage(input.getClass()));
+    }
+  }
+
+  private static void validateRange(Long beginIndex, Long endIndex, int inputLength) {
+    if (beginIndex < 0 || endIndex < beginIndex || endIndex > inputLength) {
+      throw new IllegalArgumentException(String.format(
+          "invalid Slice() range [%d, %d) for input of length %d",
+          beginIndex,
+          endIndex,
+          inputLength));
     }
   }
 
