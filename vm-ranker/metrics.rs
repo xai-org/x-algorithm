@@ -327,6 +327,14 @@ lazy_static! {
         &["bonus"]
     )
     .unwrap();
+    pub static ref INELIGIBLE_HEAD_CANDIDATES: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_ineligible_head_candidates_total",
+            "Candidates whose reply, share or click predictions were left out of the value model because home-mixer flagged that head as ineligible"
+        ),
+        &["head"]
+    )
+    .unwrap();
     pub static ref SAMPLED_CANDIDATES: IntCounter = register_int_counter!(
         "vm_ranker_sampled_candidates_total",
         "Candidates with Phoenix heads in sampled value-model requests"

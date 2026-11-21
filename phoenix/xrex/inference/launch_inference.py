@@ -23,7 +23,8 @@ from xrex.utils import cluster
 
 import xrex.inference.serving_services
 
-for _family in ("xrex.inference.reply_services",):
+_OPTIONAL_FAMILIES = ("xrex.inference.reply_services",)
+for _family in _OPTIONAL_FAMILIES:
     if importlib.util.find_spec(_family) is not None:
         importlib.import_module(_family)
 

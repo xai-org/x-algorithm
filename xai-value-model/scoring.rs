@@ -89,28 +89,13 @@ fn skip_score(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -
 fn engage_sum(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
     weighted_terms(weights, candidate)
         .iter()
-        .filter(|(name, _)| {
-            *name != "dwell_time"
-                && *name != "not_dwelled"
-                && *name != "video_continuation"
-                && *name != "user_video_continuation"
-        })
+        .filter(|(name, _)| *name != "dwell_time" && *name != "not_dwelled")
         .map(|(_, t)| *t)
         .sum()
 }
 
-fn video_time_term(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
-    weighted_terms(weights, candidate)
-        .iter()
-        .filter(|(name, _)| *name == "video_continuation" || *name == "user_video_continuation")
-        .map(|(_, t)| *t)
-        .sum::<f64>()
-        .max(0.0)
-}
-
 fn time_factor(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
     1.0 + apply(candidate.phoenix_scores.dwell_time, weights.cont_dwell_time).max(0.0)
-        + video_time_term(weights, candidate)
 }
 
 fn multiplicative_score(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
@@ -875,7 +860,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let want = (0.36_f64).powf(-0.5) * 0.3 * 3.015 + 0.001;
+        let want = (0.36_f64).powf(-0.5) * 0.315 * 3.0 + 0.001;
         let got = fuse_heads(&weights, &positive);
         assert!((got - want).abs() < 1e-12, "got {got} want {want}");
 

@@ -34,10 +34,12 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
         let posts_above_pool = &kept[..pool_start.min(kept.len())];
         let drop_high_risk = query.params.get(EnableVideoCarouselHighRiskFilter);
         let drop_medium_risk = query.params.get(EnableVideoCarouselMediumRiskFilter);
+        let moe_only = video_carousel::moe_only(query);
         let carousel = video_carousel::select_videos(
             kept.iter()
                 .skip(pool_start)
                 .chain(&removed)
+                .filter(|candidate| !moe_only || video_carousel::from_moe_source(candidate))
                 .filter(|candidate| {
                     !video_carousel::was_seen(&query.seen_carousel_video_ids, candidate)
                 })
@@ -73,9 +75,10 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::candidate::PhoenixScores;
+    use crate::models::candidate::{PhoenixScores, RetrievalSource};
     use std::collections::HashSet;
     use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
+    use xai_home_mixer_proto as pb;
 
     #[test]
     fn carousel_skips_videos_seen_in_a_carousel() {
@@ -169,5 +172,60 @@ mod tests {
         let kept = ids(&result.kept);
         assert_eq!(kept[..5], [1, 2, 3, 4, 5]);
         assert!(!kept.contains(&11) && !kept.contains(&21));
+    }
+
+    #[test]
+    fn moe_only_carousel_shows_only_moe_videos() {
+        let mut results = FeatureSwitches::new(vec![])
+            .unwrap()
+            .match_recipient(&RecipientBuilder::new().build());
+        results.override_fs("rust_home_mixer_enable_video_carousel".to_string(), "true");
+        results.override_fs(
+            "rust_home_mixer_enable_video_carousel_moe_only".to_string(),
+            "true",
+        );
+        let query = ScoredPostsQuery {
+            params: results.into(),
+            video_carousel_eligible: true,
+            ..Default::default()
+        };
+        let moe = RetrievalSource::from_served_type(pb::ServedType::ForYouPhoenixRetrievalMoe);
+        let other = RetrievalSource::from_served_type(pb::ServedType::ForYouPhoenixRetrieval);
+        let video = |tweet_id: u64, retrieval_sources, extra| PostCandidate {
+            tweet_id,
+            author_id: tweet_id,
+            has_video: Some(true),
+            video_aspect_ratio: Some(0.5),
+            video_carousel_extra: extra,
+            retrieval_sources,
+            brand_safety_verdict: Some(BrandSafetyVerdict::Safe),
+            phoenix_scores: PhoenixScores {
+                video_open_score: Some(1.0 / tweet_id as f64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let feed = (1..=RESULT_SIZE as u64).map(|tweet_id| PostCandidate {
+            tweet_id,
+            ..Default::default()
+        });
+        let pool = [
+            video(101, vec![other], false),
+            video(201, vec![moe, other], false),
+            video(102, vec![other], true),
+            video(202, vec![moe], true),
+            video(203, vec![moe], true),
+        ];
+
+        VideoCarouselFilter.filter(&query, feed.chain(pool).collect());
+
+        let ids: HashSet<u64> = query
+            .video_carousel
+            .get()
+            .unwrap()
+            .iter()
+            .map(|video| video.tweet_id)
+            .collect();
+        assert_eq!(ids, HashSet::from([201, 202, 203]));
     }
 }

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-19T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-11-20T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -18,6 +18,12 @@ param!(
     u32,
     "rust_home_mixer_phoenix_cold_start_max_results",
     200
+);
+param!(
+    PhoenixRetrievalDatasetTopK,
+    String,
+    "rust_home_mixer_phoenix_retrieval_dataset_top_k",
+    ""
 );
 
 param!(
@@ -809,6 +815,12 @@ param!(
     false
 );
 param!(
+    EnableUnderTheHoodSetting,
+    bool,
+    "rust_home_mixer_enable_under_the_hood_setting",
+    false
+);
+param!(
     MaxPostsToCache,
     usize,
     "rust_home_mixer_max_posts_to_cache",
@@ -1521,6 +1533,12 @@ param!(
     EnableVideoCarouselMoeSource,
     bool,
     "rust_home_mixer_enable_video_carousel_moe_source",
+    false
+);
+param!(
+    EnableVideoCarouselMoeOnly,
+    bool,
+    "rust_home_mixer_enable_video_carousel_moe_only",
     false
 );
 param!(

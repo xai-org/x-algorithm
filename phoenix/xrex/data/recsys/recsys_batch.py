@@ -60,6 +60,7 @@ from xrex.data.recsys.feature_config import (
     INT64_FEATURES,
     NUM_ADS_COUNT_FEATURES,
     NUM_ADS_CTR_FEATURES,
+    SAMPLE_WEIGHT_SEQ_COLUMN,
     STALE_POST_14D_TTL_SEC,
     STALE_POST_30D_TTL_SEC,
     BoolFeature,
@@ -72,6 +73,7 @@ from xrex.data.recsys.feature_config import (
     UserInt64Feature,
 )
 from xrex.data.recsys.negative_word_match import clear_word_match, compute_word_match
+from xrex.data.recsys.teacher_distill import mask_bad_spans, read_teacher_slots
 from xrex.models.recsys_embedding import HashKeys, HashTable
 
 if TYPE_CHECKING:
@@ -393,14 +395,17 @@ class PostSeq(TypedDict):
     post_ids: npt.NDArray[np.int64] | None
     product_surface: npt.NDArray[np.int32]
     client_app_id: npt.NDArray[np.int32]
+    is_broadcast: NotRequired[npt.NDArray[np.bool_]]
     continuous_actions: npt.NDArray[np.float32]
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
     trained_candidate_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    sample_weight: NotRequired[npt.NDArray[np.float32] | None]
     head_eligible_mask: NotRequired[npt.NDArray[np.bool_] | None]
     value_label_valid: NotRequired[npt.NDArray[np.bool_]]
     value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     conversion_delay_ms: NotRequired[npt.NDArray[np.int32]]
+    teacher_probs: NotRequired[npt.NDArray[np.float32]]
     aux_value_content_view_ratio: NotRequired[npt.NDArray[np.float32]]
     aux_value_content_view_valid: NotRequired[npt.NDArray[np.bool_]]
     aux_value_content_view_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
@@ -681,11 +686,15 @@ def _extend_conversion_delays(post_seq: PostSeq, shape: tuple[int, int]) -> np.n
     return out
 
 
-def _scatter_candidate_slots(slots: np.ndarray, candidate_mask: np.ndarray) -> np.ndarray:
+def _scatter_candidate_slots(
+    slots: np.ndarray, candidate_mask: np.ndarray, fill: float = 0
+) -> np.ndarray:
     rank = np.cumsum(candidate_mask, axis=1) - 1
     keep = candidate_mask & (rank < slots.shape[1])
-    gathered = np.take_along_axis(slots, np.clip(rank, 0, slots.shape[1] - 1), axis=1)
-    return np.where(keep, gathered, np.zeros((), dtype=slots.dtype))
+    trailing = (1,) * (slots.ndim - 2)
+    index = np.clip(rank, 0, slots.shape[1] - 1).reshape(*rank.shape, *trailing)
+    gathered = np.take_along_axis(slots, index, axis=1)
+    return np.where(keep.reshape(index.shape), gathered, np.asarray(fill, dtype=slots.dtype))
 
 
 def _read_string_slots(
@@ -698,6 +707,29 @@ def _read_string_slots(
     values = col.values.slice(col.offset * width, candidate_mask.shape[0] * width)
     slots = np.asarray(values.to_numpy(zero_copy_only=False), dtype=object)
     return _scatter_candidate_slots(slots.reshape(candidate_mask.shape[0], width), candidate_mask)
+
+
+def _read_teacher_probs(
+    record_batch: pa.RecordBatch,
+    teacher: str,
+    actions: tuple[int, ...],
+    candidate_mask: np.ndarray,
+    impressed_ms: np.ndarray,
+    bad_spans_ms: tuple[tuple[int, int], ...],
+) -> np.ndarray:
+    slots = read_teacher_slots(record_batch, teacher, actions)
+    if slots is None:
+        return np.full((*candidate_mask.shape, len(actions)), np.nan, dtype=np.float32)
+    probs = _scatter_candidate_slots(slots, candidate_mask, fill=np.nan)
+    return mask_bad_spans(probs, impressed_ms, bad_spans_ms)
+
+
+def _extend_distill_targets(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    if (probs := post_seq.get("teacher_probs")) is None:
+        return {}
+    widened = np.full((*shape, probs.shape[-1]), np.nan, dtype=np.float32)
+    widened[:, : probs.shape[1]] = probs
+    return {"teacher_probs": widened}
 
 
 def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
@@ -982,6 +1014,7 @@ def from_record_batch(
     dump_keep_rate_per_10000: int | None = None,
     read_ads_engagement_counts: bool = False,
     read_ads_ctr_features: bool = False,
+    per_candidate_sample_weight: bool = False,
     *,
     alloc: ArrayAllocator,
     aux_value_events: tuple[str, ...] = (),
@@ -989,6 +1022,9 @@ def from_record_batch(
     ad_side_fields: tuple[str, ...] = ad_side.AD_SIDE_DEFAULT_FIELDS,
     long_term_author_profile_size: int = 0,
     history_url_id_columns: tuple[str, ...] = (HISTORY_URL_ID_COLUMN,),
+    distill_teacher: str = "",
+    distill_actions: tuple[int, ...] = (),
+    distill_bad_spans_ms: tuple[tuple[int, int], ...] = (),
 ) -> RecsysFeaturesBatch:
     if read_ads_engagement_counts and (
         num_negatives_per_example or num_global_negatives_per_example
@@ -1003,6 +1039,10 @@ def from_record_batch(
     if read_ad_side_ids and (num_negatives_per_example or num_global_negatives_per_example):
         raise ValueError(
             "read_ad_side_ids fills real candidate slots only; negatives are unsupported"
+        )
+    if per_candidate_sample_weight and dump_keep_rate_per_10000 is not None:
+        raise ValueError(
+            "per_candidate_sample_weight does not combine with dump_keep_rate_per_10000"
         )
     start = time.time()
     batch_size = record_batch.num_rows
@@ -1034,6 +1074,16 @@ def from_record_batch(
     new_event_mask = _col(record_batch, "newEventMask", batch_size, np.bool_, alloc=alloc)
     padding_mask = _col(record_batch, "paddingMask", batch_size, np.bool_, alloc=alloc)
     promoted_ids = _col(record_batch, "promotedIdSeq", batch_size, np.int64, alloc=alloc)
+    if per_candidate_sample_weight and SAMPLE_WEIGHT_SEQ_COLUMN in record_batch.schema.names:
+        sample_weight_seq = _col(
+            record_batch, SAMPLE_WEIGHT_SEQ_COLUMN, batch_size, np.float32, alloc=alloc
+        )
+        null_rows = ~record_batch.column(SAMPLE_WEIGHT_SEQ_COLUMN).is_valid().to_numpy(
+            zero_copy_only=False
+        )
+        sample_weight_seq[null_rows] = np.nan
+    else:
+        sample_weight_seq = None
     if "lineItemObjectiveSeq" in record_batch.schema.names:
         line_item_objective = _col(
             record_batch, "lineItemObjectiveSeq", batch_size, np.int16, alloc=alloc
@@ -1109,12 +1159,28 @@ def from_record_batch(
         if (slots := _read_string_slots(record_batch, column, new_event_mask & padding_mask))
         is not None
     }
+    teacher_probs = (
+        _read_teacher_probs(
+            record_batch,
+            distill_teacher,
+            distill_actions,
+            new_event_mask & padding_mask,
+            impression_timestamps_ms,
+            distill_bad_spans_ms,
+        )
+        if distill_teacher
+        else None
+    )
 
     if "clientAppIdSeq" in record_batch.schema.names:
         client_app_id = _col(record_batch, "clientAppIdSeq", batch_size, np.int32, alloc=alloc)
     else:
         seq_len = actions.shape[1]
         client_app_id = alloc.zeros((batch_size, seq_len), dtype=np.int32)
+    if "isBroadcastSeq" in record_batch.schema.names:
+        is_broadcast = _col(record_batch, "isBroadcastSeq", batch_size, np.bool_, alloc=alloc)
+    else:
+        is_broadcast = alloc.zeros(actions.shape[:2], dtype=np.bool_)
     if "conversionKeepBits" in record_batch.schema.names:
         conversion_keep_bits = _col(
             record_batch, "conversionKeepBits", batch_size, np.uint8, alloc=alloc
@@ -1417,6 +1483,7 @@ def from_record_batch(
     candidate_impr_ts = alloc.zeros(cand_shape_2d, dtype=np.int32)
     candidate_product_surface = alloc.zeros(cand_shape_2d, dtype=np.int32)
     candidate_client_app_id = alloc.zeros(cand_shape_2d, dtype=np.int32)
+    candidate_is_broadcast = alloc.zeros(cand_shape_2d, dtype=np.bool_)
     candidate_trained_actions_bits = alloc.full(
         cand_shape_2d, CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP, dtype=np.uint8
     )
@@ -1441,12 +1508,20 @@ def from_record_batch(
     candidate_lexical_strings = {
         column: np.zeros(cand_shape_2d, dtype=object) for column in lexical_strings
     }
+    candidate_teacher_probs: dict[str, np.ndarray] = {}
+    if teacher_probs is not None:
+        candidate_teacher_probs["teacher_probs"] = alloc.full(
+            (*cand_shape_2d, teacher_probs.shape[-1]), np.nan, dtype=np.float32
+        )
     candidate_post_creation_ts_sec = alloc.zeros(cand_shape_2d, dtype=np.int32)
     candidate_actions = alloc.zeros(cand_shape_3d, dtype=actions.dtype)
     candidate_continuous_actions = alloc.zeros(
         cand_shape_3d_continuous, dtype=continuous_actions.dtype
     )
     candidate_promoted_ids = alloc.zeros(cand_shape_2d, dtype=promoted_ids.dtype)
+    candidate_sample_weight = (
+        alloc.zeros(cand_shape_2d, dtype=np.float32) if sample_weight_seq is not None else None
+    )
     candidate_line_item_objective = alloc.zeros(cand_shape_2d, dtype=np.int16)
     candidate_safety_label_mask = alloc.zeros(cand_shape_2d, dtype=np.int64)
     candidate_search_query_embeddings: np.ndarray | None = None
@@ -1622,6 +1697,7 @@ def from_record_batch(
             candidate_impr_ts[*cslice] = ts_values.astype(np.int32)
             candidate_product_surface[*cslice] = product_surface[*dslice]
             candidate_client_app_id[*cslice] = client_app_id[*dslice]
+            candidate_is_broadcast[*cslice] = is_broadcast[*dslice]
             if conversion_keep_bits is not None:
                 candidate_trained_actions_bits[*cslice] = conversion_keep_bits[*dslice]
             if conversion_eligible_types is not None:
@@ -1638,7 +1714,11 @@ def from_record_batch(
             candidate_conversion_delays[*cslice] = conversion_delays[*dslice, :]
             for column, values in lexical_strings.items():
                 candidate_lexical_strings[column][*cslice] = values[*dslice]
+            if teacher_probs is not None:
+                candidate_teacher_probs["teacher_probs"][*cslice] = teacher_probs[*dslice, :]
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
+            if candidate_sample_weight is not None and sample_weight_seq is not None:
+                candidate_sample_weight[*cslice] = sample_weight_seq[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
             if candidate_positions is not None and cand_positions_aligned is not None:
@@ -1726,6 +1806,7 @@ def from_record_batch(
             candidate_impr_ts[not_found] = 0
             candidate_product_surface[not_found] = 0
             candidate_client_app_id[not_found] = 0
+            candidate_is_broadcast[not_found] = False
             candidate_post_creation_ts_sec[not_found] = 0
             candidate_actions[not_found] = 0
             candidate_continuous_actions[not_found] = 0
@@ -1734,7 +1815,11 @@ def from_record_batch(
             if candidate_ad_side is not None:
                 candidate_ad_side[not_found] = 0
             candidate_conversion_delays[not_found] = CONVERSION_DELAY_NONE
+            for values in candidate_teacher_probs.values():
+                values[not_found] = np.nan
             candidate_promoted_ids[not_found] = 0
+            if candidate_sample_weight is not None:
+                candidate_sample_weight[not_found] = 0
             candidate_line_item_objective[not_found] = 0
             candidate_safety_label_mask[not_found] = 0
             table_embs[not_found] = 0.0
@@ -1872,11 +1957,13 @@ def from_record_batch(
         ip_hashes=hash_table.get_ip_hash(candidate_ip_ids),
         product_surface=candidate_product_surface,
         client_app_id=candidate_client_app_id,
+        is_broadcast=candidate_is_broadcast,
         post_ids=candidate_post_ids if include_candidate_post_ids else None,
         trained_candidate_mask=candidate_trained_mask,
         **candidate_head_eligible,
         **candidate_value_labels,
         conversion_delay_ms=candidate_conversion_delays,
+        **candidate_teacher_probs,
         continuous_actions=candidate_continuous_actions,
         promoted_ids=candidate_promoted_ids,
         line_item_objective=candidate_line_item_objective,
@@ -1950,6 +2037,28 @@ def from_record_batch(
         )
     if candidate_ad_side is not None:
         candidate_seq_with_negatives["ad_side_ids"] = candidate_ad_side
+    record_sample_weights = (
+        dump_keep_sample_weights(actions, new_event_mask, dump_keep_rate_per_10000)
+        if dump_keep_rate_per_10000 is not None
+        else record_batch.column("sampleWeight")
+        .to_numpy(zero_copy_only=False)
+        .astype(np.float32)
+        .reshape(-1, 1)
+        if "sampleWeight" in record_batch.schema.names
+        else np.ones((batch_size, 1), dtype=np.float32)
+    )
+    if per_candidate_sample_weight:
+        weights = alloc.zeros(
+            (batch_size, candidate_seq_with_negatives["post_hashes"].shape[1]), dtype=np.float32
+        )
+        weights[:] = record_sample_weights
+        if candidate_sample_weight is not None:
+            np.copyto(
+                weights[:, :max_candidate_post_action_pairs],
+                candidate_sample_weight,
+                where=~np.isnan(candidate_sample_weight),
+            )
+        candidate_seq_with_negatives["sample_weight"] = weights
     batch = RecsysFeaturesBatch(
         user_hashes=hash_table.get_user_hash(user_ids),
         user_ip_hashes=hash_table.get_ip_hash(user_ip_ids),
@@ -1957,16 +2066,7 @@ def from_record_batch(
         candidate_seq=candidate_seq_with_negatives,
         **user_features,
         user_installed_apps_multihot=user_installed_apps_multihot,
-        sample_weights=(
-            dump_keep_sample_weights(actions, new_event_mask, dump_keep_rate_per_10000)
-            if dump_keep_rate_per_10000 is not None
-            else record_batch.column("sampleWeight")
-            .to_numpy(zero_copy_only=False)
-            .astype(np.float32)
-            .reshape(-1, 1)
-            if "sampleWeight" in record_batch.schema.names
-            else np.ones((batch_size, 1), dtype=np.float32)
-        ),
+        sample_weights=record_sample_weights,
         sample_source=sample_source,
     )
     if cand_positions_aligned is not None:
@@ -2011,6 +2111,7 @@ def apply_negative_sampling(
     post_ids = post_seq["post_ids"]
     product_surface = post_seq["product_surface"]
     client_app_id = post_seq["client_app_id"]
+    is_broadcast = post_seq.get("is_broadcast")
     trained_candidate_mask = post_seq.get("trained_candidate_mask")
     post_creation_ts_sec = post_seq["post_creation_ts_sec"]
     continuous_actions = post_seq["continuous_actions"]
@@ -2063,6 +2164,7 @@ def apply_negative_sampling(
         (batch_size, total_candidate_slots), dtype=product_surface.dtype
     )
     new_client_app_id = alloc.zeros((batch_size, total_candidate_slots), dtype=client_app_id.dtype)
+    new_is_broadcast = alloc.zeros((batch_size, total_candidate_slots), dtype=np.bool_)
     new_trained_mask = alloc.ones(
         (batch_size, total_candidate_slots, actions.shape[-1]), dtype=np.bool_
     )
@@ -2096,6 +2198,8 @@ def apply_negative_sampling(
     new_ip_hashes[:, positive_slice, :] = ip_hashes
     new_product_surface[:, positive_slice] = product_surface
     new_client_app_id[:, positive_slice] = client_app_id
+    if is_broadcast is not None:
+        new_is_broadcast[:, positive_slice] = is_broadcast
     if trained_candidate_mask is not None:
         new_trained_mask[:, positive_slice] = trained_candidate_mask
     new_post_creation_ts_sec[:, positive_slice] = post_creation_ts_sec
@@ -2312,6 +2416,7 @@ def apply_negative_sampling(
         ip_hashes=new_ip_hashes,
         product_surface=new_product_surface,
         client_app_id=new_client_app_id,
+        is_broadcast=new_is_broadcast,
         post_ids=new_post_ids,
         trained_candidate_mask=new_trained_mask,
         **_extend_head_eligible_mask(post_seq, total_candidate_slots),
@@ -2319,6 +2424,7 @@ def apply_negative_sampling(
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, total_candidate_slots)
         ),
+        **_extend_distill_targets(post_seq, (batch_size, total_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,
@@ -2360,6 +2466,7 @@ def apply_global_negative_sampling(
     post_ids = post_seq["post_ids"]
     product_surface = post_seq["product_surface"]
     client_app_id = post_seq["client_app_id"]
+    is_broadcast = post_seq.get("is_broadcast")
     post_creation_ts_sec = post_seq["post_creation_ts_sec"]
     promoted_ids = post_seq["promoted_ids"]
     line_item_objective = post_seq["line_item_objective"]
@@ -2395,6 +2502,7 @@ def apply_global_negative_sampling(
         (batch_size, expanded_candidate_slots),
         dtype=client_app_id.dtype,
     )
+    new_is_broadcast = alloc.zeros((batch_size, expanded_candidate_slots), dtype=np.bool_)
     _gn_trained_mask = post_seq.get("trained_candidate_mask")
     new_post_creation_ts_sec = alloc.zeros(
         (batch_size, expanded_candidate_slots),
@@ -2429,6 +2537,8 @@ def apply_global_negative_sampling(
     new_ip_hashes[:, original_slice, :] = ip_hashes
     new_product_surface[:, original_slice] = product_surface
     new_client_app_id[:, original_slice] = client_app_id
+    if is_broadcast is not None:
+        new_is_broadcast[:, original_slice] = is_broadcast
     new_post_creation_ts_sec[:, original_slice] = post_creation_ts_sec
     new_continuous_actions[:, original_slice, :] = continuous_actions
     if categorical_features.shape[2] > 0:
@@ -2572,6 +2682,7 @@ def apply_global_negative_sampling(
         ip_hashes=new_ip_hashes,
         product_surface=new_product_surface,
         client_app_id=new_client_app_id,
+        is_broadcast=new_is_broadcast,
         post_ids=new_post_ids,
         trained_candidate_mask=new_gn_trained_mask,
         **_extend_head_eligible_mask(post_seq, expanded_candidate_slots),
@@ -2579,6 +2690,7 @@ def apply_global_negative_sampling(
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, expanded_candidate_slots)
         ),
+        **_extend_distill_targets(post_seq, (batch_size, expanded_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,

@@ -36,7 +36,7 @@ fn records() -> Vec<ActionControlRecord> {
         live(ORDINARY.0, PageAction::SUSPEND),
         live(CSE.0, SUSPEND_PERMANENT_CSE),
         live(PERMANENT.0, SUSPEND_PERMANENT),
-        live(POST_HEAD, PageAction::SuspendAuthor {}),
+        live(POST_HEAD, PageAction::SUSPEND_AUTHOR),
     ]
 }
 
@@ -441,6 +441,171 @@ async fn a_post_author_suspension_orders_against_the_author() {
     let t = run_on_slot(&b, slot, &post_author(Account::Clean)).await;
     assert_eq!(t.status, "success", "{:?}", t.outcomes);
     assert_eq!(suspends(&t), sent_ordinary());
+}
+
+const POST_LABEL: PageAction = PageAction::PostSpamHighRecall {
+    lifetime: crate::action_control::Lifetime::Permanent,
+};
+
+fn author(permanent: bool, policy: SuspensionPolicy) -> PageAction {
+    PageAction::SuspendAuthor { permanent, policy }
+}
+
+fn records_with_post(actions: Vec<PageAction>) -> Vec<ActionControlRecord> {
+    let mut r = records();
+    r.pop();
+    r.push(record(POST_HEAD, None, None, ControlMode::Live, actions));
+    r
+}
+
+fn labels_post(t: &Trace) -> bool {
+    t.ais
+        .iter()
+        .any(|(_, r)| r.to_string().contains("SpamHighRecall"))
+}
+
+#[tokio::test]
+async fn an_author_suspend_with_options_orders_against_the_author() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let pm = SuspensionPolicy::PlatformManipulation;
+    let cse = SuspensionPolicy::Cse;
+    let b = bed().await;
+    for (action, class, sent) in [
+        (author(true, pm), CLASS_SUSPEND_PERMANENT, sent_permanent()),
+        (
+            author(false, cse),
+            CLASS_SUSPEND_CSE,
+            vec![(false, "Cse".into())],
+        ),
+        (author(true, cse), CLASS_SUSPEND_CSE, sent_cse()),
+    ] {
+        b.set_records(&records_with_post(vec![action])).await;
+        let t = b.run_fresh(&post_author(Account::Clean)).await;
+        assert_eq!(t.status, "success", "{action:?}: {:?}", info(&t));
+        assert_eq!(suspends(&t), sent, "{action:?}");
+        assert_eq!(t.dedup_calls[0], format!("try_insert(class={class})=new"));
+        assert_eq!(info(&t)["acted_class"], class.to_string());
+    }
+
+    let sent_cse_held = Some(SlotHolder::Outcome(CLASS_SUSPEND_CSE));
+    let in_flight_cse = Some(SlotHolder::Claim(CLASS_SUSPEND_CSE));
+    let sent_perm_held = Some(SlotHolder::Outcome(CLASS_SUSPEND_PERMANENT));
+    for (action, reads, status, reads_made) in [
+        (
+            author(false, cse),
+            vec![sent_cse_held],
+            ALREADY_CSE_SUSPENDED,
+            1,
+        ),
+        (
+            author(false, cse),
+            vec![in_flight_cse, in_flight_cse, sent_cse_held],
+            ALREADY_CSE_SUSPENDED,
+            3,
+        ),
+        (
+            author(true, pm),
+            vec![sent_cse_held],
+            ALREADY_CSE_SUSPENDED,
+            1,
+        ),
+        (
+            author(true, pm),
+            vec![sent_perm_held],
+            ALREADY_PERMANENTLY_SUSPENDED,
+            1,
+        ),
+        (author(true, cse), vec![sent_cse_held], "success", 1),
+        (author(false, cse), vec![sent_perm_held], "success", 1),
+    ] {
+        b.set_records(&records_with_post(vec![action])).await;
+        let slot = ScriptedSlot::new(NEW, reads);
+        let t = run_on_slot(&b, slot.clone(), &post_author(Account::Clean)).await;
+        let what = format!("{action:?}");
+        assert_eq!(t.status, status, "{what}: {:?}", t.outcomes);
+        assert_eq!(slot.read_count(), reads_made, "{what}");
+        assert!(
+            slot.read_keys
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|k| *k == DedupKey::entity(EntityType::User, Account::Clean.user_id())),
+            "{what}: reads the author's slot"
+        );
+        if status == "success" {
+            assert_eq!(suspends(&t).len(), 1, "{what}");
+        } else {
+            assert!(nothing_sent(&t), "{what}");
+            assert_eq!(info(&t)[PERMANENT_SEEN_IN], PERMANENT_SEEN_IN_DEDUP);
+        }
+    }
+
+    let slot = ScriptedSlot::new(
+        NEW,
+        vec![Some(SlotHolder::Outcome(CLASS_SUSPEND_PERMANENT))],
+    );
+    let t = run_on_slot(&b, slot, &permanent(Account::Clean)).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(suspends(&t), sent_permanent());
+
+    b.set_records(&records_with_post(vec![POST_LABEL, author(false, cse)]))
+        .await;
+    let slot = ScriptedSlot::new(NEW, vec![sent_cse_held]);
+    let t = run_on_slot(&b, slot, &post_author(Account::Clean)).await;
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert!(suspends(&t).is_empty());
+    assert!(labels_post(&t), "{:?}", t.ais);
+}
+
+#[tokio::test]
+async fn an_author_suspend_on_a_suspended_author_follows_the_gizmoduck_order() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let pm = SuspensionPolicy::PlatformManipulation;
+    let cse = SuspensionPolicy::Cse;
+    let (b, _) = bed_suspended(Account::Clean, true).await;
+    for (action, sent) in [
+        (author(false, pm), false),
+        (author(true, pm), false),
+        (author(false, cse), false),
+        (author(true, cse), true),
+    ] {
+        b.set_records(&records_with_post(vec![POST_LABEL, action]))
+            .await;
+        let t = b.run_fresh(&post_author(Account::Clean)).await;
+        let what = format!("{action:?}");
+        if action == PageAction::SUSPEND_AUTHOR {
+            assert_eq!(t.status, ALREADY_SUSPENDED, "{what}: {:?}", info(&t));
+            assert!(nothing_sent(&t), "{what}");
+            continue;
+        }
+        assert_eq!(t.status, "success", "{what}: {:?}", info(&t));
+        assert!(labels_post(&t), "{what}: {:?}", t.ais);
+        if sent {
+            assert_eq!(suspends(&t), sent_cse(), "{what}");
+        } else {
+            assert!(suspends(&t).is_empty(), "{what}");
+            assert_eq!(info(&t)[PERMANENT_SEEN_IN], PERMANENT_SEEN_IN_GIZMODUCK);
+        }
+    }
+    b.set_records(&records_with_post(vec![author(true, pm)]))
+        .await;
+    let t = b.run_fresh(&post_author(Account::Clean)).await;
+    assert_eq!(t.status, ALREADY_PERMANENTLY_SUSPENDED, "{:?}", info(&t));
+    assert!(nothing_sent(&t));
+
+    let (b, _) = bed_suspended(Account::Clean, false).await;
+    for (action, sent) in [
+        (author(true, pm), sent_permanent()),
+        (author(false, cse), vec![(false, "Cse".into())]),
+        (author(true, cse), sent_cse()),
+    ] {
+        b.set_records(&records_with_post(vec![POST_LABEL, action]))
+            .await;
+        let t = b.run_fresh(&post_author(Account::Clean)).await;
+        assert_eq!(t.status, "success", "{action:?}: {:?}", info(&t));
+        assert_eq!(suspends(&t), sent, "{action:?}");
+        assert!(labels_post(&t), "{action:?}");
+    }
 }
 
 #[tokio::test]

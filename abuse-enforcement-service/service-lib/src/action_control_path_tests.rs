@@ -803,7 +803,7 @@ async fn a_post_page_decision_skips_a_suspended_or_deactivated_author() {
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Days30,
                 },
-                PageAction::SuspendAuthor {},
+                PageAction::SUSPEND_AUTHOR,
             ],
         )],
         false,
@@ -1026,7 +1026,7 @@ fn as_page_actions(specs: &serde_json::Value, entity: EntityType) -> Option<Vec<
             ("suspend", EntityType::Post)
                 if !permanent && s.get("policy")?.as_str()? == "PlatformManipulation" =>
             {
-                PageAction::SuspendAuthor {}
+                PageAction::SUSPEND_AUTHOR
             }
             ("liveness_check", EntityType::User) => PageAction::LivenessCheck {},
             ("label", EntityType::User) if label_ok => PageAction::SpamHighRecall {
@@ -2020,7 +2020,7 @@ async fn a_page_label_is_not_blocked_by_another_heads_hold_on_the_post() {
 
     b.set_records(&labelling(vec![
         nsfw_label(Lifetime::Permanent),
-        PageAction::SuspendAuthor {},
+        PageAction::SUSPEND_AUTHOR,
     ]))
     .await;
     let t = b
@@ -2770,4 +2770,215 @@ async fn a_permanent_policy_suspend_reaches_ais_as_set_and_upgrades_a_suspended_
         "{:?}",
         t.dedup_calls
     );
+}
+
+const POST_SHR_PERMANENT: PageAction = PageAction::PostSpamHighRecall {
+    lifetime: Lifetime::Permanent,
+};
+
+fn author_suspend(permanent: bool, policy: crate::action_control::SuspensionPolicy) -> PageAction {
+    PageAction::SuspendAuthor { permanent, policy }
+}
+
+fn author_permanent_cse() -> PageAction {
+    author_suspend(true, crate::action_control::SuspensionPolicy::Cse)
+}
+
+fn suspend_sent(t: &Trace) -> Option<(bool, String)> {
+    t.ais.iter().find_map(|(_, r)| {
+        let actions: Vec<&serde_json::Value> = match r.get("actions") {
+            Some(serde_json::Value::Array(a)) => a.iter().collect(),
+            _ => r.get("action").into_iter().collect(),
+        };
+        actions.into_iter().find_map(|a| {
+            let s = a.get("suspendUser")?;
+            Some((
+                s.get("perm")?.as_bool()?,
+                s.get("policy")?.as_str()?.to_owned(),
+            ))
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_permanent_cse_author_suspend_is_sent_with_the_post_label_and_upgrades_a_suspended_author()
+ {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let actions = vec![POST_SHR_PERMANENT, author_permanent_cse()];
+    let b = bed(labelling(actions.clone()), false).await;
+    for account in [Account::Clean, Account::Suspended] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_eq!(t.status, "success", "{account:?}: {:?}", t.outcomes);
+        assert_eq!(
+            suspend_sent(&t),
+            Some((true, "Cse".to_owned())),
+            "{account:?}"
+        );
+        assert!(
+            sends_label(&t, "SpamHighRecall"),
+            "{account:?}: {:?}",
+            t.ais
+        );
+        assert_eq!(
+            info(&t)["action_specs"],
+            action_control::action_specs_json(&action_control::page_specs(&actions))
+        );
+        assert_eq!(
+            t.dedup_calls[0],
+            format!("try_insert(class={})=new", dedup_cache::CLASS_SUSPEND_CSE),
+            "{account:?}"
+        );
+        assert_eq!(
+            info(&t)["acted_class"],
+            dedup_cache::CLASS_SUSPEND_CSE.to_string()
+        );
+        assert!(!info(&t).contains_key(ALREADY_SUSPENDED_STRIPPED));
+    }
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Deactivated))
+        .await;
+    assert_eq!(t.status, "already_deactivated");
+    assert!(t.ais.is_empty() && t.tickets == 0);
+}
+
+#[tokio::test]
+async fn each_author_suspend_option_upgrades_a_suspended_author_and_the_plain_one_skips() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![PageAction::SUSPEND_AUTHOR]), false).await;
+    for permanent in [false, true] {
+        for policy in crate::action_control::SuspensionPolicy::ALL {
+            let author = author_suspend(permanent, policy);
+            b.set_records(&labelling(vec![POST_SHR_PERMANENT, author]))
+                .await;
+            let t = b
+                .run_admitted(&post_topic(&b), &reply_by(Account::Suspended))
+                .await;
+            if author == PageAction::SUSPEND_AUTHOR {
+                assert_eq!(t.status, ALREADY_SUSPENDED, "{author:?}");
+                assert!(t.ais.is_empty() && t.tickets == 0, "{author:?}");
+            } else {
+                assert_eq!(t.status, "success", "{author:?}: {:?}", t.outcomes);
+                assert_eq!(
+                    suspend_sent(&t),
+                    Some((permanent, policy.as_str().to_owned())),
+                    "{author:?}"
+                );
+                assert!(sends_label(&t, "SpamHighRecall"), "{author:?}");
+            }
+        }
+    }
+    b.set_records(&labelling(vec![
+        POST_SHR_PERMANENT,
+        PageAction::SUSPEND_AUTHOR,
+    ]))
+    .await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert_eq!(
+        suspend_sent(&t),
+        Some((false, "PlatformManipulation".to_owned()))
+    );
+    assert_eq!(
+        t.dedup_calls[0],
+        format!("try_insert(class={})=new", dedup_cache::CLASS_SUSPEND)
+    );
+}
+
+#[tokio::test]
+async fn an_author_suspend_never_replaces_a_held_cse_or_permanent_suspension_and_the_label_still_goes_on()
+ {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![PageAction::SUSPEND_AUTHOR]), false).await;
+    let author = Account::Clean.user_id();
+    let pm = crate::action_control::SuspensionPolicy::PlatformManipulation;
+    let cse = crate::action_control::SuspensionPolicy::Cse;
+    for (held, suspend, sent) in [
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(false, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(true, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(false, cse),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(true, cse),
+            true,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(false, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(true, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(false, cse),
+            true,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(true, cse),
+            true,
+        ),
+    ] {
+        let what = format!("held {held}, {suspend:?}");
+        b.set_records(&labelling(vec![POST_SHR_PERMANENT, suspend]))
+            .await;
+        b.dedup.slots.lock().unwrap().clear();
+        b.dedup.hold(EntityType::User, author, held);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, "success", "{what}: {:?}", t.outcomes);
+        assert!(sends_label(&t, "SpamHighRecall"), "{what}: {:?}", t.ais);
+        if sent {
+            assert!(suspend_sent(&t).is_some(), "{what}");
+            assert!(!info(&t).contains_key(PERMANENT_SEEN_IN), "{what}");
+        } else {
+            assert_eq!(suspend_sent(&t), None, "{what}");
+            assert_eq!(
+                info(&t)[PERMANENT_SEEN_IN],
+                PERMANENT_SEEN_IN_DEDUP,
+                "{what}"
+            );
+            assert_eq!(
+                info(&t)["acted_class"],
+                dedup_cache::CLASS_LABEL.to_string(),
+                "{what}: only the label was sent"
+            );
+        }
+    }
+
+    for (held, status) in [
+        (dedup_cache::CLASS_SUSPEND_CSE, ALREADY_CSE_SUSPENDED),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            ALREADY_PERMANENTLY_SUSPENDED,
+        ),
+    ] {
+        b.set_records(&labelling(vec![author_suspend(true, pm)]))
+            .await;
+        b.dedup.slots.lock().unwrap().clear();
+        b.dedup.hold(EntityType::User, author, held);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, status, "{held}: {:?}", t.outcomes);
+        assert!(t.ais.is_empty() && t.tickets == 0, "{held}");
+    }
 }

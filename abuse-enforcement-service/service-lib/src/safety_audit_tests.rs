@@ -27,7 +27,7 @@ async fn post_page_actions_never_waive_the_follower_ceiling() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let mut got = Vec::new();
     for action in [
-        PageAction::SuspendAuthor {},
+        PageAction::SUSPEND_AUTHOR,
         PageAction::PostSpamHighRecall {
             lifetime: action_control::Lifetime::Days30,
         },

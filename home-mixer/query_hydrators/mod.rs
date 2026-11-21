@@ -20,6 +20,7 @@ pub mod retrieval_sequence_query_hydrator;
 pub mod scoring_sequence_query_hydrator;
 pub mod served_history_query_hydrator;
 pub mod subscribed_user_ids_query_hydrator;
+pub mod under_the_hood_setting_query_hydrator;
 pub mod user_demographics_query_hydrator;
 pub mod user_inferred_gender_query_hydrator;
 pub mod user_installed_apps_query_hydrator;

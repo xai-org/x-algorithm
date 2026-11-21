@@ -28,8 +28,11 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
             ..candidate
         }));
         if video_carousel::is_enabled(query) {
+            let moe_only = video_carousel::moe_only(query);
             selected.extend(video_carousel::top_videos_by_carousel_score(
-                &non_selected,
+                non_selected
+                    .iter()
+                    .filter(|candidate| !moe_only || video_carousel::from_moe_source(candidate)),
                 query.params.get(VideoCarouselExtraCandidates),
                 &CarouselScoring::from_query(query),
                 &query.seen_carousel_video_ids,

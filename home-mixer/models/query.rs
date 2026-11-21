@@ -126,6 +126,7 @@ pub struct ScoredPostsQuery {
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
     pub is_under_the_hood_request: bool,
+    pub under_the_hood_setting_enabled: bool,
     pub is_preview: bool,
     pub is_polling: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -258,6 +259,7 @@ impl ScoredPostsQuery {
             subscription_level,
             is_shadow_traffic,
             is_under_the_hood_request: false,
+            under_the_hood_setting_enabled: false,
             is_preview,
             is_polling: false,
             cursor: None,

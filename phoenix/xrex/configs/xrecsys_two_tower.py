@@ -753,6 +753,9 @@ for config in configs:
                 "mask_in_batch_false_negatives",
                 RecsysTwoTowerModelConfig.mask_in_batch_false_negatives,
             ),
+            negative_pool_rows=mparams.get(
+                "negative_pool_rows", RecsysTwoTowerModelConfig.negative_pool_rows
+            ),
             user_query_heads=mparams.get(
                 "user_query_heads", RecsysTwoTowerModelConfig.user_query_heads
             ),

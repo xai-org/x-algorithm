@@ -589,6 +589,69 @@ async fn a_claim_left_with_ais_reads_the_account_first() {
 }
 
 #[tokio::test]
+async fn a_post_run_with_a_permanent_cse_author_suspend_upgrades_a_suspended_author() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(run_config(false, 10), vec![]).await;
+    let head = "SpamEmbeddingPtosDistilled";
+    let label = crate::replay_tests::rule_labels(BAKED_POST_RULES)
+        .into_iter()
+        .next()
+        .expect("a post routing label");
+    let post = |account, run_id: &str| {
+        with_run(
+            message(EntityType::Post, head, "clf", &[&label], account),
+            run_id,
+        )
+    };
+    let shr = PageAction::PostSpamHighRecall {
+        lifetime: Lifetime::Permanent,
+    };
+    let author_cse = PageAction::SuspendAuthor {
+        permanent: true,
+        policy: crate::action_control::SuspensionPolicy::Cse,
+    };
+    let rec = put_running(
+        &b.backfill_store,
+        RUN,
+        head,
+        vec![shr, author_cse],
+        vec![LevelRow::Missing],
+    );
+    assert_eq!(rec.v, backfill::BACKFILL_RUN_RECORD_VERSION);
+    assert_eq!(rec.v, 3);
+    let s = post(Account::Suspended, RUN);
+    let post_id = Facts::resolve_target(&s).1;
+    b.put_crashed_claim(RUN, EntityType::Post, post_id);
+    let (t, run_tickets) = b.run_backfill(&s).await;
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert_eq!(ais_names(&t).len(), 2, "{:?}", ais_names(&t));
+    assert!(ais_names(&t).iter().any(|n| n == "suspendUser"));
+    assert_eq!(run_tickets, 1);
+    assert!(
+        t.ais.iter().any(|(_, r)| {
+            let r = r.to_string();
+            r.contains(r#""perm":true"#) && r.contains(r#""policy":"Cse""#)
+        }),
+        "{:?}",
+        t.ais
+    );
+
+    let plain_run = "run-00000002";
+    put_running(
+        &b.backfill_store,
+        plain_run,
+        head,
+        vec![PageAction::SUSPEND_AUTHOR],
+        vec![LevelRow::Missing],
+    );
+    let s = post(Account::Suspended, plain_run);
+    b.put_crashed_claim(plain_run, EntityType::Post, Facts::resolve_target(&s).1);
+    b.dedup.slots.lock().unwrap().clear();
+    let (t, run_tickets) = b.run_backfill(&s).await;
+    assert!(t.ais.is_empty() && run_tickets == 0, "{}", t.status);
+}
+
+#[tokio::test]
 async fn the_hold_lookup_fails_closed_for_run_decisions_only() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     for mode in ["shadow", "off"] {

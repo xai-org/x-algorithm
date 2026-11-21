@@ -2,7 +2,8 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 9;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 10;
+pub const POST_SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 10;
 pub const RAISED_FOLLOWER_LIMIT_RECORD_VERSION: u32 = 9;
 pub const FOLLOWER_CEILING_CHECK: FollowerCeilingCheck = FollowerCeilingCheck {
     id: "very_high_follower_count",
@@ -316,7 +317,12 @@ pub enum PageAction {
             PhoenixSkip { lifetime: Lifetime },
         PostSpamHighRecall { lifetime: Lifetime },
             HideReply { lifetime: Lifetime },
-        SuspendAuthor {},
+        SuspendAuthor {
+        #[serde(default, skip_serializing_if = "is_false")]
+        permanent: bool,
+        #[serde(default, skip_serializing_if = "SuspensionPolicy::is_default")]
+        policy: SuspensionPolicy,
+    },
         PostLabel {
         #[cfg_attr(feature = "openapi", schema(value_type = String))]
         label: PostLabelName,
@@ -347,8 +353,41 @@ impl PageAction {
         policy: SuspensionPolicy::PlatformManipulation,
     };
 
+            pub const SUSPEND_AUTHOR: PageAction = PageAction::SuspendAuthor {
+        permanent: false,
+        policy: SuspensionPolicy::PlatformManipulation,
+    };
+
+            pub fn suspension(self) -> Option<(bool, SuspensionPolicy)> {
+        match self {
+            PageAction::Suspend { permanent, policy }
+            | PageAction::SuspendAuthor { permanent, policy } => Some((permanent, policy)),
+            _ => None,
+        }
+    }
+
+    fn suspension_with_options(self) -> bool {
+        self.suspension()
+            .is_some_and(|(permanent, policy)| permanent || !policy.is_default())
+    }
+
         pub fn uses_suspension_options(self) -> bool {
-        matches!(self, PageAction::Suspend { permanent, policy } if permanent || !policy.is_default())
+        self.entity() == ControlEntity::User && self.suspension_with_options()
+    }
+
+        pub fn uses_post_suspension_options(self) -> bool {
+        self.entity() == ControlEntity::Post && self.suspension_with_options()
+    }
+
+            fn suspensions(entity: ControlEntity) -> impl Iterator<Item = PageAction> {
+        [false, true].into_iter().flat_map(move |permanent| {
+            SuspensionPolicy::ALL
+                .into_iter()
+                .map(move |policy| match entity {
+                    ControlEntity::User => PageAction::Suspend { permanent, policy },
+                    ControlEntity::Post => PageAction::SuspendAuthor { permanent, policy },
+                })
+        })
     }
 
     pub fn entity(self) -> ControlEntity {
@@ -359,7 +398,7 @@ impl PageAction {
             | PageAction::PhoenixSkip { .. } => ControlEntity::User,
             PageAction::PostSpamHighRecall { .. }
             | PageAction::HideReply { .. }
-            | PageAction::SuspendAuthor {}
+            | PageAction::SuspendAuthor { .. }
             | PageAction::PostLabel { .. } => ControlEntity::Post,
         }
     }
@@ -370,13 +409,7 @@ impl PageAction {
 
                 pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
         match entity {
-            ControlEntity::User => [false, true]
-                .into_iter()
-                .flat_map(|permanent| {
-                    SuspensionPolicy::ALL
-                        .into_iter()
-                        .map(move |policy| PageAction::Suspend { permanent, policy })
-                })
+            ControlEntity::User => Self::suspensions(entity)
                 .chain([
                     PageAction::LivenessCheck {},
                     PageAction::SpamHighRecall {
@@ -415,9 +448,9 @@ impl PageAction {
                 PageAction::HideReply {
                     lifetime: Lifetime::Permanent,
                 },
-                PageAction::SuspendAuthor {},
             ]
             .into_iter()
+            .chain(Self::suspensions(entity))
             .chain(PostLabelName::all().flat_map(|label| {
                 [Lifetime::Days7, Lifetime::Days30, Lifetime::Permanent]
                     .map(|lifetime| PageAction::PostLabel { label, lifetime })
@@ -454,7 +487,7 @@ impl PageAction {
             PageAction::PhoenixSkip { .. } => "phoenix_skip",
             PageAction::PostSpamHighRecall { .. } => "post_spam_high_recall",
             PageAction::HideReply { .. } => "hide_reply",
-            PageAction::SuspendAuthor {} => "suspend_author",
+            PageAction::SuspendAuthor { .. } => "suspend_author",
             PageAction::PostLabel { label, .. } => label.as_str(),
         }
     }
@@ -535,6 +568,12 @@ impl ActionControlRecord {
         self.actions.iter().any(|a| a.uses_suspension_options())
     }
 
+            pub fn uses_post_suspension_options(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| a.uses_post_suspension_options())
+    }
+
         pub fn sets_author_skips(&self) -> bool {
         self.follower_threshold.is_some() || self.skip_high_credibility.is_some()
     }
@@ -548,8 +587,10 @@ impl ActionControlRecord {
             .is_some_and(|n| n >= follower_ceiling())
     }
 
-                                    pub fn schema_version(&self) -> u32 {
-        if self.raises_follower_limit() {
+                                        pub fn schema_version(&self) -> u32 {
+        if self.uses_post_suspension_options() {
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION
+        } else if self.raises_follower_limit() {
             RAISED_FOLLOWER_LIMIT_RECORD_VERSION
         } else if self.uses_post_label() {
             POST_LABEL_RECORD_VERSION
@@ -918,7 +959,7 @@ mod tests {
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Permanent
                 },
-                PageAction::SuspendAuthor {},
+                PageAction::SUSPEND_AUTHOR,
             ]
         );
     }
@@ -982,17 +1023,138 @@ mod tests {
     }
 
     #[test]
-    fn the_user_menu_offers_each_suspension_once_and_the_post_menu_none() {
-        let user = PageAction::menu(ControlEntity::User);
-        let suspends: Vec<&PageAction> = user.iter().filter(|a| a.kind() == "suspend").collect();
-        assert_eq!(suspends.len(), 2 * SuspensionPolicy::ALL.len());
-        assert_eq!(suspends[0], &PageAction::SUSPEND);
-        let mut seen = std::collections::HashSet::new();
-        assert!(suspends.iter().all(|a| seen.insert(**a)));
-        assert!(
-            PageAction::menu(ControlEntity::Post)
-                .iter()
-                .all(|a| !a.uses_suspension_options())
+    fn an_author_suspend_writes_its_options_only_when_they_differ_from_the_default() {
+        let plain: PageAction = serde_json::from_str(r#"{"kind":"suspend_author"}"#).unwrap();
+        assert_eq!(plain, PageAction::SUSPEND_AUTHOR);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"kind":"suspend_author"}"#
+        );
+        assert!(!plain.uses_post_suspension_options());
+        let spelled: PageAction = serde_json::from_str(
+            r#"{"kind":"suspend_author","permanent":false,"policy":"PlatformManipulation"}"#,
+        )
+        .unwrap();
+        assert_eq!(spelled, PageAction::SUSPEND_AUTHOR);
+        for (json, permanent, policy) in [
+            (
+                r#"{"kind":"suspend_author","permanent":true}"#,
+                true,
+                SuspensionPolicy::PlatformManipulation,
+            ),
+            (
+                r#"{"kind":"suspend_author","policy":"Cse"}"#,
+                false,
+                SuspensionPolicy::Cse,
+            ),
+            (
+                r#"{"kind":"suspend_author","permanent":true,"policy":"Cse"}"#,
+                true,
+                SuspensionPolicy::Cse,
+            ),
+        ] {
+            let a: PageAction = serde_json::from_str(json).unwrap();
+            assert_eq!(a, PageAction::SuspendAuthor { permanent, policy });
+            assert_eq!(serde_json::to_string(&a).unwrap(), json);
+            assert_eq!(a.suspension(), Some((permanent, policy)));
+            assert!(a.uses_post_suspension_options(), "{json}");
+            assert!(!a.uses_suspension_options(), "{json}");
+            assert_eq!(a.kind(), "suspend_author");
+            assert_eq!(a.entity(), ControlEntity::Post);
+        }
+        let account = PageAction::Suspend {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        assert!(account.uses_suspension_options());
+        assert!(!account.uses_post_suspension_options());
+    }
+
+    #[test]
+    fn each_menu_offers_its_entitys_suspension_once_per_option() {
+        for (entity, kind, default) in [
+            (ControlEntity::User, "suspend", PageAction::SUSPEND),
+            (
+                ControlEntity::Post,
+                "suspend_author",
+                PageAction::SUSPEND_AUTHOR,
+            ),
+        ] {
+            let menu = PageAction::menu(entity);
+            let suspends: Vec<&PageAction> = menu.iter().filter(|a| a.kind() == kind).collect();
+            assert_eq!(suspends.len(), 2 * SuspensionPolicy::ALL.len(), "{kind}");
+            assert_eq!(suspends[0], &default);
+            let mut seen = std::collections::HashSet::new();
+            assert!(suspends.iter().all(|a| seen.insert(**a)));
+            assert!(
+                menu.iter()
+                    .filter_map(|a| a.suspension())
+                    .eq(suspends.iter().filter_map(|a| a.suspension())),
+                "{kind}: the menu's only suspensions, in the same order on both menus"
+            );
+            assert!(menu.iter().all(|a| a.entity() == entity));
+        }
+        let user: Vec<_> = PageAction::menu(ControlEntity::User)
+            .iter()
+            .filter_map(|a| a.suspension())
+            .collect();
+        let post: Vec<_> = PageAction::menu(ControlEntity::Post)
+            .iter()
+            .filter_map(|a| a.suspension())
+            .collect();
+        assert_eq!(user, post);
+    }
+
+    #[test]
+    fn a_record_with_an_author_suspension_option_is_refused_by_older_images() {
+        let old = r#"{"v":3,"entity_type":"post","head":"H","mode":"live","actions":[{"kind":"suspend_author"}],"version":1,"confidence":"high","rollout_bp":1000}"#;
+        let mut r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            ROLLOUT_RECORD_VERSION,
+            "a plain author suspend keeps its version"
+        );
+        for action in [
+            PageAction::SuspendAuthor {
+                permanent: true,
+                policy: SuspensionPolicy::PlatformManipulation,
+            },
+            PageAction::SuspendAuthor {
+                permanent: false,
+                policy: SuspensionPolicy::Cse,
+            },
+        ] {
+            r.actions = vec![action];
+            assert_eq!(r.schema_version(), 10);
+            assert_eq!(r.schema_version(), POST_SUSPENSION_OPTIONS_RECORD_VERSION);
+            assert!(r.schema_version() > RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+        }
+        r.actions = vec![
+            PageAction::PostSpamHighRecall {
+                lifetime: Lifetime::Permanent,
+            },
+            PageAction::SuspendAuthor {
+                permanent: true,
+                policy: SuspensionPolicy::Cse,
+            },
+        ];
+        r.follower_threshold = Some(follower_ceiling());
+        assert_eq!(
+            r.schema_version(),
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            "above the raised follower limit"
+        );
+        assert_eq!(
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            ACTION_CONTROL_RECORD_VERSION
+        );
+
+        let user = r#"{"v":6,"entity_type":"user","head":"H","mode":"live","actions":[{"kind":"suspend","permanent":true,"policy":"Cse"}],"version":1}"#;
+        let r = ActionControlRecord::parse_strict(user.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            SUSPENSION_OPTIONS_RECORD_VERSION,
+            "an account suspend with options stays v: 6"
         );
     }
 
@@ -1031,7 +1193,9 @@ mod tests {
             r#"{"kind":"suspend","perm":true}"#,
             r#"{"kind":"suspend","policy":"Spam"}"#,
             r#"{"kind":"suspend","permanent":"yes"}"#,
-            r#"{"kind":"suspend_author","permanent":true}"#,
+            r#"{"kind":"suspend_author","perm":true}"#,
+            r#"{"kind":"suspend_author","policy":"Spam"}"#,
+            r#"{"kind":"suspend_author","permanent":"yes"}"#,
             r#"{"kind":"spam_high_recall","lifetime":"90d"}"#,
             r#"{"kind":"label","labels":["SpamHighRecall"]}"#,
             r#"{"kind":"arkose"}"#,
@@ -1206,10 +1370,7 @@ mod tests {
             assert!(h.raises_follower_limit());
             assert_eq!(h.schema_version(), 9);
             assert_eq!(h.schema_version(), RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
-            assert_eq!(
-                RAISED_FOLLOWER_LIMIT_RECORD_VERSION,
-                ACTION_CONTROL_RECORD_VERSION
-            );
+            assert!(h.schema_version() <= ACTION_CONTROL_RECORD_VERSION);
             h.v = h.schema_version();
             let json = serde_json::to_string(&h).unwrap();
             assert_eq!(
@@ -1510,7 +1671,9 @@ mod tests {
             }
         }
         assert!(
-            !post(High).contains(&PageAction::SuspendAuthor {}),
+            LevelRow::ALL
+                .iter()
+                .all(|&l| post(l).iter().all(|a| a.suspension().is_none())),
             "a post default never suspends the author"
         );
     }

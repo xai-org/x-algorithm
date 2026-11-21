@@ -183,11 +183,14 @@ BASE_REQUIRED_COLUMNS: list[str] = [
 ]
 
 
+SAMPLE_WEIGHT_SEQ_COLUMN = "sampleWeightSeq"
+
 OPTIONAL_COLUMNS: list[str] = [
     "searchQueryEmbeddingSeq",
     "lineItemObjectiveSeq",
     "safetyLabelMaskSeq",
     "semanticIdSeq",
+    "isBroadcastSeq",
     "sampleWeight",
     "firstDpaProductKey",
     "dpaSidCodesSeq",

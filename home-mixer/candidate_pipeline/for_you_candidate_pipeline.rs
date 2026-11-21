@@ -19,6 +19,7 @@ use crate::query_hydrators::ads_user_state_query_hydrator::AdsUserStateQueryHydr
 use crate::query_hydrators::frame_dismissal_query_hydrator::FrameDismissalQueryHydrator;
 use crate::query_hydrators::past_request_timestamps_query_hydrator::PastRequestTimestampsQueryHydrator;
 use crate::query_hydrators::served_history_query_hydrator::ServedHistoryQueryHydrator;
+use crate::query_hydrators::under_the_hood_setting_query_hydrator::UnderTheHoodSettingQueryHydrator;
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
@@ -242,6 +243,9 @@ impl ForYouCandidatePipeline {
                 &past_request_timestamps_client,
             ))),
             Box::new(FrameDismissalQueryHydrator {
+                strato_client: Arc::clone(&strato_client),
+            }),
+            Box::new(UnderTheHoodSettingQueryHydrator {
                 strato_client: Arc::clone(&strato_client),
             }),
             Box::new(AdsUserStateQueryHydrator {

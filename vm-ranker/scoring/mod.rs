@@ -195,7 +195,7 @@ mod tests {
         compute_value_scores, CandidateScoringInputs, ClassFactors, QueryScoringContext,
         ValueModelWeights, NEGATIVE_SCORES_OFFSET,
     };
-    use xai_vm_ranker_proto::experiment::RequestPayload;
+    use xai_vm_ranker_proto::experiment::{CandidatePayload, RequestPayload};
     use xai_vm_ranker_proto::{PhoenixScores, RankCandidate, ViewerContext};
 
     const FEATURES_YAML: &str = r#"
@@ -476,6 +476,79 @@ rust_home_mixer_author_exploration:
             assert!((boosted[0].score - (base[0].score + 0.2)).abs() < 1e-12);
             assert_eq!(boosted[1].score, base[1].score);
             assert_eq!(boosted[0].weighted_score, base[0].weighted_score);
+        }
+    }
+
+    #[tokio::test]
+    async fn ineligible_engagement_heads_are_left_out_of_the_score() {
+        let score = |payload: CandidatePayload, exclude: bool| async move {
+            let mut req = request(
+                vec![RankCandidate {
+                    tweet_id: 1,
+                    author_id: 10,
+                    in_network: true,
+                    phoenix_scores: Some(PhoenixScores {
+                        favorite_score: Some(0.5),
+                        reply_score: Some(0.2),
+                        share_score: Some(0.1),
+                        share_via_dm_score: Some(0.05),
+                        share_via_copy_link_score: Some(0.02),
+                        click_score: Some(0.3),
+                        ..Default::default()
+                    }),
+                    experiment_payload: payload.encode_to_vec().into(),
+                    ..Default::default()
+                }],
+                "US",
+            );
+            let overrides = &mut req.viewer.as_mut().unwrap().fs_overrides;
+            for (key, value) in [
+                (
+                    "rust_home_mixer_vm_ranker_exclude_ineligible_engagement_heads",
+                    exclude.to_string(),
+                ),
+                ("rust_home_mixer_share_weight", "1.0".to_string()),
+                ("rust_home_mixer_share_via_dm_weight", "1.0".to_string()),
+                (
+                    "rust_home_mixer_share_via_copy_link_weight",
+                    "1.0".to_string(),
+                ),
+                ("rust_home_mixer_click_weight", "1.0".to_string()),
+            ] {
+                overrides.insert(key.to_string(), value);
+            }
+            rank(req, context(config(), DebiasModels::default()))
+                .await
+                .unwrap()[0]
+                .score
+        };
+        let (reply, share, click) = (4.0 * 0.2, 0.1 + 0.05 + 0.02, 0.3);
+        let all_heads = 2.0 * 0.5 + reply + share + click + NEGATIVE_SCORES_OFFSET;
+        let reply_ineligible = CandidatePayload {
+            reply_ineligible: true,
+            ..Default::default()
+        };
+        let share_ineligible = CandidatePayload {
+            share_ineligible: true,
+            ..Default::default()
+        };
+        let click_ineligible = CandidatePayload {
+            click_ineligible: true,
+            ..Default::default()
+        };
+
+        for (payload, exclude, want) in [
+            (CandidatePayload::default(), true, all_heads),
+            (reply_ineligible.clone(), true, all_heads - reply),
+            (share_ineligible, true, all_heads - share),
+            (click_ineligible, true, all_heads - click),
+            (reply_ineligible, false, all_heads),
+        ] {
+            let got = score(payload.clone(), exclude).await;
+            assert!(
+                (got - want).abs() < 1e-12,
+                "{payload:?} exclude={exclude}: got {got} want {want}"
+            );
         }
     }
 

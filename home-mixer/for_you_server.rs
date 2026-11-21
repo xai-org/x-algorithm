@@ -50,7 +50,9 @@ impl ForYouFeedServer {
         feed_log::log_feed_response(&result);
 
         let show_frame = result.query.params.get(params::EnableUnderTheHoodFrame)
-            && result.query.params.get(params::EnableUnderTheHood);
+            && result.query.params.get(params::EnableUnderTheHood)
+            && (!result.query.params.get(params::EnableUnderTheHoodSetting)
+                || result.query.under_the_hood_setting_enabled);
         let rendered = if show_frame || result.query.is_under_the_hood_request {
             trace.as_ref().map(under_the_hood::pipeline_trace)
         } else {

@@ -202,6 +202,7 @@ message PredictNextActionsRequest {
   ScoreCacheInfo score_cache = 28;
 
   VmRankSpec vmRank = 29;
+  bool getScoreCacheLogits = 30;
 }
 
 message ScoreCacheInfo {
@@ -493,6 +494,7 @@ enum RetrievalDatasetType {
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_2DAY = 27;
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_7DAY = 28;
   RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_14DAY = 29;
+  RETRIEVAL_DATASET_TYPE_POPULAR_VIDEO_2DAY = 30;
 }
 
 message ScoredCandidate {
@@ -1518,6 +1520,8 @@ message UserActionMeta {
   uint64 safetyLabelMask = 27;
   optional uint32 percent_screen_height_100k = 28;
   optional uint64 fair_view_time_ms = 29;
+  optional bool is_broadcast = 30;
+  optional uint64 kafka_timestamp_ms = 31;
 }
 
 message TweetInfo {
@@ -2099,6 +2103,8 @@ message RawHistoryInfo {
   optional uint64 last_added_time_ms = 5;
   optional HistorySourceInfo chad_ad_history = 6;
   optional HistorySourceInfo web_conversions = 7;
+  optional uint64 first_kafka_timestamp_ms = 8;
+  optional uint64 last_kafka_timestamp_ms = 9;
 }
 
 message HistorySourceInfo {

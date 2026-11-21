@@ -309,7 +309,7 @@ async fn a_post_decision_skips_a_test_account_author_on_both_paths() {
             None,
             None,
             ControlMode::Live,
-            vec![PageAction::SuspendAuthor {}],
+            vec![PageAction::SUSPEND_AUTHOR],
         )
     }];
     for records in [Vec::new(), page] {

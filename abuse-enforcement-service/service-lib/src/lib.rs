@@ -408,15 +408,18 @@ fn strip_redundant_suspends(
 ) -> Vec<decision::ActionSpec> {
     let is_suspend =
         |s: &decision::ActionSpec| matches!(s, decision::ActionSpec::SuspendUser { .. });
-    let outranks_temporary = specs
-        .iter()
-        .any(|s| s.dedup_action_class() > dedup_cache::CLASS_SUSPEND);
-    if !user.suspended || outranks_temporary || !specs.iter().any(is_suspend) {
+    if !user.suspended || outranks_temporary_suspension(specs) || !specs.iter().any(is_suspend) {
         return Vec::new();
     }
     let (stripped, kept) = std::mem::take(specs).into_iter().partition(is_suspend);
     *specs = kept;
     stripped
+}
+
+fn outranks_temporary_suspension(specs: &[decision::ActionSpec]) -> bool {
+    specs
+        .iter()
+        .any(|s| s.dedup_action_class() > dedup_cache::CLASS_SUSPEND)
 }
 
 const ALREADY_PERMANENTLY_SUSPENDED: &str = "already_permanently_suspended";
@@ -430,7 +433,7 @@ const PERMANENT_SEEN_IN_DEDUP: &str = "dedup";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outranking {
                     Gizmoduck,
-            Dedup(u8),
+            Dedup { class: u8, author_slot: bool },
 }
 
 impl Outranking {
@@ -440,13 +443,16 @@ impl Outranking {
         }
         match self {
             Outranking::Gizmoduck => !spec.is_permanent_cse_suspension(),
-            Outranking::Dedup(class) => spec.dedup_action_class() < class,
+            Outranking::Dedup { class, author_slot } => outranked_by(class, spec, author_slot),
         }
     }
 
     fn status(self) -> &'static str {
         match self {
-            Outranking::Dedup(dedup_cache::CLASS_SUSPEND_CSE) => ALREADY_CSE_SUSPENDED,
+            Outranking::Dedup {
+                class: dedup_cache::CLASS_SUSPEND_CSE,
+                ..
+            } => ALREADY_CSE_SUSPENDED,
             _ => ALREADY_PERMANENTLY_SUSPENDED,
         }
     }
@@ -454,9 +460,18 @@ impl Outranking {
     fn seen_in(self) -> &'static str {
         match self {
             Outranking::Gizmoduck => PERMANENT_SEEN_IN_GIZMODUCK,
-            Outranking::Dedup(_) => PERMANENT_SEEN_IN_DEDUP,
+            Outranking::Dedup { .. } => PERMANENT_SEEN_IN_DEDUP,
         }
     }
+}
+
+fn outranked_by(class: u8, spec: &decision::ActionSpec, author_slot: bool) -> bool {
+    let mine = spec.dedup_action_class();
+    class > mine
+        || (author_slot
+            && class == mine
+            && class >= dedup_cache::CLASS_SUSPEND_PERMANENT
+            && !spec.is_permanent_cse_suspension())
 }
 
 fn drop_outranked_suspends(
@@ -493,7 +508,7 @@ const SLOT_POLL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuspendOrder {
     Proceed,
-        Outranked(u8),
+            Outranked(Outranking),
 }
 
 async fn order_suspends(
@@ -501,16 +516,18 @@ async fn order_suspends(
     specs: &[decision::ActionSpec],
     user_id: i64,
 ) -> SuspendOrder {
-    let Some(mine) = specs
+    let Some(strongest) = specs
         .iter()
         .filter(|s| matches!(s, decision::ActionSpec::SuspendUser { .. }))
-        .map(decision::ActionSpec::dedup_action_class)
-        .max()
+        .max_by_key(|s| s.dedup_action_class())
     else {
         return SuspendOrder::Proceed;
     };
+    let mine = strongest.dedup_action_class();
     let key = DedupKey::entity(EntityType::User, user_id);
     let own_key = key == slot.key;
+    let author_slot = !own_key;
+    let outranks_mine = |class: u8| outranked_by(class, strongest, author_slot);
     let own_nonce = slot.claim_nonce.filter(|_| own_key);
     let displaced = slot.displaced_in_flight_suspend.filter(|_| own_key);
     let started = tokio::time::Instant::now();
@@ -518,12 +535,13 @@ async fn order_suspends(
     loop {
         let other = match slot.cache.holder(&key, own_nonce).await {
             Some(SlotHolder::Outcome(class))
-                if class > mine && class >= dedup_cache::CLASS_SUSPEND_PERMANENT =>
+                if outranks_mine(class) && class >= dedup_cache::CLASS_SUSPEND_PERMANENT =>
             {
-                return SuspendOrder::Outranked(class);
+                return SuspendOrder::Outranked(Outranking::Dedup { class, author_slot });
             }
             Some(SlotHolder::Claim(class))
-                if class >= dedup_cache::CLASS_SUSPEND && class != mine =>
+                if class >= dedup_cache::CLASS_SUSPEND
+                    && (class != mine || outranks_mine(class)) =>
             {
                 Some(class)
             }
@@ -538,7 +556,7 @@ async fn order_suspends(
             }
             return SuspendOrder::Proceed;
         };
-        let budget = if other > mine {
+        let budget = if outranks_mine(other) {
             AWAIT_STRONGER
         } else {
             AWAIT_WEAKER
@@ -919,18 +937,9 @@ async fn run_enforcement_inner(
             }
             if control.page_driven() {
                 let account = facts.user();
-                let upgrades = control.page_actions.iter().any(|a| {
-                    matches!(
-                        a,
-                        action_control::PageAction::Suspend {
-                            permanent: true,
-                            ..
-                        } | action_control::PageAction::Suspend {
-                            policy: action_control::SuspensionPolicy::Cse,
-                            ..
-                        }
-                    )
-                });
+                let upgrades = outranks_temporary_suspension(&action_control::page_specs(
+                    &control.page_actions,
+                ));
                 let skip = if account.suspended && !upgrades {
                     Some(ALREADY_SUSPENDED)
                 } else if account.deactivated {
@@ -1072,16 +1081,10 @@ async fn run_enforcement_inner(
 
             if !dry_run
                 && let Some(slot) = slot
-                && let SuspendOrder::Outranked(class) =
+                && let SuspendOrder::Outranked(by) =
                     order_suspends(slot, &specs, facts.user_id).await
-                && let Some(outcome) = drop_outranked_suspends(
-                    &mut specs,
-                    Outranking::Dedup(class),
-                    extra,
-                    dry_run,
-                    &facts,
-                    score,
-                )
+                && let Some(outcome) =
+                    drop_outranked_suspends(&mut specs, by, extra, dry_run, &facts, score)
             {
                 return Ok(outcome);
             }

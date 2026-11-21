@@ -238,13 +238,9 @@ pub fn check_message(
 
 pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool {
     actions.iter().all(|a| match a {
-        PageAction::Suspend {
-            permanent: false, ..
+        PageAction::Suspend { .. } | PageAction::SuspendAuthor { .. } => {
+            account.suspended && matches!(*a, PageAction::SUSPEND | PageAction::SUSPEND_AUTHOR)
         }
-        | PageAction::SuspendAuthor {} => account.suspended,
-        PageAction::Suspend {
-            permanent: true, ..
-        } => false,
         PageAction::SpamHighRecall { .. } => account.labels.iter().any(|l| l == "SpamHighRecall"),
         PageAction::PhoenixSkip { .. } => account
             .labels
@@ -1401,6 +1397,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::action_control::SuspensionPolicy;
     use crate::action_control::test_support::MemControlStore;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -2370,7 +2367,7 @@ mod tests {
             (
                 "wrong_entity",
                 BackfillRunStartRequest {
-                    actions: vec![PageAction::SuspendAuthor {}],
+                    actions: vec![PageAction::SUSPEND_AUTHOR],
                     ..base.clone()
                 },
             ),
@@ -2407,7 +2404,7 @@ mod tests {
                 BackfillRunStartRequest {
                     entity: ControlEntity::Post,
                     source: RunSource::LighterAction,
-                    actions: vec![PageAction::SuspendAuthor {}],
+                    actions: vec![PageAction::SUSPEND_AUTHOR],
                     ..base.clone()
                 },
             ),
@@ -3161,5 +3158,39 @@ mod tests {
         assert!(already_applied(&[phoenix], &phoenix_labelled));
         assert!(!already_applied(&[phoenix], &labelled));
         assert!(!already_applied(&[shr], &phoenix_labelled));
+    }
+
+    #[test]
+    fn already_applied_never_reads_a_permanent_or_policy_suspension_back() {
+        let suspended = GizmoduckFacts {
+            suspended: true,
+            ..Default::default()
+        };
+        let permanently = GizmoduckFacts {
+            suspended: true,
+            permanently_suspended: true,
+            ..Default::default()
+        };
+        assert!(already_applied(&[PageAction::SUSPEND_AUTHOR], &suspended));
+        assert!(!already_applied(
+            &[PageAction::SUSPEND_AUTHOR],
+            &GizmoduckFacts::default()
+        ));
+        for permanent in [false, true] {
+            for policy in SuspensionPolicy::ALL {
+                for action in [
+                    PageAction::Suspend { permanent, policy },
+                    PageAction::SuspendAuthor { permanent, policy },
+                ] {
+                    let plain = !permanent && policy == SuspensionPolicy::PlatformManipulation;
+                    assert_eq!(already_applied(&[action], &suspended), plain, "{action:?}");
+                    assert_eq!(
+                        already_applied(&[action], &permanently),
+                        plain,
+                        "{action:?}: gizmoduck doesn't name the policy"
+                    );
+                }
+            }
+        }
     }
 }

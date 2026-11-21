@@ -42,11 +42,17 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
     load_global_ids_from_parquet_file,
 )
-from xrex.data.recsys import id_list_features, long_term_author_profile, reply_features
+from xrex.data.recsys import (
+    id_list_features,
+    long_term_author_profile,
+    reply_features,
+    teacher_distill,
+)
 from xrex.data.recsys.ad_side_ids import AD_SIDE_FIELD_COLUMNS
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
+    SAMPLE_WEIGHT_SEQ_COLUMN,
 )
 from xrex.data.recsys.recsys_batch import (
     ADS_COUNT_COLUMNS,
@@ -1241,9 +1247,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
         if self.read_ads_ctr_features:
             ctr_columns = [c for pair in ADS_CTR_COUNT_PAIRS for c in pair]
             optional_columns = list(dict.fromkeys([*optional_columns, *ctr_columns]))
+        if self.per_candidate_sample_weight:
+            optional_columns = [*optional_columns, SAMPLE_WEIGHT_SEQ_COLUMN]
         if self.read_ad_side_ids:
             ad_columns = [c for f in self.ad_side_field_names for c in AD_SIDE_FIELD_COLUMNS[f]]
             optional_columns = list(dict.fromkeys([*optional_columns, *ad_columns]))
+        if self.distill_teacher:
+            optional_columns = [*optional_columns, teacher_distill.COLUMN]
         candidate_mm_lookup = self._candidate_mm_lookup
         embedding_col_name: str | None = None
         if self.multimodal_embedding_type is not None and candidate_mm_lookup is None:
@@ -1303,6 +1313,9 @@ class PhoenixKafkaDataset(PhoenixDataset):
             self.multimodal_embedding_type,
             search_query_embedding_dim=self.search_query_embedding_dim,
             aux_value_events=self.aux_value_events,
+            distill_teacher=self.distill_teacher,
+            distill_actions=self.distill_actions,
+            distill_bad_spans_ms=self.distill_bad_spans_ms,
             candidate_negative_filter=self.candidate_negative_filter,
             candidate_negative_mode=(
                 self.candidate_negative_mode
@@ -1329,6 +1342,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             candidate_embedding_fn=candidate_mm_lookup,
             read_ads_engagement_counts=self.read_ads_engagement_counts,
             read_ads_ctr_features=self.read_ads_ctr_features,
+            per_candidate_sample_weight=self.per_candidate_sample_weight,
             alloc=self._alloc,
             read_ad_side_ids=self.read_ad_side_ids,
             ad_side_fields=self.ad_side_field_names,
@@ -1467,6 +1481,11 @@ class PhoenixKafkaDataset(PhoenixDataset):
             resume_position,
         )
         validate_seek_options(self.seek_to_timestamp_ms, self.seek_to_offset)
+        if self.per_candidate_sample_weight and self.negative_downsample_rate != 1:
+            raise ValueError(
+                "per_candidate_sample_weight requires negative_downsample_rate=1: the reader's "
+                "rate goes to sampleWeight, which sampleWeightSeq replaces on candidate slots"
+            )
         if type(self.native_checkpoint_restart) is not bool:
             raise ValueError("Native restart policy must be an exact Boolean")
         if self.native_checkpoint_restart:

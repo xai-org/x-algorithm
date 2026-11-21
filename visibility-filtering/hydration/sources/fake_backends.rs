@@ -180,10 +180,6 @@ impl TESClient for Tes {
         unreachable!()
     }
 
-    async fn get_min_video_durations(&self, _: Vec<u64>) -> Answers<i64> {
-        unreachable!()
-    }
-
     async fn get_media_count(&self, _: Vec<u64>) -> Answers<i64> {
         unreachable!()
     }

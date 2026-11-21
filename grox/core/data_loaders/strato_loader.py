@@ -63,7 +63,7 @@ class UserStratoLoader:
     strato = StratoContentUnderstandingAuthorMetadata()
     _is_high_page_rank_v2 = StratoIsHighPageRankV2User()
     _is_grey_badge = StratoIsGreyBadgeUser()
-    _high_page_rank_v2_cache: TTLCache[int, HighPageRankUser | None] = TTLCache(
+    _high_page_rank_v2_cache: TTLCache[int, HighPageRankUser] = TTLCache(
         maxsize=100_000, ttl=30 * 60
     )
     _grey_badge_cache: TTLCache[int, bool] = TTLCache(maxsize=100_000, ttl=30 * 60)
@@ -83,20 +83,33 @@ class UserStratoLoader:
         if cached is not cls._MISSING:
             return cached
         info = await cls._is_high_page_rank_v2.fetch(user_id)
-        cls._high_page_rank_v2_cache[user_id] = info
+        if info is not None:
+            cls._high_page_rank_v2_cache[user_id] = info
         return info
 
     @classmethod
-    async def is_high_page_rank_v2_user(cls, user_id: int) -> bool:
+    async def is_high_page_rank_v2_user(
+        cls, user_id: int, *, strict: bool = False
+    ) -> bool:
         info = await cls.fetch_high_page_rank_v2(user_id)
-        return bool(info and info.isHighPageRankUser)
+        if info is None:
+            if strict:
+                raise RuntimeError(
+                    f"isHighPageRankV2 returned empty for user_id={user_id}"
+                )
+            return False
+        return info.isHighPageRankUser
 
     @classmethod
-    async def is_grey_badge_user(cls, user_id: int) -> bool:
+    async def is_grey_badge_user(cls, user_id: int, *, strict: bool = False) -> bool:
         cached = cls._grey_badge_cache.get(user_id, cls._MISSING)
         if cached is not cls._MISSING:
             return cached
-        result = bool(await cls._is_grey_badge.fetch(user_id))
+        result = await cls._is_grey_badge.fetch(user_id)
+        if result is None:
+            if strict:
+                raise RuntimeError(f"isGreyBadge returned empty for user_id={user_id}")
+            return False
         cls._grey_badge_cache[user_id] = result
         return result
 

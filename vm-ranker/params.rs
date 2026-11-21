@@ -325,6 +325,12 @@ param!(
     0.0
 );
 param!(
+    ExcludeIneligibleEngagementHeads,
+    bool,
+    "rust_home_mixer_vm_ranker_exclude_ineligible_engagement_heads",
+    false
+);
+param!(
     UserDebiasEnabled,
     bool,
     "rust_home_mixer_vm_ranker_user_debias_enabled",

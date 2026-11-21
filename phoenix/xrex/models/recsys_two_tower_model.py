@@ -1076,6 +1076,13 @@ def positive_log_denominator(
     return jnp.logaddexp(numerator_logits, shared)
 
 
+def _same_negative_group(
+    first_row: jax.Array, num_users: int, pool_rows: int, group_rows: int
+) -> jax.Array:
+    own_group = (first_row + jnp.arange(num_users)) // group_rows
+    return own_group[:, None] == (jnp.arange(pool_rows) // group_rows)[None, :]
+
+
 def retrieval_loss(
     batch: RecsysFeaturesBatch,
     user_representation: jax.Array,
@@ -1102,10 +1109,18 @@ def retrieval_loss(
     candidate_tables: tuple[jax.Array, jax.Array | None] | None = None,
     mask_in_batch_false_negatives: bool = False,
     loss_normalizers: dict[str, jax.Array] | None = None,
+    negative_pool_rows: int = 0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     _, L, _ = candidate_representation.shape
     N = num_global_negatives_per_example
     C = candidate_seq_len
+    if negative_pool_rows < 0:
+        raise ValueError(f"negative_pool_rows ({negative_pool_rows}) must not be negative")
+    if negative_pool_rows > 0 and apply_u2u_and_i2i_loss:
+        raise ValueError(
+            "negative_pool_rows groups the user x candidate negatives only; the u2u and i2i "
+            "terms would still use every row on the device. Turn apply_u2u_and_i2i_loss off."
+        )
     assert L == C + N, (
         f"candidate_representation.shape[1] ({candidate_representation.shape[1]}) must be candidate_seq_len ({C}) + num_global_negatives_per_example ({N})"
     )
@@ -1129,6 +1144,16 @@ def retrieval_loss(
         scorer,
     ) -> tuple[jax.Array, jax.Array]:
         local_P = local_candidate.shape[0]
+        same_group = None
+        if negative_pool_rows > 0:
+            if local_P % negative_pool_rows != 0:
+                raise ValueError(
+                    f"a device's {local_P} pool rows do not divide into groups of "
+                    f"negative_pool_rows ({negative_pool_rows})"
+                )
+            same_group = _same_negative_group(
+                pool_offset[0], local_user.shape[0], local_P, negative_pool_rows
+            )
 
         def slots(x, index):
             return None if x is None else x[index].reshape((-1, *x.shape[2:]))
@@ -1148,6 +1173,8 @@ def retrieval_loss(
                 inbatch_scores = local_user @ inbatch_cand.T
 
             inbatch_pad = padding_mask[:, :C].reshape((1, local_P * C))
+            if same_group is not None:
+                inbatch_pad = inbatch_pad & jnp.repeat(same_group, C, axis=1)
             inbatch_scores = jnp.where(inbatch_pad, inbatch_scores, -INF)
         else:
             rows = pool_offset[0] + jnp.arange(local_user.shape[0])
@@ -1182,6 +1209,8 @@ def retrieval_loss(
             global_neg_scores = local_user @ global_cand.T
 
         global_pad = padding_mask[:, C:].reshape((1, local_P * N))
+        if same_group is not None:
+            global_pad = global_pad & jnp.repeat(same_group, N, axis=1)
         global_neg_scores = jnp.where(global_pad, global_neg_scores, -INF)
 
         return inbatch_scores, global_neg_scores
@@ -1591,6 +1620,7 @@ def compute_retrieval_loss(
     mol_fused_gate: bool = False,
     candidate_tables: tuple[jax.Array, jax.Array | None] | None = None,
     mask_in_batch_false_negatives: bool = False,
+    negative_pool_rows: int = 0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     (pool,) = retrieval_pools(
         [batch["candidate_seq"]],
@@ -1628,6 +1658,7 @@ def compute_retrieval_loss(
         mol_fused_gate=mol_fused_gate,
         candidate_tables=candidate_tables,
         mask_in_batch_false_negatives=mask_in_batch_false_negatives,
+        negative_pool_rows=negative_pool_rows,
     )
     metrics = retrieval_metrics(
         batch,
@@ -2874,6 +2905,7 @@ class RecsysTwoTowerModel(hk.Module):
                 candidate_tables=candidate_pool[h].mol_tables,
                 mask_in_batch_false_negatives=self.config.mask_in_batch_false_negatives,
                 loss_normalizers=None if loss_normalizers is None else loss_normalizers[str(h)],
+                negative_pool_rows=self.config.negative_pool_rows if is_training else 0,
             )
             total_loss = total_loss + head_loss
             prefix = f"{head_names[h]}/" if num_heads > 1 else ""
@@ -2974,6 +3006,7 @@ class RecsysTwoTowerModelConfig(Config):
     mol_serving_kernel: bool = False
     mol_side_table_in_checkpoint: bool = False
     mask_in_batch_false_negatives: bool = False
+    negative_pool_rows: int = 0
 
     positive_actions: list[int] = field(
         default_factory=lambda: [

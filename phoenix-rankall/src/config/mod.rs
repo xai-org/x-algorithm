@@ -106,6 +106,26 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 0, env = "TAIL_MIN_FAV_COUNT")]
     pub tail_min_fav_count: i64,
+
+    #[arg(long, default_value_t = 10_000, env = "POPULAR_VIDEO_MIN_VIEW_COUNT")]
+    pub popular_video_min_view_count: i64,
+
+    #[arg(long, default_value_t = 100, env = "POPULAR_VIDEO_MIN_FAV_COUNT")]
+    pub popular_video_min_fav_count: i64,
+
+    #[arg(
+        long,
+        default_value = "/data/phoenix_index/prod/post_sid_v8_256x6_snapshots/nsfw_video_7day.parquet",
+        env = "POPULAR_VIDEO_EXCLUDE_POSTS_IN"
+    )]
+    pub popular_video_exclude_posts_in: PathBuf,
+
+    #[arg(
+        long,
+        default_value = "/data/phoenix_index/prod/post_sid_v8_256x6_snapshots/video_2day.parquet",
+        env = "POPULAR_VIDEO_REQUIRE_POSTS_IN"
+    )]
+    pub popular_video_require_posts_in: PathBuf,
 }
 
 impl Cli {
@@ -139,6 +159,8 @@ pub enum PipelineKind {
     Sid,
     #[value(name = "sid-tail")]
     SidTail,
+    #[value(name = "sid-popular-video")]
+    SidPopularVideo,
     Ads,
     Analysis,
 }
@@ -148,7 +170,9 @@ impl PipelineKind {
         match self {
             Self::Main | Self::Sid => "phoenix_rank_all_indexing_event",
             Self::Topic => "phoenix_rank_all_indexing_event_backup",
-            Self::Metadata | Self::SidTail => "phoenix_rankall_metadata_event",
+            Self::Metadata | Self::SidTail | Self::SidPopularVideo => {
+                "phoenix_rankall_metadata_event"
+            }
             Self::Analysis => "home_mixer_phoenix_scored_candidates",
             Self::Ads => "",
         }
@@ -157,12 +181,18 @@ impl PipelineKind {
     pub fn is_implemented(&self) -> bool {
         matches!(
             self,
-            Self::Main | Self::Topic | Self::Metadata | Self::Analysis | Self::Sid | Self::SidTail
+            Self::Main
+                | Self::Topic
+                | Self::Metadata
+                | Self::Analysis
+                | Self::Sid
+                | Self::SidTail
+                | Self::SidPopularVideo
         )
     }
 
     pub fn needs_sid_endpoint(&self) -> bool {
-        matches!(self, Self::Sid | Self::SidTail)
+        matches!(self, Self::Sid | Self::SidTail | Self::SidPopularVideo)
     }
 
     pub fn window_configs(&self) -> Vec<WindowConfig> {
@@ -229,6 +259,7 @@ impl PipelineKind {
                 WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14),
             ],
             Self::SidTail => vec![WindowConfig::new("tail", 24)],
+            Self::SidPopularVideo => vec![WindowConfig::new("popular_video", 48)],
             Self::Analysis | Self::Ads => vec![],
         }
     }
@@ -244,6 +275,7 @@ impl fmt::Display for PipelineKind {
             Self::Analysis => write!(f, "analysis"),
             Self::Sid => write!(f, "sid"),
             Self::SidTail => write!(f, "sid-tail"),
+            Self::SidPopularVideo => write!(f, "sid-popular-video"),
         }
     }
 }
@@ -254,6 +286,8 @@ pub struct WindowConfig {
     pub retention: Duration,
     pub min_age: Option<Duration>,
     pub exclude_posts_in: Option<String>,
+    pub exclude_posts_in_file: Option<PathBuf>,
+    pub require_posts_in_file: Option<PathBuf>,
 }
 
 impl WindowConfig {
@@ -263,11 +297,23 @@ impl WindowConfig {
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: None,
             exclude_posts_in: None,
+            exclude_posts_in_file: None,
+            require_posts_in_file: None,
         }
     }
 
     pub fn excluding_posts_in(mut self, index_name: impl Into<String>) -> Self {
         self.exclude_posts_in = Some(index_name.into());
+        self
+    }
+
+    pub fn excluding_posts_in_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.exclude_posts_in_file = Some(path.into());
+        self
+    }
+
+    pub fn requiring_posts_in_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.require_posts_in_file = Some(path.into());
         self
     }
 
@@ -278,6 +324,8 @@ impl WindowConfig {
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: Some(Duration::from_secs(min_age_hours * 3600)),
             exclude_posts_in: None,
+            exclude_posts_in_file: None,
+            require_posts_in_file: None,
         }
     }
 

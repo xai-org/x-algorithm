@@ -3,16 +3,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::warn;
+use prost::Message;
 use xai_feature_switches::{AuthorRulesEvaluator, Params};
 use xai_value_model::{
     compute_value_scores, set_user_video_continuation, weighted_terms, CandidateScoringInputs,
     ClassFactors, PhoenixScores, QueryScoringContext, ValueModelWeights, ValueScores,
 };
-use xai_vm_ranker_proto::{HeadContribution, RankRequest};
+use xai_vm_ranker_proto::experiment::CandidatePayload;
+use xai_vm_ranker_proto::{HeadContribution, RankCandidate, RankRequest};
 
 use crate::metrics::{
-    AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM, SAMPLED_CANDIDATES,
-    VALUE_MODEL_CLASS_FACTORS, VALUE_MODEL_FALLBACK, VALUE_MODEL_REQUESTS, VALUE_MODEL_STAGE,
+    AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM,
+    INELIGIBLE_HEAD_CANDIDATES, SAMPLED_CANDIDATES, VALUE_MODEL_CLASS_FACTORS,
+    VALUE_MODEL_FALLBACK, VALUE_MODEL_REQUESTS, VALUE_MODEL_STAGE,
 };
 use crate::params::*;
 use crate::ranking_config::snowflake_creation_ms;
@@ -178,12 +181,59 @@ pub fn scoring_context(req: &RankRequest, params: &Params) -> QueryScoringContex
 
 pub fn candidate_inputs(
     req: &RankRequest,
+    params: &Params,
     weights: &ValueModelWeights,
 ) -> Vec<CandidateScoringInputs> {
-    req.candidates
+    let exclude_ineligible = params.get(ExcludeIneligibleEngagementHeads);
+    let mut excluded = [0u64; 3];
+    let inputs = req
+        .candidates
         .iter()
-        .map(|c| CandidateScoringInputs::from_rank_candidate(c, weights.min_video_duration_ms))
-        .collect()
+        .map(|c| {
+            let mut inputs =
+                CandidateScoringInputs::from_rank_candidate(c, weights.min_video_duration_ms);
+            if exclude_ineligible {
+                let flagged = exclude_ineligible_heads(c, &mut inputs.phoenix_scores);
+                for (count, flagged) in excluded.iter_mut().zip(flagged) {
+                    *count += u64::from(flagged);
+                }
+            }
+            inputs
+        })
+        .collect();
+    for (head, count) in ["reply", "share", "click"].into_iter().zip(excluded) {
+        if count > 0 {
+            INELIGIBLE_HEAD_CANDIDATES
+                .with_label_values(&[head])
+                .inc_by(count);
+        }
+    }
+    inputs
+}
+
+fn exclude_ineligible_heads(candidate: &RankCandidate, scores: &mut PhoenixScores) -> [bool; 3] {
+    if candidate.experiment_payload.is_empty() {
+        return [false; 3];
+    }
+    let Ok(payload) = CandidatePayload::decode(candidate.experiment_payload.as_ref()) else {
+        return [false; 3];
+    };
+    if payload.reply_ineligible {
+        scores.reply_score = None;
+    }
+    if payload.share_ineligible {
+        scores.share_score = None;
+        scores.share_via_dm_score = None;
+        scores.share_via_copy_link_score = None;
+    }
+    if payload.click_ineligible {
+        scores.click_score = None;
+    }
+    [
+        payload.reply_ineligible,
+        payload.share_ineligible,
+        payload.click_ineligible,
+    ]
 }
 
 fn compute_or_fallback(
@@ -205,7 +255,7 @@ fn compute_or_fallback(
             }
         }
     }
-    let mut inputs = candidate_inputs(req, &weights);
+    let mut inputs = candidate_inputs(req, params, &weights);
     if weights.user_video_continuation != 0.0 {
         set_user_video_continuation(&mut inputs);
     }

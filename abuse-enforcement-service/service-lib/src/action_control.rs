@@ -149,7 +149,7 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
         | PageAction::HideReply { .. }
         | PageAction::PostLabel { .. } => 0,
         PageAction::LivenessCheck {} => 1,
-        PageAction::Suspend { .. } | PageAction::SuspendAuthor {} => 2,
+        PageAction::Suspend { .. } | PageAction::SuspendAuthor { .. } => 2,
     };
     let mut sorted: Vec<PageAction> = actions.to_vec();
     sorted.sort_by_key(rank);
@@ -177,13 +177,10 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
                 ttl_msec: lifetime.ttl_msec(),
             },
             PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,
-            PageAction::Suspend { permanent, policy } => ActionSpec::SuspendUser {
+            PageAction::Suspend { permanent, policy }
+            | PageAction::SuspendAuthor { permanent, policy } => ActionSpec::SuspendUser {
                 perm: permanent,
                 policy: policy.as_str().into(),
-            },
-            PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {
-                perm: false,
-                policy: SuspensionPolicy::PlatformManipulation.as_str().into(),
             },
         })
         .collect()
@@ -878,18 +875,11 @@ pub fn harsher_because(
         }
         for a in &after.actions {
             let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());
-            match (a, same_kind) {
-                (PageAction::Suspend { .. } | PageAction::SuspendAuthor {}, None) => {
-                    why.push("adds suspend".into())
-                }
-                (
-                    PageAction::Suspend { permanent, policy },
-                    Some(PageAction::Suspend {
-                        permanent: was_permanent,
-                        policy: was_policy,
-                    }),
-                ) => {
-                    if *permanent && !was_permanent {
+            match (a.suspension(), same_kind) {
+                (Some(_), None) => why.push("adds suspend".into()),
+                (Some((permanent, policy)), Some(b)) => {
+                    let (was_permanent, was_policy) = b.suspension().unwrap_or_default();
+                    if permanent && !was_permanent {
                         why.push("makes the suspension permanent".into());
                     }
                     if policy != was_policy {
@@ -900,9 +890,11 @@ pub fn harsher_because(
                         ));
                     }
                 }
-                (PageAction::LivenessCheck {}, None) => why.push("adds liveness check".into()),
-                (_, None) => why.push("adds a label".into()),
-                (_, Some(b)) => {
+                (None, None) if matches!(a, PageAction::LivenessCheck {}) => {
+                    why.push("adds liveness check".into())
+                }
+                (None, None) => why.push("adds a label".into()),
+                (None, Some(b)) => {
                     if let (Some(new), Some(old)) = (label_days(a), label_days(b))
                         && new > old
                     {
@@ -2775,7 +2767,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use xai_abuse_enforcement_types::action_control::{
-        AUTHOR_SKIPS_RECORD_VERSION, SUSPENSION_OPTIONS_RECORD_VERSION,
+        AUTHOR_SKIPS_RECORD_VERSION, POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+        RAISED_FOLLOWER_LIMIT_RECORD_VERSION, SUSPENSION_OPTIONS_RECORD_VERSION,
     };
 
     const SUSPEND: PageAction = PageAction::SUSPEND;
@@ -2963,10 +2956,11 @@ mod tests {
             "user/h/New",
             br#"{"v":1,"entity_type":"user","head":"New","mode":"live","version":1,"future":1}"#,
         );
-        store.put_raw(
-            "user/h/Newer",
-            br#"{"v":10,"entity_type":"user","head":"Newer","mode":"rules","version":1}"#,
+        let newer = format!(
+            r#"{{"v":{},"entity_type":"user","head":"Newer","mode":"rules","version":1}}"#,
+            ACTION_CONTROL_RECORD_VERSION + 1
         );
+        store.put_raw("user/h/Newer", newer.as_bytes());
         ac.refresh().await.unwrap();
         assert_eq!(
             resolve(&ac, "H", "c", &[]).mode,
@@ -3407,7 +3401,7 @@ mod tests {
             post.unknown && post.matched.is_none() && post.page_actions.is_empty(),
             "a user record never touches post decisions"
         );
-        let author = PageAction::SuspendAuthor {};
+        let author = PageAction::SUSPEND_AUTHOR;
         let (ac, _) = loaded(&[
             live(head, None, None, vec![SUSPEND]),
             live(head, None, None, vec![author]),
@@ -3612,7 +3606,7 @@ mod tests {
     fn hide_reply_sends_the_risky_high_viz_reply_post_label() {
         let hide = |lifetime| PageAction::HideReply { lifetime };
         assert_eq!(
-            page_specs(&[PageAction::SuspendAuthor {}, hide(Lifetime::Permanent)]),
+            page_specs(&[PageAction::SUSPEND_AUTHOR, hide(Lifetime::Permanent)]),
             vec![
                 ActionSpec::AddPostLabelsV2 {
                     labels: vec!["RiskyHighVizReply".into()],
@@ -3976,7 +3970,7 @@ mod tests {
                 put(
                     "H",
                     ControlMode::Live,
-                    vec![SUSPEND, PageAction::SuspendAuthor {}],
+                    vec![SUSPEND, PageAction::SUSPEND_AUTHOR],
                 ),
                 "wrong_entity_actions",
             ),
@@ -4171,7 +4165,7 @@ mod tests {
                 ..put(
                     "PostHead",
                     ControlMode::Live,
-                    vec![PageAction::SuspendAuthor {}],
+                    vec![PageAction::SUSPEND_AUTHOR],
                 )
             },
         )
@@ -5324,7 +5318,7 @@ mod tests {
         let rows = store.pkey_rows(MH_PKEY);
         let (_, bytes) = rows.iter().find(|(k, _)| k == "user/h/H").unwrap();
         let mut newer: Value = serde_json::from_slice(bytes).unwrap();
-        newer["v"] = (RAISED_FOLLOWER_LIMIT_RECORD_VERSION + 1).into();
+        newer["v"] = (ACTION_CONTROL_RECORD_VERSION + 1).into();
         assert!(
             parse_record(&serde_json::to_vec(&newer).unwrap()).is_err(),
             "a reader refuses a record version above its own"
@@ -5459,7 +5453,7 @@ mod tests {
     async fn the_list_says_the_service_takes_the_skips_and_their_default() {
         let (ac, _) = loaded(&[]).await;
         let list = ac.list(&on(), baked_safety()).await;
-        assert_eq!(list.feature_version, 9);
+        assert_eq!(list.feature_version, 10);
         let view = list.follower_skip.unwrap();
         assert_eq!(view, crate::safety_checks::follower_skip_view());
         assert!(view.today_threshold < view.ceiling);
@@ -7370,9 +7364,40 @@ mod tests {
             }]
         );
         assert_eq!(
-            page_specs(&[PageAction::SuspendAuthor {}]),
+            page_specs(&[PageAction::SUSPEND_AUTHOR]),
             page_specs(&[SUSPEND]),
-            "the author suspend is unchanged"
+            "the plain author suspend is unchanged"
+        );
+        for permanent in [false, true] {
+            for policy in SuspensionPolicy::ALL {
+                assert_eq!(
+                    page_specs(&[PageAction::SuspendAuthor { permanent, policy }]),
+                    page_specs(&[PageAction::Suspend { permanent, policy }]),
+                    "{permanent} {policy:?}: the author suspend sends what the account suspend does"
+                );
+            }
+        }
+        assert_eq!(
+            page_specs(&[
+                PageAction::SuspendAuthor {
+                    permanent: true,
+                    policy: SuspensionPolicy::Cse,
+                },
+                PageAction::PostSpamHighRecall {
+                    lifetime: Lifetime::Permanent,
+                },
+            ]),
+            vec![
+                ActionSpec::AddPostLabelsV2 {
+                    labels: vec!["SpamHighRecall".into()],
+                    ttl_msec: None,
+                },
+                ActionSpec::SuspendUser {
+                    perm: true,
+                    policy: "Cse".into()
+                },
+            ],
+            "the post label goes first, then the author suspend"
         );
         assert_eq!(
             page_specs(&[SUSPEND_PERMANENT_CSE]),
@@ -7417,6 +7442,39 @@ mod tests {
         assert_eq!(
             harsher_because(Some(&r(vec![SUSPEND])), &r(vec![SUSPEND]), None),
             Vec::<String>::new()
+        );
+        let author_cse = PageAction::SuspendAuthor {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        let label = PageAction::PostSpamHighRecall {
+            lifetime: Lifetime::Permanent,
+        };
+        assert_eq!(
+            harsher_because(
+                Some(&r(vec![label, PageAction::SUSPEND_AUTHOR])),
+                &r(vec![label, author_cse]),
+                None,
+            ),
+            vec![
+                "makes the suspension permanent".to_owned(),
+                "changes the suspension policy (PlatformManipulation to Cse)".to_owned()
+            ],
+            "an author suspend made permanent and moved to Cse"
+        );
+        assert_eq!(
+            harsher_because(Some(&r(vec![label])), &r(vec![label, author_cse]), None),
+            vec!["adds suspend".to_owned()]
+        );
+        assert!(
+            harsher_because(
+                Some(&r(vec![author_cse])),
+                &r(vec![PageAction::SUSPEND_AUTHOR]),
+                None
+            )
+            .iter()
+            .all(|w| !w.contains("permanent")),
+            "an author suspend back to temporary is softer"
         );
         let rules_perm =
             serde_json::json!([{"kind": "suspend", "permanent": true, "policy": "Cse"}]);
@@ -7491,6 +7549,83 @@ mod tests {
         let row = &held.records["user/l/H/high"];
         assert_eq!(
             (row.mode, row.version),
+            (ControlMode::Recording, 1),
+            "an older image keeps the log-only copy it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_record_saved_with_an_author_suspension_option_is_refused_by_an_image_before_them()
+     {
+        let author_cse = PageAction::SuspendAuthor {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        let label = PageAction::PostSpamHighRecall {
+            lifetime: Lifetime::Permanent,
+        };
+        let post_put = |mode, actions, expected_version| ActionControlPutRequest {
+            entity_type: ControlEntity::Post,
+            expected_version,
+            ..put("H", mode, actions)
+        };
+        let (ac, store) = loaded(&[]).await;
+        let first = set(&ac, post_put(ControlMode::Recording, vec![], None)).await;
+        assert!(first.is_ok(), "{first:?}");
+        let old = Arc::new(ActionControl::new(
+            store.clone(),
+            "prod".into(),
+            "pod-old".into(),
+        ));
+        refresh_as_older_image(&old).await;
+
+        let plain = set(
+            &ac,
+            post_put(
+                ControlMode::Live,
+                vec![label, PageAction::SUSPEND_AUTHOR],
+                Some(1),
+            ),
+        )
+        .await;
+        assert!(plain.is_ok(), "{plain:?}");
+        let row = stored(&store, "post/h/H");
+        assert!(
+            row.v < POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            "a plain author suspend keeps an older version: {}",
+            row.v
+        );
+
+        let out = set(
+            &ac,
+            post_put(ControlMode::Live, vec![label, author_cse], Some(2)),
+        )
+        .await;
+        assert!(out.is_ok(), "{out:?}");
+        let row = stored(&store, "post/h/H");
+        assert_eq!(
+            (row.actions.clone(), row.v),
+            (
+                vec![label, author_cse],
+                POST_SUSPENSION_OPTIONS_RECORD_VERSION
+            )
+        );
+        assert!(
+            row.v > RAISED_FOLLOWER_LIMIT_RECORD_VERSION,
+            "above every version the image before it reads"
+        );
+        let author = serde_json::to_value(author_cse).unwrap();
+        assert!(
+            author.get("permanent").is_some() && author.get("policy").is_some(),
+            "the image before it refuses the action itself too (deny_unknown_fields)"
+        );
+        refresh_as_older_image(&old).await;
+        let held = old.snapshot();
+        assert_eq!(
+            (
+                held.records["post/h/H"].mode,
+                held.records["post/h/H"].version
+            ),
             (ControlMode::Recording, 1),
             "an older image keeps the log-only copy it held"
         );

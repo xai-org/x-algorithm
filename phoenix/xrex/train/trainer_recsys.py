@@ -59,6 +59,7 @@ else:
 
     AsyncEmbContextHandle = typing.Any
 
+from xrex.data.recsys import teacher_distill
 from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import EXPLICIT_NEGATIVE_ACTIONS
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch, compute_time_gap_timestamps
@@ -90,6 +91,7 @@ from xrex.models.recsys_model import (
     RecsysAggregatedModel,
     RecsysAggregatedModelConfig,
 )
+from xrex.models.recsys_overarch_model import RecsysOverArchModel, RecsysOverArchModelConfig
 from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel, scale_post_table_slots
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partition_grad_norms
@@ -592,6 +594,15 @@ class RecsysTrainer(Trainer):
             missing = [e for e in events if e not in self.dataset.aux_value_events]
             if missing:
                 self.dataset.aux_value_events = (*self.dataset.aux_value_events, *missing)
+            if (
+                isinstance(self.model_config, RecsysOverArchModelConfig)
+                and self.model_config.distill_teacher
+            ):
+                self.dataset.distill_teacher = self.model_config.distill_teacher
+                self.dataset.distill_actions = self.model_config.distill_action_indices
+                self.dataset.distill_bad_spans_ms = teacher_distill.parse_spans_ms(
+                    self.model_config.distill_bad_spans_ms
+                )
         if self.export_stablehlo_bundle and not self.checkpoint_config.copy_port:
             raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
         if self.forward_only and (
@@ -769,6 +780,7 @@ class RecsysTrainer(Trainer):
                 trained_candidate_mask=dummy_3d,
                 ads_head_masking=self.model_config.ads_head_masking,
                 enable_platform_metrics=self.model_config.enable_platform_metrics,
+                enable_broadcast_metrics=self.model_config.enable_broadcast_metrics,
                 metric_mask_keys=self.model_config.metric_mask_keys,
             ).keys()
         )
@@ -2781,7 +2793,10 @@ class RecsysTrainer(Trainer):
             if isinstance(self.model_config, RecsysTwoTowerModelConfig):
                 if self.model_config.apply_u2u_and_i2i_loss:
                     raise ValueError("num_microbatch > 1 does not support apply_u2u_and_i2i_loss")
-            elif type(self.model_config) is not RecsysAggregatedModelConfig:
+            elif type(self.model_config) not in (
+                RecsysAggregatedModelConfig,
+                RecsysOverArchModelConfig,
+            ):
                 raise ValueError("num_microbatch > 1 supports only the ranker and the two-tower")
             if self.empty_history_augmentation_rate > 0:
                 raise ValueError(
@@ -2885,7 +2900,7 @@ class RecsysTrainer(Trainer):
             )
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
             smoothing_windows = tuple(self.smoothing_windows) if rce_ema is not None else None
-            if type(model) is RecsysAggregatedModel:
+            if type(model) in (RecsysAggregatedModel, RecsysOverArchModel):
                 loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, True)
                 return loss, model.metrics(
                     metric_inputs, batch, stats, rce_ema, rce_alpha, smoothing_windows, calib_ema
@@ -2906,7 +2921,7 @@ class RecsysTrainer(Trainer):
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
-            if type(model) is RecsysAggregatedModel:
+            if type(model) in (RecsysAggregatedModel, RecsysOverArchModel):
                 loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, False)
                 return loss, model.metrics(metric_inputs, batch, stats)
             return model.loss(None, batch, recsys_embeddings, is_training=False)

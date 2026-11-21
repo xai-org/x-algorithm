@@ -335,6 +335,11 @@ class RetrievalDataset(Enum):
     AI_VIDEO_MODEL_2DAY = (27, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_2day.parquet"), None)
     AI_VIDEO_MODEL_7DAY = (28, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_7day.parquet"), None)
     AI_VIDEO_MODEL_14DAY = (29, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_14day.parquet"), None)
+    POPULAR_VIDEO_2DAY = (
+        30,
+        _idx("post_sid_v8_256x6_popular_video_snapshots/popular_video_2day.parquet"),
+        None,
+    )
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)

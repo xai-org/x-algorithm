@@ -38,27 +38,6 @@ impl QuoteHydrator {
         }
     }
 
-    async fn get_quoted_video_durations(
-        &self,
-        quoted_tweet_ids: Vec<u64>,
-    ) -> HashMap<u64, Option<i32>> {
-        if quoted_tweet_ids.is_empty() {
-            return HashMap::new();
-        }
-        let result = tokio::time::timeout(
-            QUOTED_CONTENT_TIMEOUT,
-            self.tes_client.get_min_video_durations(quoted_tweet_ids),
-        )
-        .await;
-        match result {
-            Ok(durations) => durations
-                .into_iter()
-                .filter_map(|(id, result)| result.ok().map(|d| (id, d.map(|v| v as i32))))
-                .collect(),
-            Err(_) => HashMap::new(),
-        }
-    }
-
     async fn get_blocked_by(&self, viewer_id: u64, quoted_user_ids: Vec<u64>) -> HashSet<u64> {
         if quoted_user_ids.is_empty() {
             return HashSet::new();
@@ -110,6 +89,12 @@ impl QuoteHydrator {
                     has_photo: info.has_photo,
                     has_video: info.has_video,
                     media_count: info.media_count.clamp(0, i32::MAX as i64) as i32,
+                    min_video_duration_ms: info
+                        .video_durations_ms
+                        .iter()
+                        .copied()
+                        .min()
+                        .map(|v| v as i32),
                     max_video_duration_ms: info
                         .video_durations_ms
                         .iter()
@@ -162,6 +147,7 @@ pub struct QuotedMedia {
     pub has_photo: bool,
     pub has_video: bool,
     pub media_count: i32,
+    pub min_video_duration_ms: Option<i32>,
     pub max_video_duration_ms: Option<i32>,
 }
 
@@ -175,7 +161,6 @@ pub struct Quote {
     tweet_id: Option<u64>,
     user_id: Option<u64>,
     author_blocks_viewer: bool,
-    video_duration_ms: Option<i32>,
 }
 
 pub struct Quotes {
@@ -255,16 +240,8 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
             .into_iter()
             .collect();
 
-        let fetch_quoted_duration = query.params.get(EnableQuotedVqvDurationCheck);
-        let quoted_tweet_ids: Vec<u64> = if fetch_quoted_duration {
-            unique_quoted_tweet_ids.clone()
-        } else {
-            Vec::new()
-        };
-
-        let (blocked_by, quoted_durations, quoted_content) = tokio::join!(
+        let (blocked_by, quoted_content) = tokio::join!(
             self.get_blocked_by(query.user_id, quoted_user_ids),
-            self.get_quoted_video_durations(quoted_tweet_ids),
             self.get_quoted_content(unique_quoted_tweet_ids),
         );
 
@@ -274,9 +251,6 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
                 tweet_id,
                 user_id,
                 author_blocks_viewer: user_id.is_some_and(|uid| blocked_by.contains(&uid)),
-                video_duration_ms: tweet_id
-                    .and_then(|id| quoted_durations.get(&id).copied())
-                    .flatten(),
             })
             .collect();
         Ok(Quotes {
@@ -285,14 +259,17 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for QuoteHydrator {
         })
     }
 
-    fn apply(&self, _query: &ScoredPostsQuery, candidates: &mut [PostCandidate], fetched: Quotes) {
+    fn apply(&self, query: &ScoredPostsQuery, candidates: &mut [PostCandidate], fetched: Quotes) {
+        let check_quoted_duration = query.params.get(EnableQuotedVqvDurationCheck);
         for (candidate, quote) in candidates.iter_mut().zip(fetched.quotes) {
             let content = quote.tweet_id.and_then(|id| fetched.content.get(&id));
             let media = content.and_then(|content| content.media.as_ref());
             candidate.quoted_tweet_id = quote.tweet_id;
             candidate.quoted_user_id = quote.user_id;
             candidate.quoted_author_blocks_viewer = Some(quote.author_blocks_viewer);
-            candidate.quoted_video_duration_ms = quote.video_duration_ms;
+            candidate.quoted_video_duration_ms = media
+                .filter(|_| check_quoted_duration)
+                .and_then(|media| media.min_video_duration_ms);
             candidate.quoted_tweet_text = content.and_then(|content| content.text.clone());
             candidate.quoted_has_media = media.map(|media| media.has_media);
             candidate.quoted_has_photo = media.map(|media| media.has_photo);

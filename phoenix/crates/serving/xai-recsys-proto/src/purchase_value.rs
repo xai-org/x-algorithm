@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
-use crate::{ContinuousActionName, PredictNextActionsRequest, PurchaseValueBaseline};
+use crate::{
+    AppConversionLabelEvent, ContinuousActionName, PredictNextActionsRequest, PurchaseValueBaseline,
+};
 
 pub const ACTION_INDEX: usize = ContinuousActionName::AdsWebCtPurchaseValue as usize;
 
@@ -9,6 +11,18 @@ pub const MAX_EVENT_USD: f64 = 100_000.0;
 pub fn is_countable_usd(usd: f64) -> bool {
     usd.is_finite() && usd > 0.0 && usd <= MAX_EVENT_USD
 }
+
+pub const MIN_APP_EVENT_USD: f64 = 0.10;
+
+pub fn is_countable_app_usd(usd: f64) -> bool {
+    is_countable_usd(usd) && usd >= MIN_APP_EVENT_USD
+}
+
+pub fn usd_of_micro(price_usd_micro: i64) -> f64 {
+    price_usd_micro as f64 / 1_000_000.0
+}
+
+pub const LABEL_HORIZON_MS: i64 = 8 * 3_600_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ValueEvent {
@@ -84,6 +98,24 @@ pub enum AppValueEvent {
 }
 
 impl AppValueEvent {
+    pub const ALL: [AppValueEvent; 5] = [
+        Self::Purchase,
+        Self::AddToCart,
+        Self::LevelAchieved,
+        Self::TutorialComplete,
+        Self::SignUp,
+    ];
+
+    pub const fn label_event(self) -> AppConversionLabelEvent {
+        match self {
+            Self::Purchase => AppConversionLabelEvent::Purchase,
+            Self::AddToCart => AppConversionLabelEvent::AddToCart,
+            Self::LevelAchieved => AppConversionLabelEvent::LevelAchieved,
+            Self::TutorialComplete => AppConversionLabelEvent::TutorialComplete,
+            Self::SignUp => AppConversionLabelEvent::SignUp,
+        }
+    }
+
     pub const fn clickhouse_name(self) -> &'static str {
         match self {
             Self::Purchase => "PURCHASE",
@@ -363,6 +395,26 @@ mod tests {
         for usd in [0.0, -1.0, MAX_EVENT_USD + 0.01, f64::NAN, f64::INFINITY] {
             assert!(!is_countable_usd(usd), "{usd}");
         }
+        assert!(is_countable_app_usd(MIN_APP_EVENT_USD) && is_countable_app_usd(MAX_EVENT_USD));
+        for usd in [0.0, 0.01, 0.09, MAX_EVENT_USD + 0.01, f64::NAN] {
+            assert!(!is_countable_app_usd(usd), "{usd}");
+        }
+    }
+
+    #[test]
+    fn app_value_events_follow_the_target_table_and_have_their_own_label_slots() {
+        let app_targets: Vec<ValueTarget> = ValueTarget::ALL_TARGETS
+            .into_iter()
+            .filter(|target| matches!(target, ValueTarget::App(_)))
+            .collect();
+        assert_eq!(app_targets, AppValueEvent::ALL.map(ValueTarget::App));
+        for event in AppValueEvent::ALL {
+            assert_eq!(
+                event.label_event().as_str_name(),
+                format!("APP_CONVERSION_LABEL_EVENT_{}", event.clickhouse_name())
+            );
+        }
+        assert_eq!(usd_of_micro(4_990_000), 4.99);
     }
 
     #[test]

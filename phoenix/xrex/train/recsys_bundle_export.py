@@ -553,6 +553,7 @@ def _batch_template(
 ) -> Any:
     model_config = export_cfg.model_config
     batch = export_cfg.dataset.example_data(bs)
+    batch["candidate_seq"].pop("is_broadcast", None)
 
     if packed:
         from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch

@@ -14,6 +14,7 @@ use xai_recsys_rankall::processor::analysis_processor::AnalysisProcessor;
 use xai_recsys_rankall::processor::blacklist::Blacklist;
 use xai_recsys_rankall::processor::main_processor::MainProcessor;
 use xai_recsys_rankall::processor::metadata_processor::MetadataProcessor;
+use xai_recsys_rankall::processor::sid_popular_video_processor::SidPopularVideoProcessor;
 use xai_recsys_rankall::processor::sid_processor::SidProcessor;
 use xai_recsys_rankall::processor::sid_tail_processor::SidTailProcessor;
 use xai_recsys_rankall::processor::topic_processor::TopicProcessor;
@@ -141,7 +142,7 @@ async fn main() -> Result<()> {
                 Arc::try_unwrap(metrics).unwrap_or_else(|m| (*m).clone()),
             )
         }
-        PipelineKind::Sid | PipelineKind::SidTail => {
+        PipelineKind::Sid | PipelineKind::SidTail | PipelineKind::SidPopularVideo => {
             let endpoint = cli.sid_endpoint.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "--sid-endpoint is required when --pipeline={}",
@@ -151,7 +152,16 @@ async fn main() -> Result<()> {
             if cli.sid_num_levels == 0 {
                 bail!("--sid-num-levels must be > 0 for the SID pipeline");
             }
-            let windows = cli.pipeline.window_configs();
+            let mut windows = cli.pipeline.window_configs();
+            if cli.pipeline == PipelineKind::SidPopularVideo {
+                windows = windows
+                    .into_iter()
+                    .map(|w| {
+                        w.excluding_posts_in_file(&cli.popular_video_exclude_posts_in)
+                            .requiring_posts_in_file(&cli.popular_video_require_posts_in)
+                    })
+                    .collect();
+            }
 
             let sid_metrics = SidMetrics::new(&registry).context("failed to create SID metrics")?;
             let sid_client = Arc::new(
@@ -199,6 +209,27 @@ async fn main() -> Result<()> {
                         Box::new(SidTailProcessor::new(
                             cli.tail_max_author_followers,
                             cli.tail_min_fav_count,
+                            Arc::clone(&sid_client),
+                            tokio::runtime::Handle::current(),
+                        ))
+                    }
+                    PipelineKind::SidPopularVideo => {
+                        info!(
+                            "SID popular-video hydration enabled: endpoint={endpoint}, \
+                             min_view_count={}, min_fav_count={}, exclude_posts_in={}, \
+                             require_posts_in={}, min_post_age={}s, timeout={}s, \
+                             backfill_max_age={}h, windows={window_names:?}",
+                            cli.popular_video_min_view_count,
+                            cli.popular_video_min_fav_count,
+                            cli.popular_video_exclude_posts_in.display(),
+                            cli.popular_video_require_posts_in.display(),
+                            cli.sid_min_post_age_seconds,
+                            cli.sid_request_timeout_seconds,
+                            cli.sid_backfill_max_age_hours,
+                        );
+                        Box::new(SidPopularVideoProcessor::new(
+                            cli.popular_video_min_view_count,
+                            cli.popular_video_min_fav_count,
                             Arc::clone(&sid_client),
                             tokio::runtime::Handle::current(),
                         ))

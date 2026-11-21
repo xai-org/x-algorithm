@@ -1847,6 +1847,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             padded["ads_count_buckets"] = pad_array(ads_counts)
         if (ads_ctr := post_seq.get("ads_ctr_buckets")) is not None:
             padded["ads_ctr_buckets"] = pad_array(ads_ctr)
+        if (sample_weight := post_seq.get("sample_weight")) is not None:
+            padded["sample_weight"] = pad_array(sample_weight)
         if (ad_side := post_seq.get("ad_side_ids")) is not None:
             padded["ad_side_ids"] = pad_array(ad_side)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
@@ -1855,6 +1857,10 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 ((0, batch_size - num_rows), (0, 0), (0, 0)),
                 constant_values=CONVERSION_DELAY_NONE,
             )
+        if (probs := post_seq.get("teacher_probs")) is not None:
+            padded["teacher_probs"] = np.pad(
+                probs, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=np.nan
+            )
         for key, (_, _, fill) in PAGE_RECORD_COLUMNS.items():
             if (values := post_seq.get(key)) is not None:
                 padded[key] = np.pad(
@@ -1862,6 +1868,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 )
         if (impressed := post_seq.get("rl_impressed")) is not None:
             padded["rl_impressed"] = pad_array(impressed)
+        if (is_broadcast := post_seq.get("is_broadcast")) is not None:
+            padded["is_broadcast"] = pad_array(is_broadcast)
         return padded
 
     def _pad_post_seq_fields(post_seq: PostSeq) -> PostSeq:
@@ -1963,6 +1971,9 @@ class PhoenixDataset(Dataset):
     date_range: tuple[str, str] | None = None
     search_query_embedding_dim: int = 0
     aux_value_events: tuple[str, ...] = ()
+    distill_teacher: str = ""
+    distill_actions: tuple[int, ...] = ()
+    distill_bad_spans_ms: tuple[tuple[int, int], ...] = ()
 
     candidate_negative_filter: CandidateNegativeFilter | None = None
     candidate_negative_mode: CandidateNegativeMode | None = None
@@ -1994,6 +2005,7 @@ class PhoenixDataset(Dataset):
     page_records: bool = False
     read_ads_engagement_counts: bool = False
     read_ads_ctr_features: bool = False
+    per_candidate_sample_weight: bool = False
     read_ad_side_ids: bool = False
     ad_side_fields: str = "campaign,line_item,creative"
     ad_fields_sidecar_root: str | None = None
@@ -2613,11 +2625,15 @@ class PhoenixDataset(Dataset):
                         history_url_embedding_dim=self.history_url_embedding_dim,
                         read_ads_engagement_counts=self.read_ads_engagement_counts,
                         read_ads_ctr_features=self.read_ads_ctr_features,
+                        per_candidate_sample_weight=self.per_candidate_sample_weight,
                         long_term_author_profile_size=self.long_term_author_profile_size,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
                         read_ad_side_ids=self.read_ad_side_ids,
                         ad_side_fields=self.ad_side_field_names,
+                        distill_teacher=self.distill_teacher,
+                        distill_actions=self.distill_actions,
+                        distill_bad_spans_ms=self.distill_bad_spans_ms,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2786,6 +2802,14 @@ class PhoenixDataset(Dataset):
             )
         }
 
+    def _example_teacher_probs(
+        self, batch_size: int, candidate_seq_len: int
+    ) -> dict[str, np.ndarray]:
+        if not self.distill_teacher:
+            return {}
+        shape = (batch_size, candidate_seq_len, len(self.distill_actions))
+        return {"teacher_probs": np.full(shape, np.nan, np.float32)}
+
     def example_data(
         self,
         batch_size: int,
@@ -2857,6 +2881,7 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+                is_broadcast=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
@@ -2866,6 +2891,7 @@ class PhoenixDataset(Dataset):
                     for key, dtype in value_label_dtypes(self.aux_value_events).items()
                 },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
+                **self._example_teacher_probs(batch_size, candidate_seq_len),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -2914,6 +2940,10 @@ class PhoenixDataset(Dataset):
         if self.read_ads_ctr_features:
             batch["candidate_seq"]["ads_ctr_buckets"] = np.zeros(
                 (batch_size, candidate_seq_len, NUM_ADS_CTR_FEATURES), dtype=np.uint8
+            )
+        if self.per_candidate_sample_weight:
+            batch["candidate_seq"]["sample_weight"] = np.ones(
+                (batch_size, candidate_seq_len), dtype=np.float32
             )
         if self.read_ad_side_ids:
             batch["candidate_seq"]["ad_side_ids"] = np.zeros(
@@ -3026,6 +3056,7 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                is_broadcast=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
@@ -3035,6 +3066,7 @@ class PhoenixToyDataset(PhoenixDataset):
                     for key, dtype in value_label_dtypes(self.aux_value_events).items()
                 },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
+                **self._example_teacher_probs(batch_size, candidate_seq_len),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,
