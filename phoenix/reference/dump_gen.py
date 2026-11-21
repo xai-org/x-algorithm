@@ -53,6 +53,7 @@ def _batch_relpath(partition: int, batch_id: int) -> str:
 
 
 def _load_sid_codes(path: str, world: World) -> np.ndarray:
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     if not Path(path).is_file():
@@ -72,12 +73,21 @@ def _load_sid_codes(path: str, world: World) -> np.ndarray:
             f"error: {path} covers the right number of posts but different ids, so "
             "it was assigned against another world. Generate both from the same --seed."
         )
-    flat = t.column("post_sid").combine_chunks().values.to_numpy(zero_copy_only=False)
-    if flat.size != pid.size * SID_NUM_LEVELS:
+    sid_col = t.column("post_sid").combine_chunks()
+    if sid_col.null_count:
+        raise SystemExit(f"error: post_sid in {path} contains null rows.")
+    if pa.types.is_fixed_size_list(sid_col.type):
+        row_lengths = np.full(len(sid_col), sid_col.type.list_size)
+    else:
+        row_lengths = np.diff(sid_col.offsets.to_numpy(zero_copy_only=False))
+    if (row_lengths != SID_NUM_LEVELS).any():
         raise SystemExit(
             f"error: post_sid in {path} is not fixed-width {SID_NUM_LEVELS} "
-            f"({flat.size} codes for {pid.size} posts)."
+            "(ragged list column not supported)."
         )
+    if sid_col.values.null_count:
+        raise SystemExit(f"error: post_sid in {path} contains null elements.")
+    flat = sid_col.values.to_numpy(zero_copy_only=False)
     return flat.astype(np.int32).reshape(pid.size, SID_NUM_LEVELS)
 
 
