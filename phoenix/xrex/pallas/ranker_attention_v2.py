@@ -219,6 +219,8 @@ def mha_forward_kernel_inference(
     seg_q = pl.load(segment_ref, (pl.dslice(offset_q, block_q),)).astype(jnp.int8)[:, None]
     seq_q_is_not_padding = seg_q != PADDING_SEGMENT_ID
 
+    span_q = offset_q + jnp.arange(block_q)
+
     temp = pl.load(temp_ref, (pl.dslice(offset_q, block_q),))
     temp = jnp.expand_dims(temp, axis=-1)
 
@@ -227,6 +229,8 @@ def mha_forward_kernel_inference(
 
         offset_k = start_k * block_k
         k = pl.load(k_ref, (slice(None), pl.dslice(offset_k, block_k)))
+        seg_k = pl.load(segment_ref, (pl.dslice(offset_k, block_k),)).astype(jnp.int8)[None, :]
+        span_k = offset_k + jnp.arange(block_k)
 
         qk = pl.dot(q, k)
         if sm_scale != 1.0:
@@ -240,7 +244,9 @@ def mha_forward_kernel_inference(
 
         qk *= temp
 
-        qk = jnp.where(seq_q_is_not_padding, qk, DEFAULT_MASK_VALUE)
+        mask = jnp.logical_or(seg_k == HISTORY_SEGMENT_ID, span_q[:, None] == span_k[None, :])
+        mask = jnp.logical_and(seq_q_is_not_padding, mask)
+        qk = jnp.where(mask, qk, DEFAULT_MASK_VALUE)
 
         max_logit = jnp.max(qk, axis=1)
         max_logit = jnp.maximum(max_logit, 1.0)

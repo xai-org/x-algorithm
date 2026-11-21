@@ -100,17 +100,13 @@ class PallasRankerAttentionInference(CustomAttention):
             use_h100_kernel = gpu_arch() == GpuArch.H100
 
             if use_h100_kernel:
-                from xrex.pallas import ranker_attention_fa3
+                from xrex.pallas import ranker_attention_fa3, ranker_attention_utils
 
                 block_q = 64
                 block_kv = 128
                 assert q.shape[1] % (block_q * 2) == 0 and k.shape[1] % block_kv == 0, (
                     "q.shape[1] and k.shape[1] must be a multiple of block_q * 2 and block_kv"
                 )
-                history_upper = self.config.num_user_prefix_tokens + self.config.history_seq_len
-                candidate_lower = history_upper
-                candidate_upper = q.shape[1]
-                bound = (0, history_upper, candidate_lower, candidate_upper)
                 tuning_config = ranker_attention_fa3.TuningConfig(
                     block_q=block_q,
                     block_kv=block_kv,
@@ -120,8 +116,7 @@ class PallasRankerAttentionInference(CustomAttention):
                     block_q_dq=block_q,
                     block_kv_dq=block_kv,
                 )
-                batch_size = q.shape[0]
-                bound_arr = ranker_attention_fa3._normalize_bound(bound, batch_size, q.shape[1])
+                bound_arr = ranker_attention_utils.bounds_from_segment_ids(segment_ids)
                 attn = ranker_attention_fa3._attention_forward_inference(
                     q,
                     k,

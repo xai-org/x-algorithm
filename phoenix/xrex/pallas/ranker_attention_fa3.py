@@ -1374,9 +1374,10 @@ def _attention_forward_inference(
 
                 log2e = math.log2(math.e)
                 m_ij = jnp.maximum(m_i, qk.max(axis=1) * log2e)
-                alpha = jnp.exp2(m_i - m_ij)
+                m_safe = jnp.where(m_ij == -jnp.inf, 0.0, m_ij)
+                alpha = jnp.exp2(m_i - m_safe)
                 m_i = m_ij
-                p = jnp.exp2(qk * log2e - lax.broadcast_in_dim(m_ij, qk.shape, [0]))
+                p = jnp.exp2(qk * log2e - lax.broadcast_in_dim(m_safe, qk.shape, [0]))
                 acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
                 l_i *= alpha
                 p16 = p.astype(dtype)
@@ -1407,12 +1408,22 @@ def _attention_forward_inference(
                 plgpu.barrier_arrive(v_consumed_barriers.at[slot])
                 return acc, m_i, l_i
 
-            def no_mask_fn(qk, kv_step):
-                return qk
+            def history_mask_fn(qk, kv_step):
+                kv_ids = (
+                    plgpu.broadcasted_iota(
+                        jnp.int32,
+                        (block_q, block_kv),
+                        1,
+                        layout=plgpu.Layout.WGMMA,
+                    )
+                    + (hist_k_start + kv_step) * block_kv
+                )
+                history_mask = (kv_ids >= history_lower_bound) & (kv_ids < history_upper_bound)
+                return jnp.where(history_mask, qk, -jnp.inf)
 
             def hist_kv_loop(kv_step, carry):
                 acc, m_i, l_i = carry
-                return _step_body(kv_step, acc, m_i, l_i, no_mask_fn)
+                return _step_body(kv_step, acc, m_i, l_i, history_mask_fn)
 
             acc, m_i, l_i = lax.fori_loop(0, hist_steps, hist_kv_loop, (acc, m_i, l_i))
 
@@ -1460,7 +1471,8 @@ def _attention_forward_inference(
 
             pl.when(wg_idx == 0)(perform_schedule_barrier)
 
-            acc /= lax.broadcast_in_dim(l_i, (block_q, head_dim), [0])
+            l_safe = jnp.where(l_i == 0, 1.0, l_i)
+            acc /= lax.broadcast_in_dim(l_safe, (block_q, head_dim), [0])
             qo_smem[...] = acc.astype(dtype)
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
