@@ -12,14 +12,10 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
         query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> SelectResult<PostCandidate> {
-        let (carousel_only, candidates): (Vec<_>, Vec<_>) =
-            if video_carousel::moe_source_is_carousel_only(query) {
-                candidates
-                    .into_iter()
-                    .partition(video_carousel::only_from_moe_source)
-            } else {
-                (Vec::new(), candidates)
-            };
+        let moe_carousel_only = video_carousel::moe_source_is_carousel_only(query);
+        let (carousel_only, candidates): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| video_carousel::is_carousel_only(candidate, moe_carousel_only));
         let mut selected = self.sort(candidates);
         let mut non_selected =
             selected.split_off(params::TOP_K_CANDIDATES_TO_SELECT.min(selected.len()));
@@ -28,11 +24,11 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
             ..candidate
         }));
         if video_carousel::is_enabled(query) {
-            let moe_only = video_carousel::moe_only(query);
+            let allowed_source = video_carousel::allowed_source(query);
             selected.extend(video_carousel::top_videos_by_carousel_score(
                 non_selected
                     .iter()
-                    .filter(|candidate| !moe_only || video_carousel::from_moe_source(candidate)),
+                    .filter(|candidate| allowed_source(candidate)),
                 query.params.get(VideoCarouselExtraCandidates),
                 &CarouselScoring::from_query(query),
                 &query.seen_carousel_video_ids,
@@ -193,6 +189,22 @@ mod tests {
 
         let (_, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
         assert_eq!(tweet_ids(extras), vec![106]);
+    }
+
+    #[test]
+    fn popular_video_posts_are_carousel_only() {
+        let popular =
+            RetrievalSource::from_served_type(pb::ServedType::ForYouPhoenixRetrievalPopularVideo);
+        let mut candidates = candidates();
+        candidates.push(PostCandidate {
+            score: Some(1000.0),
+            retrieval_sources: vec![popular],
+            ..video(201, 0.99)
+        });
+        let result = TopKScoreSelector.select(&carousel_query("1.0", "0.0"), candidates);
+        let (top_k, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
+        assert!(!tweet_ids(top_k).contains(&201));
+        assert_eq!((extras[0].tweet_id, extras[0].score), (201, None));
     }
 
     #[test]

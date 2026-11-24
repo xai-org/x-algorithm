@@ -8,6 +8,7 @@ pub mod phoenix_moe_source;
 pub mod phoenix_source;
 pub mod phoenix_topics_source;
 pub mod popular_posts_source;
+pub mod popular_video_source;
 pub mod prompts_source;
 pub mod push_to_home_source;
 pub mod reverse_chron_posts_source;

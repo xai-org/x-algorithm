@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -264,6 +265,10 @@ def check_resume_path(position: DataPosition | None, path: str | None, allow_cha
     )
 
 
+_VALID_BATCHES_READ_ATTEMPTS = 6
+_VALID_BATCHES_READ_BACKOFF_S = 0.2
+
+
 def load_valid_batches_metadata(path: str) -> ValidBatchesMetadata | None:
     if is_iceberg_path(path):
         index = iceberg_index(path.removesuffix(_VALID_BATCHES_SUFFIX))
@@ -275,16 +280,31 @@ def load_valid_batches_metadata(path: str) -> ValidBatchesMetadata | None:
             max_valid_batch=index.num_batches - 1,
             num_partitions=index.num_partitions,
         )
-    try:
-        data = json.loads(_read_text(path))
-        return ValidBatchesMetadata(
-            min_valid_batch=int(data["min_valid_batch"]),
-            max_valid_batch=int(data["max_valid_batch"]),
-            num_partitions=int(data["num_partitions"]),
-        )
-    except (OSError, KeyError, ValueError, json.JSONDecodeError) as e:
-        logger.warning("Failed to load valid batches metadata from %s: %s", path, e)
-        return None
+    for attempt in range(_VALID_BATCHES_READ_ATTEMPTS):
+        try:
+            data = json.loads(_read_text(path))
+            return ValidBatchesMetadata(
+                min_valid_batch=int(data["min_valid_batch"]),
+                max_valid_batch=int(data["max_valid_batch"]),
+                num_partitions=int(data["num_partitions"]),
+            )
+        except FileNotFoundError as e:
+            logger.warning("Failed to load valid batches metadata from %s: %s", path, e)
+            return None
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as e:
+            last = attempt == _VALID_BATCHES_READ_ATTEMPTS - 1
+            logger.warning(
+                "Failed to load valid batches metadata from %s (attempt %d of %d%s): %s",
+                path,
+                attempt + 1,
+                _VALID_BATCHES_READ_ATTEMPTS,
+                "" if last else "; reading it again",
+                e,
+            )
+            if last:
+                return None
+            time.sleep(_VALID_BATCHES_READ_BACKOFF_S * (attempt + 1))
+    return None
 
 
 def parse_date_time(s: str) -> datetime:

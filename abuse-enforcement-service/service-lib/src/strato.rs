@@ -23,7 +23,7 @@ pub struct CredClients {
 }
 
 #[allow(deprecated)]
-async fn strato_fetch<K, V, T>(
+pub(crate) async fn strato_fetch<K, V, T>(
     strato: &Strato,
     key: K,
     view: Option<V>,

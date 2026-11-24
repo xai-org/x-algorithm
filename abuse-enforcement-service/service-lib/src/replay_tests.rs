@@ -224,6 +224,10 @@ impl TestBed {
                 grey_badge: column("grey"),
             },
             uas_strato: column("uas"),
+            reply_parents: crate::invited_reply::ReplyParents::new(
+                column("reply_parent"),
+                std::time::Duration::from_secs(1),
+            ),
             dynamic_config,
             rules_cache: Arc::new(rules_cache),
             allowlist: None,
@@ -259,6 +263,34 @@ impl TestBed {
             gizmoduck: gd,
             strato: server,
         }
+    }
+
+            pub(crate) async fn answer_reply_parent(
+        &self,
+        parent_id: i64,
+        status: u16,
+        record: serde_json::Value,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex("/reply_parent$"))
+            .and(wiremock::matchers::body_string_contains(
+                parent_id.to_string(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "v": record })),
+            )
+            .with_priority(1)
+            .mount(&self.strato)
+            .await;
+    }
+
+        pub(crate) async fn reply_parent_reads(&self) -> usize {
+        self.strato.received_requests().await.map_or(0, |r| {
+            r.iter()
+                .filter(|q| q.url.path().ends_with("/reply_parent"))
+                .count()
+        })
     }
 
         pub(crate) async fn fetches(&self) -> usize {

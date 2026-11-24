@@ -1,38 +1,40 @@
-import os
 import asyncio
 import logging
+import os
 import traceback
 from urllib.parse import urlparse
-from tenacity import retry, wait_fixed, stop_after_attempt
+
+from blobstore_http.cdn_downloader import CDNDownloader
 from broadcast_tools.broadcast import BroadcastLoader
-from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
-from monitor.metrics import Metrics
-from video_tools.image import (
-    process_image_bytes,
-    resize_tile,
-    enhance_image_with_clahe,
-    side_by_side,
-)
 from grox.config.config import grox_config
-from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
+from grox.core.clients.nightowl_client import NightOwlClient
+from grox.core.data_loaders.data_types import (
+    BroadcastMetadata,
+    Image,
+    Post,
+    RankingQuery,
+    Video,
+)
 from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
 from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
-from grox.core.clients.nightowl_client import NightOwlClient
+from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
+from grox.core.lm.convo import Image as ConvoImage
+from grox.core.lm.convo import Video as ConvoVideo
 from grox_fetcher_client import GroxFetcherClient
-from video_tools.subtitles import SubtitleAligner
-from video_tools.key_frames import ShotKeyFramesExtractor
-from video_tools.video_frames import VideoFramesExtractor
-from grox.core.data_loaders.data_types import (
-    Post,
-    Image,
-    Video,
-    BroadcastMetadata,
-    RankingQuery,
-)
-from blobstore_http.cdn_downloader import CDNDownloader
 from html_render.tweet_render_for_grox import TweetRenderForGrox
+from monitor.metrics import Metrics
 from strato_http.queries.media_entities import StratoMediaEntities
 from strato_http.queries.video_subtitle import StratoVideoSubtitle
+from tenacity import retry, stop_after_attempt, wait_fixed
+from video_tools.image import (
+    enhance_image_with_clahe,
+    process_image_bytes,
+    resize_tile,
+    side_by_side,
+)
+from video_tools.key_frames import ShotKeyFramesExtractor
+from video_tools.subtitles import SubtitleAligner
+from video_tools.video_frames import VideoFramesExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +139,9 @@ class MediaLoader:
                 )
 
     @classmethod
-    async def hydrate_post(cls, post: Post) -> None:
+    async def hydrate_post(
+        cls, post: Post, *, include_descendants: bool = True
+    ) -> None:
         Metrics.counter("media_loader.hydrate_post.count").add(
             1, attributes=cls._metrics_attributes()
         )
@@ -146,7 +150,7 @@ class MediaLoader:
             >= grox_config.media_hydration.deluxe_fav_count_threshold
         )
 
-        if is_high_fav and not post.ancestors:
+        if include_descendants and is_high_fav and not post.ancestors:
             if cls.descendant_id_provider is None:
                 logger.warning("No descendant id provider available")
             else:

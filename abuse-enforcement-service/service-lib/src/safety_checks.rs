@@ -10,7 +10,9 @@ pub use xai_abuse_enforcement_types::action_control::{
     SafetyCheckView, SafetyChecksByEntity, SafetyChecksStatus,
 };
 
-use crate::facts::{EmailConfirmedState, EntityType, Facts, GizmoduckFacts};
+use crate::facts::{
+    EmailConfirmedState, EntityFacts, EntityType, Facts, GizmoduckFacts, InvitedReply,
+};
 use crate::rules::{CompiledRules, EvalError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +185,36 @@ pub const TEST_ACCOUNT: SafetyCheck = SafetyCheck {
     when: "the account matches the service's test-account policy",
 };
 
-const SERVICE_ONLY: &[&str] = &[FOLLOWER_CEILING.id, GIZMODUCK_TEST_USER.id, TEST_ACCOUNT.id];
+pub const INVITED_REPLY: SafetyCheck = SafetyCheck {
+    id: "invited_reply",
+    reason: "invited_reply_skipped",
+    when: "the reply's parent post mentions the reply's author in its own text",
+};
+
+pub const INVITED_REPLY_UNKNOWN: SafetyCheck = SafetyCheck {
+    id: "invited_reply_unknown",
+    reason: "invited_reply_unknown_skipped",
+    when: "the reply's parent post couldn't be read",
+};
+
+const SERVICE_ONLY: &[&str] = &[
+    FOLLOWER_CEILING.id,
+    GIZMODUCK_TEST_USER.id,
+    TEST_ACCOUNT.id,
+    INVITED_REPLY.id,
+    INVITED_REPLY_UNKNOWN.id,
+];
+
+pub fn invited_reply_stop(facts: &Facts) -> Option<&'static SafetyCheck> {
+    let EntityFacts::Post(post) = &facts.entity else {
+        return None;
+    };
+    match post.invited {
+        InvitedReply::Mentioned => Some(&INVITED_REPLY),
+        InvitedReply::Unknown => Some(&INVITED_REPLY_UNKNOWN),
+        InvitedReply::NotAReply | InvitedReply::NotInvited => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -511,7 +542,10 @@ pub fn first_page_stop(
     if stops_at(facts, true, skips.follower_ceiling()) {
         return Ok(Some(&FOLLOWER_CEILING));
     }
-    listed
+    match listed {
+        Ok(None) => Ok(invited_reply_stop(facts)),
+        listed => listed,
+    }
 }
 
 pub fn first_stop(
@@ -1650,11 +1684,106 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invited_replies_stop_post_decisions_last_on_both_paths() {
+        let d = DEFAULT_FOLLOWER_SKIP.ceil() as i64;
+        let c = follower_ceiling() as i64;
+        let with = |entity: EntityType, a: Author, invited: InvitedReply| {
+            let mut f = author_facts(entity, a, &["anchor_campaign_suspend"]);
+            if let EntityFacts::Post(p) = &mut f.entity {
+                p.invited = invited;
+            }
+            f
+        };
+        let page = |f: &Facts| {
+            first_page_stop(f.entity_type, f, AuthorSkips::default())
+                .unwrap()
+                .map(|c| c.reason)
+        };
+        for (invited, want) in [
+            (InvitedReply::Mentioned, Some("invited_reply_skipped")),
+            (InvitedReply::Unknown, Some("invited_reply_unknown_skipped")),
+            (InvitedReply::NotInvited, None),
+            (InvitedReply::NotAReply, None),
+        ] {
+            assert_eq!(
+                page(&with(EntityType::Post, with_followers(1), invited)),
+                want,
+                "{invited:?}"
+            );
+            for s in [skips(Some(0), Some(false)), skips(Some(250), None)] {
+                let f = with(EntityType::Post, with_followers(1), invited);
+                assert_eq!(
+                    first_page_stop(EntityType::Post, &f, s)
+                        .unwrap()
+                        .map(|c| c.reason),
+                    want,
+                    "{invited:?} {s:?}: no head switch"
+                );
+            }
+            assert_eq!(
+                page(&with(EntityType::Post, with_followers(d), invited)),
+                Some("high_follower_count")
+            );
+            assert_eq!(
+                page(&with(EntityType::Post, with_followers(c), invited)),
+                Some("very_high_follower_count")
+            );
+            let waived = Author {
+                waived: true,
+                ..with_followers(d)
+            };
+            assert_eq!(
+                page(&with(EntityType::Post, waived, invited)),
+                want,
+                "{invited:?}: not waived"
+            );
+        }
+        assert_eq!(
+            page(&with(
+                EntityType::User,
+                with_followers(1),
+                InvitedReply::Mentioned
+            )),
+            None
+        );
+
+        let rules = compiled(BAKED_POST);
+        let decide = |a: Author, invited: InvitedReply| {
+            let mut f = with(EntityType::Post, a, invited);
+            f.score.labels = vec!["cse_reports_embedding_v2".to_owned()];
+            let (d, id) = crate::rules::decide_with_id(&rules, &f).unwrap();
+            match d {
+                crate::decision::Decision::Act(_) => format!("act:{id}"),
+                crate::decision::Decision::Skip(r) => r,
+            }
+        };
+        assert!(decide(with_followers(1), InvitedReply::NotInvited).starts_with("act:"));
+        assert_eq!(
+            decide(with_followers(1), InvitedReply::Mentioned),
+            "invited_reply_skipped"
+        );
+        assert_eq!(
+            decide(with_followers(1), InvitedReply::Unknown),
+            "invited_reply_unknown_skipped"
+        );
+        assert_eq!(
+            decide(with_followers(d), InvitedReply::Mentioned),
+            "high_follower_count",
+            "a skip the rules chose keeps its reason"
+        );
+    }
+
                 #[test]
     fn test_account_checks_leave_the_comparison_alone() {
         assert!(status(EntityType::User, &compiled(BAKED_USER)).ok);
         assert!(status(EntityType::Post, &compiled(BAKED_POST)).ok);
-        for check in [GIZMODUCK_TEST_USER, TEST_ACCOUNT] {
+        for check in [
+            GIZMODUCK_TEST_USER,
+            TEST_ACCOUNT,
+            INVITED_REPLY,
+            INVITED_REPLY_UNKNOWN,
+        ] {
             let rule = format!(
                 "  - id: {}\n    when: user.deactivated\n    then:\n      kind: skip\n      reason: {}\n\n",
                 check.id, check.reason

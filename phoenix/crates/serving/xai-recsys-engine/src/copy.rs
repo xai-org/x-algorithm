@@ -248,6 +248,22 @@ impl Default for Sender {
 }
 
 impl Sender {
+    pub fn forget(self: &Arc<Self>, prefix: &str) {
+        let (sender, owned) = (self.clone(), prefix.to_string());
+        let forget = async move {
+            let dropped = forget_prefix(&mut *sender.bytez.lock().await, &owned);
+            if !dropped.is_empty() {
+                task::spawn_blocking(move || drop(dropped));
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(forget);
+            }
+            Err(_) => log::warn!("copy: no runtime to drop the cached files under {prefix}"),
+        }
+    }
+
     pub fn new(max_entries: usize) -> Self {
         Self {
             bytez: Mutex::new(BTreeMap::new()),
@@ -366,6 +382,18 @@ fn mmap_file(
         }
         Ok((Bytes::from_owner(mmap), Arc::new(mrs)))
     })
+}
+
+pub fn forget_prefix<V>(bytez: &mut BTreeMap<String, V>, prefix: &str) -> Vec<V> {
+    let keys: Vec<String> = bytez
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.iter().filter_map(|k| bytez.remove(k)).collect()
 }
 
 fn cleanup<'a>(mut bytez: MutexGuard<'a, BTreeMap<String, (Bytes, MRs)>>, max_entries: usize) {
@@ -1045,5 +1073,36 @@ mod tests {
         let disabled = Sender::new(DEFAULT_MAX_ENTRIES);
         assert!(disabled.publish_manifest(vec![], vec![]).is_err());
         assert!(disabled.revoke_manifest(Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_a_prefix_drops_only_its_files() {
+        let mut bytez: BTreeMap<String, u32> = [
+            "elapsed_samples_000000000000001000/run-0/w",
+            "gateway/held/elapsed_samples_000000000000001000/run-0/w",
+            "gateway/held/elapsed_samples_000000000000001000/run-0/emb/c/0/0",
+            "gateway/held/elapsed_samples_000000000000001000/run-01/w",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| (k.to_string(), i as u32))
+        .collect();
+        let dropped = forget_prefix(
+            &mut bytez,
+            "gateway/held/elapsed_samples_000000000000001000/run-0/",
+        );
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(
+            bytez.keys().collect::<Vec<_>>(),
+            [
+                "elapsed_samples_000000000000001000/run-0/w",
+                "gateway/held/elapsed_samples_000000000000001000/run-01/w",
+            ]
+        );
     }
 }

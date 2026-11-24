@@ -1,21 +1,21 @@
-import os
 import logging
+import os
 from pathlib import Path
 
-from pydantic import Field, BaseModel, ConfigDict
-from monitor.config import LoggingConfig, MetricsConfig
+from embed.embed_http import EmbeddingModelConfig
+from grok_sampler.config import OaiModelConfig
 from grox.config.env import grox_env
 from kafka_cli.config import KafkaConsumerConfig, KafkaProducerConfig
 from kafka_cli.multi_region_consumer import MultiRegionKafkaConsumerConfig
 from kafka_cli.multi_region_producer import MultiRegionKafkaProducerConfig
+from monitor.config import LoggingConfig, MetricsConfig
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
     BaseSettings,
+    PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
-    PydanticBaseSettingsSource,
 )
-from embed.embed_http import EmbeddingModelConfig
-from grok_sampler.config import OaiModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,11 @@ class XReviewIntakeConfig(BaseModel):
     timeout: float = 10.0
 
 
+class XReviewReportingConfig(BaseModel):
+    endpoint: str
+    timeout: float = 20.0
+
+
 class GroxConfig(BaseSettings):
     metrics: MetricsConfig = MetricsConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -256,6 +261,7 @@ class GroxConfig(BaseSettings):
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
     xreview_intake: XReviewIntakeConfig | None = None
+    xreview_reporting: XReviewReportingConfig | None = None
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)
 

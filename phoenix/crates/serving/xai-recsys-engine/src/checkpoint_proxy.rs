@@ -59,6 +59,7 @@ pub struct CheckpointProxy {
     num_trainers: Option<usize>,
     download_concurrency: usize,
     request_timeout: Duration,
+    evict_guard: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl CheckpointProxy {
@@ -83,7 +84,13 @@ impl CheckpointProxy {
             verify_checksums,
             download_concurrency,
             request_timeout,
+            evict_guard: None,
         }
+    }
+
+    pub fn with_evict_guard(mut self, guard: Arc<parking_lot::Mutex<()>>) -> Self {
+        self.evict_guard = Some(guard);
+        self
     }
 
     async fn resolve_and_connect(
@@ -469,6 +476,7 @@ impl CheckpointProxy {
         CHECKPOINTS_AVAILABLE.set(elapsed_dirs.len() as f64);
 
         if elapsed_dirs.len() > self.max_entries {
+            let _evicting = self.evict_guard.as_ref().map(|g| g.lock());
             let to_remove = elapsed_dirs.len() - self.max_entries;
             for name in &elapsed_dirs[..to_remove] {
                 let path = format!("{}{}", ROOT_DIR, name);
@@ -512,6 +520,7 @@ impl CheckpointProxy {
             .collect();
         elapsed_dirs.sort();
 
+        let _evicting = self.evict_guard.as_ref().map(|g| g.lock());
         while free < needed && elapsed_dirs.len() > 1 {
             let name = elapsed_dirs.remove(0);
             let path = format!("{}{}", ROOT_DIR, name);

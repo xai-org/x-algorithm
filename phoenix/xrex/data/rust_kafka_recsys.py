@@ -11,9 +11,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import zip_longest
 from typing import Iterator
 
+import pyarrow as pa
+
 from xai_configlib import configclass
+from xrex import settings
 from xrex.data import rust_ext
 from xrex.data.parquet_recsys import DataPosition, load_global_ids_from_parquet_file
+from xrex.data.recsys import iceberg_layout
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.streaming.kafkaconsumer import ConsumerMode, _check_reset_sentinel
 from xrex.data.streaming.kafkaloader import (
@@ -27,6 +31,16 @@ from xrex.data.streaming.kafkaloader import (
 
 rank_logger = logging.getLogger("rank")
 
+_SIZED_COLUMNS = ("actionNameMultiHotSeqSeq", "continuousActionValuesSeqSeq")
+
+
+_mixed_batches_skipped = [0]
+_mixed_batches_lock = threading.Lock()
+
+
+class MixedLayoutBatch(ValueError):
+    pass
+
 
 _QSIZE_LOG_INTERVAL_SECS = 1.0
 
@@ -34,28 +48,136 @@ _QSIZE_LOG_INTERVAL_SECS = 1.0
 @configclass
 class RustKafkaDataset(PhoenixKafkaDataset):
     reader_count: int | None = None
+    """Kafka readers: None selects automatically; zero forces local readers."""
     reader_port: int = 19200
+    """First source-reader port on each host."""
     max_redistribution_bytes: int = 256 << 20
+    """Maximum encoded size of one redistributed Arrow batch."""
+
+    iceberg_table: str | None = None
+    """Read the topic from its Iceberg dump table instead of the brokers: ``catalog.namespace.table``,
+    a table the Kafka Iceberg dumps write with one Kafka partition per file
+    (``prod/recsys/kafka-iceberg-dump``), in a catalog of ``settings.ICEBERG_CATALOGS``. Readers,
+    redistribution, batching and the per-partition offsets a checkpoint keeps are the Kafka path's:
+    a partition is read in offset order, a resume continues at its checkpointed offset, and a fresh
+    start takes the table's first offset (``auto_offset_reset="earliest"``) or only what later
+    commits bring (``"latest"``, ``reset_to_latest``). Records arrive a commit at a time. No broker
+    is asked for the partition count, so set ``num_kafka_partitions``. Sampling, drop mode and
+    ``seek_to_timestamp_ms`` are refused: they would thin or seek a topic, not a table. A table
+    stores fixed-size lists as lists and a column the records lack as nulls; every batch is put
+    back in the messages' layout before it is converted (``iceberg_layout.dump_layout``)."""
+    iceberg_refuse_mixed_batches: bool = False
+    """What happens to a batch from the table whose records are not of one layout (a producer changed a list length;
+    see ``_check_one_layout``). False skips the batch, counts it and trains on: the reader already drops the odd
+    records one by one, so this is the one batch in which the old and the new layout meet, and a resume would only
+    read it again. True ends the run there, as the Kafka reader ends on messages whose schemas do not merge."""
+    iceberg_poll_secs: float = 30.0
+    """How often the table is listed for new commits."""
 
     queue_size: int = 1000
+    """Rust reader channel capacity in decoded RecordBatches; a hint, since the reader enforces a
+    per-partition floor."""
 
     num_converter_threads: int = 1
+    """Threads running ``kafka_to_training_batch`` on the reader's Arrow batches. The consumer
+    thread keeps pulling and logging; results are enqueued in reader order. Conversion is
+    numpy-bound and releases the GIL, so a second thread nearly doubles rows/s per rank."""
 
     max_partition_fetch_bytes: int = 50 << 20
+    """librdkafka ``max.partition.fetch.bytes``; the default matches the Rust reader's. Lower it for
+    wide records when seeking into a backlog."""
 
     keep_per_factor: float = 1.0
+    """DDA sampling numerator: keep ``keep_per_factor`` of every ``sampling_factor`` messages,
+    evenly spread. At 1 the kept set matches the Python consumer's
+    ``count % sampling_factor == 0`` rule. A fractional value thins at that rate; with
+    ``sampling_factor=1`` it is the keep rate (``0.37`` keeps 37%)."""
 
     drop_catchup_window_secs: float = 7200.0
+    """Target time (seconds) to clear the staleness backlog once drop mode engages. The
+    per-partition keep rate is derived from the observed drain rate to hit this window."""
 
     drop_min_staleness_secs: float = 10.0
+    """Lower edge of the deadband (seconds): messages at or below this staleness are never
+    dropped. Drop allowance fades to zero approaching it, so the keep rate eases back to 1.0."""
 
     drop_staleness_band_secs: float = 30.0
+    """Width (seconds) of the band above the deadband over which drop allowance ramps 0→1
+    (smoothstep), so a job that cannot keep up settles in the band instead of oscillating
+    across a hard threshold. ``0`` makes it a hard cutoff."""
 
     drop_min_keep_rate: float = 0.2
+    """Floor on the keep fraction. A partition pinned here cannot catch up even at max drop;
+    escalation is manual via ``POST /catchup-kafka`` or ``POST /reset-kafka`` (seek to latest)."""
 
     drop_update_window_secs: float = 30.0
+    """How often (seconds) each partition re-estimates its drain rate and keep rate. 30 s spans
+    many training steps so step burstiness averages out; larger is smoother but laggier."""
 
     python_otel_on_last_shard_only: bool = False
+    """Start the Python OTel exporter only on the last shard, whose process reports the training
+    metrics. Each Python export stalls its process for 1-3 s, and every other process waits for it.
+    The other shards stop exporting ``recsys_kafka_queue_size``, which alerts join on per pod, and
+    ``recsys_kafka_batch_processing_seconds``. The Rust reader's ``recsys_kafka_*`` series stay."""
+
+    def ensure_partition_count(self) -> None:
+        if self.iceberg_table is None:
+            super().ensure_partition_count()
+        else:
+            self._check_iceberg_table()
+
+    def _check_iceberg_table(self) -> None:
+        table = self.iceberg_table
+        problems = [
+            problem
+            for refused, problem in (
+                (self.num_kafka_partitions is None, "set num_kafka_partitions: no broker is asked"),
+                (
+                    self.sampling_factor != 1 or self.keep_per_factor != 1.0,
+                    "sampling_factor and keep_per_factor are not applied",
+                ),
+                (self.enable_drop_on_high_qps, "enable_drop_on_high_qps thins by staleness"),
+                (self.seek_to_timestamp_ms is not None, "seek_to_timestamp_ms is not supported"),
+                (self.is_eval, "an eval dataset is not supported"),
+            )
+            if refused
+        ]
+        if problems:
+            raise ValueError(f"iceberg_table={table!r}: " + "; ".join(problems))
+
+    def kafka_to_training_batch(
+        self, batch: list[pa.RecordBatch], batch_size: int, shard_index: int = 0
+    ) -> RecsysFeaturesBatch:
+        if self.iceberg_table is not None:
+            batch = [iceberg_layout.dump_layout(record_batch) for record_batch in batch]
+            for record_batch in batch:
+                self._check_one_layout(record_batch)
+        return super().kafka_to_training_batch(batch, batch_size, shard_index)
+
+    def _check_one_layout(self, record_batch: pa.RecordBatch) -> None:
+        ragged = iceberg_layout.ragged_lengths(record_batch, list(_SIZED_COLUMNS))
+        if not ragged:
+            return
+        found = "; ".join(
+            f"{column} holds lists of "
+            + ", then of ".join(f"{low} to {high}" for low, high in lengths)
+            for column, lengths in ragged.items()
+        )
+        raise MixedLayoutBatch(
+            f"iceberg_table={self.iceberg_table!r}: a batch of {record_batch.num_rows} records is not of one layout: "
+            f"{found} (outermost lists first). A producer changed a list length and the table holds records of both "
+            "layouts; as on Kafka, where such messages do not merge, they cannot be trained in one batch."
+        )
+
+    def _skip_mixed_batch(self, mixed: MixedLayoutBatch) -> None:
+        if self.iceberg_refuse_mixed_batches:
+            raise mixed
+        with _mixed_batches_lock:
+            skipped = _mixed_batches_skipped[0] = _mixed_batches_skipped[0] + 1
+        if skipped & (skipped - 1) == 0:
+            rank_logger.warning(
+                "skipped %d batches of mixed layout so far; the last: %s", skipped, mixed
+            )
 
     def _warn_ignored_inherited_fields(self) -> None:
         problems: list[tuple[str, object, str]] = []
@@ -159,35 +281,50 @@ class RustKafkaDataset(PhoenixKafkaDataset):
 
             RecordBatchProvider = rust_ext.load("xai_recsys_kafka_reader").RecordBatchProvider
 
-            auth = auto_detect_auth(
-                self.bootstrap_servers,
-                self.sasl_mechanism,
-                self.sasl_plain_username,
-            )
-            if auth.mode == "mtls":
-                rust_bootstrap = self._resolve_bootstrap_servers(auth)
+            if self.iceberg_table is not None:
+                self._check_iceberg_table()
+                source = {
+                    "bootstrap_servers": "",
+                    "sasl_username": "",
+                    "sasl_password": "",
+                    "iceberg_table": self.iceberg_table,
+                    "iceberg_catalogs": settings.ICEBERG_CATALOGS or None,
+                    "iceberg_poll_secs": self.iceberg_poll_secs,
+                    "iceberg_one_layout_columns": ",".join(_SIZED_COLUMNS),
+                }
             else:
-                rust_bootstrap = self.bootstrap_servers
+                auth = auto_detect_auth(
+                    self.bootstrap_servers,
+                    self.sasl_mechanism,
+                    self.sasl_plain_username,
+                )
+                source = {
+                    "bootstrap_servers": (
+                        self._resolve_bootstrap_servers(auth)
+                        if auth.mode == "mtls"
+                        else self.bootstrap_servers
+                    ),
+                    "sasl_username": auth.sasl_username or self.sasl_plain_username,
+                    "sasl_password": auth.sasl_password or "",
+                    "security_protocol": "SSL" if auth.mode == "mtls" else "SASL_SSL",
+                    "ssl_ca_location": (
+                        auth.ca_path
+                        if auth.mode != "mtls" or auth.ca_path
+                        else (platform_ca_bundle_path() or system_ca_bundle_path())
+                    ),
+                    "ssl_certificate_location": auth.cert_path,
+                    "ssl_key_location": auth.key_path,
+                }
 
             provider = RecordBatchProvider(
                 topic=self.topic_name,
-                bootstrap_servers=rust_bootstrap,
                 group_id=self.group_id,
                 batch_size=batch_size,
                 num_shards=num_shards,
                 shard_index=self._reader_rank if reader_count else shard_index,
                 num_partitions=self.num_kafka_partitions,
                 sasl_mechanism=self.sasl_mechanism,
-                sasl_username=auth.sasl_username or self.sasl_plain_username,
-                sasl_password=auth.sasl_password or "",
-                security_protocol="SSL" if auth.mode == "mtls" else "SASL_SSL",
-                ssl_ca_location=(
-                    auth.ca_path
-                    if auth.mode != "mtls" or auth.ca_path
-                    else (platform_ca_bundle_path() or system_ca_bundle_path())
-                ),
-                ssl_certificate_location=auth.cert_path,
-                ssl_key_location=auth.key_path,
+                **source,
                 auto_offset_reset=self.auto_offset_reset,
                 max_partition_fetch_bytes=self.max_partition_fetch_bytes,
                 queue_size=self.queue_size,
@@ -278,6 +415,14 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                         future, batch_offsets = item
                         try:
                             payload = (future.result(), batch_offsets)
+                        except MixedLayoutBatch as mixed:
+                            try:
+                                self._skip_mixed_batch(mixed)
+                            except MixedLayoutBatch as refused:
+                                forward_error.append(refused)
+                                enqueue(refused)
+                                return
+                            continue
                         except Exception as error:
                             forward_error.append(error)
                             enqueue(error)
@@ -310,7 +455,13 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                     continue
 
                 if converters is None:
-                    example = self.kafka_to_training_batch([record_batch], batch_size, shard_index)
+                    try:
+                        example = self.kafka_to_training_batch(
+                            [record_batch], batch_size, shard_index
+                        )
+                    except MixedLayoutBatch as mixed:
+                        self._skip_mixed_batch(mixed)
+                        continue
                     if not enqueue((example, offsets)):
                         return
                     batches_since_log += 1

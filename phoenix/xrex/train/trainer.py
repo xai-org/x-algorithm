@@ -1501,7 +1501,9 @@ class Trainer(Config):
             def dispatch_step_to_device(soft_step):
                 nonlocal dispatched_samples
                 next_data_batch_start = time.perf_counter()
-                batch = self.next_data_batch()
+                batch = self.next_data_batch_or_end()
+                if batch is None:
+                    return None
                 next_data_batch_time = time.perf_counter() - next_data_batch_start
                 lr = self.lr_schedule_in_samples(dispatched_samples, self.batch_size)
 
@@ -1590,6 +1592,10 @@ class Trainer(Config):
                 if awaiting_processing is not None:
                     process_step_results(*awaiting_processing)
                     awaiting_processing = None
+                if dispatched is None:
+                    self.max_steps = step - 1
+                    reason = f"{self.max_steps=}"
+                    break
                 if process_after_next_dispatch(soft_step):
                     awaiting_processing = dispatched
                 else:
@@ -1603,6 +1609,22 @@ class Trainer(Config):
 
         checkpointing.wait_until_finished()
         ctx.on_step({}, metrics_utils.pop())
+
+    def stops_at_reader_end(self) -> bool:
+        return False
+
+    def next_data_batch_or_end(self):
+        if not self.stops_at_reader_end():
+            return self.next_data_batch()
+        try:
+            batch = self.next_data_batch()
+        except StopIteration:
+            batch = None
+        ran_out = multihost_utils.process_allgather(np.array([batch is None], dtype=np.int32))
+        if np.any(ran_out):
+            rank_logger.info("A reader ran out of data before max_steps=%s", self.max_steps)
+            return None
+        return batch
 
     def before_stop_check(self, soft_step: int) -> None:
         pass

@@ -2,8 +2,8 @@ use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     EnablePhoenixMOESource, EnableVideoCarousel, EnableVideoCarouselMoeOnly,
-    EnableVideoCarouselMoeSource, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
-    VideoCarouselImmersiveVqvWeight, VideoCarouselNotInterestedWeight,
+    EnableVideoCarouselMoeSource, EnableVideoCarouselPopularOnly, VIDEO_CAROUSEL_MAX_VIDEOS,
+    VIDEO_CAROUSEL_MIN_VIDEOS, VideoCarouselImmersiveVqvWeight, VideoCarouselNotInterestedWeight,
     VideoCarouselOpenTimesImmersiveDwellWeight, VideoCarouselVideoContinuationWeight,
     VideoCarouselVideoOpenWeight, VideoCarouselWeightedScoreWeight,
 };
@@ -29,23 +29,32 @@ pub(crate) fn moe_source_is_carousel_only(query: &ScoredPostsQuery) -> bool {
         && !sid_source_enabled(query)
 }
 
-pub(crate) fn only_from_moe_source(candidate: &PostCandidate) -> bool {
+pub(crate) fn is_carousel_only(candidate: &PostCandidate, moe_carousel_only: bool) -> bool {
     !candidate.retrieval_sources.is_empty()
         && candidate
             .retrieval_sources
             .iter()
-            .all(|source| source.served_type == pb::ServedType::ForYouPhoenixRetrievalMoe)
+            .all(|source| match source.served_type {
+                pb::ServedType::ForYouPhoenixRetrievalPopularVideo => true,
+                pb::ServedType::ForYouPhoenixRetrievalMoe => moe_carousel_only,
+                _ => false,
+            })
 }
 
-pub(crate) fn moe_only(query: &ScoredPostsQuery) -> bool {
-    query.params.get(EnableVideoCarouselMoeOnly) && !sid_source_enabled(query)
-}
-
-pub(crate) fn from_moe_source(candidate: &PostCandidate) -> bool {
-    candidate
-        .retrieval_sources
-        .iter()
-        .any(|source| source.served_type == pb::ServedType::ForYouPhoenixRetrievalMoe)
+pub(crate) fn allowed_source(query: &ScoredPostsQuery) -> impl Fn(&PostCandidate) -> bool {
+    let moe_only = query.params.get(EnableVideoCarouselMoeOnly) && !sid_source_enabled(query);
+    let popular_only = query.params.get(EnableVideoCarouselPopularOnly);
+    move |candidate| {
+        !(moe_only || popular_only)
+            || candidate
+                .retrieval_sources
+                .iter()
+                .any(|source| match source.served_type {
+                    pb::ServedType::ForYouPhoenixRetrievalMoe => moe_only,
+                    pb::ServedType::ForYouPhoenixRetrievalPopularVideo => popular_only,
+                    _ => false,
+                })
+    }
 }
 
 pub(crate) fn was_seen(seen: &HashSet<u64>, candidate: &PostCandidate) -> bool {

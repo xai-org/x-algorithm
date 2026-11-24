@@ -125,6 +125,13 @@ lazy_static! {
             &["kind"])
             .unwrap();
 
+            pub static ref INVITED_REPLY_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_invited_reply_total",
+            "Post decisions on replies, by whether the parent post invited the reply.",
+            &["answer"])
+            .unwrap();
+
                     pub static ref GIZMODUCK_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_gizmoduck_core_latency_seconds",
@@ -489,6 +496,7 @@ pub fn init() {
     let _ = &*GIZMODUCK_CHECK_TOTAL;
     let _ = &*GIZMODUCK_LOGIN_EMAIL_TOTAL;
     let _ = &*TEST_ACCOUNT_SKIPS_TOTAL;
+    let _ = &*INVITED_REPLY_TOTAL;
     let _ = &*GIZMODUCK_LATENCY;
     let _ = &*STRATO_RETRIES;
     let _ = &*RETRY_ATTEMPTS;

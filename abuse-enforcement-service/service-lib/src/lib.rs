@@ -17,6 +17,7 @@ pub mod gizmoduck_labels;
 pub mod growthbook;
 pub mod growthbook_writer;
 pub mod head_guard;
+pub mod invited_reply;
 #[cfg(test)]
 mod ledger_contract_fixtures;
 pub mod limiter;
@@ -41,6 +42,8 @@ mod backfill_path_tests;
 mod confidence_adversarial_tests;
 #[cfg(test)]
 mod confidence_path_tests;
+#[cfg(test)]
+mod invited_reply_path_tests;
 #[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
@@ -80,7 +83,9 @@ use xai_strato::{Strato, StratoClientConfig};
 
 use crate::config::Config;
 use crate::decision::Decision;
-use crate::facts::{EntityFacts, EntityType, Facts, PostFacts, ScoreFacts, UserFacts};
+use crate::facts::{
+    EntityFacts, EntityType, Facts, InvitedReply, PostFacts, ScoreFacts, UserFacts,
+};
 use crate::growthbook::DynamicConfig;
 use crate::growthbook_writer::GrowthBookWriter;
 use crate::service::{
@@ -232,6 +237,7 @@ struct EnforcementCtx {
     gd: gizmoduck::GizmoduckCoreClient,
     cred_clients: strato::CredClients,
     uas_strato: Arc<Strato>,
+        reply_parents: invited_reply::ReplyParents,
     dynamic_config: DynamicConfig,
             rules_cache: Arc<rules::RulesCache>,
     allowlist: Option<allowlist::ManhattanAllowlist>,
@@ -742,15 +748,18 @@ async fn run_enforcement_inner(
                             allowlist: author_allowlist,
                             ..Default::default()
                         },
+                        invited: InvitedReply::NotAReply,
                     }),
                     uas: None,
                 };
                 return Ok(skip_outcome(reason.into(), dry_run, &partial, score));
             }
 
-            let (user_res, cred_res) = tokio::join!(
+            let (user_res, cred_res, invited) = tokio::join!(
                 fetch_user(&ctx.gd, author_id),
                 fetch_cred(&ctx.cred_clients, author_id),
+                ctx.reply_parents
+                    .invited(score.in_reply_to_post_id, author_id),
             );
 
             Facts {
@@ -769,6 +778,7 @@ async fn run_enforcement_inner(
                         user: user_res?,
                         cred: cred_res?,
                     },
+                    invited,
                 }),
                 uas: None,
             }
@@ -887,6 +897,15 @@ async fn run_enforcement_inner(
         metrics::TEST_ACCOUNT_SKIPS_TOTAL
             .with_label_values(&[kind])
             .inc();
+    }
+    if [
+        safety_checks::INVITED_REPLY.id,
+        safety_checks::INVITED_REPLY_UNKNOWN.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let EntityFacts::Post(post) = &facts.entity
+    {
+        extra.insert("invited_reply".into(), post.invited.as_str().into());
     }
     extra.insert("matched_rule_id".into(), rule_id);
 
@@ -3411,6 +3430,20 @@ pub async fn start_kafka_consumers(
         cfg.uas_column
     );
 
+    #[allow(deprecated)]
+    let reply_parents = invited_reply::ReplyParents::new(
+        Arc::new(
+            Strato::new(&cfg.reply_parent_column, StratoClientConfig::default())
+                .context("Failed to create reply-parent Strato client")?,
+        ),
+        Duration::from_millis(cfg.reply_parent_timeout_ms),
+    );
+    info!(
+        column = %cfg.reply_parent_column,
+        timeout_ms = cfg.reply_parent_timeout_ms,
+        "reply-parent Strato client initialised"
+    );
+
     let post_labels: Option<Arc<dyn post_labels::PostLabelReader>> =
         match post_labels::VfPostLabels::connect(&cfg.post_labels_zone).await {
             Ok(reader) => {
@@ -3433,6 +3466,7 @@ pub async fn start_kafka_consumers(
         gd,
         cred_clients,
         uas_strato,
+        reply_parents,
         dynamic_config: state.dynamic_config.clone(),
         rules_cache: state.rules_cache.clone(),
         allowlist: state.allowlist.clone(),
@@ -4345,6 +4379,8 @@ mod dedup_retention_tests {
             "gizmoduck_skipped",
             "user_not_found",
             "test_user_skipped",
+            "invited_reply_skipped",
+            "invited_reply_unknown_skipped",
             "user_in_allowlist",
             "post_in_allowlist",
             "rule_eval_error",
@@ -6147,6 +6183,10 @@ rules:
                 grey_badge: column("grey"),
             },
             uas_strato: column("uas"),
+            reply_parents: invited_reply::ReplyParents::new(
+                column("reply_parent"),
+                Duration::from_secs(1),
+            ),
             dynamic_config,
             rules_cache: Arc::new(rules::RulesCache::new()),
             allowlist: None,

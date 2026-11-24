@@ -40,6 +40,37 @@ def dump_layout(record_batch: pa.RecordBatch) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays(list(kept.values()), names=list(kept))
 
 
+def ragged_lengths(
+    record_batch: pa.RecordBatch, columns: list[str]
+) -> dict[str, list[tuple[int, int]]]:
+    ragged: dict[str, list[tuple[int, int]]] = {}
+    for name in columns:
+        if name not in record_batch.schema.names:
+            continue
+        array = record_batch.column(name)
+        if _fixed_size_at_every_depth(array.type):
+            continue
+        lengths: list[tuple[int, int]] = []
+        while True:
+            if pa.types.is_fixed_size_list(array.type):
+                lengths.append((array.type.list_size, array.type.list_size))
+            elif pa.types.is_list(array.type) or pa.types.is_large_list(array.type):
+                found = pc.min_max(pc.list_value_length(array)).as_py()
+                lengths.append((found["min"] or 0, found["max"] or 0))
+            else:
+                break
+            array = array.flatten()
+        if any(low != high for low, high in lengths):
+            ragged[name] = lengths
+    return ragged
+
+
+def _fixed_size_at_every_depth(data_type: pa.DataType) -> bool:
+    while pa.types.is_fixed_size_list(data_type):
+        data_type = data_type.value_type
+    return not (pa.types.is_list(data_type) or pa.types.is_large_list(data_type))
+
+
 def _log_once(column: str, what: str) -> None:
     if (column, what) not in _logged:
         _logged.add((column, what))

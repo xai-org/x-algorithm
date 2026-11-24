@@ -292,12 +292,23 @@ pub fn decide_with_id(
     rules: &CompiledRules,
     facts: &Facts,
 ) -> Result<(Decision, String), EvalError> {
-    use crate::safety_checks::{FOLLOWER_CEILING, PRE_CEILING, ceiling_stops, test_account_stop};
+    use crate::safety_checks::{
+        FOLLOWER_CEILING, PRE_CEILING, ceiling_stops, invited_reply_stop, test_account_stop,
+    };
     let decided = decide_by_rules(rules, facts);
     let stop = test_account_stop(facts)
         .or_else(|| ceiling_stops(facts, false).then_some(&FOLLOWER_CEILING));
     let Some(check) = stop else {
-        return decided;
+        return match decided {
+            Ok((Decision::Act(_), _)) => match invited_reply_stop(facts) {
+                Some(invited) => Ok((
+                    Decision::Skip(invited.reason.to_owned()),
+                    invited.id.to_owned(),
+                )),
+                None => decided,
+            },
+            other => other,
+        };
     };
     match decided {
         Ok((decision @ Decision::Skip(_), id)) if PRE_CEILING.contains(&id.as_str()) => {
@@ -946,6 +957,7 @@ mod tests {
             labels: vec![],
             allowlist: AllowlistFacts::default(),
             author,
+            invited: crate::facts::InvitedReply::NotAReply,
         });
         f
     }

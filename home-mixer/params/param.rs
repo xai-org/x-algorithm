@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-20T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-11-23T16:00:40Z
 use xai_feature_switches::param;
 
 param!(
@@ -1307,7 +1307,7 @@ param!(
     TeacherTtlSeconds,
     u64,
     "rust_home_mixer_teacher_ttl_seconds",
-    3000
+    10800
 );
 
 param!(
@@ -1539,6 +1539,30 @@ param!(
     EnableVideoCarouselMoeOnly,
     bool,
     "rust_home_mixer_enable_video_carousel_moe_only",
+    false
+);
+param!(
+    EnableVideoCarouselPopularVideoSource,
+    bool,
+    "rust_home_mixer_enable_video_carousel_popular_video_source",
+    false
+);
+param!(
+    VideoCarouselPopularVideoClusterId,
+    String,
+    "rust_home_mixer_video_carousel_popular_video_cluster_id",
+    "Experiment26Fou"
+);
+param!(
+    VideoCarouselPopularVideoMaxResults,
+    u32,
+    "rust_home_mixer_video_carousel_popular_video_max_results",
+    100
+);
+param!(
+    EnableVideoCarouselPopularOnly,
+    bool,
+    "rust_home_mixer_enable_video_carousel_popular_only",
     false
 );
 param!(

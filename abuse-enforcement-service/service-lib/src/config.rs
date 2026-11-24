@@ -156,6 +156,16 @@ pub struct Config {
     )]
     pub uas_column: String,
 
+    #[arg(
+        long,
+        default_value = "tweetypie/federated/tweetForApiTweetV3.Tweet",
+        env = "REPLY_PARENT_COLUMN"
+    )]
+    pub reply_parent_column: String,
+
+    #[arg(long, default_value_t = 3000, env = "REPLY_PARENT_TIMEOUT_MS")]
+    pub reply_parent_timeout_ms: u64,
+
     #[arg(long, env = "GROWTHBOOK_URL")]
     pub growthbook_url: Option<String>,
 

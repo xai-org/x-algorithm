@@ -127,12 +127,12 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for TeacherScoreSideEffect {
     fn enable(&self, query: Arc<ScoredPostsQuery>) -> bool {
         let params = &query.params;
         is_prod()
-            && !query.has_cached_posts
-            && query.scoring_sequence.is_some()
             && params.get(EnableTeacherScoreSideEffect)
             && params.get(EnablePhoenixRequestCacheSideEffect)
             && !teacher_action_indices(params).is_empty()
-            && is_prod_cluster(&PhoenixScorer::resolve_cluster(&query))
+            && (query.has_cached_posts
+                || (query.scoring_sequence.is_some()
+                    && is_prod_cluster(&PhoenixScorer::resolve_cluster(&query))))
     }
 
     async fn side_effect(
@@ -158,28 +158,35 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for TeacherScoreSideEffect {
             record_call("empty");
             return Ok(());
         }
-        let written = self
-            .teacher_cache_client
-            .set_ex(
-                teacher_cache_key(prediction_request_id),
-                encode_cache_value(&entry)?,
-                params.get(TeacherTtlSeconds),
-            )
-            .await
-            .map_err(|e| e.to_string());
-        record_call(if written.is_ok() {
-            "written"
+        let key = teacher_cache_key(prediction_request_id);
+        let value = encode_cache_value(&entry)?;
+        let ttl_seconds = params.get(TeacherTtlSeconds);
+        let written = if query.has_cached_posts {
+            self.teacher_cache_client
+                .append_if_exists_ex(key, value, ttl_seconds)
+                .await
+                .map(|appended| if appended { "appended" } else { "no_entry" })
         } else {
-            "write_error"
+            self.teacher_cache_client
+                .set_ex(key, value, ttl_seconds)
+                .await
+                .map(|()| "written")
+        };
+        record_call(match &written {
+            Ok(outcome) => outcome,
+            Err(_) => "write_error",
         });
-        written
+        written.map(|_| ()).map_err(|e| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PredictNextActions;
+    use xai_candidate_pipeline::component_library::clients::redis_client::MockRedisClient;
+    use xai_feature_switches::{FeatureSwitches, Param, RecipientBuilder, Value};
     use xai_recsys_proto::{
         CandidateDistributionSet, NextActionDistribution, PredictNextActionsResponse,
     };
@@ -241,6 +248,44 @@ mod tests {
                 (10, 11, vec![fav, reply], vec![0.125, 0.75]),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn later_pages_append_their_posts_to_the_request_entry() {
+        let fs = FeatureSwitches::new(vec![]).unwrap();
+        let mut results = fs.match_recipient(&RecipientBuilder::new().build());
+        results.override_value(
+            TeacherActionIndices.key().to_string(),
+            Value::Array(vec![Value::from(ActionName::ServerTweetFav as i64)]),
+        );
+        let params: Params = results.into();
+        let page = |has_cached_posts: bool, prediction_request_id: u64, tweet_id: u64| {
+            let mut post = candidate(tweet_id, Some(1.0));
+            post.phoenix_scores.favorite_score = Some(0.5);
+            post.prediction_request_id = Some(prediction_request_id);
+            Arc::new(SideEffectInput {
+                query: Arc::new(ScoredPostsQuery {
+                    params: params.clone(),
+                    has_cached_posts,
+                    ..Default::default()
+                }),
+                selected_candidates: vec![post],
+                non_selected_candidates: vec![],
+            })
+        };
+        let cache = Arc::new(MockRedisClient::default());
+        let side_effect = TeacherScoreSideEffect::new(cache.clone());
+
+        side_effect.side_effect(page(false, 7, 1)).await.unwrap();
+        side_effect.side_effect(page(true, 7, 2)).await.unwrap();
+        side_effect.side_effect(page(true, 8, 3)).await.unwrap();
+
+        let stored = cache.get(teacher_cache_key(7)).await.unwrap();
+        let entry =
+            CandidateSet::decode(zstd::decode_all(stored.as_slice()).unwrap().as_slice()).unwrap();
+        let served: Vec<u64> = entry.candidates.iter().map(|t| t.tweet_id).collect();
+        assert_eq!(served, vec![1, 2]);
+        assert!(cache.get_opt(teacher_cache_key(8)).await.unwrap().is_none());
     }
 
     #[test]

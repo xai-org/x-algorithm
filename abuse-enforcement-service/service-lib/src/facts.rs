@@ -105,6 +105,38 @@ pub struct PostFacts {
     pub labels: Vec<String>,
     #[serde(default)]
     pub author: UserFacts,
+    #[serde(default)]
+    pub invited: InvitedReply,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitedReply {
+    #[default]
+    NotAReply,
+    Mentioned,
+    NotInvited,
+    Unknown,
+}
+
+impl InvitedReply {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAReply => "not_a_reply",
+            Self::Mentioned => "mentioned",
+            Self::NotInvited => "not_invited",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "mentioned" => Self::Mentioned,
+            "not_invited" => Self::NotInvited,
+            "unknown" => Self::Unknown,
+            _ => Self::NotAReply,
+        }
+    }
 }
 
 impl Facts {
@@ -394,6 +426,9 @@ fn emit_post_facts(m: &mut BTreeMap<String, String>, p: &PostFacts) {
         serde_json::to_string(&p.labels).unwrap_or_else(|_| "[]".into()),
     );
     emit_allowlist_block(m, "post_allowlist", &p.allowlist);
+    if p.invited != InvitedReply::NotAReply {
+        m.insert("post_invited_reply".into(), p.invited.as_str().into());
+    }
     emit_user_signals(m, &p.author);
 }
 
@@ -433,6 +468,9 @@ impl Facts {
                     .unwrap_or_default(),
                 allowlist: parse_allowlist_block(map, "post_allowlist"),
                 author: reconstruct_user_signals(map),
+                invited: map
+                    .get("post_invited_reply")
+                    .map_or(InvitedReply::NotAReply, |s| InvitedReply::parse(s)),
             }),
         };
 
@@ -960,6 +998,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                invited: InvitedReply::NotAReply,
             }),
             uas: None,
         };
@@ -1124,5 +1163,45 @@ mod tests {
         assert!(body.last_month.is_empty());
         assert_eq!(body.last_year.len(), 1);
         assert_eq!(body.activities().count(), 1);
+    }
+
+    #[test]
+    fn the_invited_answer_round_trips_and_only_replies_write_it() {
+        let score = ScoreResult {
+            user_id: 7,
+            entity_type: xai_abuse_proto::enforcement::EntityType::Post as i32,
+            entity_id: 70,
+            ..Default::default()
+        };
+        for invited in [
+            InvitedReply::Mentioned,
+            InvitedReply::NotInvited,
+            InvitedReply::Unknown,
+            InvitedReply::NotAReply,
+        ] {
+            let facts = Facts {
+                entity_type: EntityType::Post,
+                entity_id: 70,
+                user_id: 7,
+                topic: "t".into(),
+                score: ScoreFacts::from_score(&score),
+                entity: EntityFacts::Post(PostFacts {
+                    author_id: 7,
+                    invited,
+                    ..Default::default()
+                }),
+                uas: None,
+            };
+            let m = facts.to_additional_info_map();
+            assert_eq!(
+                m.get("post_invited_reply").map(String::as_str),
+                (invited != InvitedReply::NotAReply).then_some(invited.as_str()),
+            );
+            let back = Facts::from_additional_info_map(&m, &score, "t").unwrap();
+            let EntityFacts::Post(p) = back.entity else {
+                panic!("post")
+            };
+            assert_eq!(p.invited, invited);
+        }
     }
 }

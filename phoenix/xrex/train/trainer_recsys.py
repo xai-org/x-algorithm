@@ -1542,6 +1542,13 @@ class RecsysTrainer(Trainer):
             coordination=coordination,
         )
 
+    def stops_at_reader_end(self) -> bool:
+        return (
+            self.stop_at_data_end
+            and self.checkpoint_config.save_final_checkpoint
+            and not self.follow_data_end
+        )
+
     def before_stop_check(self, soft_step: int) -> None:
         follower = self._data_end_follower
         if follower is None:

@@ -34,12 +34,12 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
         let posts_above_pool = &kept[..pool_start.min(kept.len())];
         let drop_high_risk = query.params.get(EnableVideoCarouselHighRiskFilter);
         let drop_medium_risk = query.params.get(EnableVideoCarouselMediumRiskFilter);
-        let moe_only = video_carousel::moe_only(query);
+        let allowed_source = video_carousel::allowed_source(query);
         let carousel = video_carousel::select_videos(
             kept.iter()
                 .skip(pool_start)
                 .chain(&removed)
-                .filter(|candidate| !moe_only || video_carousel::from_moe_source(candidate))
+                .filter(|candidate| allowed_source(candidate))
                 .filter(|candidate| {
                     !video_carousel::was_seen(&query.seen_carousel_video_ids, candidate)
                 })
