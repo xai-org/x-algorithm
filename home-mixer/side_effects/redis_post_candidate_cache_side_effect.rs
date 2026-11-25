@@ -1,6 +1,7 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::MaxPostsToCache;
+use crate::params::{MaxPostsToCache, VideoCarouselExtraCandidates};
+use crate::util::video_carousel::CarouselScoring;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::redis_client::{self, RedisClient};
@@ -20,22 +21,27 @@ impl RedisPostCandidateCacheSideEffect {
     }
 
     pub(crate) fn get_candidates_to_cache<'a>(
+        query: &ScoredPostsQuery,
         selected: &'a [PostCandidate],
         non_selected: &'a [PostCandidate],
-        max_posts_to_cache: usize,
     ) -> Vec<&'a PostCandidate> {
-        let mut all_candidates: Vec<&PostCandidate> = selected
-            .iter()
-            .chain(non_selected.iter())
-            .filter(|c| c.weighted_score.is_some_and(|s| s > 0.0))
-            .collect();
+        let (mut carousel_only, mut all_candidates): (Vec<&PostCandidate>, Vec<&PostCandidate>) =
+            selected
+                .iter()
+                .chain(non_selected.iter())
+                .filter(|c| c.weighted_score.is_some_and(|s| s > 0.0))
+                .partition(|c| c.carousel_only);
         all_candidates.sort_by(|a, b| {
             b.weighted_score
                 .unwrap()
                 .partial_cmp(&a.weighted_score.unwrap())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all_candidates.truncate(max_posts_to_cache);
+        all_candidates.truncate(query.params.get(MaxPostsToCache));
+        let scoring = CarouselScoring::from_query(query);
+        carousel_only.sort_by(|a, b| scoring.rank(a, b));
+        carousel_only.truncate(query.params.get(VideoCarouselExtraCandidates));
+        all_candidates.extend(carousel_only);
         all_candidates
     }
 }
@@ -50,13 +56,12 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for RedisPostCandidateCacheSide
         &self,
         input: Arc<SideEffectInput<ScoredPostsQuery, PostCandidate>>,
     ) -> Result<(), String> {
-        let max_posts_to_cache = input.query.params.get(MaxPostsToCache);
         let user_id = input.query.user_id;
 
         let candidates_to_cache = Self::get_candidates_to_cache(
+            &input.query,
             &input.selected_candidates,
             &input.non_selected_candidates,
-            max_posts_to_cache,
         );
 
         let cache_key = redis_client::cached_posts_key(
@@ -244,9 +249,9 @@ mod tests {
             .collect();
 
         let result = RedisPostCandidateCacheSideEffect::get_candidates_to_cache(
+            &ScoredPostsQuery::default(),
             &selected,
             &non_selected,
-            max_posts_to_cache,
         );
 
         assert_eq!(result.len(), max_posts_to_cache);
@@ -264,13 +269,37 @@ mod tests {
         let non_selected = vec![candidate(4, 400, Some(3.0)), candidate(5, 500, Some(-1.0))];
 
         let result = RedisPostCandidateCacheSideEffect::get_candidates_to_cache(
+            &ScoredPostsQuery::default(),
             &selected,
             &non_selected,
-            750,
         );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].tweet_id, 1);
         assert_eq!(result[1].tweet_id, 4);
+    }
+
+    #[test]
+    fn carousel_only_posts_skip_feed_cache_spots() {
+        let selected: Vec<PostCandidate> = (0..1000).map(|i| candidate(i, i, Some(1.0))).collect();
+        let non_selected: Vec<PostCandidate> = (1000..1040)
+            .map(|i| PostCandidate {
+                carousel_only: true,
+                ..candidate(i, i, Some(2.0))
+            })
+            .collect();
+
+        let cached = RedisPostCandidateCacheSideEffect::get_candidates_to_cache(
+            &ScoredPostsQuery::default(),
+            &selected,
+            &non_selected,
+        );
+
+        assert_eq!(cached.iter().filter(|c| !c.carousel_only).count(), 750);
+        assert_eq!(cached.iter().filter(|c| c.carousel_only).count(), 30);
+        assert!(crate::util::video_carousel::is_carousel_only(
+            cached[750],
+            false
+        ));
     }
 }

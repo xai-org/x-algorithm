@@ -81,6 +81,7 @@ from xrex.eval.recsys_eval import RecsysTwoTowerEval, run_recsys_evals
 from xrex.models.compress_token_ids import compress_token_ids, compress_token_ids_by_search
 from xrex.models.fp8 import Fp8Gemms, check_compiled_fp8_gemms
 from xrex.models.model_utils import Parameter, unwrap_tree
+from xrex.models.page_rl import USER_DEBIAS_PARAM_REGEX
 from xrex.models.recsys_embedding import (
     EmbTable,
     RecsysEmbeddings,
@@ -520,7 +521,10 @@ class RecsysTrainer(Trainer):
 
     use_row_emb: bool = False
     row_emb_recv_factor: float = 2.0
+
     num_microbatch: int = 1
+
+    microbatch_iteration: typing.Literal["loop", "scan"] = "loop"
 
     forward_only: bool = False
     _forward_only_first_metrics_s: float | None = field(default=None, init=False, repr=False)
@@ -602,6 +606,16 @@ class RecsysTrainer(Trainer):
                 self.dataset.distill_actions = self.model_config.distill_action_indices
                 self.dataset.distill_bad_spans_ms = teacher_distill.parse_spans_ms(
                     self.model_config.distill_bad_spans_ms
+                )
+            self.dataset.user_history_stats_dim = self.model_config.user_history_stats_dim
+        if (
+            isinstance(self.model_config, RecsysAggregatedModelConfig)
+            and self.model_config.page_rl.user_debias.enabled
+        ):
+            partitions = self.optim_config.clip_partitions or []
+            if USER_DEBIAS_PARAM_REGEX not in partitions:
+                self.optim_config = replace(
+                    self.optim_config, clip_partitions=[*partitions, USER_DEBIAS_PARAM_REGEX]
                 )
         if self.export_stablehlo_bundle and not self.checkpoint_config.copy_port:
             raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
@@ -766,7 +780,6 @@ class RecsysTrainer(Trainer):
     def _metric_ema_cells(self) -> list[tuple[str, str]]:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
         from xrex.data.recsys.ads_head_masking import metric_head_mask_keys
-        from xrex.data.recsys.constants import engagement_to_ids
         from xrex.models.recsys_model import build_metric_masks
 
         dummy = jnp.zeros((1, 1))
@@ -785,7 +798,7 @@ class RecsysTrainer(Trainer):
             ).keys()
         )
         head_mask_keys = metric_head_mask_keys(
-            engagement_to_ids(self.model_config.metric_group),
+            self.model_config.engagement_ids(),
             mask_keys,
             own_slice=self.model_config.metric_own_slice,
         )
@@ -2111,7 +2124,7 @@ class RecsysTrainer(Trainer):
                 gradients = accumulate(gradients, gradients_k)
                 if pool is not None:
                     pool_gradients = accumulate(pool_gradients, pool_gradients_k[0])
-                return gradients, pool_gradients, (loss_k, stats, emb_gradients, metric_inputs)
+                return (gradients, pool_gradients), (loss_k, stats, emb_gradients, metric_inputs)
 
             inputs = (rngs, batches, embeddings, candidate_inputs)
             inputs, loss_normalizers = jax.lax.optimization_barrier((inputs, loss_normalizers))
@@ -2121,18 +2134,31 @@ class RecsysTrainer(Trainer):
                 if pool is None
                 else jax.tree.map(lambda x: jnp.zeros(x.shape, jnp.float32), pool)
             )
-            outputs = []
-            for k in range(rngs.shape[0]):
-                if k > 0:
-                    inputs, gradients, pool_gradients, outputs[-1] = jax.lax.optimization_barrier(
-                        (inputs, gradients, pool_gradients, outputs[-1])
+            if self.microbatch_iteration == "scan":
+                (gradients, pool_gradients), (losses, stats, emb_gradients, metric_inputs) = (
+                    jax.lax.scan(
+                        lambda sums, microbatch: body(*sums, *microbatch),
+                        (gradients, pool_gradients),
+                        inputs,
                     )
-                microbatch = jax.tree.map(operator.itemgetter(k), inputs)
-                gradients, pool_gradients, output = body(gradients, pool_gradients, *microbatch)
-                outputs.append(output)
-            losses, stats, emb_gradients, metric_inputs = jax.tree.map(
-                lambda *xs: jnp.stack(xs), *outputs
-            )
+                )
+            else:
+                outputs = []
+                for k in range(rngs.shape[0]):
+                    if k > 0:
+                        inputs, gradients, pool_gradients, outputs[-1] = (
+                            jax.lax.optimization_barrier(
+                                (inputs, gradients, pool_gradients, outputs[-1])
+                            )
+                        )
+                    microbatch = jax.tree.map(operator.itemgetter(k), inputs)
+                    (gradients, pool_gradients), output = body(
+                        gradients, pool_gradients, *microbatch
+                    )
+                    outputs.append(output)
+                losses, stats, emb_gradients, metric_inputs = jax.tree.map(
+                    lambda *xs: jnp.stack(xs), *outputs
+                )
             if pool_vjp is not None:
                 pool_param_gradients, pool_emb_gradients = pool_vjp(
                     jax.tree.map(lambda g, x: g.astype(x.dtype), pool_gradients, pool)
@@ -2856,6 +2882,19 @@ class RecsysTrainer(Trainer):
         ):
             if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):
                 raise ValueError("page_rl needs a dataset with page_records=True")
+        if (
+            isinstance(self.model_config, RecsysAggregatedModelConfig)
+            and (
+                self.model_config.video_completion_head
+                or self.model_config.video_completion_history
+                or self.model_config.feature_prep.enable_video_completion_rate_history
+            )
+            and not (isinstance(self.dataset, PhoenixDataset) and self.dataset.read_video_duration)
+        ):
+            raise ValueError(
+                "video_completion_head / _history / enable_video_completion_rate_history need a "
+                "dataset with read_video_duration=True"
+            )
         if self.model_config.model_config.fp8_gemms != Fp8Gemms.OFF and not self.forward_only:
             if not self.use_async_emb:
                 raise ValueError("fp8_gemms requires use_async_emb=True")

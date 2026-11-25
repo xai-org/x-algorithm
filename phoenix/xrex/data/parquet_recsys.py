@@ -1997,12 +1997,14 @@ class PhoenixDataset(Dataset):
     ld_label_exclude_clicks: bool = False
     enable_stale_post: bool = False
     enable_stale_post_30d: bool = False
+    user_history_stats_dim: int = 0
 
     ads_head_masking: bool = False
     dump_keep_rate_per_10000: int | None = None
     ads_pixel_head_masking: bool = False
     ads_late_window_heads: bool = False
     page_records: bool = False
+    read_video_duration: bool = False
     read_ads_engagement_counts: bool = False
     read_ads_ctr_features: bool = False
     per_candidate_sample_weight: bool = False
@@ -2627,6 +2629,7 @@ class PhoenixDataset(Dataset):
                         read_ads_ctr_features=self.read_ads_ctr_features,
                         per_candidate_sample_weight=self.per_candidate_sample_weight,
                         long_term_author_profile_size=self.long_term_author_profile_size,
+                        user_history_stats_dim=self.user_history_stats_dim,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
                         read_ad_side_ids=self.read_ad_side_ids,
@@ -2788,6 +2791,8 @@ class PhoenixDataset(Dataset):
             batch_shape["user_id_list_mask"] = jax.ShapeDtypeStruct(ilm.shape, ilm.dtype)
         for key, arr in author_profile.present(example_data).items():
             batch_shape[key] = jax.ShapeDtypeStruct(arr.shape, arr.dtype)
+        if (stats := example_data.get("user_history_stats")) is not None:
+            batch_shape["user_history_stats"] = jax.ShapeDtypeStruct(stats.shape, stats.dtype)
 
         return batch_shape
 
@@ -2959,6 +2964,10 @@ class PhoenixDataset(Dataset):
                 author_profile.empty(
                     batch_size, self.long_term_author_profile_size, self.hash_table.get_author_hash
                 )
+            )
+        if self.user_history_stats_dim:
+            batch["user_history_stats"] = np.zeros(
+                (batch_size, self.user_history_stats_dim), dtype=np.float32
             )
         return batch
 

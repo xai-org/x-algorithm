@@ -59,6 +59,7 @@ class Int64Feature(enum.IntEnum):
     clientAppIdSeq = 0
     promotedIdSeq = 1
     dpaSidLevel0 = 3
+    firstVideoDurationMsSeq = 4
     favCountSeq = 5
     replyCountSeq = 6
     repostCountSeq = 7
@@ -76,6 +77,12 @@ class Int64Feature(enum.IntEnum):
     dpaSidLevel3 = 19
     dpaSidLevel4 = 20
     dpaSidLevel5 = 21
+    notInterestedCountSeq = 22
+    notificationSentCountSeq = 23
+    notificationOpenCountSeq = 24
+    notificationClickCountSeq = 25
+    notificationDismissCountSeq = 26
+    notificationSeeLessOftenCountSeq = 27
 
 
 DPA_SID_NUM_LEVELS = 6
@@ -185,6 +192,8 @@ BASE_REQUIRED_COLUMNS: list[str] = [
 
 SAMPLE_WEIGHT_SEQ_COLUMN = "sampleWeightSeq"
 
+VIDEO_DURATION_COLUMN = "firstVideoDurationMsSeq"
+
 OPTIONAL_COLUMNS: list[str] = [
     "searchQueryEmbeddingSeq",
     "lineItemObjectiveSeq",
@@ -196,6 +205,7 @@ OPTIONAL_COLUMNS: list[str] = [
     "dpaSidCodesSeq",
     "authorFollowerCountSeq",
     "inReplyToPostIdSeq",
+    "firstVideoDurationMsSeq",
     "sample_source",
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
@@ -219,6 +229,12 @@ OPTIONAL_COLUMNS: list[str] = [
     "webConvTimeOnSiteInferredMsSeq",
     "webConvTimeOnSiteMeasuredMsSeq",
     "webConvTrackingIntegrationSeq",
+    "notInterestedCountSeq",
+    "notificationSentCountSeq",
+    "notificationOpenCountSeq",
+    "notificationClickCountSeq",
+    "notificationDismissCountSeq",
+    "notificationSeeLessOftenCountSeq",
     "exactPhraseSeq",
     "matchedWordFractionSeq",
     "lexicalTextSeq",

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-11-23T16:00:40Z
+// mirrored from config feature-switch defaults; last sync 2026-11-24T16:00:39Z
 use xai_feature_switches::param;
 
 param!(
@@ -821,6 +821,12 @@ param!(
     false
 );
 param!(
+    EnableUnderTheHoodLimit,
+    bool,
+    "rust_home_mixer_enable_under_the_hood_limit",
+    false
+);
+param!(
     MaxPostsToCache,
     usize,
     "rust_home_mixer_max_posts_to_cache",
@@ -1423,6 +1429,18 @@ param!(
     JetfuelFrameGrokbotSuggestedTasksFatigueHours,
     u32,
     "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_fatigue_hours",
+    6
+);
+param!(
+    EnableJetfuelFrameGrokbotBlackFriday,
+    bool,
+    "rust_home_mixer_jetfuel_frame_grokbot_black_friday_enabled",
+    false
+);
+param!(
+    JetfuelFrameGrokbotBlackFridayFatigueHours,
+    u32,
+    "rust_home_mixer_jetfuel_frame_grokbot_black_friday_fatigue_hours",
     6
 );
 

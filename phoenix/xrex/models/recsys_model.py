@@ -78,11 +78,16 @@ from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_st
 from xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions
 from xrex.models.layers import Linear, get_parameter
 from xrex.models.loss_recsys import (
+    EgmnMixture,
     binary_threshold_loss_compute,
     continuous_loss_compute,
     continuous_loss_weights,
     cread_log_thresholds,
     cread_loss_compute,
+    egmn_expected_value,
+    egmn_initial_bias,
+    egmn_loss_compute,
+    egmn_mixture_from_raw,
     multihot_loss_compute,
     multihot_loss_weights,
     tweedie_loss_compute,
@@ -92,12 +97,20 @@ from xrex.models.normalization import rms_norm_fn
 from xrex.models.page_rl import (
     REALIZED_NEGATIVE_ACTIONS,
     REALIZED_POSITIVE_ACTIONS,
+    USER_DEBIAS_ACTIONS,
+    USER_DEBIAS_OUTPUTS,
+    VIDEO_COMPLETED_ACTION,
     PageDecodeInputs,
     PageRlConfig,
+    UserDebiasBatch,
+    VideoCompletionLabelConfig,
     page_decode_noop_outputs,
     page_rl_head_features,
     page_rl_loss_and_stats,
+    page_user_debias_serve,
+    page_user_debias_shift,
     run_page_decode,
+    video_completion_labels,
 )
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import (
@@ -111,8 +124,10 @@ from xrex.models.recsys_feature_prep import (
     DWELL_TIME_DEFAULT_SENTINEL_SEC,
     MAX_VALID_DWELL_SEC,
     MIN_VALID_DWELL_SEC,
+    NOTIFICATION_COUNT_ORDER,
     FeaturePrepConfig,
     build_feature_prep_inputs,
+    user_history_stats_features,
 )
 from xrex.models.recsys_sid import (
     reconstruct_entity_sid,
@@ -201,6 +216,29 @@ RECENT_POSITIVE_ACTIONS: tuple[str, ...] = (
     "CLIENT_TWEET_SHARE_VIA_COPY_LINK",
     "CLIENT_TWEET_CLICK_SEND_VIA_DIRECT_MESSAGE",
 )
+
+VIDEO_COMPLETED_HEAD = "IsVideoCompleted"
+VIDEO_COMPLETED_PRIOR = 0.06
+
+
+def with_video_completion_history(
+    batch: RecsysFeaturesBatch, label: VideoCompletionLabelConfig
+) -> RecsysFeaturesBatch:
+    history = batch["history_seq"]
+    continuous_actions, int64_features = history["continuous_actions"], history["int64_features"]
+    assert continuous_actions is not None
+    trains, completed = video_completion_labels(
+        jnp.asarray(continuous_actions)[..., recsys_pb2.ContinuousActionName.DWELL_TIME],
+        jnp.asarray(int64_features)[..., Int64Feature.firstVideoDurationMsSeq],
+        label,
+    )
+    actions = jnp.asarray(history["actions"])
+    actions = actions.at[..., VIDEO_COMPLETED_ACTION].set(
+        (trains & completed).astype(actions.dtype)
+    )
+    return typing.cast(
+        RecsysFeaturesBatch, {**batch, "history_seq": {**history, "actions": actions}}
+    )
 
 
 def recency_time_features(x: jax.Array, k: int = RECENCY_FOURIER) -> jax.Array:
@@ -493,7 +531,7 @@ class ContinuousActionLossConfig(Config):
 
     loss_weight: float = 0.0
 
-    loss_type: Literal["mse", "mae", "huber", "tweedie", "binary", "cread"] = "mae"
+    loss_type: Literal["mse", "mae", "huber", "tweedie", "binary", "cread", "egmn"] = "mae"
 
     tweedie_power: float = 1.5
 
@@ -514,6 +552,15 @@ class ContinuousActionLossConfig(Config):
     cread_serve_power: float = 1.0
 
     cread_serve_scale: float = 1.0
+
+    cread_add_click_dwell: bool = False
+
+    egmn_num_gaussians: int = 10
+    egmn_entropy_weight: float = 0.1
+    egmn_regression_weight: float = 1.0
+    egmn_regression_loss: Literal["mae", "mse", "huber", "none"] = "mae"
+    egmn_unit_secs: float = 10.0
+    egmn_min_sigma_secs: float = 1.0
 
     activation: Literal["sigmoid", "softplus"] | None = None
 
@@ -554,6 +601,14 @@ class ContinuousActionLossConfig(Config):
                 "loss_type='binary' outputs a probability in [0, 1]; output_cap does not apply"
             )
 
+        if self.cread_add_click_dwell and (
+            self.loss_type not in ("cread", "egmn")
+            or self.action_index != recsys_pb2.ContinuousActionName.DWELL_TIME
+        ):
+            raise ValueError(
+                "cread_add_click_dwell requires loss_type='cread' or 'egmn' on DWELL_TIME"
+            )
+
         if self.loss_type == "cread":
             _ = self.cread_threshold_values
             if not 0.0 < self.cread_serve_power <= CREAD_SERVE_POWER_MAX:
@@ -566,6 +621,10 @@ class ContinuousActionLossConfig(Config):
                     f"cread_huber_delta_sec ({self.cread_huber_delta_sec}) must be in "
                     f"(0, norm_scale={self.norm_config.norm_scale})"
                 )
+
+    @property
+    def masks_dwell_sentinels(self) -> bool:
+        return self.loss_type in ("cread", "egmn") and self.cread_mask_sentinel_labels
 
     @property
     def cread_threshold_values(self) -> tuple[float, ...]:
@@ -589,6 +648,17 @@ def validate_continuous_action_losses(losses: list[ContinuousActionLossConfig]) 
                 "filters; zero out the one being replaced"
             )
         seen[key] = lc.metric_name
+
+
+def continuous_action_label(
+    continuous_actions: jax.Array, loss_config: ContinuousActionLossConfig
+) -> jax.Array:
+    label = continuous_actions[..., loss_config.action_index]
+    if not loss_config.cread_add_click_dwell:
+        return label
+    click_dwell = continuous_actions[..., recsys_pb2.ContinuousActionName.CLICK_DWELL_TIME]
+    is_sentinel = (label == 0.0) | (label == DWELL_TIME_DEFAULT_SENTINEL_SEC)
+    return jnp.where(is_sentinel, label, label + click_dwell)
 
 
 @configclass
@@ -707,6 +777,11 @@ def _get_surface_mask(
         return ~jnp.isin(product_surface, jnp.array(loss_config.exclude_product_surfaces))
     else:
         return jnp.ones(product_surface.shape, dtype=jnp.bool_)
+
+
+def page_user_debias_stats(batch: RecsysFeaturesBatch) -> jax.Array:
+    stats = cast_jax(batch["user_history_stats"])
+    return jax.lax.stop_gradient(user_history_stats_features(stats.reshape(-1, stats.shape[-1])))
 
 
 def _rescale_sigmoid_heads_for_inference(
@@ -943,13 +1018,18 @@ def engagement_metrics(p, y, masks, auc_thresholds, *, ndcg_shared_sorts: bool):
 
 
 def get_probs_and_labels(
-    logits: jax.Array, raw_targets: jax.Array, metric_group: str = "default"
+    logits: jax.Array,
+    raw_targets: jax.Array,
+    metric_group: str = "default",
+    extra_heads: dict[str, list[int]] | None = None,
 ) -> dict[str, tuple[jax.Array, jax.Array]]:
     logits = logits.astype(jnp.float32)
     probs = jax.nn.sigmoid(logits)
     prob_labels = {}
-    eng_to_ids = engagement_to_ids(metric_group)
-    for eng_name, client_event_list in eng_to_ids.items():
+    for eng_name, client_event_list in {
+        **engagement_to_ids(metric_group),
+        **(extra_heads or {}),
+    }.items():
         id_array = jnp.array(client_event_list)
         y = jnp.any(raw_targets[..., id_array] == 1, axis=-1).astype(jnp.float32)
         p = probs[..., id_array].max(axis=-1)
@@ -1479,6 +1559,10 @@ class RecsysAggregatedModelConfig(Config):
 
     metric_group: str = "default"
 
+    video_completion_head: bool = False
+    video_completion_history: bool = False
+    video_completion_label: VideoCompletionLabelConfig = VideoCompletionLabelConfig()
+
     metric_mask_keys: list[str] | None = None
     metric_own_slice: bool = False
     metrics_ndcg_shared_sorts: bool = False
@@ -1490,6 +1574,8 @@ class RecsysAggregatedModelConfig(Config):
     history_url_embedding_dim: int = 0
 
     search_query_embedding_dim: int = 0
+
+    user_history_stats_dim: int = 0
 
     use_post_sid: bool = False
     use_post_embedding: bool = True
@@ -1565,6 +1651,14 @@ class RecsysAggregatedModelConfig(Config):
             return 0
         return EMBEDDING_CONFIG[self.multimodal_embedding_type][1]
 
+    def extra_metric_heads(self) -> dict[str, list[int]]:
+        if self.video_completion_head:
+            return {VIDEO_COMPLETED_HEAD: [VIDEO_COMPLETED_ACTION]}
+        return {}
+
+    def engagement_ids(self) -> dict[str, list[int]]:
+        return {**engagement_to_ids(self.metric_group), **self.extra_metric_heads()}
+
     def make(self, sharding_context: ShardingContext) -> RecsysAggregatedModel:
         self.validate()
         return RecsysAggregatedModel(
@@ -1614,6 +1708,24 @@ class RecsysAggregatedModelConfig(Config):
                 raise ValueError(
                     "candidate_only_layers_update_user_token supports one candidate-only layer."
                 )
+
+        debias = self.page_rl.user_debias
+        if debias.enabled and not self.page_rl.enabled:
+            raise ValueError("page_rl.user_debias trains in the page-RL loss; enable page_rl.")
+        if (debias.serve_heads or debias.serve_dwell) and not debias.enabled:
+            raise ValueError("page_rl.user_debias flags need page_rl.user_debias.enabled.")
+        if debias.enabled and self.user_history_stats_dim == 0:
+            raise ValueError(
+                "page_rl.user_debias reads user_history_stats; set user_history_stats_dim."
+            )
+        if self.user_history_stats_dim > 0 and not self.use_user_embedding:
+            raise ValueError(
+                "user_history_stats_dim adds to the user token; needs use_user_embedding."
+            )
+        if self.user_history_stats_dim > 0 and not self.feature_prep_enabled:
+            raise ValueError(
+                "user_history_stats_dim is read by feature prep; set feature_prep_enabled."
+            )
 
         if self.feature_prep_enabled:
             fp = self.feature_prep
@@ -2727,7 +2839,9 @@ class RecsysAggregatedModel(hk.Module):
         conversion_delay_ms: jax.Array | None = None,
         head_eligible_mask: jax.Array | None = None,
     ) -> dict:
-        prob_labels = get_probs_and_labels(logits, raw_targets, self.config.metric_group)
+        prob_labels = get_probs_and_labels(
+            logits, raw_targets, self.config.metric_group, self.config.extra_metric_heads()
+        )
 
         eng_names = []
         p_list = []
@@ -2744,7 +2858,7 @@ class RecsysAggregatedModel(hk.Module):
         per_head_eligible: dict[str, jax.Array] | None = None
         per_head_mask_values: jax.Array | None = None
         if head_eligible_mask is not None:
-            eng_to_ids = engagement_to_ids(self.config.metric_group)
+            eng_to_ids = self.config.engagement_ids()
             eligible = head_eligible_mask.astype(mask_values[0].dtype)
             per_head_eligible = {
                 eng_name: jnp.max(eligible[..., jnp.array(eng_to_ids[eng_name])], axis=-1)
@@ -2756,7 +2870,7 @@ class RecsysAggregatedModel(hk.Module):
             )
 
         head_mask_keys = metric_head_mask_keys(
-            engagement_to_ids(self.config.metric_group),
+            self.config.engagement_ids(),
             mask_keys,
             own_slice=self.config.metric_own_slice,
         )
@@ -2872,8 +2986,11 @@ class RecsysAggregatedModel(hk.Module):
         packed_candidate_seq_len: int,
         stats: dict,
         raw_weights: jax.Array | None = None,
+        eligible_heads: jax.Array | None = None,
     ) -> dict:
-        prob_labels = get_probs_and_labels(logits, raw_targets, self.config.metric_group)
+        prob_labels = get_probs_and_labels(
+            logits, raw_targets, self.config.metric_group, self.config.extra_metric_heads()
+        )
 
         len_per_candidate = jnp.repeat(history_len, packed_candidate_seq_len, axis=1)
 
@@ -2884,9 +3001,13 @@ class RecsysAggregatedModel(hk.Module):
             ("len_768_1022", 768, 1022),
         ]
 
+        eng_to_ids = self.config.engagement_ids()
         for eng_name, (p, y) in prob_labels.items():
+            head_mask = mask
+            if eligible_heads is not None:
+                head_mask = head_mask & eligible_heads[..., jnp.array(eng_to_ids[eng_name])].any(-1)
             for bucket_name, lo, hi in buckets:
-                bucket_mask = mask & (len_per_candidate >= lo) & (len_per_candidate <= hi)
+                bucket_mask = head_mask & (len_per_candidate >= lo) & (len_per_candidate <= hi)
                 bucket_mask_f = bucket_mask.astype(jnp.float32)
 
                 if raw_weights is not None:
@@ -3080,7 +3201,10 @@ class RecsysAggregatedModel(hk.Module):
             and self.config.context_features.enable_engagement_counts
         )
         stale_on = self.config.feature_prep_enabled and self.config.feature_prep.enable_stale_post
-        if batch is None or not (fp_on or ctx_on or stale_on):
+        notif_on = (
+            self.config.feature_prep_enabled and self.config.feature_prep.enable_notification_counts
+        )
+        if batch is None or not (fp_on or ctx_on or stale_on or notif_on):
             return stats
 
         def _add_scalar_stats(
@@ -3179,6 +3303,13 @@ class RecsysAggregatedModel(hk.Module):
                     jnp.float32
                 )
                 stats[f"ec/stale_post_14d/{side}/zeroed_frac"] = jnp.sum(is_stale * valid) / n_valid
+
+            if notif_on:
+                for feat in NOTIFICATION_COUNT_ORDER:
+                    if i64.shape[-1] > feat.value:
+                        _add_scalar_stats(
+                            feat.name.removesuffix("CountSeq"), side, i64[:, :, feat.value], valid
+                        )
 
         return stats
 
@@ -3557,7 +3688,37 @@ class RecsysAggregatedModel(hk.Module):
     @hk.transparent
     def decode(self, inputs: jax.Array) -> jax.Array:
         unembeddings = self._get_unembedding()
-        return jnp.dot(inputs.astype(unembeddings.dtype), unembeddings).astype(inputs.dtype)
+        logits = jnp.dot(inputs.astype(unembeddings.dtype), unembeddings).astype(inputs.dtype)
+        if self.config.video_completion_head:
+            logits = logits.at[..., VIDEO_COMPLETED_ACTION].set(
+                self._decode_video_completion(inputs)[..., 0]
+            )
+        return logits
+
+    @hk.transparent
+    def _decode_video_completion(self, inputs: jax.Array) -> jax.Array:
+        emb_size = self.readout_width
+        scale_config = self.config.model_config.scale_config
+        unembed = get_parameter(
+            "video_completion_unembeddings",
+            [emb_size, 1],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=scale_config.head_lr_multiplier(emb_size),
+            rms_clip_axes=(-1, -2),
+        )
+        prior_logit = math.log(VIDEO_COMPLETED_PRIOR / (1.0 - VIDEO_COMPLETED_PRIOR))
+        bias = get_parameter(
+            "video_completion_bias",
+            [1],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(prior_logit / scale_config.output_scale(emb_size)),
+            pspec=P(None),
+            lr_multiplier=1.0,
+            rms_clip_axes=(),
+        )
+        return (jnp.dot(inputs.astype(unembed.dtype), unembed) + bias).astype(inputs.dtype)
 
     @hk.transparent
     def _get_continuous_unembedding(self) -> jax.Array:
@@ -3754,6 +3915,45 @@ class RecsysAggregatedModel(hk.Module):
         return restored.astype(inputs.dtype)
 
     @hk.transparent
+    def _decode_egmn(self, inputs: jax.Array, loss_config: ContinuousActionLossConfig) -> jax.Array:
+        _config = self.config
+        emb_size = self.readout_width
+        num_gaussians = loss_config.egmn_num_gaussians
+        num_outputs = 3 * num_gaussians + 2
+        unembed_mat = get_parameter(
+            f"{loss_config.metric_name}_egmn_unembeddings",
+            [emb_size, num_outputs],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=_config.model_config.scale_config.head_lr_multiplier(emb_size),
+            rms_clip_axes=(-1, -2),
+        )
+        bias = get_parameter(
+            f"{loss_config.metric_name}_egmn_bias",
+            [num_outputs],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(
+                egmn_initial_bias(
+                    num_gaussians,
+                    loss_config.norm_config.norm_scale,
+                    loss_config.egmn_unit_secs,
+                    loss_config.egmn_min_sigma_secs,
+                )
+            ),
+            pspec=P(None),
+            dtype_unwrap=jnp.float32,
+        )
+        raw = jnp.dot(inputs.astype(unembed_mat.dtype), unembed_mat).astype(jnp.float32) + bias
+        mixture = egmn_mixture_from_raw(
+            raw, num_gaussians, loss_config.egmn_min_sigma_secs, loss_config.egmn_unit_secs
+        )
+        assert loss_config.metric_name is not None
+        self.egmn_mixtures[loss_config.metric_name] = mixture
+        expected = egmn_expected_value(mixture, loss_config.egmn_unit_secs)[..., None]
+        return expected.astype(inputs.dtype)
+
+    @hk.transparent
     def decode_continuous(
         self,
         inputs: jax.Array,
@@ -3762,6 +3962,7 @@ class RecsysAggregatedModel(hk.Module):
         cread_decode: dict[str, tuple[jax.Array, jax.Array]] | None = None,
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
         self.cread_logits: dict[str, jax.Array] = {}
+        self.egmn_mixtures: dict[str, EgmnMixture] = {}
         unembeddings = self._get_continuous_unembedding()
         logits = jnp.dot(inputs.astype(unembeddings.dtype), unembeddings).astype(inputs.dtype)
 
@@ -3823,6 +4024,8 @@ class RecsysAggregatedModel(hk.Module):
                 if c.loss_type == "cread":
                     request_decode = (cread_decode or {}).get(c.metric_name or "")
                     return self._decode_cread(inputs, c, request_decode)
+                if c.loss_type == "egmn":
+                    return self._decode_egmn(inputs, c)
                 out = self._apply_activation(head_logits, c.activation)
                 if c.output_cap > 0:
                     out = c.output_cap * jnp.tanh(out / c.output_cap)
@@ -4222,6 +4425,10 @@ class RecsysAggregatedModel(hk.Module):
     ) -> tuple[jax.Array, jax.Array, int | None, jax.Array | None]:
         _config = self.config
         assert _config.model_config.output_vocab_size is not None, "output_vocab_size is required"
+        if _config.video_completion_history:
+            recsys_features_batch = with_video_completion_history(
+                recsys_features_batch, _config.video_completion_label
+            )
 
         if _config.feature_prep_enabled:
             assert not _config.enable_dpa_input_embedding, (
@@ -4242,6 +4449,7 @@ class RecsysAggregatedModel(hk.Module):
                 is_training=is_training,
                 mesh=self.sharding_context.mesh if is_training else None,
                 data_axis=self.data_axis,
+                use_user_history_stats=_config.user_history_stats_dim > 0,
             )
             tokens = with_sharding_constraint_unless_manual(
                 tokens, P(self.data_axis, ("seq", "model"))
@@ -5009,6 +5217,21 @@ class RecsysAggregatedModel(hk.Module):
                 target_padding_mask = target_padding_mask & trained_heads.any(-1)
             if candidate_sample_weight is not None:
                 target_padding_mask = target_padding_mask & (cast_jax(candidate_sample_weight) > 0)
+            if self.config.video_completion_head:
+                assert candidate_continuous_actions is not None
+                trains, completed = video_completion_labels(
+                    candidate_continuous_actions[..., recsys_pb2.ContinuousActionName.DWELL_TIME],
+                    cast_jax(batch["candidate_seq"]["int64_features"])[
+                        ..., Int64Feature.firstVideoDurationMsSeq
+                    ],
+                    self.config.video_completion_label,
+                )
+                targets = targets.at[..., VIDEO_COMPLETED_ACTION].set(
+                    completed.astype(targets.dtype)
+                )
+                if eligible_heads is None:
+                    eligible_heads = jnp.ones(targets.shape, bool)
+                eligible_heads = eligible_heads.at[..., VIDEO_COMPLETED_ACTION].set(trains)
 
             negative_sample_mask = jnp.broadcast_to(negative_sample_mask, target_padding_mask.shape)
 
@@ -5068,7 +5291,7 @@ class RecsysAggregatedModel(hk.Module):
                             )
                         continuous_heads[index] = (head_valid_mask, head_mask)
                         valid_mask = head_valid_mask
-                        if loss_config.loss_type == "cread":
+                        if loss_config.loss_type in ("cread", "egmn"):
                             valid_mask = valid_mask.astype(jnp.bool_)
                         _, weights = continuous_loss_weights(
                             valid_mask,
@@ -5076,13 +5299,10 @@ class RecsysAggregatedModel(hk.Module):
                             loss_config.mask_negatives,
                             loss_weights,
                         )
-                        if (
-                            loss_config.loss_type == "cread"
-                            and loss_config.cread_mask_sentinel_labels
-                        ):
-                            gt_raw = candidate_continuous_actions[
-                                :, :, loss_config.action_index
-                            ].astype(jnp.float32)
+                        if loss_config.masks_dwell_sentinels:
+                            gt_raw = continuous_action_label(
+                                candidate_continuous_actions, loss_config
+                            ).astype(jnp.float32)
                             weights = weights * (
                                 (gt_raw != 0.0) & (gt_raw != DWELL_TIME_DEFAULT_SENTINEL_SEC)
                             )
@@ -5485,7 +5705,7 @@ class RecsysAggregatedModel(hk.Module):
         for index, (head_valid_mask, _) in c.continuous_heads.items():
             loss_config = self.config.continuous_action_losses[index]
             assert c.continuous_actions is not None
-            gt_raw = c.continuous_actions[:, :, loss_config.action_index]
+            gt_raw = continuous_action_label(c.continuous_actions, loss_config)
             pred_raw = candidate_continuous_preds[:, :, loss_config.action_index]
             head_normalizer = normalizer(f"continuous/{index}")
 
@@ -5524,6 +5744,36 @@ class RecsysAggregatedModel(hk.Module):
                 )
                 cread_stats[f"{loss_config.metric_name}/cls_loss"] = cread_cls_loss
                 cread_stats[f"{loss_config.metric_name}/restore_loss"] = cread_restoration_loss
+            elif loss_config.loss_type == "egmn":
+                assert loss_config.metric_name is not None
+                (
+                    action_loss,
+                    gt_clamped,
+                    pred_in_original_units,
+                    cont_loss_mask,
+                    per_element_loss,
+                    egmn_stats,
+                ) = egmn_loss_compute(
+                    gt_raw=gt_raw,
+                    mixture=self.egmn_mixtures[loss_config.metric_name],
+                    valid_mask=head_valid_mask,
+                    negative_sample_mask=c.negative_sample_mask,
+                    norm_scale=loss_config.norm_config.norm_scale,
+                    unit_secs=loss_config.egmn_unit_secs,
+                    entropy_weight=loss_config.egmn_entropy_weight,
+                    regression_weight=loss_config.egmn_regression_weight,
+                    regression_loss_type=loss_config.egmn_regression_loss,
+                    mask_negatives=loss_config.mask_negatives,
+                    sentinel_values=(
+                        (0.0, DWELL_TIME_DEFAULT_SENTINEL_SEC)
+                        if loss_config.cread_mask_sentinel_labels
+                        else ()
+                    ),
+                    raw_weights=loss_weights,
+                    normalizer=head_normalizer,
+                )
+                for key, value in egmn_stats.items():
+                    cread_stats[f"{loss_config.metric_name}/egmn_{key}"] = value
             elif loss_config.loss_type == "tweedie":
                 (
                     action_loss,
@@ -5787,6 +6037,16 @@ class RecsysAggregatedModel(hk.Module):
         def labels(names: tuple[str, ...]) -> jax.Array:
             return c.targets[..., [action_type_map[n] for n in names]]
 
+        user_debias = None
+        if self.config.page_rl.user_debias.enabled:
+            gallery = c.product_surface == recsys_pb2.ProductSurface.PRODUCT_SURFACE_GALLERY_PAGE
+            trained = (c.loss_padding_mask > 0) & ~c.negative_sample_mask.astype(jnp.bool_)
+            user_debias = UserDebiasBatch(
+                stats=page_user_debias_stats(batch),
+                labels=rows(c.targets[..., jnp.asarray(USER_DEBIAS_ACTIONS)] > 0),
+                rows=rows(trained & gallery, False),
+            )
+
         assert c.continuous_actions is not None
         return page_rl_loss_and_stats(
             config=self.config.page_rl,
@@ -5810,6 +6070,7 @@ class RecsysAggregatedModel(hk.Module):
             valid_mask=rows(valid, False),
             post_sids=rows(cand["post_sids"]),
             auth_hashes=rows(cast_jax(cand["auth_hashes"])[..., 0].astype(jnp.int32)),
+            user_debias=user_debias,
         )
 
     @hk.transparent
@@ -5908,6 +6169,7 @@ class RecsysAggregatedModel(hk.Module):
                 packed_candidate_seq_len=c.targets.shape[1] // history_len.shape[1],
                 stats=stats,
                 raw_weights=c.loss_weights,
+                eligible_heads=c.eligible_heads,
             )
 
         continuous_masks = self._build_metric_masks(
@@ -5936,7 +6198,7 @@ class RecsysAggregatedModel(hk.Module):
                     variant_loss_mask = head_variant_mask & (~c.negative_sample_mask)
                 else:
                     variant_loss_mask = head_variant_mask
-                if loss_config.loss_type == "cread" and loss_config.cread_mask_sentinel_labels:
+                if loss_config.masks_dwell_sentinels:
                     variant_loss_mask = (
                         variant_loss_mask
                         & (head["gt_raw"] != 0.0)
@@ -6087,6 +6349,8 @@ class RecsysAggregatedModel(hk.Module):
         run_decoder: bool = True,
     ) -> tuple[jax.Array, ...]:
         decode = page_decode is not None and run_decoder
+        debias = self.config.page_rl.user_debias
+        serve_debias = debias.enabled and (debias.serve_heads or debias.serve_dwell)
         targets = batch["candidate_seq"]["actions"]
         product_surface = batch["candidate_seq"]["product_surface"]
         if targets is not None:
@@ -6123,7 +6387,7 @@ class RecsysAggregatedModel(hk.Module):
                 segment_ids=segment_ids,
                 seqpack_layout=layout,
                 product_surface=product_surface,
-                return_candidate_embeddings=decode,
+                return_candidate_embeddings=decode or serve_debias,
                 cread_decode=self._request_cread_decode(batch, layout),
             )
         else:
@@ -6182,7 +6446,7 @@ class RecsysAggregatedModel(hk.Module):
                 segment_ids=segment_ids.astype(jnp.int32),
                 candidate_start_offset=candidate_start_offset,
                 product_surface=product_surface,
-                return_candidate_embeddings=decode,
+                return_candidate_embeddings=decode or serve_debias,
                 purchase_value_features=self._purchase_value_features(batch),
             )
 
@@ -6193,10 +6457,12 @@ class RecsysAggregatedModel(hk.Module):
             product_surface,
         )
 
-        if page_decode is None:
-            return candidate_logits, candidate_continuous_predictions
-        if not decode:
-            noop = page_decode_noop_outputs(self.config.page_rl, page_decode)
+        noop = (
+            ()
+            if page_decode is None
+            else page_decode_noop_outputs(self.config.page_rl, page_decode)
+        )
+        if not (decode or serve_debias):
             return candidate_logits, candidate_continuous_predictions, *noop
         candidate_embeddings, user_embeddings = outputs[4:]
         per_user = [
@@ -6211,6 +6477,20 @@ class RecsysAggregatedModel(hk.Module):
             per_user = [x.reshape(-1, per_user_c, *x.shape[2:]) for x in per_user]
             user_embeddings = user_embeddings.reshape(-1, user_embeddings.shape[-1])
         logits_u, cont_u, emb_u, auth_u, sids_u = per_user
+        if serve_debias:
+            shift = page_user_debias_shift(debias, user_embeddings, page_user_debias_stats(batch))
+            heads_mask = (
+                jnp.full((user_embeddings.shape[0], USER_DEBIAS_OUTPUTS), jnp.nan)
+                if page_decode is None or page_decode.user_debias_heads is None
+                else page_decode.user_debias_heads
+            )
+            logits_u, cont_u = page_user_debias_serve(debias, logits_u, cont_u, shift, heads_mask)
+            candidate_logits = logits_u.reshape(candidate_logits.shape)
+            candidate_continuous_predictions = cont_u.reshape(
+                candidate_continuous_predictions.shape
+            )
+        if page_decode is None or not run_decoder:
+            return candidate_logits, candidate_continuous_predictions, *noop
         decoded = run_page_decode(
             self.config.page_rl,
             logits_u,

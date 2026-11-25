@@ -74,6 +74,7 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.negative_word_match import clear_word_match, compute_word_match
 from xrex.data.recsys.teacher_distill import mask_bad_spans, read_teacher_slots
+from xrex.data.user_debias_feed import history_stats_from_batch
 from xrex.models.recsys_embedding import HashKeys, HashTable
 
 if TYPE_CHECKING:
@@ -247,6 +248,14 @@ _ENGAGEMENT_COUNT_INT64_INDICES = (
     Int64Feature.repostCountSeq.value,
     Int64Feature.quoteCountSeq.value,
     Int64Feature.viewCountSeq.value,
+)
+_NOTIFICATION_COUNT_INT64_INDICES = (
+    Int64Feature.notInterestedCountSeq.value,
+    Int64Feature.notificationSentCountSeq.value,
+    Int64Feature.notificationOpenCountSeq.value,
+    Int64Feature.notificationClickCountSeq.value,
+    Int64Feature.notificationDismissCountSeq.value,
+    Int64Feature.notificationSeeLessOftenCountSeq.value,
 )
 
 POST_CATEGORICAL_FEATURE_LIST = CATEGORICAL_FEATURES
@@ -547,6 +556,7 @@ class RecsysFeaturesBatch(TypedDict):
     user_long_term_author_in_window: NotRequired[npt.NDArray[np.bool_]]
     user_long_term_author_dwell_post_counts: NotRequired[npt.NDArray[np.int32]]
     user_long_term_author_avg_dwell_ms: NotRequired[npt.NDArray[np.int32]]
+    user_history_stats: NotRequired[npt.NDArray[np.float32]]
     packing_layout: NotRequired[SequencePackedLayout | None]
     dwell_cread_power: NotRequired[npt.NDArray[np.float32] | None]
     dwell_cread_scale: NotRequired[npt.NDArray[np.float32] | None]
@@ -1015,6 +1025,7 @@ def from_record_batch(
     read_ads_engagement_counts: bool = False,
     read_ads_ctr_features: bool = False,
     per_candidate_sample_weight: bool = False,
+    user_history_stats_dim: int = 0,
     *,
     alloc: ArrayAllocator,
     aux_value_events: tuple[str, ...] = (),
@@ -1346,6 +1357,10 @@ def from_record_batch(
             impression_timestamps_ms.shape[1],
             (hist_raw_int64, cand_raw_int64),
         )
+    else:
+        for raw in (hist_raw_int64, cand_raw_int64):
+            for idx in _NOTIFICATION_COUNT_INT64_INDICES:
+                raw.pop(Int64Feature(idx).name, None)
 
     _timezone_enum = hist_raw_categorical.get(
         "timezoneSeq",
@@ -1831,7 +1846,9 @@ def from_record_batch(
     candidate_ip_ids = cand_int64_features[:, :, _ip_idx]
 
     _saturate_idx = _ENGAGEMENT_COUNT_INT64_INDICES + (
-        reply_features.REPLY_SATURATE_INT64_INDICES if reply_parent_mode else ()
+        reply_features.REPLY_SATURATE_INT64_INDICES
+        if reply_parent_mode
+        else _NOTIFICATION_COUNT_INT64_INDICES
     )
     for _ec_idx in _saturate_idx:
         np.clip(
@@ -2075,6 +2092,14 @@ def from_record_batch(
         batch["user_id_list_hashes"], batch["user_id_list_mask"] = user_id_lists
     if user_long_term_authors is not None:
         typing.cast(dict[str, np.ndarray], batch).update(user_long_term_authors)
+    if user_history_stats_dim:
+        stats = history_stats_from_batch(record_batch)
+        if stats.shape[1] != user_history_stats_dim:
+            raise ValueError(
+                f"user_history_stats_dim={user_history_stats_dim}, but the featurizer gives "
+                f"{stats.shape[1]} columns"
+            )
+        batch["user_history_stats"] = stats
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
         if candidate_negative_filter is not None

@@ -491,6 +491,7 @@ pub struct Inventory {
     pub held: Option<String>,
     pub pinned: Vec<String>,
     pub followed: Option<String>,
+    pub mirrored: Vec<String>,
 }
 
 impl Inventory {
@@ -802,6 +803,18 @@ impl Ledger {
         Some(source)
     }
 
+    pub fn forget_download(&mut self, peer: &Peer, prefix: &str) {
+        let key = self.key_of(peer);
+        if let Some(record) = self.peers.get_mut(&key)
+            && record
+                .downloaded
+                .as_ref()
+                .is_some_and(|d| d.prefix == prefix && d.ok)
+        {
+            record.downloaded = None;
+        }
+    }
+
     pub fn ack(&self) -> Value {
         let mut offered = Map::new();
         let mut downloaded = Map::new();
@@ -981,11 +994,25 @@ fn held_offer(p: &Policy, inv: &Inventory) -> Option<Offer> {
 
 pub(crate) fn candidate_offer(p: &Policy, inv: &Inventory) -> Option<Offer> {
     let latest = inv.latest.as_ref()?;
-    if p.ceiling.as_ref().is_some_and(|c| !c.allows(latest)) {
+    let Some(ceiling) = p.ceiling.as_ref().filter(|c| !c.allows(latest)) else {
+        return offer_of(p, inv, latest);
+    };
+    if !matches!(p.mode, Mode::Canary | Mode::Rolling) {
         return None;
     }
+    let elapsed = |real: &String| parse_prefix(real).map(|(n, _)| n);
+    let mut allowed: Vec<&String> = inv
+        .mirrored
+        .iter()
+        .filter(|real| ceiling.allows(real) && elapsed(real) < elapsed(latest))
+        .collect();
+    allowed.sort_by_key(|real| std::cmp::Reverse(elapsed(real)));
+    allowed.into_iter().find_map(|real| offer_of(p, inv, real))
+}
+
+fn offer_of(p: &Policy, inv: &Inventory, latest: &str) -> Option<Offer> {
     let holds = p.mode != Mode::Follow || p.held.is_some();
-    if inv.held.as_ref() == Some(latest) && holds {
+    if inv.held.as_deref() == Some(latest) && holds {
         return None;
     }
     if let Some(released) = &p.released {
@@ -1009,7 +1036,7 @@ pub(crate) fn candidate_offer(p: &Policy, inv: &Inventory) -> Option<Offer> {
     Some(Offer {
         serving,
         seq,
-        source: Source::Upstream(latest.clone()),
+        source: Source::Upstream(latest.to_string()),
     })
 }
 
@@ -1172,6 +1199,7 @@ mod tests {
             held: Some(real(1000)),
             pinned: vec![real(1000)],
             followed,
+            mirrored: Vec::new(),
         };
         assert_eq!(offered(&p, &inv(1300, None), "fresh"), Some(held.clone()));
         assert_eq!(offered(&p, &inv(1100, None), "fresh"), Some(held.clone()));
@@ -1283,6 +1311,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_canary_offers_the_newest_allowed_candidate_while_the_trainer_saves_past_the_ceiling() {
+        let cand = |elapsed: u64| format!("elapsed_samples_{elapsed:018}/cand");
+        let canary = |cap: &str| {
+            policy(json!({
+                "version": 3,
+                "mode": "canary",
+                "held": {"prefix": serving_prefix(2000, "inc", 3), "servingSeq": 2000},
+                "released": {"run": "cand", "generation": 4, "seqOffset": 1000},
+                "slots": [{"slotId": 30, "namespace": "ns", "podSelector": "app=x",
+                           "canaryPods": 2, "admitted": ["uid-a"]}],
+                "ceiling": {"prefixes": [cap]},
+            }))
+        };
+        let inv = Inventory {
+            latest: Some(cand(1300)),
+            held: Some(real(1000)),
+            pinned: vec![real(1000)],
+            mirrored: vec![
+                cand(1300),
+                cand(1100),
+                "elapsed_samples_1150/cand".into(),
+                real(1250),
+                cand(900),
+                cand(1200),
+            ],
+            ..Default::default()
+        };
+        let held = serving_prefix(2000, "inc", 3);
+        let ask = |ledger: &mut Ledger, p: &Policy, uid: &str| {
+            let peer = Peer::Pod {
+                slot_id: 30,
+                uid: uid.into(),
+            };
+            ledger
+                .decide(Some(p), &peer, &inv, at(10))
+                .map(|o| o.serving)
+        };
+
+        let p = canary(&cand(1200));
+        let mut ledger = Ledger::default();
+        let allowed = Some(serving_prefix(2200, "cand", 4));
+        assert_eq!(ask(&mut ledger, &p, "uid-a"), allowed, "the admitted pod");
+        assert_eq!(ask(&mut ledger, &p, "uid-b"), allowed, "a pod with room");
+        assert_eq!(ask(&mut ledger, &p, "uid-c"), Some(held.clone()), "no room");
+        assert_eq!(ask(&mut ledger, &p, "uid-b"), allowed, "admitted on it");
+
+        let p = canary("elapsed_samples_1150/cand");
+        assert_eq!(
+            ask(&mut Ledger::default(), &p, "uid-a"),
+            Some(serving_prefix(2150, "cand", 4))
+        );
+        for cap in [cand(900), real(1250), cand(1000)] {
+            let p = canary(&cap);
+            assert_eq!(
+                ask(&mut Ledger::default(), &p, "uid-a"),
+                Some(held.clone()),
+                "ceiling {cap}"
+            );
+        }
+        let mut rolling = canary(&cand(1200)).raw;
+        rolling["mode"] = json!("rolling");
+        rolling["slots"][0]["released"] = json!(true);
+        assert_eq!(
+            ask(&mut Ledger::default(), &policy(rolling), "uid-z"),
+            allowed
+        );
+    }
+
     fn at(now_secs: u64) -> Decide {
         Decide {
             fresh: true,
@@ -1300,6 +1397,7 @@ mod tests {
             held: Some(real(1000)),
             pinned: vec![real(1000)],
             followed,
+            mirrored: Vec::new(),
         };
         let restored = follow_holding(Some(real(1100)));
         assert_eq!(
@@ -1467,6 +1565,7 @@ mod tests {
             held: Some(ckpt(1000, "inc-0")),
             pinned: vec![ckpt(1000, "inc-0")],
             followed,
+            mirrored: Vec::new(),
         };
         let restored = policy(json!({
             "version": 5,

@@ -98,6 +98,8 @@ pub struct PostCandidate {
     pub video_md5_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub video_carousel_extra: bool,
+    #[serde(default)]
+    pub carousel_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]

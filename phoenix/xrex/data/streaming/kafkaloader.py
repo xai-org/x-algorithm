@@ -53,6 +53,7 @@ from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
     SAMPLE_WEIGHT_SEQ_COLUMN,
+    VIDEO_DURATION_COLUMN,
 )
 from xrex.data.recsys.recsys_batch import (
     ADS_COUNT_COLUMNS,
@@ -89,6 +90,7 @@ from xrex.data.streaming.kafkaconsumer import (
     validate_offset_map,
     validate_seek_options,
 )
+from xrex.data.user_debias_feed import HISTORY_STATS_COLUMNS
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.utils import cluster
 
@@ -822,7 +824,7 @@ def _unify_record_batch_schemas(
 
     col_names: list[str] = list(required_columns)
     for opt_name in optional_columns:
-        if opt_name in all_batch_names:
+        if opt_name in all_batch_names and opt_name not in col_names:
             col_names.append(opt_name)
 
     canonical_types: dict[str, pa.DataType] = {}
@@ -1216,9 +1218,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
         start_time = time.time()
 
         required_columns: list[str] = list(REQUIRED_COLUMNS)
+        if self.read_video_duration:
+            required_columns.append(VIDEO_DURATION_COLUMN)
         if self.exclude_required_columns:
             excluded = {c.strip() for c in self.exclude_required_columns.split(",") if c.strip()}
             required_columns = [c for c in required_columns if c not in excluded]
+        if self.user_history_stats_dim:
+            required_columns = list(dict.fromkeys(required_columns + HISTORY_STATS_COLUMNS))
 
         if not self._logged_schema and batch:
             first_rb = batch[0]
@@ -1343,6 +1349,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             read_ads_engagement_counts=self.read_ads_engagement_counts,
             read_ads_ctr_features=self.read_ads_ctr_features,
             per_candidate_sample_weight=self.per_candidate_sample_weight,
+            user_history_stats_dim=self.user_history_stats_dim,
             alloc=self._alloc,
             read_ad_side_ids=self.read_ad_side_ids,
             ad_side_fields=self.ad_side_field_names,

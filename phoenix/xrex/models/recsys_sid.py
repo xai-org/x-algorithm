@@ -9,6 +9,7 @@ from typing import Callable
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from numpy import typing as npt
@@ -16,6 +17,8 @@ from numpy import typing as npt
 from xrex.models.layers import get_parameter
 from xrex.models.sharding_context import axis_group_size
 from xrex.utils.sharding import in_manual_shard_map, shard_map_unless_manual
+
+_DECODER_PARTS = ("hi", "mid", "lo")
 
 
 @functools.lru_cache(maxsize=2)
@@ -126,6 +129,35 @@ def _decode_distinct_sid_tuples(
     return recon[group][jnp.argsort(order)].reshape(*sids.shape[:-1], recon_dim)
 
 
+def _frozen_decoder_params(
+    decoder: tuple[npt.NDArray, ...], name_prefix: str
+) -> tuple[jax.Array, ...]:
+    def split(x: npt.NDArray) -> list[npt.NDArray]:
+        parts, rest = [], x.astype(np.float32)
+        for _ in _DECODER_PARTS:
+            parts.append(rest.astype(jnp.bfloat16))
+            rest = rest - parts[-1].astype(np.float32)
+        assert not rest.any(), "a decoder tensor is not exactly three bf16 parts"
+        return parts
+
+    tensors = []
+    for key, x in zip(("stages", "w0", "b0", "w1", "b1"), decoder):
+        total = None
+        for i, suffix in enumerate(_DECODER_PARTS):
+            part = get_parameter(
+                f"{name_prefix}_sid_decoder_table_{key}_{suffix}",
+                list(x.shape),
+                dtype=jnp.float32,
+                init=lambda shape, dtype, x=x, i=i: jnp.asarray(split(x)[i], dtype),
+                pspec=P(*[None] * x.ndim),
+                lr_multiplier=0.0,
+                dtype_unwrap=jnp.float32,
+            )
+            total = part if total is None else total + part
+        tensors.append(jax.lax.stop_gradient(total))
+    return tuple(tensors)
+
+
 def reconstruct_entity_sid(
     sids: jnp.ndarray,
     target_dim: int,
@@ -137,7 +169,25 @@ def reconstruct_entity_sid(
     mesh: Mesh | None = None,
     data_axis: str | tuple[str, ...] | None = None,
     rows_per_decoder_pass: int | None = None,
+    decoder_params: bool = False,
+    remat: bool = False,
 ) -> jnp.ndarray:
+    if remat:
+        return hk.remat(
+            lambda s: reconstruct_entity_sid(
+                s,
+                target_dim,
+                decoder_path,
+                lr_multiplier_func,
+                embed_init_scale,
+                fprop_dtype,
+                name_prefix,
+                mesh=mesh,
+                data_axis=data_axis,
+                rows_per_decoder_pass=rows_per_decoder_pass,
+                decoder_params=decoder_params,
+            )
+        )(sids)
     assert mesh is None or (data_axis is not None and rows_per_decoder_pass is not None), (
         "a mesh needs the data axis sids are sharded on and rows_per_decoder_pass"
     )
@@ -147,7 +197,14 @@ def reconstruct_entity_sid(
         f"post_sids have {sids.shape[-1]} levels but the decoder at {decoder_path!r} "
         f"expects {num_levels}; set sid_num_levels to match the artifact."
     )
-    stages, (w0, b0, w1, b1) = jax.tree.map(jnp.asarray, (stages_np, (w0_np, b0_np, w1_np, b1_np)))
+    if decoder_params:
+        stages, w0, b0, w1, b1 = _frozen_decoder_params(
+            (stages_np, w0_np, b0_np, w1_np, b1_np), name_prefix
+        )
+    else:
+        stages, (w0, b0, w1, b1) = jax.tree.map(
+            jnp.asarray, (stages_np, (w0_np, b0_np, w1_np, b1_np))
+        )
     run_decoder = functools.partial(_run_sid_decoder, stages=stages, w0=w0, b0=b0, w1=w1, b1=b1)
     recon_dim = w1.shape[1]
 

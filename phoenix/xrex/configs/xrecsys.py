@@ -97,6 +97,8 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
         sid_decoder_path=mparams.get("sid_decoder_path", ""),
         sid_recon_rows_per_decoder_pass=mparams.get("sid_recon_rows_per_decoder_pass", 16384),
+        sid_recon_decoder_params=mparams.get("sid_recon_decoder_params", False),
+        sid_recon_remat=mparams.get("sid_recon_remat", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 

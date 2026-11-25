@@ -314,7 +314,7 @@ fn record_candidate_fill(feature: &str, filled: u64, total: u64) {
 }
 
 pub(crate) fn is_reply_width(n_post_int64: usize) -> bool {
-    n_post_int64 > REPLY_SELF_REPLY_INT64_INDEX
+    n_post_int64 == REPLY_SELF_REPLY_INT64_INDEX + 1
 }
 
 impl InputBuffer {

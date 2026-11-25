@@ -119,6 +119,30 @@ impl HistorySourceInfo {
             length,
             first_event_ms: span.map(|(lo, _)| lo),
             last_event_ms: span.map(|(_, hi)| hi),
+            first_kafka_timestamp_ms: None,
+            last_kafka_timestamp_ms: None,
+        }
+    }
+
+    pub fn with_kafka_timestamps(
+        self,
+        kafka_timestamps_ms: impl IntoIterator<Item = Option<i64>>,
+    ) -> Self {
+        let mut span: Option<(u64, u64)> = None;
+        let mut missing = false;
+        for ms in kafka_timestamps_ms {
+            match ms {
+                Some(ms) if ms > 0 => {
+                    let ms = ms as u64;
+                    span = Some(span.map_or((ms, ms), |(lo, hi)| (lo.min(ms), hi.max(ms))));
+                }
+                _ => missing = true,
+            }
+        }
+        Self {
+            first_kafka_timestamp_ms: span.map(|(lo, _)| if missing { 0 } else { lo }),
+            last_kafka_timestamp_ms: span.map(|(_, hi)| hi),
+            ..self
         }
     }
 }
@@ -135,6 +159,7 @@ mod tests {
                 length: 5,
                 first_event_ms: Some(2_000),
                 last_event_ms: Some(9_000),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -143,9 +168,32 @@ mod tests {
                 length: 2,
                 first_event_ms: None,
                 last_event_ms: None,
+                ..Default::default()
             }
         );
         assert_eq!(HistorySourceInfo::of([]), HistorySourceInfo::default());
+    }
+
+    #[test]
+    fn the_kafka_range_spans_the_positive_timestamps() {
+        let kafka = |timestamps: &[Option<i64>]| {
+            let s = HistorySourceInfo::of([1_000]).with_kafka_timestamps(timestamps.to_vec());
+            (s.first_kafka_timestamp_ms, s.last_kafka_timestamp_ms)
+        };
+        assert_eq!(
+            kafka(&[Some(7_000), Some(3_000)]),
+            (Some(3_000), Some(7_000))
+        );
+        assert_eq!(
+            kafka(&[Some(7_000), None, Some(0), Some(3_000), Some(-1)]),
+            (Some(0), Some(7_000))
+        );
+        assert_eq!(kafka(&[None, Some(0)]), (None, None));
+
+        let source =
+            HistorySourceInfo::of([1_000, 2_000]).with_kafka_timestamps([Some(1_500), None]);
+        assert_eq!(source.length, 2);
+        assert_eq!(source.first_event_ms, Some(1_000));
     }
 
     #[test]

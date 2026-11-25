@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
 use crate::model_config::ModelConfig;
-use arrow::array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array};
+use arrow::array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Int16Array, Int32Array, Int64Array,
+};
 use arrow::ipc::reader::StreamReader;
 use half::f16;
 use lazy_static::lazy_static;
 use prometheus::{IntCounterVec, register_int_counter_vec};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_recsys_proto as pb;
 
@@ -40,9 +43,28 @@ pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
     tweet_id == WEB_CONV_FAKE_TWEET_ID || has_conv_bit
 }
 
+pub use xai_user_debias::HISTORY_STATS_DIM as USER_HISTORY_STATS_DIM;
+
 pub const WEB_CONV_URL_ID_COLUMN: &str = "webConvUrlId";
 pub const WEB_CONV_RANKED_URL_ID_COLUMNS: [&str; 3] =
     ["webConvUrlIdRanked", "webConvUrlId2", "webConvUrlId3"];
+
+const FIRST_VIDEO_DURATION_MS_COLUMN: &str = "firstVideoDurationMs";
+
+fn stamp_video_duration(
+    model_config: &ModelConfig,
+    history_int64_features: &mut [i64],
+    row: usize,
+    duration_ms: i64,
+) {
+    let n = model_config.hash_table.num_post_int64_features;
+    if model_config.hash_table.video_completion_history
+        && n > int64_feature::FIRST_VIDEO_DURATION_MS_SEQ
+    {
+        history_int64_features[row * n + int64_feature::FIRST_VIDEO_DURATION_MS_SEQ] =
+            duration_ms.clamp(0, i32::MAX as i64);
+    }
+}
 
 pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
     ids.filter(|ids| {
@@ -159,6 +181,7 @@ use crate::feature_config::constants::{
 use crate::feature_config::constants::{DPA_SID_CODEBOOK_SIZE, DPA_SID_NUM_LEVELS};
 use crate::feature_config::constants::{STALE_POST_14D_TTL_SEC, STALE_POST_30D_TTL_SEC};
 use crate::feature_config::float_feature::MATCHED_WORD_FRACTION_SEQ;
+use crate::feature_config::int64_feature;
 #[cfg(recsys_dpa_sid)]
 use crate::feature_config::int64_feature::{
     DPA_SID_LEVEL0, DPA_SID_LEVEL1, DPA_SID_LEVEL2, DPA_SID_LEVEL3, DPA_SID_LEVEL4, DPA_SID_LEVEL5,
@@ -176,7 +199,13 @@ use crate::feature_config::int64_feature::{FIRST_DPA_PRODUCT_KEY, FIRST_DPA_PROD
 use crate::feature_config::int64_feature::{
     LATEST_HISTORY_IMPRESSION_TIME_SEC_SEQ, REQUEST_TIME_SEC_SEQ,
 };
-#[cfg(any(recsys_time_gap, recsys_dpa_sid))]
+#[cfg(recsys_notification_counts)]
+use crate::feature_config::int64_feature::{
+    NOT_INTERESTED_COUNT_SEQ, NOTIFICATION_CLICK_COUNT_SEQ, NOTIFICATION_DISMISS_COUNT_SEQ,
+    NOTIFICATION_OPEN_COUNT_SEQ, NOTIFICATION_SEE_LESS_OFTEN_COUNT_SEQ,
+    NOTIFICATION_SENT_COUNT_SEQ,
+};
+#[cfg(any(recsys_time_gap, recsys_dpa_sid, recsys_notification_counts))]
 use crate::reply::is_reply_width;
 
 pub const PRODUCT_SURFACE_CATEGORICAL_IDX: usize = PRODUCT_SURFACE_SEQ;
@@ -357,6 +386,52 @@ pub mod ads_counts {
     }
 }
 
+pub mod history_display_location {
+    use xai_recsys_proto::ProductSurface;
+
+    pub const COLUMN: &str = "displayLocation";
+
+    const SEARCH_TWEETS: i16 = 1;
+    const TIMELINE_HOME: i16 = 2;
+    const PROFILE_TWEETS: i16 = 9;
+    const TWEET_CONVERSATION: i16 = 28;
+    const TIMELINE_HOME_REVERSE_CHRON: i16 = 29;
+    const MEDIA_VIEWER: i16 = 30;
+
+    pub fn product_surface(display_location: i16) -> i32 {
+        let surface = match display_location {
+            SEARCH_TWEETS => ProductSurface::SearchResultsPage,
+            TIMELINE_HOME => ProductSurface::HomeTimelineRanking,
+            PROFILE_TWEETS => ProductSurface::ProfilePage,
+            TWEET_CONVERSATION => ProductSurface::TweetDetailsPage,
+            TIMELINE_HOME_REVERSE_CHRON => ProductSurface::HomeTimelineLatest,
+            MEDIA_VIEWER => ProductSurface::GalleryPage,
+            _ => ProductSurface::Unknown,
+        };
+        surface as i32
+    }
+
+    pub fn overlay(
+        surfaces: &mut [i32],
+        display_locations: &[i16],
+        num_history: usize,
+    ) -> Vec<bool> {
+        let mut ad_rows = vec![false; surfaces.len()];
+        for (i, (surface, ad_row)) in surfaces
+            .iter_mut()
+            .zip(ad_rows.iter_mut())
+            .take(num_history)
+            .enumerate()
+        {
+            if *surface == 0 {
+                *ad_row = true;
+                *surface = product_surface(display_locations.get(i).copied().unwrap_or(0));
+            }
+        }
+        ad_rows
+    }
+}
+
 fn exact_phrase_categorical(lexical_match: Option<&pb::SearchLexicalMatch>) -> i32 {
     match lexical_match {
         Some(m) => 1 + m.exact_phrase as i32,
@@ -403,6 +478,43 @@ fn stamp_engagement_counts(
     }
     if num_features > VIEW_COUNT_SEQ {
         dest[base + VIEW_COUNT_SEQ] = view.min(INT32_MAX) as i64;
+    }
+}
+
+#[cfg(recsys_notification_counts)]
+fn stamp_notification_counts(
+    dest: &mut [i64],
+    num_features: usize,
+    entry_idx: usize,
+    not_interested: u64,
+    sent: u64,
+    open: u64,
+    click: u64,
+    dismiss: u64,
+    see_less_often: u64,
+) {
+    if is_reply_width(num_features) {
+        return;
+    }
+    const INT32_MAX: u64 = i32::MAX as u64;
+    let base = entry_idx * num_features;
+    if num_features > NOT_INTERESTED_COUNT_SEQ {
+        dest[base + NOT_INTERESTED_COUNT_SEQ] = not_interested.min(INT32_MAX) as i64;
+    }
+    if num_features > NOTIFICATION_SENT_COUNT_SEQ {
+        dest[base + NOTIFICATION_SENT_COUNT_SEQ] = sent.min(INT32_MAX) as i64;
+    }
+    if num_features > NOTIFICATION_OPEN_COUNT_SEQ {
+        dest[base + NOTIFICATION_OPEN_COUNT_SEQ] = open.min(INT32_MAX) as i64;
+    }
+    if num_features > NOTIFICATION_CLICK_COUNT_SEQ {
+        dest[base + NOTIFICATION_CLICK_COUNT_SEQ] = click.min(INT32_MAX) as i64;
+    }
+    if num_features > NOTIFICATION_DISMISS_COUNT_SEQ {
+        dest[base + NOTIFICATION_DISMISS_COUNT_SEQ] = dismiss.min(INT32_MAX) as i64;
+    }
+    if num_features > NOTIFICATION_SEE_LESS_OFTEN_COUNT_SEQ {
+        dest[base + NOTIFICATION_SEE_LESS_OFTEN_COUNT_SEQ] = see_less_often.min(INT32_MAX) as i64;
     }
 }
 
@@ -794,13 +906,40 @@ pub struct InputBuffer {
     pub candidate_ads_count_buckets: Vec<u8>,
     pub candidate_ads_ctr_buckets: Vec<u8>,
     pub candidate_ad_side_ids: Vec<i32>,
+    pub history_ad_row_mask: Vec<bool>,
     pub history_post_ids: Vec<i64>,
     pub history_web_conv_url_ids: Vec<(u32, i64)>,
     pub history_web_conv_ranked_url_ids: Vec<(u32, i64)>,
+    pub history_url_embeddings: Vec<(u32, Arc<[f16]>)>,
     pub history_semantic_ids: Vec<u16>,
     pub candidate_semantic_ids: Vec<u16>,
     pub num_history: usize,
     pub cread_decode: CreadDecodeOverride,
+    pub user_history_stats: Vec<f32>,
+}
+
+fn user_history_stats(
+    model_config: &ModelConfig,
+    history: Option<&arrow::record_batch::RecordBatch>,
+    candidate_set: &pb::CandidateSet,
+) -> Vec<f32> {
+    if model_config.user_history_stats_dim == 0 {
+        return Vec::new();
+    }
+    let mut rows = xai_user_debias::SequenceRows::default();
+    let filled =
+        history.is_some_and(|batch| xai_user_debias::arrow::append_batch(&mut rows, batch).is_ok());
+    USER_FEATURE_FILL_TOTAL
+        .with_label_values(&[
+            "user_history_stats",
+            if filled { "filled" } else { "missing" },
+        ])
+        .inc();
+    if !filled {
+        rows = xai_user_debias::SequenceRows::default();
+    }
+    let req_ms = i64::from(candidate_impression_sec(candidate_set)) * 1000;
+    xai_user_debias::history_stats(&rows, req_ms)
 }
 
 pub fn repeat_query_into(dest: &mut [f32], query: &[f32], n_slots: usize) {
@@ -974,6 +1113,7 @@ impl InputBuffer {
         compact_rows(&mut self.history_post_hashes, &keep);
         compact_rows(&mut self.history_auth_hashes, &keep);
         compact_rows(&mut self.history_product_surfaces, &keep);
+        compact_rows(&mut self.history_ad_row_mask, &keep);
         compact_rows(&mut self.history_actions, &keep);
         compact_rows(&mut self.history_continuous_actions, &keep);
         compact_rows(&mut self.history_categorical_features, &keep);
@@ -1217,6 +1357,18 @@ impl InputBuffer {
                     candidate.view_count,
                 );
             }
+            #[cfg(recsys_notification_counts)]
+            stamp_notification_counts(
+                &mut candidate_int64_features,
+                n_post_int64,
+                j,
+                candidate.not_interested_count,
+                candidate.notification_sent_count,
+                candidate.notification_open_count,
+                candidate.notification_click_count,
+                candidate.notification_dismiss_count,
+                candidate.notification_see_less_often_count,
+            );
 
             #[cfg(recsys_ads_dpa)]
             {
@@ -1607,6 +1759,12 @@ impl InputBuffer {
                     tweet_info.quote_count,
                     tweet_info.view_count,
                 );
+                stamp_video_duration(
+                    model_config,
+                    &mut history_int64_features,
+                    valid_entry_count,
+                    tweet_info.first_video_duration_ms.min(i32::MAX as u64) as i64,
+                );
 
                 history_is_author_followed[valid_entry_count] =
                     tweet_info.is_author_followed_by_user;
@@ -1619,6 +1777,12 @@ impl InputBuffer {
                 valid_entry_count += 1;
             }
         }
+
+        let history_ad_row_mask = if model_config.hash_table.history_display_location {
+            history_display_location::overlay(&mut history_product_surfaces, &[], valid_entry_count)
+        } else {
+            Vec::new()
+        };
 
         #[cfg(recsys_time_gap)]
         let mut candidate_int64_features = candidate_int64_features;
@@ -1766,13 +1930,16 @@ impl InputBuffer {
             candidate_ads_count_buckets: Vec::new(),
             candidate_ads_ctr_buckets: Vec::new(),
             candidate_ad_side_ids: Vec::new(),
+            history_ad_row_mask,
             history_post_ids,
             history_web_conv_url_ids: Vec::new(),
             history_web_conv_ranked_url_ids: Vec::new(),
+            history_url_embeddings: Vec::new(),
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
             cread_decode: CreadDecodeOverride::default(),
+            user_history_stats: user_history_stats(model_config, None, candidate_set),
         }
     }
 
@@ -1937,13 +2104,20 @@ impl InputBuffer {
                     candidate_ads_count_buckets: Vec::new(),
                     candidate_ads_ctr_buckets: Vec::new(),
                     candidate_ad_side_ids: Vec::new(),
+                    history_ad_row_mask: if model_config.hash_table.history_display_location {
+                        vec![false; history_seq_len]
+                    } else {
+                        Vec::new()
+                    },
                     history_post_ids: vec![0i64; history_seq_len],
                     history_web_conv_url_ids: Vec::new(),
                     history_web_conv_ranked_url_ids: Vec::new(),
+                    history_url_embeddings: Vec::new(),
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
                     candidate_semantic_ids,
                     num_history: 0,
                     cread_decode: CreadDecodeOverride::default(),
+                    user_history_stats: user_history_stats(model_config, None, candidate_set),
                 });
             }
         };
@@ -1988,6 +2162,17 @@ impl InputBuffer {
             typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN);
         let col_is_author_following_viewer =
             typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN);
+        let col_first_video_duration_ms = model_config
+            .hash_table
+            .video_completion_history
+            .then(|| typed_column::<Int64Array>(&batch, FIRST_VIDEO_DURATION_MS_COLUMN))
+            .flatten();
+        let display_location_on = model_config.hash_table.history_display_location;
+        let col_display_location = display_location_on
+            .then(|| typed_column::<Int16Array>(&batch, history_display_location::COLUMN))
+            .flatten();
+        let mut history_display_locations =
+            vec![0i16; col_display_location.map_or(0, |_| history_seq_len)];
 
         let start_row = num_rows.saturating_sub(history_seq_len);
         let mut valid_entry_count = 0;
@@ -2030,7 +2215,17 @@ impl InputBuffer {
             }
 
             if let Some(ps) = product_surfaces {
-                history_product_surfaces[valid_entry_count] = ps.value(row_idx);
+                history_product_surfaces[valid_entry_count] =
+                    if display_location_on && ps.is_null(row_idx) {
+                        0
+                    } else {
+                        ps.value(row_idx)
+                    };
+            }
+            if let Some(locations) = col_display_location
+                && locations.is_valid(row_idx)
+            {
+                history_display_locations[valid_entry_count] = locations.value(row_idx);
             }
 
             if let Some(fsl) = action_multi_hot {
@@ -2100,6 +2295,14 @@ impl InputBuffer {
                 col_quote_count.map_or(0, |arr| arr.value(row_idx)) as u64,
                 col_view_count.map_or(0, |arr| arr.value(row_idx)) as u64,
             );
+            stamp_video_duration(
+                model_config,
+                &mut history_int64_features,
+                valid_entry_count,
+                col_first_video_duration_ms
+                    .filter(|d| !d.is_null(row_idx))
+                    .map_or(0, |d| d.value(row_idx)),
+            );
             for (feature_idx, col) in col_web_conv_time_on_site {
                 if let Some(arr) = col
                     && n_post_int64 > feature_idx
@@ -2117,6 +2320,16 @@ impl InputBuffer {
 
             valid_entry_count += 1;
         }
+
+        let history_ad_row_mask = if display_location_on {
+            history_display_location::overlay(
+                &mut history_product_surfaces,
+                &history_display_locations,
+                valid_entry_count,
+            )
+        } else {
+            Vec::new()
+        };
 
         #[cfg(recsys_time_gap)]
         let mut candidate_int64_features = candidate_int64_features;
@@ -2264,13 +2477,16 @@ impl InputBuffer {
             candidate_ads_count_buckets: Vec::new(),
             candidate_ads_ctr_buckets: Vec::new(),
             candidate_ad_side_ids: Vec::new(),
+            history_ad_row_mask,
             history_post_ids,
             history_web_conv_url_ids,
             history_web_conv_ranked_url_ids,
+            history_url_embeddings: Vec::new(),
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
             cread_decode: CreadDecodeOverride::default(),
+            user_history_stats: user_history_stats(model_config, Some(&batch), candidate_set),
         })
     }
 
@@ -2406,6 +2622,7 @@ mod tests {
         PRODUCT_SURFACE_SEQ, PRODUCT_SURFACE_SEQ_COLUMN, PRODUCT_SURFACE_SEQ_NAME,
     };
     use crate::feature_config::int64_feature::{CLIENT_APP_ID_SEQ, CLIENT_APP_ID_SEQ_NAME};
+    use arrow::datatypes::DataType;
 
     #[test]
     fn candidate_impression_time_uses_request_timestamp() {
@@ -2459,9 +2676,11 @@ mod tests {
                 num_post_int64_features: 0,
                 enable_stale_post: false,
                 enable_stale_post_30d: false,
+                video_completion_history: false,
                 ads_count_features: false,
                 ads_ctr_features: false,
                 ad_side_fields: Vec::new(),
+                history_display_location: false,
             },
             history_seq_len: 4,
             candidate_seq_len: 3,
@@ -2469,6 +2688,7 @@ mod tests {
             search_query_embedding_dim: 0,
             num_categorical_features: 0,
             sid_num_levels: 0,
+            user_history_stats_dim: 0,
         }
     }
 
@@ -2482,6 +2702,7 @@ mod tests {
             history_impr_ts: vec![9_500, 8_000, 9_900, 0],
             history_actions: vec![true, false, false, true, true, true, false, false],
             history_post_ids: vec![11, 12, 13, 0],
+            history_ad_row_mask: vec![true, false, true, false],
             history_web_conv_url_ids: vec![(1, 42), (2, 43)],
             num_history: 3,
             ..Default::default()
@@ -2492,6 +2713,7 @@ mod tests {
             1
         );
         assert_eq!(buf.history_post_hashes, vec![2, 2, 3, 3, 0, 0, 0, 0]);
+        assert_eq!(buf.history_ad_row_mask, vec![false, true, false, false]);
         assert_eq!(buf.history_impr_ts, vec![8_000, 9_900, 0, 0]);
         assert_eq!(
             buf.history_actions,
@@ -3065,6 +3287,146 @@ mod tests {
     }
 
     #[test]
+    fn proto_and_columnar_history_fill_the_video_duration_slot_like_training() {
+        use arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let cases = [
+            (None, 100.0f32),
+            (Some(40_000i64), 39.7),
+            (Some(i64::from(i32::MAX) + 1), 12.0),
+        ];
+        let n = cases.len();
+        let sequence = Some(pb::UserActionSequence {
+            user_actions_data: Some(pb::UserActionSequenceDataContainer {
+                data: Some(
+                    pb::user_action_sequence_data_container::Data::OrderedAggregatedUserActionsList(
+                        pb::AggregatedUserActionList {
+                            aggregated_user_actions: cases
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &(duration_ms, dwell_s))| pb::AggregatedUserAction {
+                                    tweet_info: Some(pb::TweetInfo {
+                                        tweet_id: 11 + i as u64,
+                                        author_id: 21,
+                                        first_video_duration_ms: duration_ms.unwrap_or(0) as u64,
+                                        ..Default::default()
+                                    }),
+                                    actions: vec![pb::ActionInfo {
+                                        user_action_meta: Some(pb::UserActionMeta {
+                                            dwell_time: f64::from(dwell_s) * 1000.0,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        });
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Schema::new(vec![
+            Field::new("tweetId", DataType::Int64, false),
+            Field::new("authorId", DataType::Int64, false),
+            Field::new(
+                "continuousActionValuesSeq",
+                DataType::FixedSizeList(item.clone(), 2),
+                true,
+            ),
+            Field::new("firstVideoDurationMs", DataType::Int64, true),
+        ]);
+        let dwell: Vec<f32> = cases
+            .iter()
+            .flat_map(|&(_, dwell_s)| [0.0, dwell_s])
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| 11 + i))),
+                Arc::new(Int64Array::from(vec![21i64; n])),
+                Arc::new(FixedSizeListArray::new(
+                    item,
+                    2,
+                    Arc::new(Float32Array::from(dwell)),
+                    None,
+                )),
+                Arc::new(cases.iter().map(|&(d, _)| d).collect::<Int64Array>()),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let candidate_set = pb::CandidateSet::default();
+        let inputs = |model_config: &ModelConfig| {
+            let proto = InputBuffer::compute_for_item(
+                model_config,
+                &sequence,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            );
+            let columnar = InputBuffer::compute_from_columnar_bytes(
+                model_config,
+                &bytes,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let width = model_config.hash_table.output_vocab_size;
+            let n_int64 = model_config.hash_table.num_post_int64_features;
+            let video_completed = pb::ActionName::ClientNotificationSent as usize;
+            [proto, columnar].map(|buf| {
+                assert!((0..n).all(|row| !buf.history_actions[row * width + video_completed]));
+                (0..n)
+                    .map(|row| {
+                        (
+                            buf.history_int64_features
+                                [row * n_int64 + int64_feature::FIRST_VIDEO_DURATION_MS_SEQ],
+                            buf.history_continuous_actions[row * 2 + 1],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut model_config = test_history_model_config();
+        model_config.history_seq_len = n;
+        model_config.hash_table.num_post_int64_features =
+            int64_feature::FIRST_VIDEO_DURATION_MS_SEQ + 1;
+        let off: Vec<(i64, f32)> = cases.iter().map(|&(_, dwell_s)| (0, dwell_s)).collect();
+        assert_eq!(inputs(&model_config), [off.clone(), off]);
+
+        model_config.hash_table.video_completion_history = true;
+        let on: Vec<(i64, f32)> = cases
+            .iter()
+            .map(|&(duration_ms, dwell_s)| {
+                (
+                    duration_ms.unwrap_or(0).clamp(0, i64::from(i32::MAX)),
+                    dwell_s,
+                )
+            })
+            .collect();
+        assert_eq!(inputs(&model_config), [on.clone(), on]);
+    }
+
+    #[test]
     fn columnar_history_semantic_ids_read_semantic_id_column() {
         use arrow::array::{FixedSizeListArray, Int32Array, Int64Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -3298,6 +3660,82 @@ mod tests {
     }
 
     #[test]
+    fn columnar_user_history_stats_featurize_the_request_history() {
+        use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let i64s = |v: Vec<Option<i64>>| Arc::new(Int64Array::from(v)) as ArrayRef;
+        let i32s = |v: Vec<i32>| Arc::new(Int32Array::from(v)) as ArrayRef;
+        let bools = |v: Vec<Option<bool>>| Arc::new(BooleanArray::from(v)) as ArrayRef;
+        let hot = BooleanArray::from(vec![
+            true, false, false, false, false, true, true, false, false, false, false, true,
+        ]);
+        let list_field = Arc::new(Field::new("item", DataType::Boolean, true));
+        let batch = RecordBatch::try_from_iter([
+            ("tweetId", i64s(vec![Some(11), Some(12), Some(13)])),
+            ("authorId", i64s(vec![Some(21), Some(22), Some(23)])),
+            (
+                "impressedTimeMs",
+                i64s(vec![Some(1_000_000), Some(2_000_000), Some(3_000_000)]),
+            ),
+            ("dwellTimeMs", i64s(vec![Some(1_500), Some(9_000), None])),
+            (
+                "firstVideoDurationMs",
+                i64s(vec![Some(0), Some(30_000), Some(12_000)]),
+            ),
+            ("timezoneId", i32s(vec![21, 21, 21])),
+            ("productSurface", i32s(vec![1, 10, 10])),
+            ("hasMedia", bools(vec![Some(false), Some(true), Some(true)])),
+            (
+                "isAuthorFollowedByViewer",
+                bools(vec![Some(false), Some(true), None]),
+            ),
+            ("tweetPosition", i32s(vec![4, 0, 7])),
+            ("mediaContentType", i32s(vec![0, 0, 0])),
+            (
+                "actionNameMultiHot",
+                Arc::new(FixedSizeListArray::new(list_field, 4, Arc::new(hot), None)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let candidate_set = pb::CandidateSet {
+            request_timestamp_ms: Some(9_000_000),
+            ..Default::default()
+        };
+        let compute = |model_config: &ModelConfig| {
+            InputBuffer::compute_from_columnar_bytes(
+                model_config,
+                &bytes,
+                &candidate_set,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .user_history_stats
+        };
+
+        let mut model_config = test_history_model_config();
+        assert!(compute(&model_config).is_empty());
+        model_config.user_history_stats_dim = xai_user_debias::HISTORY_STATS_DIM;
+        let rows = xai_user_debias::parse_sequence(&bytes).unwrap();
+        assert_eq!(
+            compute(&model_config),
+            xai_user_debias::history_stats(&rows, 9_000_000)
+        );
+    }
+
+    #[test]
     fn columnar_history_web_conv_url_ids_follow_kept_positions() {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
@@ -3477,6 +3915,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(recsys_notification_counts)]
+    #[test]
+    fn notification_counts_stamped_into_candidate_int64_features() {
+        let mut model_config = test_model_config(1);
+        let n_post_int64 = NOTIFICATION_SEE_LESS_OFTEN_COUNT_SEQ + 1;
+        model_config.hash_table.num_post_int64_features = n_post_int64;
+        let mut candidate_set = pb::CandidateSet::default();
+        candidate_set.candidates.push(pb::TweetInfo {
+            tweet_id: 1000,
+            author_id: 2000,
+            not_interested_count: 12,
+            notification_sent_count: 13,
+            notification_open_count: 14,
+            notification_click_count: 15,
+            notification_dismiss_count: 16,
+            notification_see_less_often_count: 17,
+            ..Default::default()
+        });
+
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+
+        assert_eq!(12, cand.int64_features[NOT_INTERESTED_COUNT_SEQ]);
+        assert_eq!(13, cand.int64_features[NOTIFICATION_SENT_COUNT_SEQ]);
+        assert_eq!(14, cand.int64_features[NOTIFICATION_OPEN_COUNT_SEQ]);
+        assert_eq!(15, cand.int64_features[NOTIFICATION_CLICK_COUNT_SEQ]);
+        assert_eq!(16, cand.int64_features[NOTIFICATION_DISMISS_COUNT_SEQ]);
+        assert_eq!(
+            17,
+            cand.int64_features[NOTIFICATION_SEE_LESS_OFTEN_COUNT_SEQ]
+        );
+
+        let reply_width = (0..).find(|&w| is_reply_width(w)).unwrap();
+        let mut reply_row = vec![0i64; reply_width];
+        stamp_notification_counts(&mut reply_row, reply_width, 0, 1, 2, 3, 4, 5, 6);
+        assert!(reply_row.iter().all(|&v| v == 0));
     }
 
     #[cfg(recsys_ads_dpa)]
@@ -3872,6 +4347,536 @@ mod tests {
                     .iter()
                     .all(|&v| v == 0)
             );
+        }
+    }
+
+    type HistoryRow = (i64, i64, Option<i32>, Option<i16>);
+
+    fn display_location_history(rows: &[HistoryRow], location_type: Option<DataType>) -> Vec<u8> {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let mut fields = vec![
+            Field::new("tweetId", DataType::Int64, false),
+            Field::new("authorId", DataType::Int64, false),
+            Field::new(PRODUCT_SURFACE_SEQ_COLUMN, DataType::Int32, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(rows.iter().map(|r| r.0).collect::<Int64Array>()),
+            Arc::new(rows.iter().map(|r| r.1).collect::<Int64Array>()),
+            Arc::new(rows.iter().map(|r| r.2).collect::<Int32Array>()),
+        ];
+        if let Some(data_type) = location_type {
+            let locations = rows.iter().map(|r| r.3);
+            columns.push(match data_type {
+                DataType::Int16 => Arc::new(locations.collect::<Int16Array>()),
+                DataType::Int32 => {
+                    Arc::new(locations.map(|l| l.map(i32::from)).collect::<Int32Array>())
+                }
+                other => panic!("unsupported displayLocation type {other}"),
+            });
+            fields.push(Field::new(
+                history_display_location::COLUMN,
+                data_type,
+                true,
+            ));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        bytes
+    }
+
+    fn columnar_input(model_config: &ModelConfig, bytes: &[u8]) -> InputBuffer {
+        InputBuffer::compute_from_columnar_bytes(
+            model_config,
+            bytes,
+            &pb::CandidateSet::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn history_surface_categories(model_config: &ModelConfig, buf: &InputBuffer) -> Vec<i32> {
+        let n_cat = model_config.hash_table.num_post_categorical_features;
+        buf.history_categorical_features
+            .chunks(n_cat)
+            .map(|row| i32::from(row[PRODUCT_SURFACE_SEQ]))
+            .collect()
+    }
+
+    fn mask(bits: &[u8]) -> Vec<bool> {
+        bits.iter().map(|&b| b == 1).collect()
+    }
+
+    #[test]
+    fn display_location_product_surfaces_match_the_trainer() {
+        use history_display_location::product_surface;
+        let pairs = [
+            (0, 0),
+            (1, 6),
+            (2, 1),
+            (8, 0),
+            (9, 9),
+            (26, 0),
+            (28, 8),
+            (29, 2),
+            (30, 10),
+            (3, 0),
+            (31, 0),
+            (-1, 0),
+            (255, 0),
+            (i16::MAX, 0),
+            (i16::MIN, 0),
+        ];
+        for (location, surface) in pairs {
+            assert_eq!(product_surface(location), surface, "{location}");
+        }
+        let mapped: Vec<i16> = (i16::MIN..=i16::MAX)
+            .filter(|&location| product_surface(location) != 0)
+            .collect();
+        assert_eq!(mapped, [1, 2, 9, 28, 29, 30]);
+    }
+
+    #[test]
+    fn history_display_location_matches_the_trainer_reader() {
+        let long: [HistoryRow; 15] = [
+            (101, 201, Some(0), Some(2)),
+            (102, 202, Some(4), None),
+            (103, 203, Some(0), Some(30)),
+            (104, 204, Some(1), None),
+            (105, 205, Some(0), Some(2)),
+            (106, 206, Some(0), Some(29)),
+            (107, 207, Some(0), Some(1)),
+            (108, 208, Some(0), Some(28)),
+            (109, 209, Some(0), Some(9)),
+            (110, 210, Some(0), Some(30)),
+            (111, 211, Some(0), Some(8)),
+            (112, 212, Some(0), Some(26)),
+            (113, 213, Some(7), Some(28)),
+            (114, 214, Some(0), Some(0)),
+            (115, 215, Some(0), None),
+        ];
+        let short: [HistoryRow; 5] = [
+            (121, 221, None, Some(2)),
+            (122, 222, Some(0), Some(31)),
+            (123, 223, Some(0), Some(-1)),
+            (124, 224, Some(0), Some(i16::MAX)),
+            (125, 225, Some(3), Some(0)),
+        ];
+        let cases = [
+            (
+                &long[..],
+                [1, 1, 2, 6, 8, 9, 10, 0, 0, 7, 0, 0],
+                [0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1],
+                [1, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0],
+            ),
+            (
+                &short[..],
+                [1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ];
+        let mut model_config = test_history_model_config();
+        model_config.history_seq_len = 12;
+        for (rows, on_surfaces, on_mask, off_surfaces) in cases {
+            let bytes = display_location_history(rows, Some(DataType::Int16));
+            for (on, surfaces, ad_rows) in [
+                (true, on_surfaces, mask(&on_mask)),
+                (false, off_surfaces, Vec::new()),
+            ] {
+                model_config.hash_table.history_display_location = on;
+                let buf = columnar_input(&model_config, &bytes);
+                assert_eq!(buf.history_product_surfaces, surfaces, "on={on}");
+                assert_eq!(
+                    history_surface_categories(&model_config, &buf),
+                    surfaces,
+                    "on={on}"
+                );
+                assert_eq!(buf.history_ad_row_mask, ad_rows, "on={on}");
+            }
+        }
+    }
+
+    #[test]
+    fn history_display_location_stays_on_its_row() {
+        let rows: [HistoryRow; 5] = [
+            (11, 21, Some(0), Some(2)),
+            (12, 22, Some(0), Some(28)),
+            (0, 23, Some(0), Some(30)),
+            (14, 24, Some(5), Some(9)),
+            (15, 25, Some(0), Some(29)),
+        ];
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.history_display_location = true;
+        let buf = columnar_input(
+            &model_config,
+            &display_location_history(&rows, Some(DataType::Int16)),
+        );
+        assert_eq!(buf.history_post_ids, [12, 14, 15, 0]);
+        assert_eq!(buf.history_product_surfaces, [8, 5, 2, 0]);
+        assert_eq!(buf.history_ad_row_mask, [true, false, true, false]);
+    }
+
+    #[test]
+    fn history_without_display_locations_gets_only_the_ad_row_mask() {
+        let rows: [HistoryRow; 3] = [
+            (11, 21, Some(0), Some(2)),
+            (12, 22, Some(6), Some(0)),
+            (13, 23, Some(0), Some(28)),
+        ];
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.history_display_location = true;
+        let mistyped =
+            COLUMNAR_COLUMN_MISTYPED_TOTAL.with_label_values(&[history_display_location::COLUMN]);
+        for location_type in [None, Some(DataType::Int32)] {
+            let before = mistyped.get();
+            let buf = columnar_input(
+                &model_config,
+                &display_location_history(&rows, location_type.clone()),
+            );
+            assert_eq!(
+                buf.history_product_surfaces,
+                [0, 6, 0, 0],
+                "{location_type:?}"
+            );
+            assert_eq!(
+                buf.history_ad_row_mask,
+                [true, false, true, false],
+                "{location_type:?}"
+            );
+            let counted = u64::from(location_type.is_some());
+            assert_eq!(mistyped.get(), before + counted, "{location_type:?}");
+        }
+    }
+
+    #[test]
+    fn history_display_location_reads_a_null_surface_as_zero() {
+        use arrow::array::ArrayRef;
+        use arrow::buffer::NullBuffer;
+        use arrow::datatypes::{Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let surfaces =
+            Int32Array::new(vec![5, 3].into(), Some(NullBuffer::from(vec![false, true])));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+                Field::new(PRODUCT_SURFACE_SEQ_COLUMN, DataType::Int32, true),
+                Field::new(history_display_location::COLUMN, DataType::Int16, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 12])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![21i64, 22])),
+                Arc::new(surfaces),
+                Arc::new(Int16Array::from(vec![30i16, 30])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.history_display_location = true;
+        let on = columnar_input(&model_config, &bytes);
+        assert_eq!(on.history_product_surfaces, [10, 3, 0, 0]);
+        assert_eq!(on.history_ad_row_mask, [true, false, false, false]);
+        model_config.hash_table.history_display_location = false;
+        let off = columnar_input(&model_config, &bytes);
+        assert_eq!(off.history_product_surfaces, [5, 3, 0, 0]);
+    }
+
+    #[test]
+    fn proto_history_gets_the_ad_row_mask_without_an_overlay() {
+        use pb::user_action_sequence_data_container::Data;
+        let entry = |tweet_id: u64, surface: Option<i32>| pb::AggregatedUserAction {
+            tweet_info: Some(pb::TweetInfo {
+                tweet_id,
+                author_id: 21,
+                ..Default::default()
+            }),
+            actions: surface
+                .map(|product_surface| pb::ActionInfo {
+                    user_action_meta: Some(pb::UserActionMeta {
+                        product_surface,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let sequence = Some(pb::UserActionSequence {
+            user_actions_data: Some(pb::UserActionSequenceDataContainer {
+                data: Some(Data::OrderedAggregatedUserActionsList(
+                    pb::AggregatedUserActionList {
+                        aggregated_user_actions: vec![
+                            entry(11, Some(0)),
+                            entry(0, Some(0)),
+                            entry(12, Some(2)),
+                            entry(13, None),
+                        ],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        });
+        let mut model_config = test_history_model_config();
+        for on in [true, false] {
+            model_config.hash_table.history_display_location = on;
+            let buf = InputBuffer::compute_for_item(
+                &model_config,
+                &sequence,
+                &pb::CandidateSet::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(buf.history_product_surfaces, [0, 2, 0, 0], "on={on}");
+            let ad_rows = if on {
+                vec![true, false, true, false]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(buf.history_ad_row_mask, ad_rows, "on={on}");
+        }
+    }
+
+    macro_rules! assert_same_fields {
+        ($a:expr, $b:expr, $what:expr, [$($field:ident),* $(,)?]) => {
+            $( assert_eq!($a.$field, $b.$field, "{} {}", $what, stringify!($field)); )*
+        };
+    }
+
+    #[test]
+    fn history_display_location_changes_nothing_else() {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let rows = 7usize;
+        let vocab = 64usize;
+        let to_bytes = |location_type: Option<DataType>| {
+            let item = |data_type| Arc::new(Field::new("item", data_type, true));
+            let actions = FixedSizeListArray::new(
+                item(DataType::Boolean),
+                vocab as i32,
+                Arc::new(BooleanArray::from(
+                    (0..rows * vocab).map(|j| j % 9 == 2).collect::<Vec<_>>(),
+                )),
+                None,
+            );
+            let continuous = FixedSizeListArray::new(
+                item(DataType::Float32),
+                2,
+                Arc::new(Float32Array::from(
+                    (0..rows * 2).map(|j| j as f32).collect::<Vec<_>>(),
+                )),
+                None,
+            );
+            let mut fields = vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+                Field::new(PRODUCT_SURFACE_SEQ_COLUMN, DataType::Int32, true),
+                Field::new("actionNameMultiHot", actions.data_type().clone(), false),
+                Field::new(
+                    "continuousActionValuesSeq",
+                    continuous.data_type().clone(),
+                    false,
+                ),
+                Field::new("impressedTimeMs", DataType::Int64, false),
+                Field::new("timezoneId", DataType::Int32, false),
+                Field::new(FAV_COUNT_SEQ_COLUMN, DataType::Int64, false),
+            ];
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows as i64).map(|i| 100 + i),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows as i64).map(|i| 200 + i % 3),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..rows as i32).map(|i| i % 3),
+                )),
+                Arc::new(actions),
+                Arc::new(continuous),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows as i64).map(|i| 1_700_000_000_000 + 60_000 * i),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..rows as i32).map(|i| i % 4),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows as i64).map(|i| 7 * i),
+                )),
+            ];
+            let locations = (0..rows).map(|i| (i % 3 == 0).then_some(2i16));
+            match location_type {
+                Some(DataType::Int16) => columns.push(Arc::new(locations.collect::<Int16Array>())),
+                Some(DataType::Int32) => columns.push(Arc::new(
+                    locations.map(|l| l.map(i32::from)).collect::<Int32Array>(),
+                )),
+                _ => {}
+            }
+            if let Some(data_type) = location_type {
+                fields.push(Field::new(
+                    history_display_location::COLUMN,
+                    data_type,
+                    true,
+                ));
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let mut bytes = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            bytes
+        };
+        let mut model_config = test_history_model_config();
+        model_config.history_seq_len = 6;
+        model_config.hash_table.num_post_categorical_features = 18;
+        model_config.hash_table.num_post_int64_features = 15;
+        let candidates = pb::CandidateSet {
+            user_id: 7,
+            candidates: vec![pb::TweetInfo {
+                tweet_id: 900,
+                author_id: 901,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let input = |model_config: &ModelConfig, location_type: Option<DataType>| {
+            with_fixed_now_sec(1_700_000_600, || {
+                InputBuffer::compute_from_columnar_bytes(
+                    model_config,
+                    &to_bytes(location_type),
+                    &candidates,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        };
+        let unstamped = input(&model_config, None);
+        assert!(unstamped.history_ad_row_mask.is_empty());
+        let stamped = input(&model_config, Some(DataType::Int16));
+        let mistyped = input(&model_config, Some(DataType::Int32));
+        model_config.hash_table.history_display_location = true;
+        let on = input(&model_config, Some(DataType::Int16));
+        for (what, other) in [("stamped", &stamped), ("mistyped", &mistyped), ("on", &on)] {
+            assert_same_fields!(
+                unstamped,
+                other,
+                what,
+                [
+                    user_hashes,
+                    user_ip_hashes,
+                    history_post_hashes,
+                    history_auth_hashes,
+                    history_actions,
+                    history_continuous_actions,
+                    candidate_post_hashes,
+                    candidate_auth_hashes,
+                    candidate_product_surfaces,
+                    candidate_embeddings,
+                    candidate_search_query_embeddings,
+                    user_categorical_features,
+                    user_bool_features,
+                    user_float_features,
+                    user_int64_features,
+                    user_installed_apps,
+                    history_bool_features,
+                    history_float_features,
+                    history_int64_features,
+                    candidate_categorical_features,
+                    candidate_bool_features,
+                    candidate_float_features,
+                    candidate_int64_features,
+                    history_impr_ts,
+                    history_post_creation_ts_sec,
+                    candidate_impr_ts,
+                    candidate_post_creation_ts_sec,
+                    candidate_line_item_ids,
+                    candidate_campaign_ids,
+                    candidate_funding_instrument_ids,
+                    user_client_id_idx,
+                    user_country_code_idx,
+                    user_gender_idx,
+                    user_age_bucket_idx,
+                    user_age_in_years_idx,
+                    user_inferred_gender_idx,
+                    user_inferred_gender_score,
+                    candidate_conversion_dense_features,
+                    user_conversion_history_hashes,
+                    candidate_account_hashes,
+                    candidate_ads_count_buckets,
+                    candidate_ads_ctr_buckets,
+                    candidate_ad_side_ids,
+                    history_post_ids,
+                    history_web_conv_url_ids,
+                    history_web_conv_ranked_url_ids,
+                    history_url_embeddings,
+                    history_semantic_ids,
+                    candidate_semantic_ids,
+                    num_history,
+                    cread_decode,
+                    user_history_stats,
+                ]
+            );
+        }
+        for (what, other) in [("stamped", &stamped), ("mistyped", &mistyped)] {
+            assert_same_fields!(
+                unstamped,
+                other,
+                what,
+                [
+                    history_product_surfaces,
+                    history_categorical_features,
+                    history_ad_row_mask,
+                ]
+            );
+        }
+        assert_eq!(unstamped.history_product_surfaces, [1, 2, 0, 1, 2, 0]);
+        assert_eq!(on.history_product_surfaces, [1, 2, 1, 1, 2, 1]);
+        assert_eq!(
+            on.history_ad_row_mask,
+            [false, false, true, false, false, true]
+        );
+        assert_eq!(
+            history_surface_categories(&model_config, &on),
+            on.history_product_surfaces
+        );
+        let n_cat = model_config.hash_table.num_post_categorical_features;
+        for (i, (a, b)) in unstamped
+            .history_categorical_features
+            .iter()
+            .zip(&on.history_categorical_features)
+            .enumerate()
+        {
+            if i % n_cat != PRODUCT_SURFACE_SEQ {
+                assert_eq!(a, b, "categorical feature {i}");
+            }
         }
     }
 }

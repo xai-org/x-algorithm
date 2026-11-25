@@ -66,7 +66,11 @@ impl QueryHydrator<ScoredPostsQuery> for CachedPostsQueryHydrator {
         let cached_posts: Vec<PostCandidate> =
             serde_json::from_slice(&decompressed).map_err(|err| err.to_string())?;
 
-        let has_cached_posts = cached_posts.len() >= MIN_CACHED_POSTS_THRESHOLD;
+        let has_cached_posts = cached_posts
+            .iter()
+            .filter(|post| !post.carousel_only)
+            .count()
+            >= MIN_CACHED_POSTS_THRESHOLD;
 
         Ok(ScoredPostsQuery {
             cached_posts,

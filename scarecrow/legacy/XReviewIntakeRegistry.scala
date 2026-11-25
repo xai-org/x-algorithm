@@ -32,13 +32,27 @@ object XReviewIntakeRegistry extends TwitterPrivateModule {
     "CA cert path for XReview intake mTLS"
   )
 
+  flag[String](
+    "xreview.tls.client-fullchain",
+    "",
+    "Client cert chain for XReview intake mTLS"
+  )
+
+  flag[String](
+    "xreview.tls.client-key",
+    "",
+    "Client key for XReview intake mTLS"
+  )
+
   @Provides
   @Singleton
   @Exposed
   def providesXReviewReportSubmitter(
     serviceIdentifier: ServiceIdentifier,
     @Migration statsReceiver: StatsReceiver,
-    @Flag("xreview.tls.ca-cert") caCertPath: String
+    @Flag("xreview.tls.ca-cert") caCertPath: String,
+    @Flag("xreview.tls.client-fullchain") clientFullchain: String,
+    @Flag("xreview.tls.client-key") clientKeyPath: String
   ): XReviewReportSubmitter = {
     if (localMode() || personalAccountMode()) {
       XReviewReportSubmitter.noop(statsReceiver)
@@ -46,12 +60,16 @@ object XReviewIntakeRegistry extends TwitterPrivateModule {
       val prodClient = SharedXReviewIntakeClientModule.provideXReviewIntakeClient(
         serviceIdentifier = serviceIdentifier,
         statsReceiver = statsReceiver.scope("xreview"),
-        caCertPath = caCertPath
+        caCertPath = caCertPath,
+        clientFullchain = clientFullchain,
+        clientKeyPath = clientKeyPath
       )
       val stagingClient = SharedXReviewIntakeClientModule.provideXReviewStagingIntakeClient(
         serviceIdentifier = serviceIdentifier,
         statsReceiver = statsReceiver.scope("xreview_staging"),
-        caCertPath = caCertPath
+        caCertPath = caCertPath,
+        clientFullchain = clientFullchain,
+        clientKeyPath = clientKeyPath
       )
       XReviewReportSubmitter(prodClient, stagingClient, statsReceiver)
     }

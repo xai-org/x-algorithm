@@ -30,15 +30,16 @@ pub(crate) fn moe_source_is_carousel_only(query: &ScoredPostsQuery) -> bool {
 }
 
 pub(crate) fn is_carousel_only(candidate: &PostCandidate, moe_carousel_only: bool) -> bool {
-    !candidate.retrieval_sources.is_empty()
-        && candidate
-            .retrieval_sources
-            .iter()
-            .all(|source| match source.served_type {
-                pb::ServedType::ForYouPhoenixRetrievalPopularVideo => true,
-                pb::ServedType::ForYouPhoenixRetrievalMoe => moe_carousel_only,
-                _ => false,
-            })
+    candidate.carousel_only
+        || (!candidate.retrieval_sources.is_empty()
+            && candidate
+                .retrieval_sources
+                .iter()
+                .all(|source| match source.served_type {
+                    pb::ServedType::ForYouPhoenixRetrievalPopularVideo => true,
+                    pb::ServedType::ForYouPhoenixRetrievalMoe => moe_carousel_only,
+                    _ => false,
+                }))
 }
 
 pub(crate) fn allowed_source(query: &ScoredPostsQuery) -> impl Fn(&PostCandidate) -> bool {
@@ -127,7 +128,7 @@ impl CarouselScoring {
         self.immersive_vqv_weight != 0.0 || self.open_times_immersive_dwell_weight != 0.0
     }
 
-    fn rank(&self, a: &PostCandidate, b: &PostCandidate) -> Ordering {
+    pub(crate) fn rank(&self, a: &PostCandidate, b: &PostCandidate) -> Ordering {
         self.score(b)
             .total_cmp(&self.score(a))
             .then_with(|| video_open_score(b).total_cmp(&video_open_score(a)))

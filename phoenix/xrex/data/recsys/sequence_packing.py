@@ -454,6 +454,8 @@ def pack_batch(
                 for key, arr in long_term_author_profile.present(batch).items()
             }
         )
+        if (stats := batch.get("user_history_stats")) is not None:
+            out["user_history_stats"] = stats.reshape(D, B, *stats.shape[1:])
         return out
 
     history_post_hashes = batch["history_seq"]["post_hashes"]

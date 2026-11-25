@@ -107,9 +107,11 @@ pub struct HashTableConfig {
 
     pub enable_stale_post: bool,
     pub enable_stale_post_30d: bool,
+    pub video_completion_history: bool,
     pub ads_count_features: bool,
     pub ads_ctr_features: bool,
     pub ad_side_fields: Vec<crate::util::ad_side::Field>,
+    pub history_display_location: bool,
 }
 
 impl HashTableConfig {
@@ -284,6 +286,7 @@ pub struct ModelConfig {
     pub search_query_embedding_dim: usize,
     pub num_categorical_features: usize,
     pub sid_num_levels: usize,
+    pub user_history_stats_dim: usize,
 }
 
 impl ModelConfig {
@@ -356,9 +359,11 @@ impl ModelConfig {
                 num_post_int64_features,
                 enable_stale_post,
                 enable_stale_post_30d: false,
+                video_completion_history: false,
                 ads_count_features: false,
                 ads_ctr_features: false,
                 ad_side_fields: Vec::new(),
+                history_display_location: false,
             },
             history_seq_len,
             candidate_seq_len,
@@ -366,6 +371,7 @@ impl ModelConfig {
             search_query_embedding_dim,
             num_categorical_features,
             sid_num_levels: 0,
+            user_history_stats_dim: 0,
         }
     }
 }

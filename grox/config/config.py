@@ -230,6 +230,16 @@ class XReviewReportingConfig(BaseModel):
     timeout: float = 20.0
 
 
+class StratoPoolConfig(BaseModel):
+    model_config = _FROZEN
+
+    max_connections: int | None = None
+    max_keepalive_connections: int | None = None
+    keepalive_expiry_sec: int | None = None
+    connection_timeout_sec: int | None = None
+    timeout_sec: int | None = None
+
+
 class GroxConfig(BaseSettings):
     metrics: MetricsConfig = MetricsConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -261,6 +271,7 @@ class GroxConfig(BaseSettings):
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
     xreview_intake: XReviewIntakeConfig | None = None
+    strato: StratoPoolConfig | None = None
     xreview_reporting: XReviewReportingConfig | None = None
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)

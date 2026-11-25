@@ -5235,6 +5235,7 @@ dependencies = [
  "prometheus 0.14.0",
  "serde_json",
  "xai-recsys-proto",
+ "xai-user-debias",
 ]
 
 [[package]]
@@ -5401,6 +5402,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "xai-user-debias"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "indexmap 2.14.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

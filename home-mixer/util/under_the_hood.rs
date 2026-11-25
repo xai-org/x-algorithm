@@ -1,4 +1,5 @@
 use xai_candidate_pipeline::component_library::clients::{JetfuelClient, JetfuelView};
+use xai_candidate_pipeline::component_library::utils::client_utils::RequestContext;
 use xai_candidate_pipeline::pipeline_summary::{ComponentTrace, PipelineTrace, StageTrace};
 use xai_home_mixer_proto as pb;
 
@@ -87,6 +88,11 @@ pub fn post_scores(query: &ScoredPostsQuery, candidate: &PostCandidate) -> pb::U
             })
             .collect(),
     }
+}
+
+pub fn is_viewer_visible_request(query: &ScoredPostsQuery) -> bool {
+    !query.is_polling
+        && RequestContext::parse(&query.request_context) != RequestContext::BackgroundFetch
 }
 
 pub const TRACE_FRAME_ROUTE: &str = "/cards/under_the_hood/trace";

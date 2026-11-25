@@ -12,6 +12,7 @@ members = [
     "crates/serving/xai-recsys-sid-retrieval",
     "crates/serving/xai-recsys-sid-retrieval-proto",
     "crates/storage/xai-o2",
+    "crates/x-product/xai-user-debias",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 ibverbs = { git = "https://github.com/jonhoo/rust-ibverbs", rev = "f8f17509c1897ffb7218fb8297209d7befb75da4" }
+indexmap = { version = "2", features = ["serde"] }
 lazy_static = "1"
 libc = "0.2"
 log = { version = "0.4", features = ["kv", "kv_unstable"] }
@@ -71,6 +73,7 @@ serial_test = "3"
 simd-adler32 = "0.3.7"
 static_assertions = "1.1.0"
 tempfile = "3"
+thiserror = "2"
 thrift = "0.24.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
@@ -92,6 +95,7 @@ xai-recsys-proto = { path = "crates/serving/xai-recsys-proto" }
 xai-recsys-server = { path = "crates/serving/xai-recsys-server" }
 xai-recsys-sid-proto = { path = "crates/serving/xai-recsys-sid-proto" }
 xai-recsys-sid-retrieval-proto = { path = "crates/serving/xai-recsys-sid-retrieval-proto" }
+xai-user-debias = { path = "crates/x-product/xai-user-debias" }
 zstd = "0.13"
 
 [workspace.lints.clippy]

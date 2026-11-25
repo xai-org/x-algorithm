@@ -73,6 +73,7 @@ REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
         "user_int64_features",
         "user_installed_apps_multihot",
         "user_conversion_history_hashes",
+        "user_history_stats",
         "history_seq.post_hashes",
         "history_seq.auth_hashes",
         "history_seq.product_surface",
@@ -85,6 +86,8 @@ REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
         "history_seq.float_features",
         "history_seq.int64_features",
         "history_seq.post_sids",
+        "history_seq.embedding",
+        "history_seq.ad_row_mask",
         "candidate_seq.post_hashes",
         "candidate_seq.auth_hashes",
         "candidate_seq.product_surface",
@@ -1572,6 +1575,7 @@ def _prep_spec(
         "num_user_float_features": _leaf_width(batch, "user_float_features", 1),
         "num_user_int64_features": _leaf_width(batch, "user_int64_features", 1),
         "num_user_installed_apps": _leaf_width(batch, "user_installed_apps_multihot", 1),
+        "user_history_stats_dim": _leaf_width(batch, "user_history_stats", 1),
         "num_post_categorical_features": _leaf_width(hist, "categorical_features", 2),
         "num_post_bool_features": _leaf_width(hist, "bool_features", 2),
         "num_post_float_features": _leaf_width(hist, "float_features", 2),
@@ -1585,6 +1589,15 @@ def _prep_spec(
         "ads_count_features": side_inputs.ads_count_features,
         "ads_ctr_features": side_inputs.ads_ctr_features,
         "ad_side_fields": list(side_inputs.ad_side_fields),
+        "video_completion_history": bool(
+            getattr(features, "video_completion_history", False)
+            or getattr(
+                getattr(features, "feature_prep", None),
+                "enable_video_completion_rate_history",
+                False,
+            )
+        ),
+        "history_display_location": "ad_row_mask" in hist,
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,
         "sid_num_levels": _leaf_width(hist, "post_sids", 2),

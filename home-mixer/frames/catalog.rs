@@ -1,9 +1,10 @@
 use super::placement::Placement;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnableJetfuelFrameGrokbotSuggestedTasks, EnableJetfuelFrameMlbCarousel, EnableJetfuelFrameNfl,
-    EnableJetfuelFrameNflTimelinePinned, EnableJetfuelFrameNflTimelineRotation,
-    EnableJetfuelFrameSoccer, EnableJetfuelFrames, JetfuelFrameGrokbotSuggestedTasksFatigueHours,
+    EnableJetfuelFrameGrokbotBlackFriday, EnableJetfuelFrameGrokbotSuggestedTasks,
+    EnableJetfuelFrameMlbCarousel, EnableJetfuelFrameNfl, EnableJetfuelFrameNflTimelinePinned,
+    EnableJetfuelFrameNflTimelineRotation, EnableJetfuelFrameSoccer, EnableJetfuelFrames,
+    JetfuelFrameGrokbotBlackFridayFatigueHours, JetfuelFrameGrokbotSuggestedTasksFatigueHours,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +84,9 @@ pub const BASEBALL_TOPIC_ID: i64 = 1925950576740675584;
 pub const GROKBOT_SUGGESTED_TASKS_ROUTE: &str = "/grokbot/suggested_tasks";
 pub const GROKBOT_SUGGESTED_TASKS_SERVED_KEY: &str = "home.grokbot_suggested_tasks.served";
 pub const GROKBOT_SUGGESTED_TASKS_DISMISSAL_KEY: &str = "home.grokbot_suggested_tasks";
+pub const GROKBOT_BLACK_FRIDAY_ROUTE: &str = "/grokbot/black_friday";
+pub const GROKBOT_BLACK_FRIDAY_SERVED_KEY: &str = "home.grokbot_black_friday.served";
+pub const GROKBOT_BLACK_FRIDAY_DISMISSAL_KEY: &str = "home.grokbot_black_friday";
 const GROKBOT_SUGGESTED_TASKS_SLOT: usize = 3;
 const GROKBOT_SUGGESTED_TASKS_HEIGHT: i32 = 433;
 
@@ -91,7 +95,32 @@ const NFL_ROTATION_INTERVAL: usize = 7;
 pub const TIMELINES: &[Timeline] = &[
     Timeline {
         surface: Surface::ForYouHome,
-        enabled: |q| q.params.get(EnableJetfuelFrameGrokbotSuggestedTasks),
+        enabled: |q| q.params.get(EnableJetfuelFrameGrokbotBlackFriday),
+        frames: &[FrameDef {
+            route: GROKBOT_BLACK_FRIDAY_ROUTE,
+            fetch: Fetch::Jetfuel {
+                height: GROKBOT_SUGGESTED_TASKS_HEIGHT,
+            },
+            fatigue: Some(Fatigue {
+                served_key: GROKBOT_BLACK_FRIDAY_SERVED_KEY,
+                dismissal_key: GROKBOT_BLACK_FRIDAY_DISMISSAL_KEY,
+                hours: |q| q.params.get(JetfuelFrameGrokbotBlackFridayFatigueHours),
+            }),
+            is_dismissible: false,
+            placement_id: 0,
+            placement: Placement::AtSlot {
+                slot: GROKBOT_SUGGESTED_TASKS_SLOT,
+            },
+            cadence: Cadence::FirstResponseExceptPolling,
+            enabled: |_| true,
+        }],
+    },
+    Timeline {
+        surface: Surface::ForYouHome,
+        enabled: |q| {
+            q.params.get(EnableJetfuelFrameGrokbotSuggestedTasks)
+                && !q.params.get(EnableJetfuelFrameGrokbotBlackFriday)
+        },
         frames: &[FrameDef {
             route: GROKBOT_SUGGESTED_TASKS_ROUTE,
             fetch: Fetch::Jetfuel {
@@ -435,6 +464,43 @@ mod tests {
             eligible_routes(&expired),
             vec![GROKBOT_SUGGESTED_TASKS_ROUTE]
         );
+    }
+
+    #[test]
+    fn grokbot_black_friday_replaces_suggested_tasks_on_home_and_respects_dismissal() {
+        let mut results = FeatureSwitches::new(vec![])
+            .unwrap()
+            .match_recipient(&RecipientBuilder::new().build());
+        results.override_fs("rust_home_mixer_enable_jetfuel_frames".to_string(), "true");
+        results.override_fs(
+            "rust_home_mixer_jetfuel_frame_grokbot_suggested_tasks_enabled".to_string(),
+            "true",
+        );
+        results.override_fs(
+            "rust_home_mixer_jetfuel_frame_grokbot_black_friday_enabled".to_string(),
+            "true",
+        );
+        results.override_fs(
+            "rust_home_mixer_jetfuel_frame_grokbot_black_friday_fatigue_hours".to_string(),
+            "0",
+        );
+        let query = ScoredPostsQuery {
+            user_id: 1,
+            request_time_ms: NOW_MS,
+            params: results.into(),
+            frame_dismissals: Some(HashMap::new()),
+            ..Default::default()
+        };
+        assert_eq!(eligible_routes(&query), vec![GROKBOT_BLACK_FRIDAY_ROUTE]);
+
+        let dismissed = ScoredPostsQuery {
+            frame_dismissals: Some(HashMap::from([(
+                GROKBOT_BLACK_FRIDAY_DISMISSAL_KEY.to_string(),
+                NOW_MS + 30 * 24 * HOUR_MS,
+            )])),
+            ..query
+        };
+        assert!(eligible_routes(&dismissed).is_empty());
     }
 
     #[test]

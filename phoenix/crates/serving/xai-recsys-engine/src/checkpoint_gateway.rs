@@ -36,6 +36,7 @@ use tonic::{
 
 const GATEWAY_DIR: &str = "gateway";
 const HELD_DIR: &str = "held";
+const CANDIDATE_DIR: &str = "candidate";
 const STATE_FILE: &str = "state.json";
 
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -179,6 +180,7 @@ struct State {
     nfs_refused: Option<String>,
     pods_refused: Option<String>,
     pinned: Vec<(String, Vec<(String, usize)>)>,
+    candidate: Option<(String, Vec<(String, usize)>)>,
     followed: Option<String>,
     from_mark: u64,
 }
@@ -190,6 +192,7 @@ impl State {
             held: self.held.clone(),
             pinned: self.pinned.iter().map(|(p, _)| p.clone()).collect(),
             followed: self.followed.clone(),
+            mirrored: self.candidate.iter().map(|(p, _)| p.clone()).collect(),
         }
     }
 
@@ -312,10 +315,13 @@ impl Gateway {
         }
         let _ = fs::create_dir_all(gateway.held_root());
         remove_staging(&gateway.held_root());
+        remove_staging(&gateway.candidate_root());
         remove_temp_files(&gateway.cfg.root.join(GATEWAY_DIR));
+        gateway.state.lock().candidate = scan_prefixes(&gateway.candidate_root()).pop();
         if let Some(policy) = gateway.policy() {
             gateway.pin_policy(&policy);
         }
+        gateway.pin_candidate();
         let st = gateway.state.lock();
         info!(
             "gateway: opened with policy {:?}, held {:?}, {} pinned",
@@ -329,6 +335,10 @@ impl Gateway {
 
     fn held_root(&self) -> PathBuf {
         self.cfg.root.join(GATEWAY_DIR).join(HELD_DIR)
+    }
+
+    fn candidate_root(&self) -> PathBuf {
+        self.cfg.root.join(GATEWAY_DIR).join(CANDIDATE_DIR)
     }
 
     fn state_copy_dir(&self) -> Option<PathBuf> {
@@ -483,6 +493,7 @@ impl Gateway {
             st.note_followed(None);
         }
         let held = self.pin_policy(&policy);
+        self.pin_candidate();
         let nfs_refused = if self.cfg.server_index == 0 {
             let follow = (policy.mode == Mode::Follow)
                 .then(|| candidate_offer(&policy, &self.state.lock().inventory()))
@@ -587,6 +598,81 @@ impl Gateway {
                 info!("gateway: unpinned {real}");
             }
         }
+    }
+
+    fn pin_candidate(&self) {
+        let _pins = self.pins.lock();
+        let pins = self.candidate_root();
+        let _root = self.root_guard.lock();
+        let mirrored = scan_real_prefixes(&self.cfg.root);
+        let (wanted, current) = {
+            let st = self.state.lock();
+            let mut inv = st.inventory();
+            inv.mirrored.extend(mirrored);
+            let wanted = st
+                .policy
+                .as_ref()
+                .filter(|p| matches!(p.mode, Mode::Canary | Mode::Rolling) && p.ceiling.is_some())
+                .and_then(|p| candidate_offer(p, &inv))
+                .and_then(|offer| match offer.source {
+                    Source::Upstream(real) => Some(real),
+                    Source::Held(_) => None,
+                });
+            (wanted, st.candidate.clone())
+        };
+        let mut pinned = current.filter(|(real, _)| Some(real) == wanted.as_ref());
+        if pinned.is_none()
+            && let Some(real) = &wanted
+        {
+            let src = self.cfg.root.join(real);
+            let linked = tree_files(&src).and_then(|files| {
+                stage_and_publish(&pins, real, "link", None, true, |staging| {
+                    link_tree(&src, staging)?;
+                    check_tree(staging, &files)
+                })?;
+                Ok(files)
+            });
+            match linked {
+                Ok(files) => {
+                    info!("gateway: pinned the candidate {real} the ceiling allows");
+                    pinned = Some((real.clone(), files));
+                }
+                Err(e) => warn!("gateway: pinning the candidate {real}: {e}"),
+            }
+        }
+        let keep = pinned.as_ref().map(|(real, _)| real.clone());
+        self.state.lock().candidate = pinned;
+        for real in scan_real_prefixes(&pins) {
+            if Some(&real) != keep.as_ref() {
+                self.unpin_candidate(&pins, &real);
+            }
+        }
+    }
+
+    fn unpin_candidate(&self, pins: &Path, real: &str) {
+        if let Some(forget) = self.forget.lock().clone() {
+            forget(&format!("{GATEWAY_DIR}/{CANDIDATE_DIR}/{real}/"));
+        }
+        remove_prefix(pins, real);
+        info!("gateway: unpinned the candidate {real}");
+    }
+
+    pub fn release_candidate(&self) -> bool {
+        let _pins = self.pins.lock();
+        let _root = self.root_guard.lock();
+        let real = {
+            let mut st = self.state.lock();
+            match &st.candidate {
+                Some((real, _)) if !self.cfg.root.join(real).is_dir() => {
+                    let real = real.clone();
+                    st.candidate = None;
+                    real
+                }
+                _ => return false,
+            }
+        };
+        self.unpin_candidate(&self.candidate_root(), &real);
+        true
     }
 
     pub fn reconcile_durable(&self) -> Result<(), String> {
@@ -741,6 +827,7 @@ impl Gateway {
         if moved || followed {
             self.save_state();
         }
+        self.pin_candidate();
     }
 
     pub fn rewind_to(&self, newest: &str) -> bool {
@@ -811,13 +898,16 @@ impl Gateway {
         };
         let rename = |rest: &str| format!("{}/{rest}", offer.serving);
         match &offer.source {
-            Source::Upstream(real) => {
-                let dir = format!("{real}/");
-                upstream
-                    .iter()
-                    .filter_map(|(name, size)| Some((rename(name.strip_prefix(&dir)?), *size)))
-                    .collect()
-            }
+            Source::Upstream(real) => match self.pinned_candidate(real) {
+                Some(files) => files.iter().map(|(f, s)| (rename(f), *s)).collect(),
+                None => {
+                    let dir = format!("{real}/");
+                    upstream
+                        .iter()
+                        .filter_map(|(name, size)| Some((rename(name.strip_prefix(&dir)?), *size)))
+                        .collect()
+                }
+            },
             Source::Held(real) => self
                 .state
                 .lock()
@@ -829,9 +919,16 @@ impl Gateway {
         }
     }
 
+    fn pinned_candidate(&self, real: &str) -> Option<Vec<(String, usize)>> {
+        let st = self.state.lock();
+        let (pinned, files) = st.candidate.as_ref()?;
+        (pinned == real).then(|| files.clone())
+    }
+
     pub fn map_send(&self, peer: &Peer, names: &[String]) -> Result<Vec<String>, Status> {
         let now = now_secs();
         let mut st = self.state.lock();
+        let candidate = st.candidate.as_ref().map(|(real, _)| real.clone());
         names
             .iter()
             .map(|name| {
@@ -848,6 +945,11 @@ impl Gateway {
                     )));
                 }
                 match st.ledger.allowed(peer, serving, now) {
+                    Some(Source::Upstream(real))
+                        if is_real_prefix(&real) && candidate.as_ref() == Some(&real) =>
+                    {
+                        Ok(format!("{GATEWAY_DIR}/{CANDIDATE_DIR}/{real}/{rest}"))
+                    }
                     Some(Source::Upstream(real)) if is_real_prefix(&real) => {
                         Ok(format!("{real}/{rest}"))
                     }
@@ -862,10 +964,28 @@ impl Gateway {
             .collect()
     }
 
-    fn note_download(&self, peer: &Peer, prefix: &str, streamed: u64, rdma: u64, ok: bool) {
-        self.state
-            .lock()
-            .ledger
+    fn note_download(
+        &self,
+        peer: &Peer,
+        prefix: &str,
+        streamed: u64,
+        rdma: u64,
+        ok: bool,
+        read_from: Option<&str>,
+    ) {
+        let mut st = self.state.lock();
+        if !ok
+            && let Some(dir) = read_from
+            && !self.cfg.root.join(dir).is_dir()
+        {
+            info!(
+                "gateway: a Send of {prefix} failed once {dir} was gone from the serving root; not counted as {}'s download",
+                peer.key()
+            );
+            st.ledger.forget_download(peer, prefix);
+            return;
+        }
+        st.ledger
             .note_download(peer, prefix, streamed, rdma, ok, now_secs());
     }
 
@@ -902,6 +1022,42 @@ fn is_real_dir(root: &Path, real: &str) -> bool {
     };
     let dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     dir(&root.join(top)) && dir(&root.join(top).join(child))
+}
+
+fn trainer_dir_of(name: &str) -> Option<String> {
+    let pins = format!("{GATEWAY_DIR}/{CANDIDATE_DIR}/");
+    match name.strip_prefix(&pins) {
+        Some(rest) => prefix_of(rest).map(|real| format!("{pins}{real}")),
+        None if name.starts_with(&format!("{GATEWAY_DIR}/")) => None,
+        None => prefix_of(name).map(str::to_string),
+    }
+}
+
+fn scan_real_prefixes(root: &Path) -> Vec<String> {
+    let Ok(tops) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for top in tops.flatten() {
+        let top_name = top.file_name().to_string_lossy().into_owned();
+        if !top_name.starts_with("elapsed_samples_") || !top.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(top.path()) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let child_name = child.file_name().to_string_lossy().into_owned();
+            let real = format!("{top_name}/{child_name}");
+            if !child_name.starts_with('.')
+                && child.file_type().is_ok_and(|t| t.is_dir())
+                && is_real_prefix(&real)
+            {
+                out.push(real);
+            }
+        }
+    }
+    out
 }
 
 fn scan_prefixes(root: &Path) -> Vec<(String, Vec<(String, usize)>)> {
@@ -1498,6 +1654,7 @@ where
         .collect::<Result<_, _>>()
         .map_err(|e| Status::invalid_argument(format!("file names must be UTF-8: {e}")))?;
     let real = gateway.map_send(peer, &asked)?;
+    let read_from = real.first().and_then(|n| trainer_dir_of(n));
     let (all_names, prefix_sizes, suffix_sizes) =
         encode_names(real.into_iter().map(String::into_bytes).collect());
     let mut buf = get_bytes_mut();
@@ -1523,7 +1680,7 @@ where
     let asked_bytes: u64 = sizes.iter().map(|&s| s as u64).sum();
     let rdma = !endpoints.is_empty();
     if Status::from_header_map(response.headers()).is_some_and(|s| s.code() != tonic::Code::Ok) {
-        gateway.note_download(peer, &prefix, 0, 0, false);
+        gateway.note_download(peer, &prefix, 0, 0, false, read_from.as_deref());
         return Ok(response);
     }
     let peer = peer.clone();
@@ -1532,7 +1689,14 @@ where
             true => (0, if ok { asked_bytes } else { 0 }),
             false => (streamed.min(asked_bytes), 0),
         };
-        gateway.note_download(&peer, &prefix, streamed, rdma_requested, ok);
+        gateway.note_download(
+            &peer,
+            &prefix,
+            streamed,
+            rdma_requested,
+            ok,
+            read_from.as_deref(),
+        );
     });
     Ok(response.map(|inner| {
         body::Body::new(Observed {
@@ -2148,6 +2312,9 @@ pub async fn run_checkpoint_loop(
                     .downcast_ref::<io::Error>()
                     .is_some_and(|io_err| io_err.kind() == io::ErrorKind::StorageFull);
                 if storage_full {
+                    if gateway.release_candidate() {
+                        warn!("poll: storage full; freed the pinned candidate for the next poll");
+                    }
                     storage_full_streak += 1;
                     warn!(
                         "poll: storage full ({}/{}): {}",

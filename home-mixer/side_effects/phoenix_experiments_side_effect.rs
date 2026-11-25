@@ -1,7 +1,7 @@
 use crate::clients::user_action_aggregation_client::UserActionAggregationClient;
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{MaxPostsToCache, PhoenixAggregationType};
+use crate::params::PhoenixAggregationType;
 use crate::query_hydrators::scoring_sequence_query_hydrator::fetch_scoring_sequence;
 use crate::side_effects::redis_post_candidate_cache_side_effect::{
     RedisPostCandidateCacheSideEffect, REDIS_TTL_SECONDS,
@@ -351,9 +351,9 @@ impl PhoenixExperimentsSideEffect {
     ) {
         let query = &input.query;
         let candidates = shadow_candidates(
+            query,
             &input.selected_candidates,
             &input.non_selected_candidates,
-            query.params.get(MaxPostsToCache),
         );
         let mut scores = self.score_on_experiment_clusters(query, &candidates).await;
         let selected_scores: Vec<HashMap<String, f64>> = input
@@ -425,17 +425,17 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for PhoenixExperimentsSideEffec
 }
 
 fn shadow_candidates(
+    query: &ScoredPostsQuery,
     selected: &[PostCandidate],
     non_selected: &[PostCandidate],
-    max_posts_to_cache: usize,
 ) -> Vec<PostCandidate> {
     let mut seen = HashSet::new();
     selected
         .iter()
         .chain(RedisPostCandidateCacheSideEffect::get_candidates_to_cache(
+            query,
             selected,
             non_selected,
-            max_posts_to_cache,
         ))
         .filter(|c| seen.insert(c.tweet_id))
         .cloned()

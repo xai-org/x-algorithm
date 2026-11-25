@@ -67,11 +67,6 @@ ADS_INDEX_URI: str = os.environ.get("ADS_INDEX_URI", "")
 DPA_INDEX_URI: str = os.environ.get("DPA_INDEX_URI", "")
 
 
-ADS_CONVERSION_TRAIN_DATA: str = os.environ.get("XREX_ADS_CONVERSION_TRAIN_DATA", "")
-ADS_CONVERSION_EVAL_DATA: str = os.environ.get("XREX_ADS_CONVERSION_EVAL_DATA", "")
-ADS_CONVERSION_CHECKPOINT_DIR: str = os.environ.get("XREX_ADS_CONVERSION_CHECKPOINT_DIR", "")
-
-
 AOT_CACHE_DIR: str = os.environ.get("XREX_AOT_CACHE_DIR", "")
 
 HISTORY_URL_EMBEDDING_XDS_BOOTSTRAP: str = os.environ.get(

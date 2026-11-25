@@ -21,6 +21,7 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
             selected.split_off(params::TOP_K_CANDIDATES_TO_SELECT.min(selected.len()));
         non_selected.extend(carousel_only.into_iter().map(|candidate| PostCandidate {
             score: None,
+            carousel_only: true,
             ..candidate
         }));
         if video_carousel::is_enabled(query) {

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import logging
+import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -185,6 +187,132 @@ def cread_loss_compute(
     loss = cls_loss + restoration_weight * restoration_loss
 
     return loss, gt_clamped, restored, loss_mask, per_element_loss, cls_loss, restoration_loss
+
+
+class EgmnMixture(NamedTuple):
+    log_weights: jax.Array
+    rate: jax.Array
+    means: jax.Array
+    sigmas: jax.Array
+
+
+def egmn_initial_bias(
+    num_gaussians: int, norm_scale: float, unit_secs: float, min_sigma_secs: float
+) -> list[float]:
+    def inverse_softplus(x: float) -> float:
+        return math.log(math.expm1(max(x, 1e-4)))
+
+    exp_mean = 4.0 / unit_secs
+    centers = [
+        3.0 * (norm_scale / 3.0) ** (k / max(num_gaussians - 1, 1)) / unit_secs
+        for k in range(num_gaussians)
+    ]
+    gauss_weights = [1.0 / c for c in centers]
+    total = sum(gauss_weights)
+    weights = [0.5] + [0.5 * w / total for w in gauss_weights]
+    return (
+        [math.log(w) for w in weights]
+        + [inverse_softplus(1.0 / exp_mean)]
+        + [inverse_softplus(c - exp_mean) for c in centers]
+        + [inverse_softplus(0.35 * c - min_sigma_secs / unit_secs) for c in centers]
+    )
+
+
+def egmn_mixture_from_raw(
+    raw: jax.Array, num_gaussians: int, min_sigma_secs: float, unit_secs: float
+) -> EgmnMixture:
+    raw = raw.astype(jnp.float32)
+    k = num_gaussians
+    log_weights = jax.nn.log_softmax(raw[..., : k + 1], axis=-1)
+    rate = jax.nn.softplus(raw[..., k + 1]) + 1e-3
+    means = 1.0 / rate[..., None] + jax.nn.softplus(raw[..., k + 2 : 2 * k + 2])
+    sigmas = min_sigma_secs / unit_secs + jax.nn.softplus(raw[..., 2 * k + 2 :])
+    return EgmnMixture(log_weights, rate, means, sigmas)
+
+
+def egmn_expected_value(mixture: EgmnMixture, unit_secs: float) -> jax.Array:
+    weights = jnp.exp(mixture.log_weights)
+    return unit_secs * (
+        weights[..., 0] / mixture.rate + jnp.sum(weights[..., 1:] * mixture.means, axis=-1)
+    )
+
+
+def egmn_log_density(mixture: EgmnMixture, value: jax.Array) -> jax.Array:
+    log_exp = mixture.log_weights[..., 0] + jnp.log(mixture.rate) - mixture.rate * value
+    z = (value[..., None] - mixture.means) / mixture.sigmas
+    log_gauss = (
+        mixture.log_weights[..., 1:]
+        - jnp.log(mixture.sigmas)
+        - 0.5 * math.log(2.0 * math.pi)
+        - 0.5 * z * z
+    )
+    return jax.nn.logsumexp(jnp.concatenate([log_exp[..., None], log_gauss], axis=-1), axis=-1)
+
+
+def egmn_loss_compute(
+    gt_raw: jax.Array,
+    mixture: EgmnMixture,
+    valid_mask: jax.Array,
+    negative_sample_mask: jax.Array,
+    norm_scale: float,
+    unit_secs: float,
+    entropy_weight: float,
+    regression_weight: float,
+    regression_loss_type: str,
+    mask_negatives: bool = True,
+    sentinel_values: tuple[float, ...] = (),
+    raw_weights: jax.Array | None = None,
+    normalizer: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
+    gt_raw = gt_raw.astype(jnp.float32)
+    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)
+    value = gt_clamped / unit_secs
+    expected = egmn_expected_value(mixture, unit_secs)
+    per_element_nll = -egmn_log_density(mixture, value)
+    weights_k = jnp.exp(mixture.log_weights)
+    per_element_entropy = jnp.sum(weights_k * mixture.log_weights, axis=-1)
+    residual = (expected - gt_clamped) / unit_secs
+    if regression_loss_type == "mae":
+        per_element_regression = jnp.abs(residual)
+    elif regression_loss_type == "mse":
+        per_element_regression = residual * residual
+    elif regression_loss_type == "huber":
+        per_element_regression = optax.huber_loss(residual, delta=0.5)
+    elif regression_loss_type == "none":
+        per_element_regression = jnp.zeros_like(residual)
+    else:
+        raise ValueError(f"Unknown egmn regression loss: {regression_loss_type}")
+    per_element_loss = (
+        per_element_nll
+        + entropy_weight * per_element_entropy
+        + regression_weight * per_element_regression
+    )
+
+    if mask_negatives:
+        loss_mask = valid_mask.astype(jnp.bool_) & (~negative_sample_mask)
+    else:
+        loss_mask = valid_mask.astype(jnp.bool_)
+    for sentinel in sentinel_values:
+        loss_mask = loss_mask & (gt_raw != sentinel)
+
+    weights = loss_mask if raw_weights is None else loss_mask * raw_weights
+    if normalizer is None:
+        normalizer = jnp.sum(weights)
+    num_loss_samples = jnp.maximum(normalizer, 1.0)
+
+    def mean(x: jax.Array) -> jax.Array:
+        return jnp.sum(jnp.where(loss_mask, x, 0.0) * weights) / num_loss_samples
+
+    stats = {
+        "nll": mean(per_element_nll),
+        "entropy": mean(per_element_entropy),
+        "regression": mean(per_element_regression),
+        "exp_weight": mean(weights_k[..., 0]),
+        "exp_mean_secs": mean(unit_secs / mixture.rate),
+        "max_weight": mean(jnp.max(weights_k, axis=-1)),
+    }
+    loss = mean(per_element_loss)
+    return loss, gt_clamped, expected, loss_mask, per_element_loss, stats
 
 
 def binary_threshold_loss_compute(

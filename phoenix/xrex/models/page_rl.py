@@ -7,9 +7,12 @@ from typing import NamedTuple
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import optax
+from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
+from xrex.models.model_utils import get_parameter
 from xrex.models.page_critic import (
     PageCriticConfig,
     discounted_suffix_sum,
@@ -28,8 +31,21 @@ from xrex.models.page_decoder import (
     decoder_bc_loss,
     page_pg_loss,
 )
+from xrex.models.recsys_feature_prep import IMMERSIVE_NOT_DWELLED_SEC
 
 PAGE_PARAM_REGEX = "page_critic|page_decoder|kl_beta_u"
+USER_DEBIAS_PARAM_REGEX = "page_user_debias"
+
+USER_DEBIAS_ACTIONS: tuple[int, ...] = (
+    recsys_pb2.ActionName.SERVER_TWEET_FAV,
+    recsys_pb2.ActionName.SERVER_TWEET_REPLY,
+    recsys_pb2.ActionName.SERVER_TWEET_RETWEET,
+    recsys_pb2.ActionName.SERVER_TWEET_QUOTE,
+    recsys_pb2.ActionName.CLIENT_TWEET_CLICK,
+    recsys_pb2.ActionName.CLIENT_TWEET_SHARE,
+)
+USER_DEBIAS_OUTPUTS = len(USER_DEBIAS_ACTIONS) + 1
+USER_DEBIAS_DWELL_CAP_S = 300.0
 
 REALIZED_POSITIVE_ACTIONS: tuple[str, ...] = (
     "ServerTweetFav",
@@ -51,6 +67,30 @@ REALIZED_NEGATIVE_ACTIONS: tuple[str, ...] = (
     "ClientTweetMuteAuthor",
     "ClientTweetSeeFewer",
 )
+
+VIDEO_COMPLETED_ACTION = recsys_pb2.ActionName.CLIENT_NOTIFICATION_SENT
+
+
+@configclass
+class VideoCompletionLabelConfig(Config):
+    floor: float = 0.35
+    top: float = 1.4
+    d0: float = 50.0
+    k: float = 2.0
+    cap_factor: float = 3.0
+    cap_floor_s: float = 10.0
+
+
+def video_completion_labels(
+    dwell_s: jax.Array, duration_ms: jax.Array, cfg: VideoCompletionLabelConfig
+) -> tuple[jax.Array, jax.Array]:
+    dwell_s = dwell_s.astype(jnp.float32)
+    duration_ms = duration_ms.astype(jnp.float32)
+    d = duration_ms / 1000.0
+    p = cfg.floor + (cfg.top - cfg.floor) / (1.0 + (d / cfg.d0) ** cfg.k)
+    cap = cfg.cap_factor * jnp.maximum(d, cfg.cap_floor_s)
+    trains = (duration_ms > 0.0) & (dwell_s >= IMMERSIVE_NOT_DWELLED_SEC)
+    return trains, (dwell_s >= p * d) & (dwell_s <= cap)
 
 
 @configclass
@@ -76,6 +116,7 @@ class PageServeScoreConfig(Config):
     share_via_dm_weight: float = 0.0
     share_via_copy_link_weight: float = 0.0
     quote_weight: float = 5.0
+    completion_weight: float = 0.0
     cont_dwell_time_weight: float = 0.1
     not_interested_weight: float = -500.0
     report_weight: float = -1000.0
@@ -100,6 +141,7 @@ RANKING_SCORE_WEIGHT_FIELDS: tuple[str, ...] = (
     "min_video_duration_ms",
     "share_via_dm_weight",
     "share_via_copy_link_weight",
+    "completion_weight",
 )
 
 PAGE_SERVE_DECODE_MODES = ("actor", "critic")
@@ -112,6 +154,16 @@ class PageServeDecodeConfig(Config):
     nu_author: float = 0.0
     nu_sid: float = 0.0
     prior_tau: float = 0.2
+    max_pool: int = 0
+
+
+@configclass
+class PageUserDebiasConfig(Config):
+    enabled: bool = False
+    hidden_dim: int = 256
+    clip_logit: float = 1.0
+    serve_heads: bool = False
+    serve_dwell: bool = False
 
 
 @configclass
@@ -122,6 +174,7 @@ class PageRlConfig(Config):
     decoder: PageDecoderConfig = PageDecoderConfig()
     pg: PagePgConfig = PagePgConfig()
     serve_score: PageServeScoreConfig = PageServeScoreConfig()
+    user_debias: PageUserDebiasConfig = PageUserDebiasConfig()
     bc_loss_weight: float = 0.25
     critic_only: PageCriticOnlyConfig | None = None
     serve_decode: PageServeDecodeConfig = PageServeDecodeConfig()
@@ -216,6 +269,7 @@ def page_rl_loss_and_stats(
     valid_mask: jax.Array,
     post_sids: jax.Array,
     auth_hashes: jax.Array,
+    user_debias: UserDebiasBatch | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     fields = compute_page_rl_fields(
         rl_served_slot=rl_served_slot,
@@ -248,6 +302,16 @@ def page_rl_loss_and_stats(
     return_sorted = fields.return_g[:, :s_max]
     sids_sorted = _sorted(post_sids)
     auth_sorted = _sorted(auth_hashes)
+
+    debias = config.user_debias
+    debias_loss, debias_stats = jnp.zeros((), jnp.float32), {}
+    if debias.enabled:
+        assert user_debias is not None, "page_rl.user_debias needs its training inputs"
+        heads = PageUserDebias(debias)
+        debias_loss, debias_stats = page_user_debias_loss(
+            heads(user_emb, user_debias.stats), heads.global_values(), user_debias, dwell_s
+        )
+
     critic_out = page_critic_loss(
         config=config.critic,
         emb_sorted=emb_sorted,
@@ -278,8 +342,8 @@ def page_rl_loss_and_stats(
         sids_sorted=sids_sorted,
         auth_sorted=auth_sorted,
     )
-    total = critic_out.total + config.bc_loss_weight * bc_loss + pg_out.total
-    stats = {**critic_out.stats, **bc_stats, **pg_out.stats}
+    total = critic_out.total + config.bc_loss_weight * bc_loss + pg_out.total + debias_loss
+    stats = {**critic_out.stats, **bc_stats, **pg_out.stats, **debias_stats}
     if config.critic_only is not None:
         critic_only_out = page_critic_only_loss(
             config=config.critic_only,
@@ -314,6 +378,7 @@ class PageDecodeInputs(NamedTuple):
     not_dwelled_power_offset: jax.Array | None = None
     engage_bias: jax.Array | None = None
     multiplicative: jax.Array | None = None
+    user_debias_heads: jax.Array | None = None
 
     @classmethod
     def no_decode(cls, n_users: int, n_candidates: int) -> PageDecodeInputs:
@@ -335,6 +400,7 @@ class PageDecodeInputs(NamedTuple):
             not_dwelled_power_offset=unset,
             engage_bias=unset,
             multiplicative=unset,
+            user_debias_heads=jnp.full((n_users, USER_DEBIAS_OUTPUTS), jnp.nan, dtype=jnp.float32),
         )
 
 
@@ -403,6 +469,7 @@ def page_serve_weighted_score(
     share_via_dm = weight("share_via_dm_weight")
     share_via_copy_link = weight("share_via_copy_link_weight")
     quote = weight("quote_weight")
+    completion = weight("completion_weight")
     cont_dwell_time = weight("cont_dwell_time_weight")
     not_interested = weight("not_interested_weight")
     report = weight("report_weight")
@@ -422,6 +489,7 @@ def page_serve_weighted_score(
         + share_via_dm * head(an.CLIENT_TWEET_CLICK_SEND_VIA_DIRECT_MESSAGE)
         + share_via_copy_link * head(an.CLIENT_TWEET_SHARE_VIA_COPY_LINK)
         + quote * head(an.SERVER_TWEET_QUOTE)
+        + completion * head(VIDEO_COMPLETED_ACTION)
         + not_interested * head(an.CLIENT_TWEET_NOT_INTERESTED_IN)
         + report * head(an.CLIENT_TWEET_REPORT)
     )
@@ -455,6 +523,7 @@ def page_serve_weighted_score(
         + share_via_dm
         + share_via_copy_link
         + quote
+        + completion
         + jnp.maximum(not_dwelled, 0.0)
     )
     add_negative = -(not_interested + report + jnp.minimum(not_dwelled, 0.0))
@@ -499,7 +568,7 @@ def run_page_decode(
         multiplicative=request.multiplicative,
     )
     valid = jnp.arange(n_cand)[None, :] < request.n_candidates[:, None]
-    pool_k = min(config.decoder.max_steps, n_cand)
+    pool_k = page_decode_pool_k(config, n_cand)
     top_vals, top_idx = jax.lax.top_k(jnp.where(valid, wscore, -jnp.inf), pool_k)
     pool_mask = jnp.isfinite(top_vals) & (jnp.arange(pool_k)[None, :] < request.pool_n[:, None])
     behavior = jnp.where(pool_mask, top_vals, 0.0)
@@ -511,6 +580,11 @@ def run_page_decode(
     serve = config.serve_decode
     if serve.mode not in PAGE_SERVE_DECODE_MODES:
         raise ValueError(f"serve_decode.mode={serve.mode!r} not in {PAGE_SERVE_DECODE_MODES}")
+    if serve.mode != "critic" and serve.max_pool > decoder.max_steps:
+        raise ValueError(
+            f"serve_decode.max_pool={serve.max_pool} exceeds decoder.max_steps="
+            f"{decoder.max_steps}: only serve_decode.mode='critic' decodes a wider pool"
+        )
     if serve.mode == "critic":
         if config.critic_only is None:
             raise ValueError("serve_decode.mode='critic' needs page_rl.critic_only")
@@ -576,13 +650,128 @@ def run_page_decode(
     )
 
 
+def page_decode_pool_k(config: PageRlConfig, n_cand: int) -> int:
+    return min(config.serve_decode.max_pool or config.decoder.max_steps, n_cand)
+
+
 def page_decode_noop_outputs(
     config: PageRlConfig, request: PageDecodeInputs
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     n_users, n_cand = request.video_duration_ms.shape
-    pool_k = min(config.decoder.max_steps, n_cand)
+    pool_k = page_decode_pool_k(config, n_cand)
     return (
         jnp.full((n_users, pool_k), -1, dtype=jnp.int32),
         jnp.zeros((n_users, pool_k), dtype=jnp.float32),
         jnp.zeros((n_users, pool_k), dtype=jnp.float32),
     )
+
+
+class UserDebiasBatch(NamedTuple):
+    stats: jax.Array
+    labels: jax.Array
+    rows: jax.Array
+
+
+_USER_DEBIAS_GLOBAL_INIT = (-4.0,) * len(USER_DEBIAS_ACTIONS) + (2.0,)
+
+
+class PageUserDebias(hk.Module):
+    def __init__(self, config: PageUserDebiasConfig, name: str = "page_user_debias"):
+        super().__init__(name=name)
+        self._config = config
+
+    @staticmethod
+    def _param(name: str, shape: list[int], init: hk.initializers.Initializer) -> jax.Array:
+        return get_parameter(
+            name,
+            shape,
+            dtype=jnp.float32,
+            init=init,
+            pspec=P(*([None] * len(shape))),
+            dtype_unwrap=jnp.float32,
+        )
+
+    def global_values(self) -> jax.Array:
+        init = hk.initializers.Constant(jnp.asarray(_USER_DEBIAS_GLOBAL_INIT))
+        return self._param("global", [USER_DEBIAS_OUTPUTS], init)
+
+    def __call__(
+        self,
+        user_emb: jax.Array,
+        stats: jax.Array,
+    ) -> jax.Array:
+        x = jnp.concatenate([user_emb.astype(jnp.float32), stats.astype(jnp.float32)], axis=-1)
+        hidden = self._config.hidden_dim
+        dims = (x.shape[-1], hidden, hidden, USER_DEBIAS_OUTPUTS)
+        for i in range(3):
+            last = i == 2
+            w_init = (
+                hk.initializers.Constant(0.0)
+                if last
+                else hk.initializers.VarianceScaling(2.0, mode="fan_in")
+            )
+            b_init = hk.initializers.Constant(
+                jnp.asarray(_USER_DEBIAS_GLOBAL_INIT) if last else 0.0
+            )
+            w = self._param(f"both_w{i}", [dims[i], dims[i + 1]], w_init)
+            b = self._param(f"both_b{i}", [dims[i + 1]], b_init)
+            x = jnp.einsum("ud,dk->uk", x, w) + b
+            if not last:
+                x = jax.nn.relu(x)
+        return x
+
+
+def page_user_debias_shift(
+    config: PageUserDebiasConfig, user_emb: jax.Array, user_stats: jax.Array
+) -> jax.Array:
+    heads = PageUserDebias(config)
+    shift = heads(user_emb, user_stats) - heads.global_values()
+    return jnp.clip(shift, -config.clip_logit, config.clip_logit)
+
+
+def page_user_debias_serve(
+    config: PageUserDebiasConfig,
+    logits: jax.Array,
+    cont_preds: jax.Array,
+    shift: jax.Array,
+    heads_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    logits, cont_preds = jnp.asarray(logits), jnp.asarray(cont_preds)
+    shift = shift * jnp.where(jnp.isnan(heads_mask), 1.0, heads_mask)
+    if config.serve_heads:
+        logits = logits.at[..., jnp.asarray(USER_DEBIAS_ACTIONS)].add(
+            -shift[:, None, :-1].astype(logits.dtype)
+        )
+    if config.serve_dwell:
+        cont_preds = cont_preds.at[..., recsys_pb2.ContinuousActionName.DWELL_TIME].multiply(
+            jnp.exp(-shift[:, None, -1]).astype(cont_preds.dtype)
+        )
+    return logits, cont_preds
+
+
+def page_user_debias_loss(
+    user: jax.Array,
+    global_values: jax.Array,
+    batch: UserDebiasBatch,
+    dwell_s: jax.Array,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    rows = batch.rows.astype(jnp.float32)
+    n = jnp.maximum(rows.sum(), 1.0)
+    labels = batch.labels.astype(jnp.float32)
+    log_dwell = jnp.log1p(jnp.clip(dwell_s.astype(jnp.float32), 0.0, USER_DEBIAS_DWELL_CAP_S))
+
+    def fit(values: jax.Array) -> tuple[jax.Array, jax.Array]:
+        v = jnp.broadcast_to(values, (rows.shape[0], USER_DEBIAS_OUTPUTS))[:, None, :]
+        bce = optax.sigmoid_binary_cross_entropy(v[..., :-1], labels)
+        bce = (bce * rows[..., None]).sum((0, 1)) / n
+        mae = (jnp.abs(v[..., -1] - log_dwell) * rows).sum() / n
+        return bce, mae
+
+    global_bce, global_mae = fit(global_values)
+    user_bce, user_mae = fit(user)
+    total = global_bce.sum() + global_mae + user_bce.sum() + user_mae
+    return total, {
+        "page_rl/user_debias/global/dwell_mae": global_mae,
+        "page_rl/user_debias/both/dwell_mae": user_mae,
+        "page_rl/user_debias/loss": total,
+    }

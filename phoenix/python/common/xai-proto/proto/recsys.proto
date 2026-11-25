@@ -2111,6 +2111,8 @@ message HistorySourceInfo {
   uint32 length = 1;
   optional uint64 first_event_ms = 2;
   optional uint64 last_event_ms = 3;
+  optional uint64 first_kafka_timestamp_ms = 4;
+  optional uint64 last_kafka_timestamp_ms = 5;
 }
 
 service UserActionAggregationService {

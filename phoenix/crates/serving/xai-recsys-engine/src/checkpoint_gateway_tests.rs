@@ -66,6 +66,7 @@ fn write_checkpoint_of(root: &Path, elapsed: u64, run: &str) {
 struct FakeCopy {
     root: PathBuf,
     fail_sends: bool,
+    before_send: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Service<Inner> for FakeCopy {
@@ -80,6 +81,7 @@ impl Service<Inner> for FakeCopy {
     fn call(&mut self, request: Inner) -> Self::Future {
         let root = self.root.clone();
         let fail_sends = self.fail_sends;
+        let before_send = self.before_send.clone();
         Box::pin(async move {
             let path = request.uri().path().to_string();
             let mut buf = get_bytes_mut();
@@ -115,6 +117,9 @@ impl Service<Inner> for FakeCopy {
                 )
                 .await
                 .unwrap();
+                if let Some(before_send) = &before_send {
+                    before_send();
+                }
                 let mut data = Vec::new();
                 for ((name, offset), size) in decode_names(names, p, s)
                     .unwrap()
@@ -204,6 +209,7 @@ impl Fixture {
             FakeCopy {
                 root: root.to_path_buf(),
                 fail_sends: false,
+                before_send: None,
             },
             gateway.clone(),
             self.peers.clone(),
@@ -602,6 +608,339 @@ async fn a_release_with_fewer_samples_is_offered_above_what_pods_serve() {
     let (gateway, mut svc, held) = held_at_1000(&fx).await;
     canary_of_500(&fx, &gateway, 3, 500).await;
     assert_eq!(listed_prefixes(&mut svc, ip(1)).await, vec![held]);
+}
+
+#[tokio::test]
+async fn admitted_canary_pods_keep_the_allowed_candidate_while_the_trainer_saves_past_the_ceiling()
+{
+    let fx = Fixture::new();
+    let (gateway, mut svc, held) = held_at_1000(&fx).await;
+    let mut canary = canary_of_500(&fx, &gateway, 3, 600).await;
+    canary["version"] = json!(4);
+    canary["ceiling"] = json!({"prefixes": [real_of(500, CAND)]});
+    gateway.apply(&canary, Instant::now()).unwrap();
+    let candidate = serving_prefix(1100, "cand", 2);
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![candidate.clone()]
+        );
+    }
+
+    write_checkpoint_of(&fx.root, 600, CAND);
+    gateway.note_mirrored(&real_of(600, CAND));
+    for (n, want) in [(1, &candidate), (2, &candidate), (3, &held)] {
+        assert_eq!(
+            &listed_prefixes(&mut svc, ip(n)).await,
+            &vec![want.clone()],
+            "pod {n}"
+        );
+    }
+    assert_eq!(
+        send(&mut svc, ip(2), &format!("{candidate}/dense_params/w"), 96)
+            .await
+            .unwrap(),
+        file(500, "dense_params/w")
+    );
+    let ack = gateway.ack().unwrap();
+    assert_eq!(ack["offered"]["uid-1"], json!(candidate), "{ack}");
+    assert_eq!(ack["offered"]["uid-2"], json!(candidate), "{ack}");
+
+    canary["version"] = json!(5);
+    canary["ceiling"] = json!({"prefixes": [real_of(600, CAND)]});
+    gateway.apply(&canary, Instant::now()).unwrap();
+    assert_eq!(
+        listed_prefixes(&mut svc, ip(1)).await,
+        vec![serving_prefix(1200, "cand", 2)]
+    );
+}
+
+async fn canary_past_its_ceiling(
+    fx: &Fixture,
+) -> (Arc<Gateway>, GatewayService<FakeCopy>, String, String) {
+    let (gateway, mut svc, held) = held_at_1000(fx).await;
+    let mut canary = canary_of_500(fx, &gateway, 3, 600).await;
+    canary["version"] = json!(4);
+    canary["ceiling"] = json!({"prefixes": [real_of(500, CAND)]});
+    gateway.apply(&canary, Instant::now()).unwrap();
+    write_checkpoint_of(&fx.root, 600, CAND);
+    gateway.note_mirrored(&real_of(600, CAND));
+    let candidate = serving_prefix(1100, "cand", 2);
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![candidate.clone()]
+        );
+    }
+    (gateway, svc, held, candidate)
+}
+
+fn evict(gateway: &Gateway, root: &Path, real: &str) {
+    let guard = gateway.root_guard();
+    let _evicting = guard.lock();
+    fs::remove_dir_all(root.join(real.split('/').next().unwrap())).unwrap();
+}
+
+#[tokio::test]
+async fn a_canary_candidate_the_proxy_evicts_stays_whole_for_the_pods_offered_it() {
+    let fx = Fixture::new();
+    let (gateway, mut svc, _, candidate) = canary_past_its_ceiling(&fx).await;
+
+    write_checkpoint_of(&fx.root, 700, CAND);
+    evict(&gateway, &fx.root, &real_of(500, CAND));
+    gateway.note_mirrored(&real_of(700, CAND));
+
+    for (name, size) in [("dense_params/w", 96), ("emb_table/c/1/0", 200)] {
+        assert_eq!(
+            send(&mut svc, ip(2), &format!("{candidate}/{name}"), size)
+                .await
+                .unwrap(),
+            file(500, name),
+            "{name}"
+        );
+    }
+    let ack = gateway.ack().unwrap();
+    assert_eq!(
+        ack["downloaded"]["uid-2"]["prefix"],
+        json!(candidate),
+        "{ack}"
+    );
+    assert_eq!(ack["downloaded"]["uid-2"]["ok"], json!(true), "{ack}");
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![candidate.clone()],
+            "pod {n}"
+        );
+    }
+
+    drop(svc);
+    drop(gateway);
+    let restarted = fx.open();
+    let mut svc = fx.service(&restarted, &fx.root);
+    assert_eq!(
+        listed_prefixes(&mut svc, ip(1)).await,
+        vec![candidate.clone()]
+    );
+    assert_eq!(
+        send(
+            &mut svc,
+            ip(1),
+            &format!("{candidate}/emb_table/c/0/0"),
+            200
+        )
+        .await
+        .unwrap(),
+        file(500, "emb_table/c/0/0")
+    );
+}
+
+#[tokio::test]
+async fn a_canary_candidate_the_next_save_evicts_at_once_is_still_offered() {
+    let fx = Fixture::new();
+    let (gateway, mut svc, _) = held_at_1000(&fx).await;
+    let mut canary = canary_of_500(&fx, &gateway, 3, 600).await;
+    canary["version"] = json!(4);
+    canary["ceiling"] = json!({"prefixes": [real_of(500, CAND)]});
+    gateway.apply(&canary, Instant::now()).unwrap();
+    let candidate = serving_prefix(1100, "cand", 2);
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![candidate.clone()]
+        );
+    }
+
+    write_checkpoint_of(&fx.root, 600, CAND);
+    evict(&gateway, &fx.root, &real_of(500, CAND));
+    gateway.note_mirrored(&real_of(600, CAND));
+
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![candidate.clone()],
+            "pod {n}"
+        );
+    }
+    assert_eq!(
+        send(
+            &mut svc,
+            ip(1),
+            &format!("{candidate}/emb_table/c/0/0"),
+            200
+        )
+        .await
+        .unwrap(),
+        file(500, "emb_table/c/0/0")
+    );
+}
+
+#[tokio::test]
+async fn the_pinned_candidate_gives_way_to_a_full_serving_root() {
+    let fx = Fixture::new();
+    let (gateway, mut svc, held, candidate) = canary_past_its_ceiling(&fx).await;
+    assert_eq!(
+        send(&mut svc, ip(2), &format!("{candidate}/dense_params/w"), 96)
+            .await
+            .unwrap(),
+        file(500, "dense_params/w")
+    );
+
+    write_checkpoint_of(&fx.root, 700, CAND);
+    evict(&gateway, &fx.root, &real_of(500, CAND));
+    assert!(gateway.release_candidate());
+    assert!(!gateway.release_candidate(), "one pin");
+    gateway.note_mirrored(&real_of(700, CAND));
+    let pins = fx.root.join(GATEWAY_DIR).join(CANDIDATE_DIR);
+    assert_eq!(scan_real_prefixes(&pins), Vec::<String>::new());
+
+    let err = send(
+        &mut svc,
+        ip(2),
+        &format!("{candidate}/emb_table/c/1/0"),
+        200,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
+    let ack = gateway.ack().unwrap();
+    assert!(ack["downloaded"].get("uid-2").is_none(), "{ack}");
+    for n in [1, 2] {
+        assert_eq!(
+            listed_prefixes(&mut svc, ip(n)).await,
+            vec![held.clone()],
+            "pod {n}"
+        );
+    }
+}
+
+fn sending_with(
+    fx: &Fixture,
+    gateway: &Arc<Gateway>,
+    hook: impl Fn() + Send + Sync + 'static,
+) -> GatewayService<FakeCopy> {
+    GatewayService::new(
+        FakeCopy {
+            root: fx.root.clone(),
+            fail_sends: false,
+            before_send: Some(Arc::new(hook)),
+        },
+        gateway.clone(),
+        fx.peers.clone(),
+    )
+}
+
+#[tokio::test]
+async fn a_full_serving_root_keeps_the_pin_of_a_candidate_it_still_holds() {
+    let fx = Fixture::new();
+    let (gateway, mut svc, _) = held_at_1000(&fx).await;
+    let mut canary = canary_of_500(&fx, &gateway, 3, 600).await;
+    canary["version"] = json!(4);
+    canary["ceiling"] = json!({"prefixes": [real_of(500, CAND)]});
+    gateway.apply(&canary, Instant::now()).unwrap();
+    let candidate = serving_prefix(1100, "cand", 2);
+    assert_eq!(
+        listed_prefixes(&mut svc, ip(1)).await,
+        vec![candidate.clone()]
+    );
+
+    let full = gateway.clone();
+    let mut svc = sending_with(&fx, &gateway, move || {
+        full.release_candidate();
+    });
+    assert_eq!(
+        send(&mut svc, ip(1), &format!("{candidate}/dense_params/w"), 96)
+            .await
+            .unwrap(),
+        file(500, "dense_params/w")
+    );
+    let ack = gateway.ack().unwrap();
+    assert_eq!(ack["downloaded"]["uid-1"]["ok"], json!(true), "{ack}");
+    assert!(!gateway.release_candidate(), "the root still holds it");
+}
+
+#[tokio::test]
+async fn a_send_in_flight_when_the_pin_moves_on_is_not_a_failed_download() {
+    let fx = Fixture::new();
+    let (gateway, _, _, candidate) = canary_past_its_ceiling(&fx).await;
+
+    let gate = gateway.clone();
+    let mut svc = sending_with(&fx, &gateway, move || {
+        let mut passed = gate.policy().unwrap().raw;
+        passed["version"] = json!(5);
+        passed["ceiling"] = json!({"prefixes": [real_of(600, CAND)]});
+        gate.apply(&passed, Instant::now()).unwrap();
+    });
+    let err = send(&mut svc, ip(1), &format!("{candidate}/dense_params/w"), 96)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
+    assert!(fx.root.join(real_of(500, CAND)).is_dir());
+
+    let ack = gateway.ack().unwrap();
+    assert!(ack["downloaded"].get("uid-1").is_none(), "{ack}");
+}
+
+#[tokio::test]
+async fn a_canary_pod_listing_while_the_proxy_evicts_the_candidate_is_listed_it_whole() {
+    let fx = Fixture::new();
+    let (_gateway, mut svc, _, candidate) = canary_past_its_ceiling(&fx).await;
+
+    fs::remove_file(fx.root.join(real_of(500, CAND)).join("emb_table/c/1/0")).unwrap();
+
+    let mut whole: Vec<(String, usize)> = files(500)
+        .into_iter()
+        .map(|(n, d)| (format!("{candidate}/{n}"), d.len()))
+        .collect();
+    whole.sort();
+    assert_eq!(list(&mut svc, ip(1)).await, whole);
+    assert_eq!(
+        send(
+            &mut svc,
+            ip(1),
+            &format!("{candidate}/emb_table/c/1/0"),
+            200
+        )
+        .await
+        .unwrap(),
+        file(500, "emb_table/c/1/0")
+    );
+}
+
+#[tokio::test]
+async fn a_send_of_a_checkpoint_the_serving_root_dropped_is_not_a_failed_download() {
+    let fx = Fixture::new();
+    let (gateway, mut svc, _) = held_at_1000(&fx).await;
+    canary_of_500(&fx, &gateway, 3, 600).await;
+    let candidate = serving_prefix(1100, "cand", 2);
+    assert_eq!(
+        listed_prefixes(&mut svc, ip(1)).await,
+        vec![candidate.clone()]
+    );
+    assert_eq!(
+        send(&mut svc, ip(1), &format!("{candidate}/dense_params/w"), 96)
+            .await
+            .unwrap(),
+        file(500, "dense_params/w")
+    );
+
+    for elapsed in [600, 700] {
+        write_checkpoint_of(&fx.root, elapsed, CAND);
+        gateway.note_mirrored(&real_of(elapsed, CAND));
+    }
+    evict(&gateway, &fx.root, &real_of(500, CAND));
+    let err = send(
+        &mut svc,
+        ip(1),
+        &format!("{candidate}/emb_table/c/1/0"),
+        200,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
+
+    let ack = gateway.ack().unwrap();
+    assert!(ack["downloaded"].get("uid-1").is_none(), "{ack}");
 }
 
 #[tokio::test]
@@ -1513,6 +1852,7 @@ async fn a_slots_bridge_is_counted_as_a_bridge_never_as_an_unknown_peer() {
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: false,
+            before_send: None,
         },
         gateway.clone(),
         pods.clone(),
@@ -1794,6 +2134,7 @@ async fn replaced_canary_pods_free_their_admissions() {
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: false,
+            before_send: None,
         },
         gateway.clone(),
         Arc::new(peers),
@@ -1840,6 +2181,7 @@ async fn replaced_pods_free_their_share_of_the_rolling_budget() {
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: false,
+            before_send: None,
         },
         gateway.clone(),
         Arc::new(peers),
@@ -2087,6 +2429,7 @@ async fn a_send_that_never_finished_is_not_reported_downloaded() {
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: true,
+            before_send: None,
         },
         gateway.clone(),
         fx.peers.clone(),
@@ -2284,6 +2627,7 @@ async fn a_pod_that_fetched_before_the_directory_listed_it_is_named_on_the_next_
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: false,
+            before_send: None,
         },
         gateway.clone(),
         directory.clone(),
@@ -2590,6 +2934,7 @@ async fn a_send_in_flight_when_the_listing_names_its_pod_counts_as_its_download(
         FakeCopy {
             root: fx.root.clone(),
             fail_sends: false,
+            before_send: None,
         },
         gateway.clone(),
         directory.clone(),
