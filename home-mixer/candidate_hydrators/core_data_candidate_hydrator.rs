@@ -16,7 +16,7 @@ const MISSING_SCOPE: [(&str, &str); 1] = [("hydration", "missing")];
 #[derive(Clone)]
 pub struct CoreDataCandidateHydrator {
     pub tes_client: Arc<dyn TESClient + Send + Sync>,
-    pub cache: Arc<QuickCache<u64, CoreDataCacheValue>>,
+    pub cache: Arc<QuickCache<u64, Option<CoreDataCacheValue>>>,
 }
 
 impl CoreDataCandidateHydrator {
@@ -30,7 +30,7 @@ impl CoreDataCandidateHydrator {
 
 #[async_trait]
 impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrator {
-    type Fetched = Vec<Option<CoreDataCacheValue>>;
+    type Fetched = Vec<Option<Option<CoreDataCacheValue>>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
@@ -40,7 +40,7 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydr
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<Option<CoreDataCacheValue>>, String> {
+    ) -> Result<Vec<Option<Option<CoreDataCacheValue>>>, String> {
         self.fetch_cached(query, candidates, PipelineStage::Hydrator)
             .await
     }
@@ -50,7 +50,7 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydr
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
         stage: PipelineStage,
-    ) -> Result<Vec<Option<CoreDataCacheValue>>, String> {
+    ) -> Result<Vec<Option<Option<CoreDataCacheValue>>>, String> {
         self.fetch_cached(query, candidates, stage).await
     }
 
@@ -58,10 +58,10 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydr
         &self,
         _query: &ScoredPostsQuery,
         candidates: &mut [PostCandidate],
-        values: Vec<Option<CoreDataCacheValue>>,
+        values: Vec<Option<Option<CoreDataCacheValue>>>,
     ) {
         for (candidate, value) in candidates.iter_mut().zip(values) {
-            let Some(value) = value else {
+            let Some(Some(value)) = value else {
                 continue;
             };
             if candidate.author_id == 0 && value.author_id != 0 {
@@ -90,9 +90,9 @@ impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydr
 #[async_trait]
 impl CachedFetch<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrator {
     type CacheKey = u64;
-    type Value = CoreDataCacheValue;
+    type Value = Option<CoreDataCacheValue>;
 
-    fn cache_store(&self) -> &dyn CacheStore<u64, CoreDataCacheValue> {
+    fn cache_store(&self) -> &dyn CacheStore<u64, Option<CoreDataCacheValue>> {
         self.cache.as_ref()
     }
 
@@ -100,14 +100,16 @@ impl CachedFetch<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrator 
         candidate.tweet_id
     }
 
-    fn existing_value(&self, candidate: &PostCandidate) -> Option<CoreDataCacheValue> {
-        (candidate.author_id != 0 && !candidate.tweet_text.is_empty()).then(|| CoreDataCacheValue {
-            author_id: candidate.author_id,
-            retweeted_user_id: candidate.retweeted_user_id,
-            retweeted_tweet_id: candidate.retweeted_tweet_id,
-            in_reply_to_tweet_id: candidate.in_reply_to_tweet_id,
-            ancestor_users: candidate.ancestor_users.clone(),
-            tweet_text: candidate.tweet_text.clone(),
+    fn existing_value(&self, candidate: &PostCandidate) -> Option<Option<CoreDataCacheValue>> {
+        (candidate.author_id != 0 && !candidate.tweet_text.is_empty()).then(|| {
+            Some(CoreDataCacheValue {
+                author_id: candidate.author_id,
+                retweeted_user_id: candidate.retweeted_user_id,
+                retweeted_tweet_id: candidate.retweeted_tweet_id,
+                in_reply_to_tweet_id: candidate.in_reply_to_tweet_id,
+                ancestor_users: candidate.ancestor_users.clone(),
+                tweet_text: candidate.tweet_text.clone(),
+            })
         })
     }
 
@@ -115,7 +117,7 @@ impl CachedFetch<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrator 
         &self,
         _query: &ScoredPostsQuery,
         misses: &[&PostCandidate],
-    ) -> Vec<Option<CoreDataCacheValue>> {
+    ) -> Vec<Option<Option<CoreDataCacheValue>>> {
         let client = &self.tes_client;
 
         let post_features = client
@@ -150,25 +152,20 @@ impl CachedFetch<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrator 
                                 Some(Ok(Some(source))) => Some(source.text.clone()),
                                 _ => None,
                             });
-                    values.push(Some(CoreDataCacheValue {
+                    values.push(Some(Some(CoreDataCacheValue {
                         author_id: core_data.author_id,
                         retweeted_user_id: core_data.source_user_id,
                         retweeted_tweet_id: core_data.source_tweet_id,
                         in_reply_to_tweet_id: core_data.in_reply_to_tweet_id,
                         ancestor_users: build_ancestor_users(candidate, core_data, &post_features),
                         tweet_text: source_text.unwrap_or_else(|| core_data.text.clone()),
-                    }));
+                    })));
                 }
                 Some(Ok(None)) | None => {
                     missing_count += 1;
-                    values.push(Some(CoreDataCacheValue {
-                        author_id: 0,
-                        retweeted_user_id: None,
-                        retweeted_tweet_id: None,
-                        in_reply_to_tweet_id: None,
-                        ancestor_users: Vec::new(),
-                        tweet_text: String::new(),
-                    }));
+                    // Cache the miss as an explicit inner None. The outer None
+                    // remains reserved for a transport/error result.
+                    values.push(Some(None));
                 }
                 Some(Err(_)) => values.push(None),
             }
@@ -227,5 +224,128 @@ impl CoreDataCandidateHydrator {
             receiver.incr(metric_name.as_str(), &FOUND_SCOPE, hydrated_count as u64);
             receiver.incr(metric_name.as_str(), &MISSING_SCOPE, missing_count as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clients::tweet_entity_service_client::{MockTESClient, TESClient};
+    use std::sync::Arc;
+    use xai_candidate_pipeline::hydrator::Hydrator;
+
+    fn thunder_retweet() -> PostCandidate {
+        PostCandidate {
+            tweet_id: 10,
+            author_id: 100,
+            retweeted_tweet_id: Some(99),
+            retweeted_user_id: Some(200),
+            in_reply_to_tweet_id: Some(50),
+            tweet_text: String::new(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tes_success_fills_and_can_clear_graph_fields() {
+        let hydrator = CoreDataCandidateHydrator::new(
+            Arc::new(MockTESClient::default()) as Arc<dyn TESClient + Send + Sync>
+        )
+        .await;
+        let mut candidate = thunder_retweet();
+        Hydrator::update(
+            &hydrator,
+            &mut candidate,
+            PostCandidate {
+                author_id: 7,
+                retweeted_tweet_id: None,
+                retweeted_user_id: None,
+                in_reply_to_tweet_id: None,
+                tweet_text: "original".to_string(),
+                ancestor_users: vec![],
+                ..Default::default()
+            },
+        );
+        assert_eq!(candidate.author_id, 100);
+        assert_eq!(candidate.retweeted_tweet_id, None);
+        assert_eq!(candidate.retweeted_user_id, None);
+        assert_eq!(candidate.in_reply_to_tweet_id, None);
+        assert_eq!(candidate.tweet_text, "original");
+    }
+
+    #[tokio::test]
+    async fn tes_miss_hydrate_leaves_thunder_retweet_ids() {
+        let hydrator = CoreDataCandidateHydrator::new(
+            Arc::new(MockTESClient::default()) as Arc<dyn TESClient + Send + Sync>
+        )
+        .await;
+        let mut candidates = vec![thunder_retweet()];
+        let hydrated = hydrator
+            .hydrate(&ScoredPostsQuery::default(), &candidates)
+            .await;
+        assert!(
+            hydrated[0].is_ok(),
+            "miss stays Ok so it can be negative-cached"
+        );
+        hydrator.update_all(&mut candidates, hydrated);
+        assert_eq!(candidates[0].retweeted_tweet_id, Some(99));
+        assert_eq!(candidates[0].retweeted_user_id, Some(200));
+        assert_eq!(candidates[0].in_reply_to_tweet_id, Some(50));
+        assert_eq!(candidates[0].author_id, 100);
+    }
+
+    #[test]
+    fn two_phase_apply_ignores_negative_cache_and_error_slots() {
+        let hydrator = CoreDataCandidateHydrator {
+            tes_client: Arc::new(MockTESClient::default()) as Arc<dyn TESClient + Send + Sync>,
+            cache: Arc::new(default_quick_cache()),
+        };
+        let mut candidates = vec![thunder_retweet()];
+        TwoPhaseHydrator::apply(
+            &hydrator,
+            &ScoredPostsQuery::default(),
+            &mut candidates,
+            vec![Some(None)],
+        );
+        assert_eq!(candidates[0].retweeted_tweet_id, Some(99));
+        assert_eq!(candidates[0].retweeted_user_id, Some(200));
+        assert_eq!(candidates[0].in_reply_to_tweet_id, Some(50));
+
+        TwoPhaseHydrator::apply(
+            &hydrator,
+            &ScoredPostsQuery::default(),
+            &mut candidates,
+            vec![None],
+        );
+        assert_eq!(candidates[0].retweeted_tweet_id, Some(99));
+        assert_eq!(candidates[0].retweeted_user_id, Some(200));
+        assert_eq!(candidates[0].in_reply_to_tweet_id, Some(50));
+    }
+
+    #[test]
+    fn two_phase_apply_keeps_real_hit_authoritative() {
+        let hydrator = CoreDataCandidateHydrator {
+            tes_client: Arc::new(MockTESClient::default()) as Arc<dyn TESClient + Send + Sync>,
+            cache: Arc::new(default_quick_cache()),
+        };
+        let mut candidates = vec![thunder_retweet()];
+        TwoPhaseHydrator::apply(
+            &hydrator,
+            &ScoredPostsQuery::default(),
+            &mut candidates,
+            vec![Some(Some(CoreDataCacheValue {
+                author_id: 7,
+                retweeted_user_id: None,
+                retweeted_tweet_id: None,
+                in_reply_to_tweet_id: None,
+                ancestor_users: vec![],
+                tweet_text: "original".to_string(),
+            }))],
+        );
+        assert_eq!(candidates[0].author_id, 100);
+        assert_eq!(candidates[0].retweeted_tweet_id, None);
+        assert_eq!(candidates[0].retweeted_user_id, None);
+        assert_eq!(candidates[0].in_reply_to_tweet_id, None);
+        assert_eq!(candidates[0].tweet_text, "original");
     }
 }
