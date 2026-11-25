@@ -1,0 +1,12 @@
+{
+  "name": "repo-sanity",
+  "description": "Confirm core repo files and directories exist (no network, no GPU).",
+  "steps": [
+    {"kind": "path_exists", "path": "README.md"},
+    {"kind": "path_exists", "path": "LICENSE"},
+    {"kind": "path_exists", "path": "phoenix"},
+    {"kind": "path_exists", "path": "home-mixer"},
+    {"kind": "path_exists", "path": "visibility-filtering"},
+    {"kind": "file_contains", "path": "README.md", "needle": "For You"}
+  ]
+}

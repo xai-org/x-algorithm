@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""Deterministic repo-root verify tool.
+
+Commands:
+  seed
+  run <flow>
+  screenshot <page>
+  check [--write-golden]
+
+Same inputs always produce the same digests. check exits 1 if any rule fails.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import struct
+import sys
+import zlib
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+VERIFY_DIR = ROOT / "verification"
+RUNTIME = ROOT / ".verify"
+SEED_DIR = RUNTIME / "seed"
+RUNS_DIR = RUNTIME / "runs"
+SHOTS_DIR = RUNTIME / "screenshots"
+GOLDEN_DIR = VERIFY_DIR / "golden"
+
+# Fixed seed shared with phoenix/QUICKSTART.md synthetic data.
+SEED_CONSTANT = 20260721
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"verify: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        die(f"missing file: {path.relative_to(ROOT)}")
+    except json.JSONDecodeError as e:
+        die(f"invalid JSON in {path.relative_to(ROOT)}: {e}")
+
+
+def dump_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return sha256_bytes(text.encode("utf-8"))
+
+
+def canonical_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+def extract_section(text: str, heading: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    start = None
+    level = None
+    for i, line in enumerate(lines):
+        if line.strip() == heading.strip():
+            start = i
+            level = len(heading) - len(heading.lstrip("#"))
+            break
+    if start is None:
+        die(f"section not found: {heading!r}")
+    out = [lines[start]]
+    for line in lines[start + 1 :]:
+        m = re.match(r"^(#{1,6})\s", line)
+        if m and len(m.group(1)) <= level:
+            break
+        out.append(line)
+    return canonical_text("\n".join(out))
+
+
+def tracked_paths() -> list[str]:
+    paths: list[str] = []
+    for pattern in (
+        "verification/rules.json",
+        "verification/flows/*.json",
+        "verification/pages/*.json",
+        "README.md",
+        "LICENSE",
+        "phoenix/QUICKSTART.md",
+    ):
+        if "*" in pattern:
+            parent, _, name = pattern.rpartition("/")
+            base = ROOT / parent if parent else ROOT
+            paths.extend(
+                sorted(str(p.relative_to(ROOT)) for p in base.glob(name) if p.is_file())
+            )
+        else:
+            p = ROOT / pattern
+            if p.is_file():
+                paths.append(pattern)
+    return sorted(set(paths))
+
+
+def cmd_seed(_: argparse.Namespace) -> None:
+    rules = load_json(VERIFY_DIR / "rules.json")
+    expected = int(rules.get("seed_constant", SEED_CONSTANT))
+    if expected != SEED_CONSTANT:
+        die(f"rules seed_constant {expected} != tool constant {SEED_CONSTANT}")
+
+    files: dict[str, str] = {}
+    for rel in tracked_paths():
+        files[rel] = sha256_bytes((ROOT / rel).read_bytes())
+
+    state = {
+        "seed": SEED_CONSTANT,
+        "files": files,
+        "tool": "verify",
+        "version": 1,
+    }
+    digest = sha256_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+    state["digest"] = digest
+
+    dump_json(SEED_DIR / "state.json", state)
+    (SEED_DIR / "DIGEST").write_text(digest + "\n", encoding="utf-8")
+    print(f"seed ok  seed={SEED_CONSTANT}  digest={digest}")
+
+
+def run_step(step: dict[str, Any]) -> dict[str, Any]:
+    kind = step.get("kind")
+    if kind == "path_exists":
+        path = ROOT / step["path"]
+        ok = path.exists()
+        return {
+            "kind": kind,
+            "path": step["path"],
+            "ok": ok,
+            "detail": "exists" if ok else "missing",
+        }
+    if kind == "file_contains":
+        path = ROOT / step["path"]
+        if not path.is_file():
+            return {
+                "kind": kind,
+                "path": step["path"],
+                "ok": False,
+                "detail": "missing file",
+            }
+        text = path.read_text(encoding="utf-8", errors="replace")
+        needle = step["needle"]
+        ok = needle in text
+        return {
+            "kind": kind,
+            "path": step["path"],
+            "needle": needle,
+            "ok": ok,
+            "detail": "found" if ok else "not found",
+        }
+    return {"kind": kind, "ok": False, "detail": f"unknown step kind: {kind}"}
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    name = args.flow
+    flow_path = VERIFY_DIR / "flows" / f"{name}.json"
+    if not flow_path.is_file():
+        available = sorted(p.stem for p in (VERIFY_DIR / "flows").glob("*.json"))
+        die(f"unknown flow {name!r}; available: {', '.join(available) or '(none)'}")
+
+    if not (SEED_DIR / "state.json").is_file():
+        die("run requires seed first: ./verify seed")
+
+    seed_state = load_json(SEED_DIR / "state.json")
+    flow = load_json(flow_path)
+    results = [run_step(s) for s in flow.get("steps", [])]
+    passed = all(r.get("ok") for r in results)
+
+    artifact = {
+        "flow": name,
+        "description": flow.get("description", ""),
+        "seed": seed_state.get("seed"),
+        "seed_digest": seed_state.get("digest"),
+        "passed": passed,
+        "results": results,
+        "version": 1,
+    }
+    digest = sha256_text(json.dumps(artifact, sort_keys=True, separators=(",", ":")))
+    artifact["digest"] = digest
+
+    dump_json(RUNS_DIR / f"{name}.json", artifact)
+    status = "PASS" if passed else "FAIL"
+    print(f"run {status}  flow={name}  digest={digest}")
+    if not passed:
+        for r in results:
+            if not r.get("ok"):
+                print(
+                    f"  - {r.get('kind')}: {r.get('detail')} ({r.get('path', '')})",
+                    file=sys.stderr,
+                )
+        raise SystemExit(1)
+
+
+def page_body(page: dict[str, Any]) -> bytes:
+    kind = page.get("kind")
+    source = ROOT / page["source"]
+    if not source.is_file():
+        die(f"page source missing: {page['source']}")
+    text = source.read_text(encoding="utf-8")
+    if kind == "text-file":
+        body = canonical_text(text)
+    elif kind == "text-section":
+        body = extract_section(text, page["section_heading"])
+    else:
+        die(f"unknown page kind: {kind}")
+    return body.encode("utf-8")
+
+
+def write_minimal_png(path: Path, digest_hex: str, label: str) -> None:
+    material = hashlib.sha256((digest_hex + "\0" + label).encode("utf-8")).digest()
+    rows = []
+    for y in range(16):
+        row = bytearray([0])
+        for x in range(16):
+            i = (y * 16 + x) % len(material)
+            b = material[i]
+            row.extend([b, (b * 3) % 256, (b * 7) % 256])
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+    compressed = zlib.compress(raw, level=9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", compressed)
+        + chunk(b"IEND", b"")
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png)
+
+
+def cmd_screenshot(args: argparse.Namespace) -> None:
+    name = args.page
+    page_path = VERIFY_DIR / "pages" / f"{name}.json"
+    if not page_path.is_file():
+        available = sorted(p.stem for p in (VERIFY_DIR / "pages").glob("*.json"))
+        die(f"unknown page {name!r}; available: {', '.join(available) or '(none)'}")
+
+    if not (SEED_DIR / "state.json").is_file():
+        die("screenshot requires seed first: ./verify seed")
+
+    seed_state = load_json(SEED_DIR / "state.json")
+    page = load_json(page_path)
+    body = page_body(page)
+    digest = sha256_bytes(body)
+
+    shot_dir = SHOTS_DIR / name
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    (shot_dir / "snapshot.txt").write_bytes(body)
+    write_minimal_png(shot_dir / "snapshot.png", digest, name)
+
+    meta = {
+        "page": name,
+        "source": page.get("source"),
+        "kind": page.get("kind"),
+        "seed": seed_state.get("seed"),
+        "seed_digest": seed_state.get("digest"),
+        "digest": digest,
+        "bytes": len(body),
+        "files": {"snapshot.txt": "snapshot.txt", "snapshot.png": "snapshot.png"},
+        "version": 1,
+    }
+    dump_json(shot_dir / "meta.json", meta)
+    print(f"screenshot ok  page={name}  digest={digest}")
+
+
+WALL_CLOCK_RE = re.compile(
+    r"\b20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"|\b(?:unix|epoch|timestamp|wall.?clock)\b\s*[:=]\s*\d{9,}",
+    re.IGNORECASE,
+)
+
+
+def check_no_wall_clock(path: Path) -> list[str]:
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return []
+    if WALL_CLOCK_RE.search(text):
+        return [f"{path.relative_to(ROOT)}: embeds wall-clock-like values"]
+    return []
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    rules = load_json(VERIFY_DIR / "rules.json")
+    failures: list[str] = []
+
+    seed_path = SEED_DIR / "state.json"
+    if not seed_path.is_file():
+        failures.append("seed-present: missing .verify/seed/state.json (run ./verify seed)")
+        seed_state = None
+    else:
+        seed_state = load_json(seed_path)
+        if int(seed_state.get("seed", -1)) != int(rules.get("seed_constant", SEED_CONSTANT)):
+            failures.append(
+                f"seed-present: seed {seed_state.get('seed')} != rules seed_constant "
+                f"{rules.get('seed_constant')}"
+            )
+
+    if seed_state is not None:
+        for rel, expected in sorted((seed_state.get("files") or {}).items()):
+            p = ROOT / rel
+            if not p.is_file():
+                failures.append(f"seed-digest-stable: tracked file missing: {rel}")
+                continue
+            if sha256_bytes(p.read_bytes()) != expected:
+                failures.append(f"seed-digest-stable: {rel} changed since seed")
+        material = {
+            "seed": seed_state.get("seed"),
+            "files": seed_state.get("files"),
+            "tool": seed_state.get("tool"),
+            "version": seed_state.get("version"),
+        }
+        expected_digest = sha256_text(
+            json.dumps(material, sort_keys=True, separators=(",", ":"))
+        )
+        if seed_state.get("digest") != expected_digest:
+            failures.append("seed-digest-stable: seed digest mismatch (state mutated)")
+
+    for flow in rules.get("required_flows", []):
+        run_path = RUNS_DIR / f"{flow}.json"
+        if not run_path.is_file():
+            failures.append(f"flows-passed: missing run for {flow} (./verify run {flow})")
+            continue
+        run = load_json(run_path)
+        if not run.get("passed"):
+            failures.append(f"flows-passed: flow {flow} did not pass")
+        if seed_state is not None and run.get("seed_digest") != seed_state.get("digest"):
+            failures.append(f"flows-passed: flow {flow} was run against a different seed")
+
+    for page in rules.get("required_pages", []):
+        meta_path = SHOTS_DIR / page / "meta.json"
+        if not meta_path.is_file():
+            failures.append(
+                f"screenshots-present: missing screenshot for {page} "
+                f"(./verify screenshot {page})"
+            )
+            continue
+        meta = load_json(meta_path)
+        digest = meta.get("digest")
+        if not digest:
+            failures.append(f"screenshots-present: {page} meta missing digest")
+            continue
+        if seed_state is not None and meta.get("seed_digest") != seed_state.get("digest"):
+            failures.append(
+                f"screenshots-present: page {page} captured against a different seed"
+            )
+
+        golden_path = GOLDEN_DIR / f"{page}.digest"
+        if args.write_golden:
+            GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+            golden_path.write_text(digest + "\n", encoding="utf-8")
+            print(f"wrote golden  page={page}  digest={digest}")
+        elif not golden_path.is_file():
+            failures.append(
+                f"screenshots-match-golden: no golden for {page} "
+                f"(run ./verify check --write-golden once, then commit verification/golden/)"
+            )
+        else:
+            golden = golden_path.read_text(encoding="utf-8").strip()
+            if golden != digest:
+                failures.append(
+                    f"screenshots-match-golden: {page} digest {digest} != golden {golden}"
+                )
+
+    if RUNTIME.is_dir():
+        for path in sorted(RUNTIME.rglob("*")):
+            if path.is_file():
+                for msg in check_no_wall_clock(path):
+                    failures.append(f"no-wall-clock: {msg}")
+
+    if failures:
+        print("check FAIL")
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print("check PASS")
+    print(f"  seed={SEED_CONSTANT}")
+    print(f"  flows={', '.join(rules.get('required_flows', []))}")
+    print(f"  pages={', '.join(rules.get('required_pages', []))}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="verify",
+        description="Deterministic verification tool (seed / run / screenshot / check).",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("seed", help="Write fixed seed state under .verify/seed/")
+    run_p = sub.add_parser("run", help="Execute a named flow")
+    run_p.add_argument("flow", help="Flow name (see verification/flows/)")
+    shot_p = sub.add_parser("screenshot", help="Capture a named page snapshot")
+    shot_p.add_argument("page", help="Page name (see verification/pages/)")
+    check_p = sub.add_parser("check", help="Validate rules; exit 1 if any fail")
+    check_p.add_argument(
+        "--write-golden",
+        action="store_true",
+        help="Write current screenshot digests into verification/golden/",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "seed":
+        cmd_seed(args)
+    elif args.command == "run":
+        cmd_run(args)
+    elif args.command == "screenshot":
+        cmd_screenshot(args)
+    elif args.command == "check":
+        cmd_check(args)
+    else:
+        parser.error(f"unknown command {args.command}")
+
+
+if __name__ == "__main__":
+    main()
