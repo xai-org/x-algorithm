@@ -326,11 +326,11 @@ def _search_for_latest_path_manual(search_dir: Path):
     if not search_dir.exists() or not search_dir.is_dir():
         return None
 
-    m1 = PATH1_RE.search(str(search_dir))
-    if not m1:
-        return None
-    if m2 := PATH2_RE.search(str(search_dir)):
-        if _is_loadable_checkpoint(search_dir):
+    m1 = PATH1_RE.fullmatch(search_dir.name)
+    if m1 is None:
+        m1 = PATH1_RE.fullmatch(search_dir.parent.name)
+        m2 = PATH2_RE.fullmatch(search_dir.name)
+        if m1 and m2 and _is_loadable_checkpoint(search_dir):
             return m2["run_id"], search_dir, int(m1["samples"])
         return None
 
