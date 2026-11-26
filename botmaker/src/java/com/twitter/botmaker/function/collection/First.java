@@ -8,6 +8,7 @@ import com.twitter.botmaker.ASTNode;
 import com.twitter.botmaker.Context;
 import com.twitter.botmaker.compiler.ActionLevel;
 import com.twitter.botmaker.compiler.BotMakerFunction;
+import com.twitter.botmaker.compiler.exceptions.FunctionFailure;
 import com.twitter.botmaker.compiler.exceptions.SemanticCheckFailure;
 import com.twitter.botmaker.compiler.types.Type;
 import com.twitter.botmaker.function.FunctionNode1;
@@ -46,6 +47,12 @@ public class First extends FunctionNode1<Runtime, List<Object>> {
 
   @Override
   public Object apply(Context<Runtime> context, List<Object> list) {
+    if (list == null || list.isEmpty()) {
+      throw new FunctionFailure(
+          this,
+          context.getStackFrames(),
+          new IllegalArgumentException("First() called on empty list"));
+    }
     return list.get(0);
   }
 }
