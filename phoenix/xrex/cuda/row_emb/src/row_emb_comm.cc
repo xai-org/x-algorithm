@@ -94,7 +94,7 @@ void warmupKernels(int8_t* scratch, cudaStream_t stream) {
       ownership,
       0,
       scalars,
-      AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f},
+      AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f, 0.f, 0},
       stream
   );
   XAI_CUDA_CHECK(cudaStreamSynchronize(stream));

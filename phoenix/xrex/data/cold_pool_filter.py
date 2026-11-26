@@ -44,11 +44,10 @@ def cold_pool_mask(
     ok = m_view < max_views
     if max_favs is not None:
         ok &= m_fav < max_favs
-    keep_pids = m_pid[ok]
 
     post_ids_u64 = np.asarray(post_ids).astype(np.uint64, copy=False)
-    in_meta = np.isin(post_ids_u64, m_pid)
-    in_ok = np.isin(post_ids_u64, keep_pids)
+    in_meta = np.isin(post_ids_u64, m_pid, assume_unique=True)
+    in_ok = np.isin(post_ids_u64, m_pid[ok], assume_unique=True)
     mask = ~in_meta | in_ok
     logger.info(
         "Cold-pool filter (fav%s, view<%d): kept %d/%d posts "

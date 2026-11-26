@@ -1,32 +1,40 @@
-import os
 import asyncio
 import logging
+import os
 import traceback
 from urllib.parse import urlparse
-from tenacity import retry, wait_fixed, stop_after_attempt
+
+from blobstore_http.cdn_downloader import CDNDownloader
 from broadcast_tools.broadcast import BroadcastLoader
-from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
-from monitor.metrics import Metrics
-from video_tools.image import process_image_bytes, resize_tile, enhance_image_with_clahe
 from grox.config.config import grox_config
-from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
+from grox.core.clients.nightowl_client import NightOwlClient
+from grox.core.data_loaders.data_types import (
+    BroadcastMetadata,
+    Image,
+    Post,
+    RankingQuery,
+    Video,
+)
 from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
 from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
-from grox.core.clients.nightowl_client import NightOwlClient
+from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
+from grox.core.lm.convo import Image as ConvoImage
+from grox.core.lm.convo import Video as ConvoVideo
 from grox_fetcher_client import GroxFetcherClient
-from video_tools.subtitles import SubtitleAligner
-from video_tools.key_frames import ShotKeyFramesExtractor
-from video_tools.video_frames import VideoFramesExtractor
-from grox.core.data_loaders.data_types import (
-    Post,
-    Image,
-    Video,
-    BroadcastMetadata,
-    RankingQuery,
-)
-from blobstore_http.cdn_downloader import CDNDownloader
 from html_render.tweet_render_for_grox import TweetRenderForGrox
+from monitor.metrics import Metrics
+from strato_http.queries.media_entities import StratoMediaEntities
 from strato_http.queries.video_subtitle import StratoVideoSubtitle
+from tenacity import retry, stop_after_attempt, wait_fixed
+from video_tools.image import (
+    enhance_image_with_clahe,
+    process_image_bytes,
+    resize_tile,
+    side_by_side,
+)
+from video_tools.key_frames import ShotKeyFramesExtractor
+from video_tools.subtitles import SubtitleAligner
+from video_tools.video_frames import VideoFramesExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +43,8 @@ _VIDEO_DURATION_LIMIT_MINUTES = 360
 _VIDEO_PREVIEW_MIN_DURATION_MS = 30_000
 _VIDEO_MAX_ESTIMATED_BYTES = int(2 * 1024**3)
 _MAX_URL_VIDEOS_PER_POST = 7
+_COMBINED_VIEW_MIN_IMAGES = 5
+_COMBINED_VIEW_MAX_ASPECT = 3
 
 
 def _create_descendant_id_provider() -> DescendantIdProvider | None:
@@ -53,6 +63,7 @@ def _create_descendant_id_provider() -> DescendantIdProvider | None:
 
 class MediaLoader:
     strato_video_subtitle = StratoVideoSubtitle()
+    strato_media_entities = StratoMediaEntities()
     descendant_id_provider = _create_descendant_id_provider()
     descendant_hydrator = DescendantHydrator()
     cdn_downloader = CDNDownloader()
@@ -128,7 +139,9 @@ class MediaLoader:
                 )
 
     @classmethod
-    async def hydrate_post(cls, post: Post) -> None:
+    async def hydrate_post(
+        cls, post: Post, *, include_descendants: bool = True
+    ) -> None:
         Metrics.counter("media_loader.hydrate_post.count").add(
             1, attributes=cls._metrics_attributes()
         )
@@ -137,7 +150,7 @@ class MediaLoader:
             >= grox_config.media_hydration.deluxe_fav_count_threshold
         )
 
-        if is_high_fav and not post.ancestors:
+        if include_descendants and is_high_fav and not post.ancestors:
             if cls.descendant_id_provider is None:
                 logger.warning("No descendant id provider available")
             else:
@@ -168,7 +181,8 @@ class MediaLoader:
         await asyncio.gather(*media_tasks)
 
         if (
-            (
+            grox_config.media_hydration.enable_screenshot
+            and (
                 cls.post_media_is_screenshot_target(post)
                 or cls.post_media_is_screenshot_target(post.quoted_post)
             )
@@ -176,6 +190,69 @@ class MediaLoader:
             and is_high_fav
         ):
             await cls.hydrate_screenshot(post)
+
+        if grox_config.media_hydration.enable_combined_view:
+            if cls.post_media_is_screenshot_target(post):
+                await cls.hydrate_combined_view(post)
+            if post.quoted_post and cls.post_media_is_screenshot_target(
+                post.quoted_post
+            ):
+                await cls.hydrate_combined_view(post.quoted_post, source="quoted")
+
+    @classmethod
+    async def hydrate_combined_view(cls, post: Post, source: str = "post") -> None:
+        outcome = "failed"
+        try:
+            if not await cls._sort_in_display_order(post):
+                outcome = "unordered"
+            else:
+                images = [
+                    m.convo_image.content
+                    for m in post.media or []
+                    if isinstance(m, Image) and m.convo_image
+                ]
+                view = None
+                if len(images) >= _COMBINED_VIEW_MIN_IMAGES and len(images) == len(
+                    post.media or []
+                ):
+                    view = side_by_side(images, _COMBINED_VIEW_MAX_ASPECT)
+                if view:
+                    tile_size = grox_config.media_hydration.deluxe_image_tile_size
+                    post.combined_view = Image(
+                        id=post.id,
+                        url=None,
+                        convo_image=ConvoImage(content=resize_tile(view, tile_size)),
+                    )
+                outcome = "built" if view else "none"
+        except Exception:
+            logger.error(
+                f"failed to hydrate combined view for post {post.id}, error: {traceback.format_exc()}"
+            )
+        Metrics.counter("media_loader.hydrate_combined_view.count").add(
+            1,
+            attributes={
+                **cls._metrics_attributes(),
+                "outcome": outcome,
+                "source": source,
+            },
+        )
+
+    @classmethod
+    async def _sort_in_display_order(cls, post: Post) -> bool:
+        media = post.media or []
+        if len(media) < 2:
+            return True
+        entities = await cls.strato_media_entities.fetch(int(post.id))
+        position = {
+            str(e.get("mediaKey", {}).get("mediaId")): i for i, e in enumerate(entities)
+        }
+        if any((m.id or "") not in position for m in media):
+            logger.warning(
+                f"Post {post.id}: display order doesn't place every medium, keeping the loaded order"
+            )
+            return False
+        post.media = sorted(media, key=lambda m: position[m.id or ""])
+        return True
 
     @classmethod
     def ranked_posts_associated(cls, post: Post) -> list[Post]:
@@ -238,11 +315,6 @@ class MediaLoader:
                 grox_config.media_hydration.enable_light_dark_enhancement
                 and is_main_post
             )
-            should_enable_motion_reveal = (
-                grox_config.media_hydration.enable_motion_reveal
-                and is_main_post
-                and is_high_fav
-            )
             for medium in post.media:
                 if isinstance(medium, Image):
                     tasks.append(
@@ -260,7 +332,6 @@ class MediaLoader:
                             is_main_post,
                             is_high_fav,
                             should_enable_clahe_enhancement,
-                            should_enable_motion_reveal,
                         )
                     )
         if post.broadcast_metadata and post.broadcast_metadata.thumbnail_image:
@@ -319,7 +390,11 @@ class MediaLoader:
                         post.chat_group_metadata.group_avatar, False, False
                     )
                 )
-        if is_main_post and is_high_fav:
+        if (
+            grox_config.media_hydration.enable_url_videos
+            and is_main_post
+            and is_high_fav
+        ):
             video_urls = cls._extract_video_urls(post)
             if video_urls:
                 post.url_videos = [Video(url=url) for url in video_urls]
@@ -394,7 +469,6 @@ class MediaLoader:
         is_main_post: bool = False,
         is_high_fav: bool = False,
         enable_clahe_enhancement: bool = False,
-        enable_motion_reveal: bool = False,
     ) -> None:
         url = None
         if video.videoInfo and video.videoInfo.durationMillis:
@@ -418,7 +492,8 @@ class MediaLoader:
                     video.videoInfo.get_highest_variant_within(
                         duration_ms, _VIDEO_MAX_ESTIMATED_BYTES
                     )
-                    if is_main_post and is_high_fav
+                    if (is_main_post and is_high_fav)
+                    or grox_config.media_hydration.highest_video_bitrate
                     else video.videoInfo.get_best_variant()
                 )
                 if best_variant and best_variant.url:
@@ -476,7 +551,7 @@ class MediaLoader:
                 is_main_post,
                 is_high_fav,
                 enable_clahe_enhancement,
-                enable_motion_reveal,
+                video.motion_reveal,
                 max_duration=video.crop_seconds,
                 key_frames_ranking=video.key_frames_ranking,
             )
@@ -651,6 +726,7 @@ class MediaLoader:
             include_combined_video_bytes=False,
             enable_motion_reveal=enable_motion_reveal,
             max_duration=max_duration,
+            sharp_frames=grox_config.media_hydration.video_sharp_frames,
         )
         times = [frame.time_sec for frame in video_data.frames]
         frames = [frame.frame for frame in video_data.frames]
@@ -710,6 +786,7 @@ class MediaLoader:
             motion_reveal_frames=video_data.motion_reveal_frames,
             shot_key_frames=shot_key_frames,
             ranked_key_frames=ranked_key_frames,
+            sharp_frames=[frame.frame for frame in video_data.sharp_frames],
         )
 
     @classmethod

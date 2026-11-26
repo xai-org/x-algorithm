@@ -1,0 +1,45 @@
+use crate::models::NotificationKind;
+use crate::rules::levels;
+use crate::rules::levels::PostRules;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Judged {
+    Actor,
+    ActorOnRecipientPost(PostRules),
+    ActorPost(PostRules),
+}
+
+pub(crate) const fn judged(kind: NotificationKind) -> Judged {
+    match kind {
+        NotificationKind::Follow
+        | NotificationKind::FollowRequestAccepted
+        | NotificationKind::ContactJoined
+        | NotificationKind::AddedToList => Judged::Actor,
+        NotificationKind::Like | NotificationKind::Repost => {
+            Judged::ActorOnRecipientPost(levels::NOTIFICATIONS_WRITER_V2_RETWEET_SOURCE)
+        }
+        NotificationKind::Mention => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MENTION),
+        NotificationKind::Reply => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_REPLY),
+        NotificationKind::MediaTagged => {
+            Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_MEDIA_TAGGED)
+        }
+        NotificationKind::Quote => Judged::ActorPost(levels::NOTIFICATIONS_WRITER_V2_QUOTE),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::SafetyLevel;
+    use strum::VariantArray;
+
+    #[test]
+    fn each_kind_names_a_served_level() {
+        for &kind in NotificationKind::VARIANTS {
+            let judging = SafetyLevel::VARIANTS
+                .iter()
+                .filter(|level| level.judges(kind));
+            assert_eq!(judging.count(), 1, "{kind:?}");
+        }
+    }
+}

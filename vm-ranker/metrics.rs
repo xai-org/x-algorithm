@@ -1,17 +1,18 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge_vec, CounterVec, Gauge, Histogram, HistogramOpts,
-    HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
+    register_counter_vec, register_gauge, register_histogram, register_histogram_vec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts,
 };
 
 lazy_static! {
     pub static ref VALUE_MODEL_REQUESTS: CounterVec = register_counter_vec!(
         Opts::new(
             "vm_ranker_value_model_requests_total",
-            "Rank requests by scoring mode (passthrough, value_model, fallback)"
+            "Rank requests by scoring mode and whether user debias was applied"
         ),
-        &["mode"]
+        &["mode", "debias"]
     )
     .unwrap();
     pub static ref VALUE_MODEL_FALLBACK: CounterVec = register_counter_vec!(
@@ -28,6 +29,74 @@ lazy_static! {
             "Value-model requests by whether heads were weighted (heads) or the caller supplied every candidate's weighted score and only per-request adjustments ran (cached_weighted)"
         ),
         &["stage"]
+    )
+    .unwrap();
+    pub static ref VALUE_MODEL_CLASS_FACTORS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_value_model_class_factors_total",
+            "Value-model requests scored with separate dwell-time and engagement factors, by the class the factors apply to (oon, in_network)"
+        ),
+        &["class"]
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_REQUESTS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_user_debias_requests_total",
+            "User-debias requests by outcome: applied with Phoenix scores from this request (fresh), from the post cache (cached) or without a scoring time (no_hint); skipped because of model_not_loaded, stale_artifact, no_sequence, invalid_params, sequence_error or feature_mismatch"
+        ),
+        &["path"]
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_PREDICT_DURATION: Histogram = register_histogram!(
+        HistogramOpts::new(
+            "vm_ranker_user_debias_predict_seconds",
+            "Sequence parse + featurize + predict latency in seconds"
+        )
+        .buckets(prometheus::exponential_buckets(0.0001, 1.5, 25).unwrap())
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_MODEL_LOADED: IntGauge = register_int_gauge!(
+        "vm_ranker_user_debias_model_loaded",
+        "1 when a user-debias model is loaded, else 0"
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_MODEL_TRAINED_AT_MS: IntGauge = register_int_gauge!(
+        "vm_ranker_user_debias_model_trained_at_ms",
+        "trained_at_ms of the loaded user-debias model"
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_MODEL_TRAIN_RECORDS: IntGauge = register_int_gauge!(
+        "vm_ranker_user_debias_model_train_records",
+        "train_records of the loaded user-debias model"
+    )
+    .unwrap();
+    pub static ref USER_DEBIAS_MODEL_RELOADS: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_user_debias_model_reloads_total",
+            "User-debias model reload attempts by outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref CAROUSEL_MODELS_LOADED: IntGauge = register_int_gauge!(
+        "vm_ranker_carousel_models_loaded",
+        "Number of video carousel model files held in memory"
+    )
+    .unwrap();
+    pub static ref CAROUSEL_MODEL_RELOADS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_carousel_model_reloads_total",
+            "Video carousel model directory reads by outcome: ok, dir_error (kept all previous files) or file_error (kept that file's previous copy)"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref CAROUSEL_MODEL_REQUESTS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_carousel_model_requests_total",
+            "GetCarouselModel requests by outcome: ok, not_found or disabled (no --carousel-model-dir)"
+        ),
+        &["outcome"]
     )
     .unwrap();
     pub static ref SCORE_REQUESTS: CounterVec = register_counter_vec!(
@@ -168,6 +237,49 @@ lazy_static! {
         &["pool_size"]
     )
     .unwrap();
+    pub static ref DPP_WINDOW_ADJACENT_COS: Histogram = register_histogram!(
+        HistogramOpts::new(
+            "vm_ranker_dpp_window_adjacent_cos",
+            "Mean cosine between consecutive served picks per sliding-window DPP request (missing embeddings count as 0)"
+        )
+        .buckets(vec![-1.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0])
+    )
+    .unwrap();
+    pub static ref DPP_WINDOW_HISTORY_ITEMS: Histogram = register_histogram!(
+        HistogramOpts::new(
+            "vm_ranker_dpp_window_history_items",
+            "Served-history posts in the sliding-window DPP context per request (served in the last 10 minutes, at most the window size)"
+        )
+        .buckets(vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 35.0, 50.0])
+    )
+    .unwrap();
+    pub static ref DPP_HISTORY_SIDS: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_dpp_history_sids_total",
+            "Served-history posts in the sliding window needing a SID, by outcome: cached, found, missing (no SID), timeout, error or skipped (breaker open)"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref SID_LOOKUP_DURATION: HistogramVec = register_histogram_vec!(
+        HistogramOpts::new(
+            "vm_ranker_sid_lookup_seconds",
+            "SID lookup latency for served-history posts in seconds, by outcome: ok, timeout or error"
+        )
+        .buckets(prometheus::exponential_buckets(0.0005, 1.5, 15).unwrap()),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref SID_CACHE_ENTRIES: IntGauge = register_int_gauge!(
+        "vm_ranker_sid_cache_entries",
+        "Entries in the local cache of history SIDs (approximate)"
+    )
+    .unwrap();
+    pub static ref SID_CACHE_CAPACITY: IntGauge = register_int_gauge!(
+        "vm_ranker_sid_cache_capacity",
+        "Capacity of the local cache of history SIDs"
+    )
+    .unwrap();
     pub static ref CONFIG_SYNC_LAST_SUCCESS_SECS: Gauge = register_gauge!(
         "vm_ranker_config_sync_last_success_timestamp_seconds",
         "Unix time of the last successful config poll (fetch succeeded, files current)"
@@ -213,6 +325,14 @@ lazy_static! {
             "Value-model candidates by whether their author has a non-zero exploration bonus"
         ),
         &["bonus"]
+    )
+    .unwrap();
+    pub static ref INELIGIBLE_HEAD_CANDIDATES: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_ineligible_head_candidates_total",
+            "Candidates whose reply, share or click predictions were left out of the value model because home-mixer flagged that head as ineligible"
+        ),
+        &["head"]
     )
     .unwrap();
     pub static ref SAMPLED_CANDIDATES: IntCounter = register_int_counter!(

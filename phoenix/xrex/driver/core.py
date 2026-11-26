@@ -103,6 +103,8 @@ class DriverConfig(Config):
 
     machine: str = "h100"
 
+    jemalloc: bool = True
+
     config_name: str | None = None
 
     def _init_multi_run(self, ctx: DriverContext) -> MultiRunDriverState:

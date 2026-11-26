@@ -2,6 +2,8 @@ use crate::inputs::CandidateScoringInputs;
 use std::collections::HashMap;
 
 pub const NEGATIVE_SCORES_OFFSET: f64 = 0.001;
+pub const MIN_NOT_DWELLED_POWER_OFFSET: f64 = 1e-2;
+pub const VALUE_MODEL_MULTIPLICATIVE: &str = "multiplicative";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ValueModelWeights {
@@ -24,7 +26,8 @@ pub struct ValueModelWeights {
     pub follow_author: f64,
     pub post_unexplored: f64,
     pub post_unexplored_include_out_of_network: bool,
-    pub react_with_video: f64,
+    pub post_video: f64,
+    pub grok_analyze: f64,
     pub not_interested: f64,
     pub block_author: f64,
     pub mute_author: f64,
@@ -44,6 +47,10 @@ pub struct ValueModelWeights {
     pub author_diversity_floor: f64,
     pub oon_rescore_in_network_replies_retweets: bool,
     pub multiplier_pre_offset: bool,
+    pub multiplicative: bool,
+    pub not_dwelled_power_exponent: f64,
+    pub not_dwelled_power_offset: f64,
+    pub engage_bias: f64,
 }
 
 impl ValueModelWeights {
@@ -66,7 +73,8 @@ impl ValueModelWeights {
             + self.quoted_vqv
             + self.follow_author
             + self.post_unexplored
-            + self.react_with_video
+            + self.post_video
+            + self.grok_analyze
     }
 
     pub fn negative_sum(&self) -> f64 {
@@ -79,6 +87,41 @@ impl ValueModelWeights {
 
     pub fn total_sum(&self) -> f64 {
         self.positive_sum() + self.negative_sum()
+    }
+
+    pub fn multiplicative_negative_sum(&self) -> f64 {
+        -(self.not_interested + self.block_author + self.mute_author + self.report)
+    }
+
+    pub fn multiplicative_total_sum(&self) -> f64 {
+        self.positive_sum() + self.engage_bias + self.multiplicative_negative_sum()
+    }
+
+    pub fn offset_negative_sum(&self) -> f64 {
+        if self.multiplicative {
+            self.multiplicative_negative_sum()
+        } else {
+            self.negative_sum()
+        }
+    }
+
+    pub fn offset_total_sum(&self) -> f64 {
+        if self.multiplicative {
+            self.multiplicative_total_sum()
+        } else {
+            self.total_sum()
+        }
+    }
+
+    pub fn set_multiplicative(&mut self, mode: &str, exponent: f64, offset: f64, engage_bias: f64) {
+        self.multiplicative = mode == VALUE_MODEL_MULTIPLICATIVE;
+        self.not_dwelled_power_exponent = if exponent.is_finite() { exponent } else { 0.0 };
+        self.not_dwelled_power_offset = offset.max(MIN_NOT_DWELLED_POWER_OFFSET);
+        self.engage_bias = if engage_bias.is_finite() {
+            engage_bias
+        } else {
+            0.0
+        };
     }
 
     pub fn reply_weight_for(&self, candidate: &CandidateScoringInputs) -> f64 {
@@ -109,7 +152,7 @@ impl ValueModelWeights {
         self
     }
 
-    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 29] {
+    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 30] {
         [
             ("favorite", &mut self.favorite),
             ("reply", &mut self.reply),
@@ -134,7 +177,8 @@ impl ValueModelWeights {
             ("profile_visit_secs", &mut self.profile_visit_secs),
             ("follow_author", &mut self.follow_author),
             ("post_unexplored", &mut self.post_unexplored),
-            ("react_with_video", &mut self.react_with_video),
+            ("post_video", &mut self.post_video),
+            ("grok_analyze", &mut self.grok_analyze),
             ("not_interested", &mut self.not_interested),
             ("block_author", &mut self.block_author),
             ("mute_author", &mut self.mute_author),
@@ -165,6 +209,8 @@ impl ValueModelWeights {
                 ("follow_author", self.follow_author),
                 ("post_unexplored", self.post_unexplored),
                 ("pdwell", self.post_unexplored),
+                ("post_video", self.post_video),
+                ("grok_analyze", self.grok_analyze),
                 ("not_interested", self.not_interested),
                 ("block_author", self.block_author),
                 ("mute_author", self.mute_author),

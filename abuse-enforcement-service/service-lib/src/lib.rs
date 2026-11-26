@@ -4,17 +4,20 @@ pub mod ais_client;
 pub mod allowlist;
 pub mod api_doc;
 pub mod auth;
+pub mod backfill;
+pub mod backfill_claims;
 pub mod confidence;
 pub mod config;
 pub mod decision;
 pub mod dedup_cache;
 pub mod entities;
 pub mod facts;
-pub mod generic_actions;
 pub mod gizmoduck;
 pub mod gizmoduck_labels;
 pub mod growthbook;
 pub mod growthbook_writer;
+pub mod head_guard;
+pub mod invited_reply;
 #[cfg(test)]
 mod ledger_contract_fixtures;
 pub mod limiter;
@@ -22,6 +25,7 @@ pub mod manhattan;
 pub mod metrics;
 pub mod off_switch;
 pub mod overturn_hold;
+pub mod post_labels;
 pub mod restart_on_config_change;
 pub mod rules;
 pub mod safety_checks;
@@ -33,13 +37,21 @@ pub mod test_user;
 #[cfg(test)]
 mod action_control_path_tests;
 #[cfg(test)]
+mod backfill_path_tests;
+#[cfg(test)]
 mod confidence_adversarial_tests;
 #[cfg(test)]
 mod confidence_path_tests;
 #[cfg(test)]
+mod invited_reply_path_tests;
+#[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
 mod safety_audit_tests;
+#[cfg(test)]
+mod suspend_order_path_tests;
+#[cfg(test)]
+mod test_account_path_tests;
 
 use xai_abuse_proto::enforcement as abuse_proto;
 
@@ -50,11 +62,10 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::dedup_cache::{DedupCheck, DedupSlot};
+use crate::dedup_cache::{DedupCheck, DedupKey, DedupSlot, SlotHolder};
 use anyhow::{Context, Result};
 use axum::Router;
 
-use clap::Parser;
 use futures::future::join_all;
 use prost::Message;
 use serde::Deserialize;
@@ -66,14 +77,15 @@ use xai_kafka::{
     KafkaConsumerConfigBuilder, KafkaMessage, KafkaProducer, KafkaProducerConfigBuilder,
     apply_auth_config, resolve_kafka_brokers, run_batch_consumer, self_delete_pod,
 };
-use xai_service_runner::{ServerBuilder, ServerInfo};
 
 #[allow(deprecated)]
 use xai_strato::{Strato, StratoClientConfig};
 
 use crate::config::Config;
 use crate::decision::Decision;
-use crate::facts::{EntityFacts, EntityType, Facts, PostFacts, ScoreFacts, UserFacts};
+use crate::facts::{
+    EntityFacts, EntityType, Facts, InvitedReply, PostFacts, ScoreFacts, UserFacts,
+};
 use crate::growthbook::DynamicConfig;
 use crate::growthbook_writer::GrowthBookWriter;
 use crate::service::{
@@ -89,7 +101,6 @@ use crate::strato::{
 };
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
-const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 
 #[derive(Debug, Deserialize)]
@@ -153,11 +164,40 @@ struct DecisionContext {
             would_dedup_held: Option<u8>,
                 held_class: u8,
                 global_dry_run: bool,
+            run: Option<Arc<backfill::BackfillRunRecord>>,
+                run_nonce: i64,
+        slot: Option<DecisionSlot>,
+}
+
+#[derive(Clone)]
+struct DecisionSlot {
+    cache: Arc<dyn DedupSlot>,
+    key: DedupKey,
+    claim_nonce: Option<u64>,
+            displaced_in_flight_suspend: Option<u8>,
+}
+
+impl std::fmt::Debug for DecisionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionSlot")
+            .field("key", &self.key)
+            .field("claim_nonce", &self.claim_nonce)
+            .field(
+                "displaced_in_flight_suspend",
+                &self.displaced_in_flight_suspend,
+            )
+            .finish()
+    }
 }
 
 impl DecisionContext {
                     fn records_only(&self) -> bool {
         self.global_dry_run || self.control.record_only()
+    }
+
+            fn dedup_key(&self, entity_type: EntityType, entity_id: i64) -> DedupKey {
+        DedupKey::entity(entity_type, entity_id)
+            .with_post_labels(self.control.dedup_labels().as_deref())
     }
 
         fn claimed(&self) -> bool {
@@ -197,6 +237,7 @@ struct EnforcementCtx {
     gd: gizmoduck::GizmoduckCoreClient,
     cred_clients: strato::CredClients,
     uas_strato: Arc<Strato>,
+        reply_parents: invited_reply::ReplyParents,
     dynamic_config: DynamicConfig,
             rules_cache: Arc<rules::RulesCache>,
     allowlist: Option<allowlist::ManhattanAllowlist>,
@@ -204,7 +245,10 @@ struct EnforcementCtx {
                 kafka_producer_decisions_json: Option<Arc<KafkaProducer>>,
                             hold_gate: Arc<overturn_hold::HoldGate>,
             off_switch: Arc<off_switch::OffSwitch>,
+            head_guard: Arc<head_guard::HeadGuard>,
             action_control: Arc<action_control::ActionControl>,
+            backfill: Arc<backfill::Backfill>,
+            post_labels: Option<Arc<dyn post_labels::PostLabelReader>>,
         #[cfg(test)]
     outcome_log: Option<Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>>,
 }
@@ -265,6 +309,7 @@ struct ScoreResultProcessor {
     retry_queue: Arc<Mutex<BinaryHeap<RetryEntry>>>,
         last_progress: Arc<AtomicI64>,
         max_in_flight: usize,
+                backfill_topic: bool,
 }
 
 
@@ -295,14 +340,73 @@ fn decision_outcome(
         score: score.score,
         calibration_id: score.calibration_id.clone(),
         confidence_evidence: score.confidence_evidence.clone(),
+        in_reply_to_user_id: score.in_reply_to_user_id,
+        in_reply_to_post_id: score.in_reply_to_post_id,
     }
 }
-
-const REQUESTED_ACTIONS_DENIED: &str = "requested_actions_denied";
 
 const ALREADY_SUSPENDED: &str = "already_suspended";
 
 const ALREADY_SUSPENDED_STRIPPED: &str = "already_suspended_stripped";
+
+const ALREADY_POST_LABELED: &str = "already_post_labeled";
+
+const POST_LABELS_CARRIED: &str = "post_labels_carried";
+
+const POST_LABELS_READ: &str = "post_labels_read";
+
+async fn drop_carried_post_labels(
+    reader: Option<&dyn post_labels::PostLabelReader>,
+    facts: &mut Facts,
+    specs: &mut Vec<decision::ActionSpec>,
+    extra: &mut BTreeMap<String, String>,
+) -> bool {
+    let Some(reader) = reader else {
+        metrics::POST_LABEL_READ_TOTAL
+            .with_label_values(&["unavailable"])
+            .inc();
+        extra.insert(POST_LABELS_READ.into(), "unavailable".into());
+        return false;
+    };
+    let now_ms = now_millis();
+    let carried = match reader.labels(facts.entity_id, now_ms).await {
+        Ok(Some(carried)) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["ok"])
+                .inc();
+            carried
+        }
+        Ok(None) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["not_found"])
+                .inc();
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                post_id = facts.entity_id,
+                "post label read failed: {e:#}; sending every label"
+            );
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["failed"])
+                .inc();
+            extra.insert(POST_LABELS_READ.into(), "failed".into());
+            return false;
+        }
+    };
+    if let EntityFacts::Post(post) = &mut facts.entity {
+        post.present = true;
+        post.labels = carried.keys().cloned().collect();
+    }
+    let dropped = post_labels::drop_carried(specs, &carried, now_ms);
+    if !dropped.is_empty() {
+        extra.insert(
+            POST_LABELS_CARRIED.into(),
+            serde_json::to_string(&dropped).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+    specs.is_empty()
+}
 
 fn strip_redundant_suspends(
     specs: &mut Vec<decision::ActionSpec>,
@@ -310,10 +414,7 @@ fn strip_redundant_suspends(
 ) -> Vec<decision::ActionSpec> {
     let is_suspend =
         |s: &decision::ActionSpec| matches!(s, decision::ActionSpec::SuspendUser { .. });
-    let has_perm = specs
-        .iter()
-        .any(|s| matches!(s, decision::ActionSpec::SuspendUser { perm: true, .. }));
-    if !user.suspended || has_perm || !specs.iter().any(is_suspend) {
+    if !user.suspended || outranks_temporary_suspension(specs) || !specs.iter().any(is_suspend) {
         return Vec::new();
     }
     let (stripped, kept) = std::mem::take(specs).into_iter().partition(is_suspend);
@@ -321,30 +422,165 @@ fn strip_redundant_suspends(
     stripped
 }
 
-#[derive(Debug, PartialEq)]
-enum ExpandedDecision {
-    Skip(String),
-    Act(Vec<decision::ActionSpec>),
+fn outranks_temporary_suspension(specs: &[decision::ActionSpec]) -> bool {
+    specs
+        .iter()
+        .any(|s| s.dedup_action_class() > dedup_cache::CLASS_SUSPEND)
 }
 
-fn expand_requested_actions_decision(
-    entity_type: EntityType,
-    score_facts: &ScoreFacts,
-    allowlist: &generic_actions::GenericActionAllowlist,
-) -> (ExpandedDecision, Option<String>) {
-    let resolved = generic_actions::resolve_requested_actions(
-        entity_type,
-        &score_facts.requested_actions,
-        allowlist,
+const ALREADY_PERMANENTLY_SUSPENDED: &str = "already_permanently_suspended";
+
+const ALREADY_CSE_SUSPENDED: &str = "already_cse_suspended";
+
+const PERMANENT_SEEN_IN: &str = "permanent_suspension_seen_in";
+const PERMANENT_SEEN_IN_GIZMODUCK: &str = "gizmoduck";
+const PERMANENT_SEEN_IN_DEDUP: &str = "dedup";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outranking {
+                    Gizmoduck,
+            Dedup { class: u8, author_slot: bool },
+}
+
+impl Outranking {
+    fn drops(self, spec: &decision::ActionSpec) -> bool {
+        if !matches!(spec, decision::ActionSpec::SuspendUser { .. }) {
+            return false;
+        }
+        match self {
+            Outranking::Gizmoduck => !spec.is_permanent_cse_suspension(),
+            Outranking::Dedup { class, author_slot } => outranked_by(class, spec, author_slot),
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Outranking::Dedup {
+                class: dedup_cache::CLASS_SUSPEND_CSE,
+                ..
+            } => ALREADY_CSE_SUSPENDED,
+            _ => ALREADY_PERMANENTLY_SUSPENDED,
+        }
+    }
+
+    fn seen_in(self) -> &'static str {
+        match self {
+            Outranking::Gizmoduck => PERMANENT_SEEN_IN_GIZMODUCK,
+            Outranking::Dedup { .. } => PERMANENT_SEEN_IN_DEDUP,
+        }
+    }
+}
+
+fn outranked_by(class: u8, spec: &decision::ActionSpec, author_slot: bool) -> bool {
+    let mine = spec.dedup_action_class();
+    class > mine
+        || (author_slot
+            && class == mine
+            && class >= dedup_cache::CLASS_SUSPEND_PERMANENT
+            && !spec.is_permanent_cse_suspension())
+}
+
+fn drop_outranked_suspends(
+    specs: &mut Vec<decision::ActionSpec>,
+    by: Outranking,
+    extra: &mut BTreeMap<String, String>,
+    dry_run: bool,
+    facts: &Facts,
+    score: &abuse_proto::ScoreResult,
+) -> Option<abuse_proto::DecisionOutcome> {
+    let before = specs.len();
+    specs.retain(|s| !by.drops(s));
+    if specs.len() == before {
+        return None;
+    }
+    let (status, seen_in) = (by.status(), by.seen_in());
+    metrics::SUSPEND_ORDER_TOTAL
+        .with_label_values(&[status, seen_in])
+        .inc();
+    extra.insert(PERMANENT_SEEN_IN.into(), seen_in.into());
+    info!(
+        user_id = facts.user_id,
+        status, seen_in, "a stronger suspension of the account outranks this one; dropping it"
     );
-    let skipped_json = resolved.skipped_info_json();
-    if resolved.specs.is_empty() {
-        (
-            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into()),
-            skipped_json,
-        )
-    } else {
-        (ExpandedDecision::Act(resolved.specs), skipped_json)
+    specs
+        .is_empty()
+        .then(|| skip_outcome(status.into(), dry_run, facts, score))
+}
+
+const AWAIT_STRONGER: Duration = Duration::from_secs(5);
+const AWAIT_WEAKER: Duration = Duration::from_secs(2);
+const SLOT_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspendOrder {
+    Proceed,
+            Outranked(Outranking),
+}
+
+async fn order_suspends(
+    slot: &DecisionSlot,
+    specs: &[decision::ActionSpec],
+    user_id: i64,
+) -> SuspendOrder {
+    let Some(strongest) = specs
+        .iter()
+        .filter(|s| matches!(s, decision::ActionSpec::SuspendUser { .. }))
+        .max_by_key(|s| s.dedup_action_class())
+    else {
+        return SuspendOrder::Proceed;
+    };
+    let mine = strongest.dedup_action_class();
+    let key = DedupKey::entity(EntityType::User, user_id);
+    let own_key = key == slot.key;
+    let author_slot = !own_key;
+    let outranks_mine = |class: u8| outranked_by(class, strongest, author_slot);
+    let own_nonce = slot.claim_nonce.filter(|_| own_key);
+    let displaced = slot.displaced_in_flight_suspend.filter(|_| own_key);
+    let started = tokio::time::Instant::now();
+    let mut waited = false;
+    loop {
+        let other = match slot.cache.holder(&key, own_nonce).await {
+            Some(SlotHolder::Outcome(class))
+                if outranks_mine(class) && class >= dedup_cache::CLASS_SUSPEND_PERMANENT =>
+            {
+                return SuspendOrder::Outranked(Outranking::Dedup { class, author_slot });
+            }
+            Some(SlotHolder::Claim(class))
+                if class >= dedup_cache::CLASS_SUSPEND
+                    && (class != mine || outranks_mine(class)) =>
+            {
+                Some(class)
+            }
+            Some(SlotHolder::Own) => displaced.filter(|&class| class < mine),
+            _ => None,
+        };
+        let Some(other) = other else {
+            if waited {
+                metrics::SUSPEND_ORDER_TOTAL
+                    .with_label_values(&["waited", ""])
+                    .inc();
+            }
+            return SuspendOrder::Proceed;
+        };
+        let budget = if outranks_mine(other) {
+            AWAIT_STRONGER
+        } else {
+            AWAIT_WEAKER
+        };
+        if started.elapsed() >= budget {
+            warn!(
+                user_id,
+                class = mine,
+                other_class = other,
+                "another decision's suspension of this account is still in flight; sending"
+            );
+            metrics::SUSPEND_ORDER_TOTAL
+                .with_label_values(&["wait_timeout", ""])
+                .inc();
+            return SuspendOrder::Proceed;
+        }
+        waited = true;
+        tokio::time::sleep(SLOT_POLL).await;
     }
 }
 
@@ -360,17 +596,10 @@ fn incoming_dedup_class(
     let Ok(reachable) = rules::reachable_decisions(&compiled, &score) else {
         return dedup_cache::CLASS_NONE;
     };
-    let allowlist = dynamic_config.generic_action_allowlist(entity_type);
     reachable
         .into_iter()
         .flat_map(|decision| match decision {
             Decision::Act(specs) => specs,
-            Decision::ActRequestedActions => {
-                match expand_requested_actions_decision(entity_type, &score, &allowlist).0 {
-                    ExpandedDecision::Act(specs) => specs,
-                    ExpandedDecision::Skip(_) => Vec::new(),
-                }
-            }
             Decision::Skip(_) => Vec::new(),
         })
         .map(|spec| spec.dedup_action_class())
@@ -378,6 +607,7 @@ fn incoming_dedup_class(
         .unwrap_or(dedup_cache::CLASS_NONE)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(dry_run, uas))]
 async fn run_enforcement_inner(
     ctx: &EnforcementCtx,
@@ -387,6 +617,8 @@ async fn run_enforcement_inner(
     held_class: u8,
     pinned_global_dry_run: bool,
     extra: &mut BTreeMap<String, String>,
+    run: Option<(&backfill::BackfillRunRecord, i64)>,
+    slot: Option<&DecisionSlot>,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let user_id = score.user_id;
     let (entity_type, entity_id) = Facts::resolve_target(score);
@@ -402,31 +634,45 @@ async fn run_enforcement_inner(
         EntityType::User => entity_id,
         EntityType::Post => user_id,
     };
-    if test_user::is_test_user_id(gated_user_id) {
-        info!(
-            user_id = gated_user_id,
-            "test user (id bitmask/range); skipping enforcement"
-        );
-        let entity = match entity_type {
+    let unfetched = || Facts {
+        entity_type,
+        entity_id,
+        user_id: gated_user_id,
+        topic: source_topic.to_owned(),
+        score: ScoreFacts::from_score(score),
+        entity: match entity_type {
             EntityType::User => EntityFacts::User(UserFacts::default()),
             EntityType::Post => EntityFacts::Post(PostFacts {
                 author_id: user_id,
                 ..Default::default()
             }),
-        };
-        let partial = Facts {
-            entity_type,
-            entity_id,
-            user_id: gated_user_id,
-            topic: source_topic.to_owned(),
-            score: ScoreFacts::from_score(score),
-            entity,
-            uas: None,
-        };
+        },
+        uas: None,
+    };
+    if test_user::is_test_user_id(gated_user_id) {
+        info!(
+            user_id = gated_user_id,
+            "test user (id bitmask/range); skipping enforcement"
+        );
         return Ok(skip_outcome(
             "test_user_skipped".into(),
             dry_run,
-            &partial,
+            &unfetched(),
+            score,
+        ));
+    }
+
+    if control.rules_unread() && control.page_actions.is_empty() {
+        record_seen_pair(&ctx.off_switch, &ctx.dynamic_config, score, source_topic);
+        record_seen_bands(ctx, score, entity_type, None, control.factory);
+        extra.insert(
+            "matched_rule_id".into(),
+            action_control::PAGE_RULE_ID.into(),
+        );
+        return Ok(skip_outcome(
+            action_control::STATUS_NO_ACTIONS.into(),
+            dry_run,
+            &unfetched(),
             score,
         ));
     }
@@ -502,15 +748,18 @@ async fn run_enforcement_inner(
                             allowlist: author_allowlist,
                             ..Default::default()
                         },
+                        invited: InvitedReply::NotAReply,
                     }),
                     uas: None,
                 };
                 return Ok(skip_outcome(reason.into(), dry_run, &partial, score));
             }
 
-            let (user_res, cred_res) = tokio::join!(
+            let (user_res, cred_res, invited) = tokio::join!(
                 fetch_user(&ctx.gd, author_id),
                 fetch_cred(&ctx.cred_clients, author_id),
+                ctx.reply_parents
+                    .invited(score.in_reply_to_post_id, author_id),
             );
 
             Facts {
@@ -529,6 +778,7 @@ async fn run_enforcement_inner(
                         user: user_res?,
                         cred: cred_res?,
                     },
+                    invited,
                 }),
                 uas: None,
             }
@@ -536,21 +786,24 @@ async fn run_enforcement_inner(
     };
 
     record_seen_pair(&ctx.off_switch, &ctx.dynamic_config, score, &facts.topic);
-    let rules_override = ctx.dynamic_config.enforcement_rules_yaml(facts.entity_type);
-    let compiled_rules = ctx
-        .rules_cache
-        .resolve(facts.entity_type, rules_override.as_ref());
-    let rules_decision = if control.page_driven() {
-        match crate::rules::decide_with_id(&compiled_rules, &facts) {
+    let compiled_rules = || {
+        ctx.rules_cache.resolve(
+            facts.entity_type,
+            ctx.dynamic_config
+                .enforcement_rules_yaml(facts.entity_type)
+                .as_ref(),
+        )
+    };
+    let rules_decision = if control.page_driven() && !control.rules_unread() {
+        match crate::rules::decide_with_id(&compiled_rules(), &facts) {
             Ok(d) => Some(d),
             Err(e) => {
                 warn!(
                     user_id,
                     topic = %facts.topic,
                     error = %e,
-                    "action control: rules eval errored on a page decision; a live scope records only",
+                    "action control: rules eval errored on a page decision",
                 );
-                control.lock_rules_unknown();
                 None
             }
         }
@@ -565,9 +818,6 @@ async fn run_enforcement_inner(
                     "rules_would_action_specs".into(),
                     action_control::action_specs_json(specs),
                 );
-                if action_control::has_cse_policy(specs) {
-                    control.lock_cse();
-                }
             }
         }
         if control.recording() && !dry_run {
@@ -580,7 +830,7 @@ async fn run_enforcement_inner(
                     .into(),
             );
         }
-        match safety_checks::first_page_stop(facts.entity_type, &facts) {
+        match safety_checks::first_page_stop(facts.entity_type, &facts, control.author_skips) {
             Ok(Some(check)) => (Decision::Skip(check.reason.to_owned()), check.id.to_owned()),
             Ok(None) if control.page_actions.is_empty() => (
                 Decision::Skip(action_control::STATUS_NO_ACTIONS.to_owned()),
@@ -607,7 +857,7 @@ async fn run_enforcement_inner(
             }
         }
     } else {
-        match crate::rules::decide_with_id(&compiled_rules, &facts) {
+        match crate::rules::decide_with_id(&compiled_rules(), &facts) {
             Ok(d) => d,
             Err(e) => {
                 warn!(
@@ -631,48 +881,85 @@ async fn run_enforcement_inner(
         None if !control.page_driven() => Some(&own),
         None => None,
     };
-    if let Some(rules) = seen_rules {
-        record_seen_bands(ctx, score, facts.entity_type, control, rules);
+    if control.rules_unread() {
+        record_seen_bands(ctx, score, facts.entity_type, None, control.factory);
+    } else if let Some(rules) = seen_rules {
+        record_seen_bands(ctx, score, facts.entity_type, Some(rules), false);
+    }
+    if [
+        safety_checks::GIZMODUCK_TEST_USER.id,
+        safety_checks::TEST_ACCOUNT.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let Some(kind) = safety_checks::test_account_signal_kind(&facts)
+    {
+        extra.insert("test_account_signal".into(), kind.into());
+        metrics::TEST_ACCOUNT_SKIPS_TOTAL
+            .with_label_values(&[kind])
+            .inc();
+    }
+    if [
+        safety_checks::INVITED_REPLY.id,
+        safety_checks::INVITED_REPLY_UNKNOWN.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let EntityFacts::Post(post) = &facts.entity
+    {
+        extra.insert("invited_reply".into(), post.invited.as_str().into());
     }
     extra.insert("matched_rule_id".into(), rule_id);
 
-    let (decision, mut requested_actions_skipped) = match decision {
-        Decision::ActRequestedActions => expand_requested_actions_decision(
-            facts.entity_type,
-            &facts.score,
-            &ctx.dynamic_config
-                .generic_action_allowlist(facts.entity_type),
-        ),
-        Decision::Skip(reason) => (ExpandedDecision::Skip(reason), None),
-        Decision::Act(specs) => (ExpandedDecision::Act(specs), None),
-    };
-
     match decision {
-        ExpandedDecision::Skip(reason) => {
-            let mut outcome = skip_outcome(reason, dry_run, &facts, score);
-            if let Some(json) = requested_actions_skipped {
-                outcome
-                    .info
-                    .insert("requested_actions_skipped".into(), json);
-            }
-            Ok(outcome)
-        }
-        ExpandedDecision::Act(mut specs) => {
+        Decision::Skip(reason) => Ok(skip_outcome(reason, dry_run, &facts, score)),
+        Decision::Act(mut specs) => {
             if control.page_driven()
                 && facts.entity_type == EntityType::User
-                && action_control::is_label_only(&control.page_actions)
-                && facts.user().labels.iter().any(|l| l == "SpamHighRecall")
+                && let Some(label) = action_control::label_only(&control.page_actions)
+                && facts.user().labels.iter().any(|l| l == label)
+            {
+                let reason = if label == gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP {
+                    "already_phoenix_skip_labeled"
+                } else {
+                    "already_spam_high_recall_labeled"
+                };
+                return Ok(skip_outcome(reason.into(), dry_run, &facts, score));
+            }
+            if control.page_driven()
+                && facts.entity_type == EntityType::Post
+                && post_labels::sent_labels(&specs).next().is_some()
+                && drop_carried_post_labels(
+                    ctx.post_labels.as_deref(),
+                    &mut facts,
+                    &mut specs,
+                    extra,
+                )
+                .await
             {
                 return Ok(skip_outcome(
-                    "already_spam_high_recall_labeled".into(),
+                    ALREADY_POST_LABELED.into(),
                     dry_run,
                     &facts,
                     score,
                 ));
             }
+            if facts.user().permanently_suspended
+                && let Some(outcome) = drop_outranked_suspends(
+                    &mut specs,
+                    Outranking::Gizmoduck,
+                    extra,
+                    dry_run,
+                    &facts,
+                    score,
+                )
+            {
+                return Ok(outcome);
+            }
             if control.page_driven() {
                 let account = facts.user();
-                let skip = if account.suspended {
+                let upgrades = outranks_temporary_suspension(&action_control::page_specs(
+                    &control.page_actions,
+                ));
+                let skip = if account.suspended && !upgrades {
                     Some(ALREADY_SUSPENDED)
                 } else if account.deactivated {
                     Some("already_deactivated")
@@ -694,6 +981,7 @@ async fn run_enforcement_inner(
                             spec,
                             facts.entity_id,
                             facts.user_id,
+                            crate::facts::head_label(score),
                             Vec::new(),
                         )
                         .name()
@@ -717,11 +1005,6 @@ async fn run_enforcement_inner(
                     outcome
                         .info
                         .insert(ALREADY_SUSPENDED_STRIPPED.into(), names);
-                    if let Some(json) = requested_actions_skipped.take() {
-                        outcome
-                            .info
-                            .insert("requested_actions_skipped".into(), json);
-                    }
                     return Ok(outcome);
                 }
                 info!(
@@ -735,8 +1018,26 @@ async fn run_enforcement_inner(
             // Overturn-hold gate: skip a suspend, or strip a label, that a
             // human reviewer overturned on appeal while that hold is still active.
             let mut hold_gate_info = BTreeMap::new();
-            let gate_cfg = ctx.dynamic_config.overturn_hold_gate();
+            let live_gate_cfg = ctx.dynamic_config.overturn_hold_gate();
+            let (gate_cfg, run_unchecked) =
+                match run.map(|_| backfill::run_gate_cfg(&live_gate_cfg)) {
+                    None => (live_gate_cfg, false),
+                    Some(Some(cfg)) => (cfg, false),
+                    Some(None) => (live_gate_cfg, true),
+                };
             let gated = gated_actions(&specs, &gate_cfg);
+            if run_unchecked && !gated.is_empty() {
+                return Ok(hold_gate_skip_outcome(
+                    overturn_hold::STATUS_HOLD_LOOKUP_FAILED,
+                    BTreeMap::from([(
+                        "overturn_hold_probe_error".to_owned(),
+                        "gate_off".to_owned(),
+                    )]),
+                    dry_run,
+                    &facts,
+                    score,
+                ));
+            }
             if !gated.is_empty() {
                 let mut gate = ctx
                     .hold_gate
@@ -744,12 +1045,7 @@ async fn run_enforcement_inner(
                     .await;
                 if let Some(status) = gate.skip_status {
                     return Ok(hold_gate_skip_outcome(
-                        status,
-                        gate.info,
-                        dry_run,
-                        &facts,
-                        score,
-                        requested_actions_skipped.take(),
+                        status, gate.info, dry_run, &facts, score,
                     ));
                 }
                 if !gate.strip_labels.is_empty() {
@@ -771,7 +1067,6 @@ async fn run_enforcement_inner(
                             dry_run,
                             &facts,
                             score,
-                            requested_actions_skipped.take(),
                         ));
                     }
                 }
@@ -800,12 +1095,22 @@ async fn run_enforcement_inner(
                     dry_run,
                     &facts,
                     score,
-                    requested_actions_skipped.take(),
                 ));
+            }
+
+            if !dry_run
+                && let Some(slot) = slot
+                && let SuspendOrder::Outranked(by) =
+                    order_suspends(slot, &specs, facts.user_id).await
+                && let Some(outcome) =
+                    drop_outranked_suspends(&mut specs, by, extra, dry_run, &facts, score)
+            {
+                return Ok(outcome);
             }
 
             if let Some(outcome) = final_checks(
                 &ctx.off_switch,
+                &ctx.head_guard,
                 &ctx.dynamic_config,
                 &specs,
                 &facts,
@@ -813,9 +1118,9 @@ async fn run_enforcement_inner(
                 source_topic,
                 dry_run,
                 &mut hold_gate_info,
-                &mut requested_actions_skipped,
+                run.map(|(r, nonce)| (ctx.backfill.as_ref(), r, nonce)),
             )
-            .await
+            .await?
             {
                 return Ok(outcome);
             }
@@ -843,10 +1148,11 @@ async fn run_enforcement_inner(
                 .map(decision::ActionSpec::dedup_action_class)
                 .max()
                 .unwrap_or(dedup_cache::CLASS_NONE);
+            let head = crate::facts::head_label(score);
             let actions: Vec<EnforcementAction> = specs
                 .iter()
                 .map(|spec| {
-                    EnforcementAction::from_spec(spec, entity_id, user_id, ais_notes.clone())
+                    EnforcementAction::from_spec(spec, entity_id, user_id, head, ais_notes.clone())
                 })
                 .collect();
             let uas_action_dims: Vec<(&'static str, String)> = actions
@@ -859,9 +1165,6 @@ async fn run_enforcement_inner(
                 serde_json::to_string(&uas_action_dims.iter().map(|(a, _)| *a).collect::<Vec<_>>())
                     .unwrap_or_else(|_| "[]".into()),
             );
-            if let Some(json) = requested_actions_skipped {
-                additional_info_map.insert("requested_actions_skipped".into(), json);
-            }
             additional_info_map.extend(hold_gate_info);
             if let Some(names) = already_suspended_stripped {
                 additional_info_map.insert(ALREADY_SUSPENDED_STRIPPED.into(), names);
@@ -925,8 +1228,8 @@ fn record_seen_bands(
     ctx: &EnforcementCtx,
     score: &abuse_proto::ScoreResult,
     entity_type: EntityType,
-    control: &action_control::Resolved,
-    rules: &(Decision, String),
+    rules: Option<&(Decision, String)>,
+    factory: bool,
 ) {
     let head = crate::facts::head_label(score);
     if head.is_empty() {
@@ -946,31 +1249,33 @@ fn record_seen_bands(
     if bands.is_empty() {
         bands.push("-");
     }
-    let specs: &[decision::ActionSpec] = match &rules.0 {
-        Decision::Act(specs) => specs,
+    let specs: &[decision::ActionSpec] = match rules {
+        Some((Decision::Act(specs), _)) => specs,
         _ => &[],
     };
-    let cse = ctx.dynamic_config.action_control_config().seen_cse(
-        head,
-        &bands,
-        action_control::has_cse_policy(specs) || control.forced == Some("cse_lock"),
-    );
     let classifier = if score.model_version.is_empty() {
         "-"
     } else {
         score.model_version.as_str()
     };
-    for (band, cse) in bands.into_iter().zip(cse) {
+    ctx.action_control
+        .record_seen_row(action_control::ActionControlSeenRow {
+            entity_type: action_control::entity_of(entity_type),
+            head: head.to_owned(),
+            classifier: classifier.to_owned(),
+            row: confidence::row_of(score.confidence).0,
+            last_seen_ms: now_millis(),
+        });
+    for band in bands {
         ctx.action_control
             .record_seen(action_control::ActionControlSeen {
                 head: head.to_owned(),
                 classifier: classifier.to_owned(),
                 band: band.to_owned(),
                 entity_type: action_control::entity_of(entity_type),
-                factory: is_factory_message(score),
-                cse,
+                factory,
                 last_seen_ms: now_millis(),
-                rule_id: rules.1.clone(),
+                rule_id: rules.map(|r| r.1.clone()).unwrap_or_default(),
                 action_specs: action_control::action_specs_value(specs),
             });
     }
@@ -979,6 +1284,7 @@ fn record_seen_bands(
 #[allow(clippy::too_many_arguments)]
 async fn final_checks(
     off_switch: &off_switch::OffSwitch,
+    head_guard: &head_guard::HeadGuard,
     dynamic_config: &DynamicConfig,
     specs: &[decision::ActionSpec],
     facts: &Facts,
@@ -986,71 +1292,142 @@ async fn final_checks(
     source_topic: &str,
     dry_run: bool,
     hold_gate_info: &mut BTreeMap<String, String>,
-    requested_actions_skipped: &mut Option<String>,
-) -> Option<abuse_proto::DecisionOutcome> {
-    if dynamic_config.off_switch_enabled() {
-        let head = crate::facts::head_label(score);
-        let classifier = score.model_version.as_str();
-        if let Some(hit) = off_switch.lookup(head, classifier, now_millis()) {
-            metrics::OFF_SWITCH_TOTAL
-                .with_label_values(&[source_topic, head, hit.scope.as_str()])
-                .inc();
-            info!(
-                user_id = facts.user_id,
-                head,
-                classifier,
-                scope = hit.scope.as_str(),
-                updated_by = %hit.record.updated_by,
-                "enforcement off switch: skipping decision"
-            );
-            let dropped: Vec<&'static str> = specs
-                .iter()
-                .map(|spec| {
-                    EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, Vec::new())
-                        .name()
-                })
-                .collect();
-            let mut info = std::mem::take(hold_gate_info);
-            info.extend(hit.info_keys());
-            info.insert(
-                "off_switch_dropped_actions".into(),
-                serde_json::to_string(&dropped).unwrap_or_else(|_| "[]".into()),
-            );
-            info.insert(
-                "action_specs".into(),
-                action_control::action_specs_json(specs),
-            );
-            return Some(hold_gate_skip_outcome(
-                off_switch::STATUS_SWITCHED_OFF,
-                info,
-                dry_run,
-                facts,
-                score,
-                requested_actions_skipped.take(),
-            ));
-        }
+    run: Option<(&backfill::Backfill, &backfill::BackfillRunRecord, i64)>,
+) -> Result<Option<abuse_proto::DecisionOutcome>> {
+    let head = crate::facts::head_label(score);
+    let classifier = score.model_version.as_str();
+    let switched_off = |keys: Vec<(String, String)>, hold_gate_info: &mut BTreeMap<_, _>| {
+        let dropped: Vec<&'static str> = specs
+            .iter()
+            .map(|spec| {
+                EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, head, Vec::new())
+                    .name()
+            })
+            .collect();
+        let mut info = std::mem::take(hold_gate_info);
+        info.extend(keys);
+        info.insert(
+            "off_switch_dropped_actions".into(),
+            serde_json::to_string(&dropped).unwrap_or_else(|_| "[]".into()),
+        );
+        info.insert(
+            "action_specs".into(),
+            action_control::action_specs_json(specs),
+        );
+        hold_gate_skip_outcome(off_switch::STATUS_SWITCHED_OFF, info, dry_run, facts, score)
+    };
+    let guards_on = dynamic_config.off_switch_enabled();
+    if guards_on && let Some(hit) = off_switch.lookup(head, classifier, now_millis()) {
+        metrics::OFF_SWITCH_TOTAL
+            .with_label_values(&[source_topic, head, hit.scope.as_str()])
+            .inc();
+        info!(
+            user_id = facts.user_id,
+            head,
+            classifier,
+            scope = hit.scope.as_str(),
+            updated_by = %hit.record.updated_by,
+            "enforcement off switch: skipping decision"
+        );
+        return Ok(Some(switched_off(hit.info_keys(), hold_gate_info)));
     }
 
     if dry_run {
         if let Some((used, cap, _)) = dynamic_config.rate_limit_stats(facts.entity_type) {
             hold_gate_info.insert("would_rate_cap".into(), (used >= cap).to_string());
         }
-        return None;
+        return Ok(None);
+    }
+    if let Some((bf, run, nonce)) = run {
+        return run_checks(bf, run, nonce, facts, score).await;
+    }
+    if guards_on
+        && let Some(r) = head_guard
+            .check(off_switch, head, classifier, now_millis())
+            .await
+    {
+        info!(
+            user_id = facts.user_id,
+            head,
+            classifier,
+            window = r.window,
+            limit = r.limit,
+            "head guard: action ceiling reached; skipping decision"
+        );
+        return Ok(Some(switched_off(r.info_keys(), hold_gate_info)));
     }
     if !dynamic_config.try_enforce(facts.entity_type).await {
         warn!(
             entity_type = facts.entity_type.as_str(),
             "max enforcement has been reached; skipping"
         );
-        let mut outcome = skip_outcome("max_enforcement_reached".into(), dry_run, facts, score);
-        if let Some(json) = requested_actions_skipped.take() {
-            outcome
-                .info
-                .insert("requested_actions_skipped".into(), json);
-        }
-        return Some(outcome);
+        return Ok(Some(skip_outcome(
+            "max_enforcement_reached".into(),
+            dry_run,
+            facts,
+            score,
+        )));
     }
-    None
+    if guards_on
+        && let Some(r) = head_guard
+            .count(off_switch, head, classifier, now_millis())
+            .await
+    {
+        info!(
+            user_id = facts.user_id,
+            head,
+            classifier,
+            window = r.window,
+            limit = r.limit,
+            "head guard: past the action ceiling; skipping decision"
+        );
+        return Ok(Some(switched_off(r.info_keys(), hold_gate_info)));
+    }
+    Ok(None)
+}
+
+async fn run_checks(
+    bf: &backfill::Backfill,
+    run: &backfill::BackfillRunRecord,
+    nonce: i64,
+    facts: &Facts,
+    score: &abuse_proto::ScoreResult,
+) -> Result<Option<abuse_proto::DecisionOutcome>> {
+    let skip = |status: &str| Ok(Some(skip_outcome(status.into(), false, facts, score)));
+    let Some(now) = bf.run(&run.run_id).await? else {
+        return skip(backfill::STATUS_RUN_UNKNOWN);
+    };
+    if let Err(status) = backfill::gate(&now, now_millis()) {
+        return skip(status);
+    }
+    let claims = bf
+        .claims()
+        .ok_or_else(|| anyhow::anyhow!("no backfill claim store on this pod"))?;
+    let key = backfill_claims::ClaimKey {
+        run_id: run.run_id.clone(),
+        entity: facts.entity_type,
+        entity_id: facts.entity_id,
+    };
+    match claims.state(&key).await? {
+        backfill_claims::ItemClaim::Finished { .. } => {
+            return skip(backfill::STATUS_ALREADY_FINISHED);
+        }
+        backfill_claims::ItemClaim::Handed { nonce: holder, age }
+            if holder != nonce
+                && age >= backfill_claims::STALE_AFTER
+                && backfill::already_applied(&run.actions, facts.user()) =>
+        {
+            return skip(backfill::STATUS_ALREADY_APPLIED);
+        }
+        _ => {}
+    }
+    let budget = bf.config().budget(facts.entity_type);
+    match claims.take(&key, nonce, budget, bf.pod()).await? {
+        backfill_claims::Take::Taken => Ok(None),
+        backfill_claims::Take::Held => skip(backfill::STATUS_CLAIM_TAKEN),
+        backfill_claims::Take::BudgetReached => skip(backfill::STATUS_BUDGET_REACHED),
+        backfill_claims::Take::NotInList => skip(backfill::STATUS_NOT_IN_RUN),
+    }
 }
 
 fn skip_outcome(
@@ -1074,15 +1451,9 @@ fn hold_gate_skip_outcome(
     dry_run: bool,
     facts: &Facts,
     score: &abuse_proto::ScoreResult,
-    requested_actions_skipped: Option<String>,
 ) -> abuse_proto::DecisionOutcome {
     let mut outcome = skip_outcome(status.to_owned(), dry_run, facts, score);
     outcome.info.extend(gate_info);
-    if let Some(json) = requested_actions_skipped {
-        outcome
-            .info
-            .insert("requested_actions_skipped".into(), json);
-    }
     outcome
 }
 
@@ -1110,21 +1481,18 @@ fn dedup_retention_for(status: &str) -> DedupRetention {
 
 async fn write_dedup_outcome(
     dedup_cache: &dyn DedupSlot,
-    entity_type: EntityType,
-    entity_id: i64,
+    key: &DedupKey,
     score: &abuse_proto::ScoreResult,
     topic: &str,
     outcome: &abuse_proto::DecisionOutcome,
     claim_nonce: Option<u64>,
 ) {
     let retention = dedup_retention_for(&outcome.status);
-    let locked_after_claim = outcome
+    let forced_recording = outcome
         .info
         .contains_key(action_control::FORCED_RECORDING_KEY);
-    if retention == DedupRetention::Release || locked_after_claim {
-        dedup_cache
-            .invalidate(entity_type, entity_id, claim_nonce)
-            .await;
+    if retention == DedupRetention::Release || forced_recording {
+        dedup_cache.invalidate(key, claim_nonce).await;
         return;
     }
     let mut score_for_dedup = score.clone();
@@ -1146,23 +1514,11 @@ async fn write_dedup_outcome(
     let compressed = zstd::encode_all(json_bytes.as_slice(), 3).unwrap_or(json_bytes);
     if retention == DedupRetention::Full {
         dedup_cache
-            .update(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update(key, &compressed, acted_class, claim_nonce)
             .await;
     } else {
         dedup_cache
-            .update_skip(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update_skip(key, &compressed, acted_class, claim_nonce)
             .await;
     }
 }
@@ -1280,7 +1636,18 @@ async fn run_enforcement(
 ) -> Result<abuse_proto::DecisionOutcome> {
     let mut control = decision.control.clone();
     let mut extra = BTreeMap::new();
-    let mut outcome = run_enforcement_inner(
+    let run = decision.run.as_deref();
+    let (entity_type, entity_id) = Facts::resolve_target(score);
+    let key = run.map(|r| backfill_claims::ClaimKey {
+        run_id: r.run_id.clone(),
+        entity: entity_type,
+        entity_id,
+    });
+    let _pair = match &key {
+        Some(k) => Some(ctx.backfill.key_locks.lock(k).await),
+        None => None,
+    };
+    let result = run_enforcement_inner(
         ctx,
         score,
         source_topic,
@@ -1288,8 +1655,37 @@ async fn run_enforcement(
         decision.held_class,
         decision.global_dry_run,
         &mut extra,
+        run.map(|r| (r, decision.run_nonce)),
+        decision.slot.as_ref(),
     )
-    .await?;
+    .await;
+    let finish = |status: String| async move {
+        if let (Some(k), Some(claims)) = (&key, ctx.backfill.claims())
+            && let Err(e) = claims.finish(k, decision.run_nonce, &status).await
+        {
+            warn!(run_id = %k.run_id, entity_id = k.entity_id, "backfill claim finish failed: {e:#}");
+        }
+    };
+    let mut outcome = match (result, run) {
+        (Ok(outcome), _) => outcome,
+        (Err(e), Some(_)) if e.downcast_ref::<PermanentAisFailure>().is_some() => {
+            finish("ais_rejected".into()).await;
+            return Err(e);
+        }
+        (Err(e), _) => return Err(e),
+    };
+    if let Some(run) = run {
+        outcome.info.extend(backfill::info_keys(run, score));
+        if outcome.status == off_switch::STATUS_SWITCHED_OFF {
+            ctx.backfill.hold_for_off_switch(run, now_millis()).await?;
+        }
+        if !decision.records_only() && !backfill::leaves_claim(&outcome.status) {
+            finish(outcome.status.clone()).await;
+            outcome
+                .info
+                .insert("backfill_claim".into(), "finished".into());
+        }
+    }
     outcome.info.extend(env_info(ctx));
     outcome.info.extend(control.info_keys());
     if decision.records_only() {
@@ -1304,7 +1700,12 @@ async fn run_enforcement(
         }
     }
     outcome.info.extend(extra);
-    control.stamp_confidence(&mut outcome);
+    if control.row.is_some() && outcome.status == off_switch::STATUS_SWITCHED_OFF {
+        outcome
+            .info
+            .entry("logged_because".into())
+            .or_insert_with(|| "off_switch".into());
+    }
     publish_decision_outcome(ctx, &outcome);
     Ok(outcome)
 }
@@ -1313,14 +1714,18 @@ fn env_info(ctx: &EnforcementCtx) -> BTreeMap<String, String> {
     BTreeMap::from([("env".to_owned(), ctx.action_control.env.clone())])
 }
 
+// A decision that carries a policy version comes from an upstream decision
+// producer that is not part of this release. Such decisions act only
+// through their head's action-control rows.
 fn is_factory_message(score: &abuse_proto::ScoreResult) -> bool {
     !score.policy_version.is_empty()
-        || !score.requested_actions.is_empty()
-        || score.summary.as_ref().is_some_and(|s| {
-            s.labels
-                .iter()
-                .any(|l| action_control::strip_dry_run_prefix(l) == action_control::FACTORY_LABEL)
-        })
+}
+
+fn author_of(score: &abuse_proto::ScoreResult, entity_type: EntityType) -> i64 {
+    match entity_type {
+        EntityType::Post => score.user_id,
+        EntityType::User => Facts::resolve_target(score).1,
+    }
 }
 
 fn resolve_control(
@@ -1330,28 +1735,47 @@ fn resolve_control(
 ) -> action_control::Resolved {
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     let producer_dry = score.dry_run || action_control::has_dry_run_prefix(labels);
-    let claim =
-        confidence::message_claim(score, &ctx.dynamic_config.confidence_config(), now_millis());
-    if !ctx.action_control.has_records() {
-        return action_control::Resolved {
-            producer_dry,
-            confidence: claim.as_ref().map(confidence::LevelOutcome::routing_label),
-            ..Default::default()
-        };
-    }
+    let factory = is_factory_message(score);
+    let claim = Some(confidence::message_claim(score, now_millis()));
     let input = action_control::ResolveInput {
         head: crate::facts::head_label(score),
         classifier: &score.model_version,
         labels,
         entity: entity_type,
-        factory: is_factory_message(score),
+        factory,
         producer_dry,
         confidence: claim,
+        author_id: author_of(score, entity_type),
     };
     ctx.action_control.resolve(
         &input,
         &ctx.dynamic_config.action_control_config(),
         |entity| safety_checks_ok(ctx, entity),
+    )
+}
+
+fn resolve_run_control(
+    ctx: &EnforcementCtx,
+    score: &abuse_proto::ScoreResult,
+    entity_type: EntityType,
+    run: &backfill::BackfillRunRecord,
+) -> action_control::Resolved {
+    let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
+    let input = action_control::ResolveInput {
+        head: crate::facts::head_label(score),
+        classifier: &score.model_version,
+        labels,
+        entity: entity_type,
+        factory: run.factory,
+        producer_dry: false,
+        confidence: Some(confidence::message_claim(score, now_millis())),
+        author_id: author_of(score, entity_type),
+    };
+    ctx.action_control.resolve_run(
+        &input,
+        &ctx.dynamic_config.action_control_config(),
+        |entity| safety_checks_ok(ctx, entity),
+        &run.actions,
     )
 }
 
@@ -1407,9 +1831,75 @@ async fn build_kafka_producers(cfg: &Config, boot_config: &serde_json::Value) ->
     producers
 }
 
+enum Admission {
+        Admitted(Option<Box<action_control::Resolved>>),
+        Dropped(&'static str),
+}
+
 impl ScoreResultProcessor {
-                                                #[tracing::instrument(skip_all)]
-    async fn process(&self, score: &abuse_proto::ScoreResult) -> Result<String, EnforcementFailed> {
+                            async fn admit(&self, score: &abuse_proto::ScoreResult) -> Admission {
+        let msg_labels: Vec<&str> = score
+            .summary
+            .as_ref()
+            .map(|s| {
+                s.labels
+                    .iter()
+                    .map(|l| action_control::strip_dry_run_prefix(l))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dropped = if !self.negative_labels.is_empty()
+            && msg_labels.iter().any(|l| self.negative_labels.contains(*l))
+        {
+            "negative_label"
+        } else if !self.labels.is_empty() && !msg_labels.iter().any(|l| self.labels.contains(*l)) {
+            "no_match"
+        } else {
+            if !self.labels.is_empty() {
+                let matches: Vec<&&str> = msg_labels
+                    .iter()
+                    .filter(|l| self.labels.contains(**l))
+                    .collect();
+                info!(?matches, "matching labels");
+            }
+            return Admission::Admitted(None);
+        };
+        if self.backfill_topic {
+            return Admission::Dropped(dropped);
+        }
+        self.ctx
+            .action_control
+            .ensure_loaded(&self.ctx.dynamic_config.action_control_config())
+            .await;
+        let (entity_type, _) = Facts::resolve_target(score);
+        let head = crate::facts::head_label(score);
+        let control = resolve_control(&self.ctx, score, entity_type);
+        let admits = if control.unknown {
+            dropped == "no_match"
+        } else {
+            self.ctx.action_control.admits_unlisted(entity_type, head)
+        };
+        if !admits {
+            return Admission::Dropped(dropped);
+        }
+        match control.admit_unlisted() {
+            Some(control) => {
+                info!(
+                    list = dropped,
+                    "admitted past the topic's label list by its head's record"
+                );
+                Admission::Admitted(Some(Box::new(control)))
+            }
+            None => Admission::Dropped(dropped),
+        }
+    }
+
+                                                        #[tracing::instrument(skip_all)]
+    async fn process(
+        &self,
+        score: &abuse_proto::ScoreResult,
+        control: Option<action_control::Resolved>,
+    ) -> Result<String, EnforcementFailed> {
         let source = "kafka";
         let topic = self.topic.as_str();
         let head = crate::facts::head_label(score);
@@ -1447,39 +1937,69 @@ impl ScoreResultProcessor {
             return Ok("invalid_entity_id".into());
         }
 
+        match (self.backfill_topic, score.backfill_run_id.is_empty()) {
+            (false, false) => {
+                return Ok(self.early_skip(
+                    score,
+                    backfill::STATUS_ID_ON_LIVE_TOPIC,
+                    BTreeMap::new(),
+                ));
+            }
+            (true, true) => {
+                return Ok(self.early_skip(score, backfill::STATUS_ID_MISSING, BTreeMap::new()));
+            }
+            _ => {}
+        }
+
         self.ctx
             .action_control
             .ensure_loaded(&self.ctx.dynamic_config.action_control_config())
             .await;
+        let (control, run) = if self.backfill_topic {
+            match self.admit_run(score, entity_type, entity_id).await {
+                Ok(run) => (
+                    resolve_run_control(&self.ctx, score, entity_type, &run),
+                    Some(run),
+                ),
+                Err((status, info)) => return Ok(self.early_skip(score, status, info)),
+            }
+        } else {
+            let control = control.unwrap_or_else(|| resolve_control(&self.ctx, score, entity_type));
+            (control, None)
+        };
         let mut decision = DecisionContext {
-            control: resolve_control(&self.ctx, score, entity_type),
+            control,
             would_dedup_held: None,
             held_class: dedup_cache::CLASS_NONE,
             global_dry_run: self.ctx.dynamic_config.is_dry_run(),
+            run,
+            run_nonce: backfill_claims::new_claim_nonce(),
+            slot: None,
         };
 
-        let incoming_class = decision.control.incoming_dedup_class(incoming_dedup_class(
-            &self.ctx.dynamic_config,
-            &self.ctx.rules_cache,
-            score,
-        ));
+        let incoming_class = decision.control.incoming_dedup_class(|| {
+            incoming_dedup_class(&self.ctx.dynamic_config, &self.ctx.rules_cache, score)
+        });
+        let dedup_key = decision.dedup_key(entity_type, entity_id);
         let claim_nonce = if decision.records_only() {
-            decision.would_dedup_held = self
-                .dedup_cache
-                .peek(entity_type, entity_id, incoming_class)
-                .await;
+            decision.would_dedup_held = self.dedup_cache.peek(&dedup_key, incoming_class).await;
             None
         } else {
-            match self
+            let mut displaced_in_flight_suspend = None;
+            let claim_nonce = match self
                 .dedup_cache
-                .try_insert(entity_type, entity_id, incoming_class)
+                .try_insert(&dedup_key, incoming_class)
                 .await
             {
                 DedupCheck::New { claim_nonce } => claim_nonce,
                 DedupCheck::ClassBypass {
                     held_class,
+                    held_in_flight,
                     claim_nonce,
                 } => {
+                    displaced_in_flight_suspend = (held_in_flight
+                        && held_class >= dedup_cache::CLASS_SUSPEND)
+                        .then_some(held_class);
                     info!(
                         incoming_class,
                         held_class, "dedup: class bypass (incoming outranks held entry)"
@@ -1510,19 +2030,24 @@ impl ScoreResultProcessor {
                             model,
                         ])
                         .inc();
+                    let mut info = env_info(&self.ctx);
+                    if let Some(run) = decision.run.as_deref() {
+                        info.extend(backfill::info_keys(run, score));
+                    }
                     publish_decision_outcome(
                         &self.ctx,
-                        &decision_outcome(
-                            score,
-                            topic,
-                            "dedup_skipped".into(),
-                            false,
-                            env_info(&self.ctx),
-                        ),
+                        &decision_outcome(score, topic, "dedup_skipped".into(), false, info),
                     );
                     return Ok("dedup_skipped".into());
                 }
-            }
+            };
+            decision.slot = Some(DecisionSlot {
+                cache: self.dedup_cache.clone(),
+                key: dedup_key.clone(),
+                claim_nonce,
+                displaced_in_flight_suspend,
+            });
+            claim_nonce
         };
 
         let outcome = match run_enforcement(&self.ctx, score, topic, &decision).await {
@@ -1530,9 +2055,7 @@ impl ScoreResultProcessor {
             Err(source) => {
                 let permanent = source.downcast_ref::<PermanentAisFailure>().is_some();
                 if permanent && decision.claimed() {
-                    self.dedup_cache
-                        .invalidate(entity_type, entity_id, claim_nonce)
-                        .await;
+                    self.dedup_cache.invalidate(&dedup_key, claim_nonce).await;
                 }
                 return Err(EnforcementFailed {
                     permanent,
@@ -1546,8 +2069,7 @@ impl ScoreResultProcessor {
         if decision.claimed() {
             write_dedup_outcome(
                 self.dedup_cache.as_ref(),
-                entity_type,
-                entity_id,
+                &dedup_key,
                 score,
                 topic,
                 &outcome,
@@ -1590,6 +2112,101 @@ impl ScoreResultProcessor {
         }
 
         Ok(status)
+    }
+
+            fn early_skip(
+        &self,
+        score: &abuse_proto::ScoreResult,
+        status: &str,
+        info: BTreeMap<String, String>,
+    ) -> String {
+        let (entity_type, _) = Facts::resolve_target(score);
+        metrics::ENFORCEMENT_TOTAL
+            .with_label_values(&[
+                "kafka",
+                &self.topic,
+                entity_type.as_str(),
+                "final",
+                status,
+                "",
+                "",
+                crate::facts::head_label(score),
+                &score.model_version,
+            ])
+            .inc();
+        let mut info = info;
+        info.extend(env_info(&self.ctx));
+        publish_decision_outcome(
+            &self.ctx,
+            &decision_outcome(score, &self.topic, status.into(), false, info),
+        );
+        status.to_owned()
+    }
+
+                                async fn admit_run(
+        &self,
+        score: &abuse_proto::ScoreResult,
+        entity_type: EntityType,
+        entity_id: i64,
+    ) -> Result<Arc<backfill::BackfillRunRecord>, (&'static str, BTreeMap<String, String>)> {
+        let bf = &self.ctx.backfill;
+        let run_id = score.backfill_run_id.as_str();
+        let mut last_err = None;
+        for backoff_ms in [0u64, 100, 500] {
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            let run = match bf.run(run_id).await {
+                Ok(run) => run,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let Some(run) = run else {
+                let info = BTreeMap::from([("backfill_run_id".to_owned(), run_id.to_owned())]);
+                return Err((backfill::STATUS_RUN_UNKNOWN, info));
+            };
+            let info: BTreeMap<String, String> =
+                backfill::info_keys(&run, score).into_iter().collect();
+            if let Err(status) = backfill::gate(&run, now_millis()) {
+                return Err((status, info));
+            }
+            if let Err(status) = backfill::check_message(&run, score) {
+                return Err((status, info));
+            }
+            let Some(claims) = bf.claims() else {
+                last_err = Some(anyhow::anyhow!("no backfill claim store on this pod"));
+                break;
+            };
+            let key = backfill_claims::ClaimKey {
+                run_id: run_id.to_owned(),
+                entity: entity_type,
+                entity_id,
+            };
+            match claims.state(&key).await {
+                Ok(backfill_claims::ItemClaim::NotInList) => {
+                    return Err((backfill::STATUS_NOT_IN_RUN, info));
+                }
+                Ok(backfill_claims::ItemClaim::Finished { status }) => {
+                    let mut info = info;
+                    info.insert("backfill_claim_status".into(), status);
+                    return Err((backfill::STATUS_ALREADY_FINISHED, info));
+                }
+                Ok(_) => return Ok(Arc::new(run)),
+                Err(e) => {
+                    warn!(run_id, error = %format!("{e:#}"), "backfill claim read failed on arrival; deciding on");
+                    return Ok(Arc::new(run));
+                }
+            }
+        }
+        warn!(
+            run_id,
+            error = %last_err.map(|e| format!("{e:#}")).unwrap_or_default(),
+            "backfill run or claim unreadable; recording without acting"
+        );
+        let info = BTreeMap::from([("backfill_run_id".to_owned(), run_id.to_owned())]);
+        Err((backfill::STATUS_RUN_UNREADABLE, info))
     }
 }
 
@@ -1638,42 +2255,17 @@ impl KafkaBatchProcessor for ScoreResultProcessor {
                 span.record("entity_type", entity_type);
                 span.record("entity_id", entity_id);
 
-                let msg_labels: Vec<&str> = score
-                    .summary
-                    .as_ref()
-                    .map(|s| {
-                        s.labels
-                            .iter()
-                            .map(|l| action_control::strip_dry_run_prefix(l))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                if !self.negative_labels.is_empty()
-                    && msg_labels.iter().any(|l| self.negative_labels.contains(*l))
-                {
-                    metrics::KAFKA_MESSAGE_LATENCY
-                        .with_label_values(&[topic, entity_type, "negative_label", "false"])
-                        .observe(start.elapsed().as_secs_f64());
-                    return None;
-                }
-
-                if !self.labels.is_empty() {
-                    let matches: Vec<&&str> = msg_labels
-                        .iter()
-                        .filter(|l| self.labels.contains(**l))
-                        .collect();
-                    if matches.is_empty() {
+                let control = match self.admit(&score).await {
+                    Admission::Admitted(control) => control.map(|c| *c),
+                    Admission::Dropped(status) => {
                         metrics::KAFKA_MESSAGE_LATENCY
-                            .with_label_values(&[topic, entity_type, "no_match", "false"])
+                            .with_label_values(&[topic, entity_type, status, "false"])
                             .observe(start.elapsed().as_secs_f64());
                         return None;
                     }
+                };
 
-                    info!(?matches, "matching labels");
-                }
-
-                match self.process(&score).await {
+                match self.process(&score, control).await {
                     Ok(status) => {
                         let enforced = if status == "success" { "true" } else { "false" };
                         metrics::KAFKA_MESSAGE_LATENCY
@@ -1857,6 +2449,7 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
                 cfg.limiter_fail_open,
                 sliding_window::USER_SNAP_PKEY,
                 "user",
+                sliding_window::DAILY_CAP,
             );
             let post_sw = sliding_window::SlidingWindowLimiter::new(
                 lim.with_bucket(limiter::GLOBAL_BUCKET_POST_ID),
@@ -1865,6 +2458,7 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
                 cfg.limiter_fail_open,
                 sliding_window::POST_SNAP_PKEY,
                 "post",
+                sliding_window::DAILY_CAP,
             );
             user_sw.spawn_background();
             post_sw.spawn_background();
@@ -1876,6 +2470,91 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
         None => (None, None),
     };
 
+    let backfill_release = cfg
+        .backfill_topic
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    let rules_cache = rules::RulesCache::new();
+    let (dynamic_config, growthbook_writer) = if backfill_release {
+        backfill_release_config(&cfg, sliding_user, sliding_post)?
+    } else {
+        live_config(&cfg, &rules_cache, sliding_user, sliding_post).await?
+    };
+
+    let boot_config = dynamic_config.config().unwrap_or(serde_json::Value::Null);
+
+    let kafka_producers = build_kafka_producers(&cfg, &boot_config).await;
+    if backfill_release && kafka_producers.decisions().is_none() {
+        anyhow::bail!(
+            "the backfill release publishes no decision outcomes: \
+             BACKFILL_SERVICE_CONFIG_JSON needs an enabled kafka.producer.decisions"
+        );
+    }
+
+    finish_state(
+        cfg,
+        ais_client,
+        limiter,
+        mh_client,
+        mh_tenant,
+        dedup_cache,
+        allowlist,
+        dynamic_config,
+        rules_cache,
+        growthbook_writer,
+        boot_config,
+        kafka_producers,
+    )
+    .await
+}
+
+fn backfill_release_config(
+    cfg: &Config,
+    sliding_user: Option<sliding_window::SlidingWindowLimiter>,
+    sliding_post: Option<sliding_window::SlidingWindowLimiter>,
+) -> Result<(DynamicConfig, Option<GrowthBookWriter>)> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if set(&cfg.growthbook_url) || set(&cfg.growthbook_key) || set(&cfg.growthbook_admin_api_key) {
+        anyhow::bail!(
+            "the backfill release reads no GrowthBook: unset GROWTHBOOK_URL, GROWTHBOOK_KEY \
+             and GROWTHBOOK_ADMIN_API_KEY (its config is BACKFILL_SERVICE_CONFIG_JSON)"
+        );
+    }
+    let raw = cfg
+        .backfill_service_config_json
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("BACKFILL_TOPIC is set but BACKFILL_SERVICE_CONFIG_JSON is not")
+        })?;
+    let config: serde_json::Value =
+        serde_json::from_str(raw).context("BACKFILL_SERVICE_CONFIG_JSON is not JSON")?;
+    if !config.is_object() {
+        anyhow::bail!("BACKFILL_SERVICE_CONFIG_JSON must be a JSON object");
+    }
+    info!(
+        config = %config,
+        "backfill release: config from BACKFILL_SERVICE_CONFIG_JSON; no GrowthBook client, rules are the baked-in mirror"
+    );
+    Ok((
+        DynamicConfig::from_static(
+            config,
+            cfg.dry_run,
+            cfg.max_enforcements_per_day,
+            cfg.max_post_enforcements_per_day,
+            sliding_user,
+            sliding_post,
+        ),
+        None,
+    ))
+}
+
+async fn live_config(
+    cfg: &Config,
+    rules_cache: &rules::RulesCache,
+    sliding_user: Option<sliding_window::SlidingWindowLimiter>,
+    sliding_post: Option<sliding_window::SlidingWindowLimiter>,
+) -> Result<(DynamicConfig, Option<GrowthBookWriter>)> {
     if cfg
         .growthbook_url
         .as_deref()
@@ -1905,7 +2584,6 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    let rules_cache = rules::RulesCache::new();
     let user_rules_yaml = dynamic_config
         .enforcement_rules_yaml(EntityType::User)
         .filter(|s| !s.trim().is_empty());
@@ -1960,11 +2638,24 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     if growthbook_writer.is_none() {
         info!("GROWTHBOOK_ADMIN_API_KEY not set — admin config-mutation endpoints will return 503");
     }
+    Ok((dynamic_config, growthbook_writer))
+}
 
-    let boot_config = dynamic_config.config().unwrap_or(serde_json::Value::Null);
-
-    let kafka_producers = build_kafka_producers(&cfg, &boot_config).await;
-
+#[allow(clippy::too_many_arguments)]
+async fn finish_state(
+    cfg: Config,
+    ais_client: ais_client::AisClient,
+    limiter: Option<limiter::LimiterClient>,
+    mh_client: Arc<xai_manhattan::NativeManhattanClient>,
+    mh_tenant: xai_manhattan::Tenant,
+    dedup_cache: Option<dedup_cache::ManhattanDedupCache>,
+    allowlist: Option<allowlist::ManhattanAllowlist>,
+    dynamic_config: DynamicConfig,
+    rules_cache: rules::RulesCache,
+    growthbook_writer: Option<GrowthBookWriter>,
+    boot_config: serde_json::Value,
+    kafka_producers: KafkaProducers,
+) -> Result<(Arc<service::AppState>, Config)> {
     let startup_probe =
         overturn_hold::startup_probe_requested(cfg.overturn_hold_startup_probe.as_deref());
     let hold_gate = Arc::new(overturn_hold::HoldGate::from_url(
@@ -2006,14 +2697,52 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     off_switch.spawn_refresh(dynamic_config.clone());
     off_switch.spawn_seen_writer();
 
-    let action_control = Arc::new(action_control::ActionControl::new(
+    let make_counter: Option<head_guard::CounterFactory> = limiter.clone().map(|lim| {
+        let (mh, tenant, fail_open) = (mh_client.clone(), mh_tenant.clone(), cfg.limiter_fail_open);
+        Box::new(move |lkey: &str| {
+            sliding_window::SlidingWindowLimiter::new(
+                lim.with_bucket(head_guard::bucket_id(lkey)),
+                mh.clone(),
+                tenant.clone(),
+                fail_open,
+                format!("{}{lkey}", head_guard::COUNT_PKEY_PREFIX),
+                "head_guard",
+                head_guard::WINDOWS,
+            )
+        }) as head_guard::CounterFactory
+    });
+    if make_counter.is_none() {
+        warn!("no Limiter connection; head-guard action ceilings are not enforced");
+    }
+    let head_guard = Arc::new(head_guard::HeadGuard::new(
         Arc::new(action_control::ManhattanControlStore::new(
             mh_client.clone(),
             mh_tenant.clone(),
         )),
-        std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned()),
-        std::env::var("HOSTNAME").unwrap_or_default(),
+        make_counter,
     ));
+    head_guard.spawn_refresh(dynamic_config.clone());
+
+    let rollout_salt = std::env::var(action_control::ROLLOUT_SALT_ENV).unwrap_or_default();
+    info!(
+        "action control: rollout buckets are {}",
+        if rollout_salt.is_empty() {
+            "unsalted"
+        } else {
+            "salted"
+        }
+    );
+    let action_control = Arc::new(
+        action_control::ActionControl::new(
+            Arc::new(action_control::ManhattanControlStore::new(
+                mh_client.clone(),
+                mh_tenant.clone(),
+            )),
+            std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned()),
+            std::env::var("HOSTNAME").unwrap_or_default(),
+        )
+        .with_rollout_salt(rollout_salt),
+    );
     if dynamic_config.action_control_config().ignore_store {
         warn!(
             "action control: GrowthBook {}.ignore_store is set; page records are ignored and recording-only heads follow the GrowthBook rules",
@@ -2023,8 +2752,54 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     action_control.spawn_refresh(dynamic_config.clone());
     action_control.spawn_seen_writer();
 
+    let claims: Option<Arc<dyn backfill_claims::ClaimStore>> = match cfg
+        .backfill_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        None => None,
+        Some(_) => {
+            let dsn = cfg.backfill_claims_pg_dsn.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("BACKFILL_TOPIC is set but BACKFILL_CLAIMS_PG_DSN is not")
+            })?;
+            let env = std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned());
+            Some(Arc::new(backfill_claims::PgClaimStore::new(dsn, &env)?))
+        }
+    };
+    let release = claims.is_some();
+    let backfill = Arc::new(
+        backfill::Backfill::new(
+            Arc::new(action_control::ManhattanControlStore::new(
+                mh_client.clone(),
+                mh_tenant.clone(),
+            )),
+            claims,
+            std::env::var("HOSTNAME").unwrap_or_default(),
+        )
+        .with_access(backfill::BackfillAccess::new(
+            &cfg.backfill_page_keys,
+            &cfg.backfill_sender_keys,
+            cfg.backfill_max_rate_per_sec,
+        )),
+    );
+    if release {
+        let access = backfill.access();
+        info!(
+            page_keys = ?access.page_keys,
+            sender_keys = ?access.sender_keys,
+            max_rate_ceiling = access.max_rate_ceiling,
+            "backfill runs: keys and speed ceiling from the Helm values; budgets and speed limit from {}",
+            backfill::SETTINGS_PKEY
+        );
+        backfill.spawn_settings_refresh();
+    }
+
+    let gd = connect_gizmoduck(&cfg).await?;
+
     let state = Arc::new(AppState {
         ais_client,
+        gd,
         dynamic_config,
         rules_cache: Arc::new(rules_cache),
         dedup_cache,
@@ -2037,11 +2812,49 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
         kafka_producers,
         hold_gate,
         off_switch,
+        head_guard,
         action_control,
+        backfill,
         boot_config,
     });
 
     Ok((state, cfg))
+}
+
+async fn connect_gizmoduck(cfg: &Config) -> Result<Option<gizmoduck::GizmoduckCoreClient>> {
+    let policy = cfg.test_account_policy()?;
+    let (domains, roles, networks) = policy.sizes();
+    info!(
+        email_domains = domains,
+        roles, networks, "test-account policy loaded"
+    );
+    let connected =
+        gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
+            zone: cfg.gizmoduck_zone.clone(),
+            ca_cert_path: cfg
+                .strato_ca_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into()),
+            client_cert_path: cfg
+                .strato_client_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into()),
+            client_key_path: cfg
+                .strato_client_key_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into()),
+            client_id: cfg.gizmoduck_client_id.clone(),
+        })
+        .await
+        .context("failed to create gizmoduck get-V2 fed-grpc client");
+    match connected {
+        Ok(gd) => Ok(Some(gd.with_policy(policy))),
+        Err(e) if !cfg.kafka_consumer_enabled => {
+            warn!("{e:#}; POST /api/action will refuse suspends");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) -> Router {
@@ -2082,6 +2895,10 @@ pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) 
             get(service::handle_off_switches_get).put(service::handle_off_switches_put),
         )
         .route(
+            "/head_guards",
+            get(service::handle_head_guards_get).put(service::handle_head_guards_put),
+        )
+        .route(
             "/action_controls",
             get(service::handle_action_controls_get).put(service::handle_action_controls_put),
         )
@@ -2092,6 +2909,26 @@ pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) 
         .route(
             "/action_controls/pod",
             get(service::handle_action_controls_pod),
+        )
+        .route(
+            "/backfill_runs",
+            get(service::handle_backfill_runs_list).post(service::handle_backfill_run_start),
+        )
+        .route(
+            "/backfill_runs/budget",
+            get(service::handle_backfill_runs_budget),
+        )
+        .route(
+            "/backfill_runs/{run_id}",
+            get(service::handle_backfill_run_get),
+        )
+        .route(
+            "/backfill_runs/{run_id}/{change}",
+            post(service::handle_backfill_run_change),
+        )
+        .route(
+            "/backfill_settings",
+            get(service::handle_backfill_settings_get).put(service::handle_backfill_settings_put),
         )
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -2147,6 +2984,7 @@ fn consumer_error_total(watched: &HashSet<String>) -> f64 {
         .sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn health_decision(
     consumed_once: bool,
     stale: Duration,
@@ -2155,10 +2993,12 @@ fn health_decision(
     stale_self_delete_after: Duration,
     error_self_delete_after: Duration,
     error_bad_now: bool,
+    quiet_topic: bool,
 ) -> (bool, bool) {
-    let ready = consumed_once && stale < stale_after && !error_bad_now;
-    let should_self_delete =
-        stale >= stale_self_delete_after || error_bad_for >= error_self_delete_after;
+    let progress_ok = quiet_topic || (consumed_once && stale < stale_after);
+    let ready = progress_ok && !error_bad_now;
+    let stale_bad = !quiet_topic && stale >= stale_self_delete_after;
+    let should_self_delete = stale_bad || error_bad_for >= error_self_delete_after;
     (ready, should_self_delete)
 }
 
@@ -2170,6 +3010,7 @@ struct WatchdogConfig {
     error_self_delete_after: Duration,
     self_delete_enabled: bool,
             error_topics: HashSet<String>,
+        quiet_topic: bool,
 }
 
 async fn kafka_health_watchdog(
@@ -2213,6 +3054,7 @@ async fn kafka_health_watchdog(
             cfg.stale_self_delete_after,
             cfg.error_self_delete_after,
             error_bad_now,
+            cfg.quiet_topic,
         );
 
         if kafka_ready.swap(healthy, Ordering::Relaxed) != healthy {
@@ -2323,17 +3165,26 @@ pub fn service_ready(state: &service::AppState) -> bool {
     state.kafka_ready.load(Ordering::Relaxed)
         && switch_lists_loaded(
             &state.off_switch,
+            &state.head_guard,
             &state.action_control,
             &state.dynamic_config,
         )
+        && backfill_settings_loaded(&state.backfill)
+}
+
+fn backfill_settings_loaded(backfill: &backfill::Backfill) -> bool {
+    backfill.claims().is_none() || backfill.settings_loaded()
 }
 
 pub fn switch_lists_loaded(
     off_switch: &off_switch::OffSwitch,
+    head_guard: &head_guard::HeadGuard,
     action_control: &action_control::ActionControl,
     dynamic_config: &DynamicConfig,
 ) -> bool {
-    off_switch.ready(dynamic_config.off_switch_enabled())
+    let switches_on = dynamic_config.off_switch_enabled();
+    off_switch.ready(switches_on)
+        && head_guard.ready(switches_on)
         && action_control.ready(&dynamic_config.action_control_config())
 }
 
@@ -2341,23 +3192,27 @@ const SWITCH_LISTS_POLL: Duration = Duration::from_millis(200);
 
 async fn wait_for_switch_lists(
     off_switch: &off_switch::OffSwitch,
+    head_guard: &head_guard::HeadGuard,
     action_control: &action_control::ActionControl,
     dynamic_config: &DynamicConfig,
 ) {
     let mut logged = false;
-    while !switch_lists_loaded(off_switch, action_control, dynamic_config) {
+    while !switch_lists_loaded(off_switch, head_guard, action_control, dynamic_config) {
         if !logged {
             warn!(
                 off_switch_loaded = off_switch.first_load_done(),
+                head_guard_loaded = head_guard.first_load_done(),
                 action_control_loaded = action_control.is_loaded(),
-                "waiting for the first read of the off-switch and action-control lists before taking Kafka work"
+                "waiting for the first read of the off-switch, head-guard and action-control lists before taking Kafka work"
             );
             logged = true;
         }
         tokio::time::sleep(SWITCH_LISTS_POLL).await;
     }
     if logged {
-        info!("off-switch and action-control lists loaded; starting the Kafka consumers");
+        info!(
+            "off-switch, head-guard and action-control lists loaded; starting the Kafka consumers"
+        );
     }
 }
 
@@ -2408,10 +3263,18 @@ pub async fn start_kafka_consumers(
 ) -> Result<KafkaConsumers> {
     wait_for_switch_lists(
         &state.off_switch,
+        &state.head_guard,
         &state.action_control,
         &state.dynamic_config,
     )
     .await;
+    if !backfill_settings_loaded(&state.backfill) {
+        warn!("waiting for the first read of the backfill runs' settings before taking Kafka work");
+        while !backfill_settings_loaded(&state.backfill) {
+            tokio::time::sleep(SWITCH_LISTS_POLL).await;
+        }
+        info!("backfill runs' settings read; starting the Kafka consumers");
+    }
     let cancel = CancellationToken::new();
     if !cfg.kafka_consumer_enabled {
         info!("KAFKA_CONSUMER_ENABLED=false — Kafka consumer disabled");
@@ -2422,33 +3285,16 @@ pub async fn start_kafka_consumers(
         });
     }
 
-    let growthbook_enabled = cfg.growthbook_url.is_some() && cfg.growthbook_key.is_some();
-    let topic_labels_json: serde_json::Value =
-        match std::fs::read_to_string(&cfg.topic_labels_config) {
-            Ok(data) => serde_json::from_str(&data).with_context(|| {
-                format!(
-                    "failed to parse topic-labels config: {}",
-                    cfg.topic_labels_config
-                )
-            })?,
-            Err(e) if growthbook_enabled => {
-                warn!(
-                    "topic-labels config not found ({e}), falling back to GrowthBook / empty config"
-                );
-                serde_json::Value::Object(Default::default())
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to read topic-labels config {}: {e}",
-                    cfg.topic_labels_config
-                ));
-            }
-        };
-
-    let effective_topic_config =
-        growthbook::kafka_consumer_topic_labels_from_config(Some(&state.boot_config))
-            .unwrap_or(topic_labels_json);
-    let topics = parse_topic_config(effective_topic_config)?;
+    let backfill_topic = cfg
+        .backfill_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let topics = match backfill_topic {
+        Some(topic) => backfill_topic_config(topic),
+        None => live_topic_config(&state, cfg)?,
+    };
+    let backfill_topic = backfill_topic.is_some();
     let default_cluster = cfg.kafka_consumer_mtls_cluster.as_str();
     let default_zone = cfg.kafka_consumer_mtls_zone.as_str();
     info!("topic config: {} topic(s)", topics.len());
@@ -2549,27 +3395,10 @@ pub async fn start_kafka_consumers(
         }
     }
 
-    let ca = cfg
-        .strato_ca_cert_path
+    let gd = state
+        .gd
         .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into());
-    let crt = cfg
-        .strato_client_cert_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into());
-    let key = cfg
-        .strato_client_key_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into());
-    let gd = gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
-        zone: cfg.gizmoduck_zone.clone(),
-        ca_cert_path: ca,
-        client_cert_path: crt,
-        client_key_path: key,
-        client_id: cfg.gizmoduck_client_id.clone(),
-    })
-    .await
-    .context("failed to create gizmoduck get-V2 fed-grpc client")?;
+        .context("no gizmoduck get-V2 fed-grpc client; the consumers can't decide without it")?;
 
     #[allow(deprecated)]
     let cred_hpr = Arc::new(
@@ -2601,6 +3430,35 @@ pub async fn start_kafka_consumers(
         cfg.uas_column
     );
 
+    #[allow(deprecated)]
+    let reply_parents = invited_reply::ReplyParents::new(
+        Arc::new(
+            Strato::new(&cfg.reply_parent_column, StratoClientConfig::default())
+                .context("Failed to create reply-parent Strato client")?,
+        ),
+        Duration::from_millis(cfg.reply_parent_timeout_ms),
+    );
+    info!(
+        column = %cfg.reply_parent_column,
+        timeout_ms = cfg.reply_parent_timeout_ms,
+        "reply-parent Strato client initialised"
+    );
+
+    let post_labels: Option<Arc<dyn post_labels::PostLabelReader>> =
+        match post_labels::VfPostLabels::connect(&cfg.post_labels_zone).await {
+            Ok(reader) => {
+                info!(zone = %cfg.post_labels_zone, "post label reader initialised");
+                Some(Arc::new(reader))
+            }
+            Err(e) => {
+                warn!(
+                    "post label reader unavailable: {e:#}; page post labels are sent \
+                     without checking the labels a post already carries"
+                );
+                None
+            }
+        };
+
     let retry_queue = Arc::new(Mutex::new(BinaryHeap::<RetryEntry>::new()));
 
     let enforcement_ctx = EnforcementCtx {
@@ -2608,6 +3466,7 @@ pub async fn start_kafka_consumers(
         gd,
         cred_clients,
         uas_strato,
+        reply_parents,
         dynamic_config: state.dynamic_config.clone(),
         rules_cache: state.rules_cache.clone(),
         allowlist: state.allowlist.clone(),
@@ -2615,7 +3474,10 @@ pub async fn start_kafka_consumers(
         kafka_producer_decisions_json: state.kafka_producers.decisions_json().cloned(),
         hold_gate: state.hold_gate.clone(),
         off_switch: state.off_switch.clone(),
+        head_guard: state.head_guard.clone(),
         action_control: state.action_control.clone(),
+        backfill: state.backfill.clone(),
+        post_labels,
         #[cfg(test)]
         outcome_log: None,
     };
@@ -2645,6 +3507,7 @@ pub async fn start_kafka_consumers(
 
                 for mut entry in ready {
                     let (entity_type, entity_id) = Facts::resolve_target(&entry.score);
+                    let dedup_key = entry.decision.dedup_key(entity_type, entity_id);
                     let span = tracing::info_span!(
                         "retry",
                         entity_type = entity_type.as_str(),
@@ -2664,8 +3527,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 write_dedup_outcome(
                                     entry.dedup_cache.as_ref(),
-                                    entity_type,
-                                    entity_id,
+                                    &dedup_key,
                                     &entry.score,
                                     &entry.topic,
                                     &outcome,
@@ -2682,7 +3544,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 entry
                                     .dedup_cache
-                                    .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                    .invalidate(&dedup_key, entry.claim_nonce)
                                     .await;
                             }
                         }
@@ -2696,7 +3558,7 @@ pub async fn start_kafka_consumers(
                                 if entry.decision.claimed() {
                                     entry
                                         .dedup_cache
-                                        .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                        .invalidate(&dedup_key, entry.claim_nonce)
                                         .await;
                                 }
                             } else {
@@ -2793,6 +3655,7 @@ pub async fn start_kafka_consumers(
                     retry_queue: retry_queue.clone(),
                     last_progress: last_progress.clone(),
                     max_in_flight,
+                    backfill_topic,
                 };
 
                 consumers.spawn(async move {
@@ -2844,6 +3707,7 @@ pub async fn start_kafka_consumers(
                 ),
                 self_delete_enabled: cfg.kafka_self_delete_enabled,
                 error_topics,
+                quiet_topic: backfill_topic,
             },
         ));
     }
@@ -2871,6 +3735,63 @@ pub async fn start_kafka_consumers(
         cancel,
         supervisor: supervise(consumers),
     })
+}
+
+fn live_topic_config(
+    state: &service::AppState,
+    cfg: &Config,
+) -> Result<HashMap<String, TopicEntry>> {
+    let growthbook_enabled = cfg.growthbook_url.is_some() && cfg.growthbook_key.is_some();
+    let topic_labels_json: serde_json::Value =
+        match std::fs::read_to_string(&cfg.topic_labels_config) {
+            Ok(data) => serde_json::from_str(&data).with_context(|| {
+                format!(
+                    "failed to parse topic-labels config: {}",
+                    cfg.topic_labels_config
+                )
+            })?,
+            Err(e) if growthbook_enabled => {
+                warn!(
+                    "topic-labels config not found ({e}), falling back to GrowthBook / empty config"
+                );
+                serde_json::Value::Object(Default::default())
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read topic-labels config {}: {e}",
+                    cfg.topic_labels_config
+                ));
+            }
+        };
+
+    let effective_topic_config =
+        growthbook::kafka_consumer_topic_labels_from_config(Some(&state.boot_config))
+            .unwrap_or(topic_labels_json);
+    let mut topics = parse_topic_config(effective_topic_config)?;
+    topics.retain(|topic, _| {
+        let keep = !backfill::is_backfill_topic(topic);
+        if !keep {
+            error!(
+                "topic map lists {topic}; the live pods never consume a backfill topic (the backfill deployment does)"
+            );
+        }
+        keep
+    });
+    Ok(topics)
+}
+
+fn backfill_topic_config(topic: &str) -> HashMap<String, TopicEntry> {
+    HashMap::from([(
+        topic.to_owned(),
+        TopicEntry {
+            cluster: None,
+            zone: None,
+            processor: TopicConfig::ScoreResult {
+                labels: HashSet::new(),
+                negative_labels: HashSet::new(),
+            },
+        },
+    )])
 }
 
 fn supervise(mut consumers: JoinSet<()>) -> JoinHandle<()> {
@@ -2958,47 +3879,6 @@ fn spawn_config_refresh_with(
             }
         }
     })
-}
-
-pub async fn serve(router: Router, state: Arc<service::AppState>, cfg: Config) -> Result<()> {
-    let server = ServerBuilder::new(cfg.port)
-        .merge(router)
-        .drain_period(Duration::from_secs(cfg.drain_period_secs))
-        .info(ServerInfo::new(SERVICE_NAME, SERVICE_VERSION))
-        .on_ready(|| async {
-            info!("Server ready and accepting requests");
-        });
-    spawn_config_refresh(&state, server.shutdown_signal());
-    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());
-    let served = server.run().await;
-    let kafka = shutdown_kafka_startup(&state, kafka).await;
-    served?;
-    kafka
-}
-
-pub async fn run() -> Result<()> {
-    init_runtime_globals();
-
-    let cfg = Config::parse();
-    let (state, cfg) = build_state(cfg).await?;
-    let api_keys = auth::ApiKeys::from_config(&cfg)?;
-    if api_keys.is_empty() {
-        warn!(
-            "API_KEYS_JSON is empty — every request to the protected admin \
-             endpoints (/action, /config*, /allowlist*) will return 401"
-        );
-    } else {
-        info!(
-            key_ids = ?api_keys.configured_key_ids(),
-            "api-key auth configured for protected admin endpoints"
-        );
-    }
-    let router = Router::new()
-        .nest("/api", build_api_router(state.clone(), api_keys))
-        .merge(build_docs_router());
-    serve(router, state, cfg).await?;
-    info!("Server shutdown complete");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3499,13 +4379,14 @@ mod dedup_retention_tests {
             "gizmoduck_skipped",
             "user_not_found",
             "test_user_skipped",
+            "invited_reply_skipped",
+            "invited_reply_unknown_skipped",
             "user_in_allowlist",
             "post_in_allowlist",
             "rule_eval_error",
             "max_enforcement_reached",
             "invalid_entity_id",
-            "requested_actions_denied",
-            "platform_row_without_requested_actions",
+            crate::action_control::STATUS_NO_ACTIONS,
             crate::overturn_hold::STATUS_HOLD_OVERTURNED,
             crate::overturn_hold::STATUS_HOLD_LOOKUP_FAILED,
         ] {
@@ -3522,7 +4403,7 @@ mod incoming_dedup_class_tests {
     };
     use serde_json::json;
 
-                                const RULES: &str = r#"
+                            const RULES: &str = r#"
 for_entity: user
 rules:
   - id: user_in_allowlist
@@ -3576,9 +4457,6 @@ rules:
   - id: hold_cluster_spam
     when: score.model_version.startsWith("cluster_spam")
     then: {kind: skip, reason: hold_cluster_spam}
-  - id: act_requested_actions
-    when: "size(score.requested_actions) > 0"
-    then: {kind: act_requested_actions}
   - id: act_suspend
     when: "true"
     then: {kind: act_suspend_user, perm: false, policy: PlatformManipulation}
@@ -3658,32 +4536,6 @@ rules:
             CLASS_NONE,
             &held("high_follower_count", CLASS_NONE)
         ));
-    }
-
-    #[tokio::test]
-    async fn requested_actions_rank_by_the_allowlisted_actions() {
-        let mut score = row("PlatformHead", "m", &[]);
-        score.requested_actions = vec![
-            abuse_proto::RequestedAction {
-                kind: "label".into(),
-                labels: vec!["SpamHighRecall".into()],
-                head: "PlatformHead".into(),
-                ..Default::default()
-            },
-            abuse_proto::RequestedAction {
-                kind: "spam_liveness_check".into(),
-                head: "PlatformHead".into(),
-                ..Default::default()
-            },
-        ];
-        let allowed = config(json!({"generic_actions": {"user": {
-            "kinds": ["label", "spam_liveness_check"],
-            "labels": ["SpamHighRecall"],
-        }}}))
-        .await;
-        assert_eq!(class_of(&allowed, &score), CLASS_CHALLENGE);
-        let denied = config(json!({})).await;
-        assert_eq!(class_of(&denied, &score), CLASS_NONE);
     }
 
                 #[tokio::test]
@@ -3857,7 +4709,6 @@ mod off_switch_hook_tests {
     struct Run {
         outcome: Option<abuse_proto::DecisionOutcome>,
         hold_gate_info: BTreeMap<String, String>,
-        requested_actions_skipped: Option<String>,
     }
 
     async fn run(
@@ -3867,12 +4718,27 @@ mod off_switch_hook_tests {
         specs: &[ActionSpec],
         dry_run: bool,
     ) -> Run {
+        let guards = head_guard::HeadGuard::new(
+            Arc::new(action_control::test_support::MemControlStore::default()),
+            None,
+        );
+        run_guarded(sw, &guards, dc, score, specs, dry_run).await
+    }
+
+    async fn run_guarded(
+        sw: &off_switch::OffSwitch,
+        guards: &head_guard::HeadGuard,
+        dc: &DynamicConfig,
+        score: &ScoreResult,
+        specs: &[ActionSpec],
+        dry_run: bool,
+    ) -> Run {
         let facts = facts_for(score);
         let mut hold_gate_info =
             BTreeMap::from([("overturn_hold_mode".to_owned(), "shadow".to_owned())]);
-        let mut requested_actions_skipped = Some(r#"[{"kind":"x"}]"#.to_owned());
         let outcome = final_checks(
             sw,
+            guards,
             dc,
             specs,
             &facts,
@@ -3880,13 +4746,13 @@ mod off_switch_hook_tests {
             TOPIC,
             dry_run,
             &mut hold_gate_info,
-            &mut requested_actions_skipped,
+            None,
         )
-        .await;
+        .await
+        .unwrap();
         Run {
             outcome,
             hold_gate_info,
-            requested_actions_skipped,
         }
     }
 
@@ -3961,29 +4827,167 @@ mod off_switch_hook_tests {
         );
     }
 
-    fn lists_for_test() -> (
-        off_switch::OffSwitch,
-        Arc<off_switch::test_support::MemStore>,
-        action_control::ActionControl,
-        Arc<action_control::test_support::MemControlStore>,
-    ) {
+        struct Lists {
+        sw: Arc<off_switch::OffSwitch>,
+        sw_store: Arc<off_switch::test_support::MemStore>,
+        hg: Arc<head_guard::HeadGuard>,
+        hg_store: Arc<action_control::test_support::MemControlStore>,
+        ac: Arc<action_control::ActionControl>,
+        ac_store: Arc<action_control::test_support::MemControlStore>,
+    }
+
+    impl Lists {
+        fn loaded(&self, dc: &DynamicConfig) -> bool {
+            switch_lists_loaded(&self.sw, &self.hg, &self.ac, dc)
+        }
+    }
+
+    fn lists_for_test() -> Lists {
         use crate::action_control::test_support::MemControlStore;
         use crate::off_switch::test_support::MemStore;
         let sw_store = Arc::new(MemStore::default());
         sw_store.fail_scan.store(true, Ordering::Relaxed);
+        let hg_store = Arc::new(MemControlStore::default());
+        hg_store.fail_scan.store(true, Ordering::Relaxed);
         let ac_store = Arc::new(MemControlStore::default());
         ac_store.fail_scan.store(true, Ordering::Relaxed);
-        (
-            off_switch::OffSwitch::new(sw_store.clone(), Arc::new(MemStore::default())),
+        Lists {
+            sw: Arc::new(off_switch::OffSwitch::new(
+                sw_store.clone(),
+                Arc::new(MemStore::default()),
+            )),
             sw_store,
-            action_control::ActionControl::new(ac_store.clone(), "test".into(), String::new()),
+            hg: Arc::new(head_guard::HeadGuard::new(hg_store.clone(), None)),
+            hg_store,
+            ac: Arc::new(action_control::ActionControl::new(
+                ac_store.clone(),
+                "test".into(),
+                String::new(),
+            )),
             ac_store,
-        )
+        }
+    }
+
+    const RELEASE_JSON: &str = r#"--backfill-service-config-json={"kafka":{"producer":{"decisions":{"enabled":true,"topic":"t"}}},"action_control":{"enabled":true}}"#;
+
+    fn release_cfg(extra: &[&str]) -> Config {
+        use clap::Parser;
+        let mut args = vec![
+            "xai-abuse-enforcement-service",
+            "--backfill-topic=abuse.enforcement.backfill.v1",
+        ];
+        if !extra
+            .iter()
+            .any(|a| a.starts_with("--backfill-service-config-json"))
+        {
+            args.push(RELEASE_JSON);
+        }
+        args.extend_from_slice(extra);
+        Config::parse_from(args)
+    }
+
+    #[test]
+    fn the_backfill_release_reads_no_growthbook() {
+        let (dc, writer) = backfill_release_config(&release_cfg(&[]), None, None).unwrap();
+        assert!(!dc.reads_growthbook());
+        assert!(writer.is_none());
+        assert!(dc.action_control_config().enabled, "from the Helm JSON");
+        assert_eq!(
+            dc.enforcement_rules_yaml(EntityType::User),
+            None,
+            "baked-in rules"
+        );
+        assert!(growthbook::kafka_producers_from_config(dc.config().as_ref())["decisions"].enabled);
+        dc.refresh();
+        assert!(
+            dc.action_control_config().enabled,
+            "a refresh changes nothing"
+        );
+
+        for flag in [
+            "--growthbook-url=https://cdn.growthbook.io",
+            "--growthbook-key=sdk-key",
+            "--growthbook-admin-api-key=admin-key",
+        ] {
+            let err = backfill_release_config(&release_cfg(&[flag]), None, None)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} accepted"));
+            assert!(
+                err.to_string().contains("reads no GrowthBook"),
+                "{flag}: {err}"
+            );
+        }
+        for bad in [
+            "--backfill-service-config-json=",
+            "--backfill-service-config-json=not json",
+            "--backfill-service-config-json=[1]",
+        ] {
+            assert!(
+                backfill_release_config(&release_cfg(&[bad]), None, None).is_err(),
+                "{bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backfill_keys_and_ceiling_come_from_the_helm_env() {
+        use clap::Parser;
+        let live = Config::parse_from(["xai-abuse-enforcement-service"]);
+        let access = backfill::BackfillAccess::new(
+            &live.backfill_page_keys,
+            &live.backfill_sender_keys,
+            live.backfill_max_rate_per_sec,
+        );
+        assert_eq!(
+            access,
+            backfill::BackfillAccess::default(),
+            "live pods: nobody"
+        );
+        let cfg = release_cfg(&[
+            "--backfill-page-keys=dev",
+            "--backfill-sender-keys=backfill_sender",
+            "--backfill-max-rate-per-sec=1000",
+        ]);
+        let access = backfill::BackfillAccess::new(
+            &cfg.backfill_page_keys,
+            &cfg.backfill_sender_keys,
+            cfg.backfill_max_rate_per_sec,
+        );
+        assert!(access.page_keys.contains("dev") && access.page_keys.len() == 1);
+        assert!(access.sender_keys.contains("backfill_sender"));
+        assert_eq!(access.max_rate_ceiling, 1_000);
     }
 
     #[tokio::test]
-    async fn readiness_waits_for_the_first_read_of_both_lists() {
-        let (sw, sw_store, ac, ac_store) = lists_for_test();
+    async fn backfill_readiness_waits_for_the_first_settings_read_only_on_the_backfill_pods() {
+        let store = Arc::new(action_control::test_support::MemControlStore::default());
+        let live = backfill::Backfill::new(store.clone(), None, String::new());
+        assert!(
+            backfill_settings_loaded(&live),
+            "live pods never read the settings"
+        );
+        let claims: Arc<dyn backfill_claims::ClaimStore> =
+            Arc::new(backfill_claims::test_support::MemClaimStore::default());
+        let pod = backfill::Backfill::new(store.clone(), Some(claims), String::new());
+        assert!(!backfill_settings_loaded(&pod));
+        store.fail_get.store(true, Ordering::Relaxed);
+        assert!(pod.refresh_settings().await.is_err());
+        assert!(
+            !backfill_settings_loaded(&pod),
+            "a failed read is not a load"
+        );
+        store.fail_get.store(false, Ordering::Relaxed);
+        pod.refresh_settings().await.unwrap();
+        assert!(
+            backfill_settings_loaded(&pod),
+            "no record is a completed read (budget 0)"
+        );
+        assert_eq!(pod.config().budget(EntityType::User), 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_the_first_read_of_every_list() {
+        let l = lists_for_test();
         let (on, _) = config(json!({})).await;
         let (sw_off, _) = config(json!({off_switch::CONFIG_KEY: {"enabled": false}})).await;
         let (ac_ignored, _) =
@@ -3994,77 +4998,83 @@ mod off_switch_hook_tests {
         }))
         .await;
 
-        assert!(!switch_lists_loaded(&sw, &ac, &on), "no read yet");
-        assert!(
-            switch_lists_loaded(&sw, &ac, &both_off),
-            "both features off: no wait"
-        );
-        assert!(
-            !switch_lists_loaded(&sw, &ac, &sw_off),
-            "action control still unread"
-        );
-        assert!(
-            !switch_lists_loaded(&sw, &ac, &ac_ignored),
-            "off switch still unread"
-        );
-        assert!(sw.refresh().await.is_err());
-        assert!(ac.refresh().await.is_err());
-        assert!(
-            !switch_lists_loaded(&sw, &ac, &on),
-            "a failed read is not a load"
-        );
+        assert!(!l.loaded(&on), "no read yet");
+        assert!(l.loaded(&both_off), "both features off: no wait");
+        assert!(!l.loaded(&sw_off), "action control still unread");
+        assert!(!l.loaded(&ac_ignored), "off switch still unread");
+        assert!(l.sw.refresh().await.is_err());
+        assert!(l.hg.refresh().await.is_err());
+        assert!(l.ac.refresh().await.is_err());
+        assert!(!l.loaded(&on), "a failed read is not a load");
 
-        sw_store.fail_scan.store(false, Ordering::Relaxed);
-        sw.refresh().await.unwrap();
-        assert!(
-            !switch_lists_loaded(&sw, &ac, &on),
-            "action control still unread"
-        );
-        assert!(switch_lists_loaded(&sw, &ac, &ac_ignored));
+        l.sw_store.fail_scan.store(false, Ordering::Relaxed);
+        l.sw.refresh().await.unwrap();
+        assert!(!l.loaded(&ac_ignored), "the guard list still unread");
+        l.hg_store.fail_scan.store(false, Ordering::Relaxed);
+        l.hg.refresh().await.unwrap();
+        assert!(!l.loaded(&on), "action control still unread");
+        assert!(l.loaded(&ac_ignored));
 
-        ac_store.fail_scan.store(false, Ordering::Relaxed);
-        ac.refresh().await.unwrap();
-        assert!(switch_lists_loaded(&sw, &ac, &on));
-        sw_store.fail_scan.store(true, Ordering::Relaxed);
-        ac_store.fail_scan.store(true, Ordering::Relaxed);
-        assert!(sw.refresh().await.is_err());
-        assert!(ac.refresh().await.is_err());
+        l.ac_store.fail_scan.store(false, Ordering::Relaxed);
+        l.ac.refresh().await.unwrap();
+        assert!(l.loaded(&on));
+        l.sw_store.fail_scan.store(true, Ordering::Relaxed);
+        l.hg_store.fail_scan.store(true, Ordering::Relaxed);
+        l.ac_store.fail_scan.store(true, Ordering::Relaxed);
+        assert!(l.sw.refresh().await.is_err());
+        assert!(l.hg.refresh().await.is_err());
+        assert!(l.ac.refresh().await.is_err());
         assert!(
-            switch_lists_loaded(&sw, &ac, &on),
+            l.loaded(&on),
             "later failures keep the last good lists and stay ready"
         );
     }
 
+                #[tokio::test]
+    async fn an_unread_guard_list_alone_holds_the_pod() {
+        let l = lists_for_test();
+        let (on, _) = config(json!({})).await;
+        let (sw_off, _) = config(json!({off_switch::CONFIG_KEY: {"enabled": false}})).await;
+        l.sw_store.fail_scan.store(false, Ordering::Relaxed);
+        l.sw.refresh().await.unwrap();
+        l.ac_store.fail_scan.store(false, Ordering::Relaxed);
+        l.ac.refresh().await.unwrap();
+        assert!(!l.loaded(&on));
+        assert!(l.loaded(&sw_off));
+        l.hg_store.fail_scan.store(false, Ordering::Relaxed);
+        l.hg.refresh().await.unwrap();
+        assert!(l.loaded(&on));
+    }
+
+    fn wait_for(l: &Lists, dc: &DynamicConfig) -> tokio::task::JoinHandle<()> {
+        let (sw, hg, ac, dc) = (l.sw.clone(), l.hg.clone(), l.ac.clone(), dc.clone());
+        tokio::spawn(async move { wait_for_switch_lists(&sw, &hg, &ac, &dc).await })
+    }
+
     #[tokio::test]
-    async fn the_consumer_wait_holds_until_both_lists_load_or_their_features_go_off() {
-        let (sw, sw_store, ac, ac_store) = lists_for_test();
-        let (sw, ac) = (Arc::new(sw), Arc::new(ac));
+    async fn the_consumer_wait_holds_until_every_list_loads_or_their_features_go_off() {
+        let l = lists_for_test();
         let (dc, _) = config(json!({})).await;
-        let waiter = {
-            let (sw, ac, dc) = (sw.clone(), ac.clone(), dc.clone());
-            tokio::spawn(async move { wait_for_switch_lists(&sw, &ac, &dc).await })
-        };
+        let waiter = wait_for(&l, &dc);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(!waiter.is_finished(), "neither list read");
+        assert!(!waiter.is_finished(), "no list read");
 
-        sw_store.fail_scan.store(false, Ordering::Relaxed);
-        sw.refresh().await.unwrap();
+        l.sw_store.fail_scan.store(false, Ordering::Relaxed);
+        l.sw.refresh().await.unwrap();
+        l.ac_store.fail_scan.store(false, Ordering::Relaxed);
+        l.ac.refresh().await.unwrap();
         tokio::time::sleep(Duration::from_millis(450)).await;
-        assert!(!waiter.is_finished(), "action control still unread");
+        assert!(!waiter.is_finished(), "the guard list still unread");
 
-        ac_store.fail_scan.store(false, Ordering::Relaxed);
-        ac.refresh().await.unwrap();
+        l.hg_store.fail_scan.store(false, Ordering::Relaxed);
+        l.hg.refresh().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
-            .expect("released once both lists are read")
+            .expect("released once every list is read")
             .unwrap();
 
-        let (sw, _, ac, _) = lists_for_test();
-        let (sw, ac) = (Arc::new(sw), Arc::new(ac));
-        let waiter = {
-            let (sw, ac, dc) = (sw.clone(), ac.clone(), dc.clone());
-            tokio::spawn(async move { wait_for_switch_lists(&sw, &ac, &dc).await })
-        };
+        let l = lists_for_test();
+        let waiter = wait_for(&l, &dc);
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(!waiter.is_finished());
         dc.set_snapshot_for_test(growthbook::ConfigSnapshot {
@@ -4103,7 +5113,6 @@ mod off_switch_hook_tests {
             "every action of the composite is dropped together"
         );
         assert_eq!(info["overturn_hold_mode"], "shadow", "hold-gate keys kept");
-        assert_eq!(info["requested_actions_skipped"], r#"[{"kind":"x"}]"#);
         assert_eq!(tickets.load(Ordering::Relaxed), 0, "no rate-cap ticket");
         assert_eq!(hits.get(), hits_before + 1);
         assert_eq!(dedup_retention_for(&outcome.status), DedupRetention::Skip);
@@ -4143,10 +5152,6 @@ mod off_switch_hook_tests {
         assert!(r.outcome.is_none());
         assert_eq!(tickets.load(Ordering::Relaxed), 1);
         assert_eq!(r.hold_gate_info["overturn_hold_mode"], "shadow");
-        assert!(
-            r.requested_actions_skipped.is_some(),
-            "left for the act path"
-        );
 
         let mut headless = score("x", "clf_v1");
         headless.summary = None;
@@ -4209,14 +5214,130 @@ mod off_switch_hook_tests {
         assert_eq!(r.outcome.unwrap().status, off_switch::STATUS_SWITCHED_OFF);
         assert_eq!(tickets.load(Ordering::Relaxed), 0);
     }
+
+    #[tokio::test]
+    async fn only_acting_decisions_count_toward_a_head_guard() {
+        use head_guard::test_support::{bucket_count, guard, with_counters};
+        let (hg, _, buckets) = with_counters(&[guard("GuardHead", None, Some(2), None)]).await;
+        let (sw, sw_store) = loaded(&[]).await;
+        let (dc, tickets) = config(json!({})).await;
+        let s = score("GuardHead", "clf_v1");
+
+        for _ in 0..5 {
+            let r = run_guarded(&sw, &hg, &dc, &s, &composite(), true).await;
+            assert!(r.outcome.is_none());
+        }
+        assert_eq!(
+            bucket_count(&buckets, "h/GuardHead"),
+            0,
+            "dry run never counts"
+        );
+
+        for _ in 0..2 {
+            let r = run_guarded(&sw, &hg, &dc, &s, &composite(), false).await;
+            assert!(r.outcome.is_none(), "acts up to the ceiling");
+        }
+        assert_eq!(bucket_count(&buckets, "h/GuardHead"), 2);
+        assert_eq!(tickets.load(Ordering::Relaxed), 2);
+        assert_eq!(sw_store.puts.load(Ordering::SeqCst), 1);
+
+        let r = run_guarded(&sw, &hg, &dc, &s, &composite(), false).await;
+        let outcome = r.outcome.expect("switched off by the ceiling");
+        assert_eq!(outcome.status, off_switch::STATUS_SWITCHED_OFF);
+        assert_eq!(
+            outcome.info["off_switch_updated_by"],
+            head_guard::UPDATED_BY
+        );
+        assert_eq!(
+            outcome.info["off_switch_reason"],
+            "action ceiling: 2 in 1h (guard v1)"
+        );
+        assert_eq!(tickets.load(Ordering::Relaxed), 2, "no rate-cap ticket");
+        assert_eq!(bucket_count(&buckets, "h/GuardHead"), 2);
+    }
+
+                #[tokio::test]
+    async fn the_cap_runs_between_the_guard_check_and_the_count() {
+        use head_guard::test_support::{bucket_count, guard, with_counters};
+        let (hg, _, buckets) = with_counters(&[guard("CapCountHead", None, Some(3), None)]).await;
+        let (sw, _) = loaded(&[]).await;
+        let s = score("CapCountHead", "clf_v1");
+
+        let (user_cap, _) = sliding_window::counting_limiter_for_test();
+        user_cap.seed_for_test();
+        let full = DynamicConfig::new(None, None, false, 1_000, 1_000, Some(user_cap), None)
+            .await
+            .unwrap();
+        full.set_snapshot_for_test(growthbook::ConfigSnapshot {
+            config: Some(json!({"max_user_enforcements_per_day": 0})),
+            ..Default::default()
+        });
+        let r = run_guarded(&sw, &hg, &full, &s, &composite(), false).await;
+        assert_eq!(r.outcome.unwrap().status, "max_enforcement_reached");
+        assert_eq!(bucket_count(&buckets, "h/CapCountHead"), 0);
+
+        let (dc, tickets) = config(json!({})).await;
+        assert!(
+            run_guarded(&sw, &hg, &dc, &s, &composite(), false)
+                .await
+                .outcome
+                .is_none()
+        );
+        buckets.lock().unwrap()["h/CapCountHead"]
+            .count
+            .store(5, Ordering::SeqCst);
+        let r = run_guarded(&sw, &hg, &dc, &s, &composite(), false).await;
+        let outcome = r.outcome.expect("past the ceiling");
+        assert_eq!(outcome.status, off_switch::STATUS_SWITCHED_OFF);
+        assert_eq!(outcome.info["head_guard_count"], "6");
+        assert_eq!(
+            tickets.load(Ordering::Relaxed),
+            2,
+            "the skipped decision spent its ticket"
+        );
+    }
+
+            #[tokio::test]
+    async fn a_reached_ceiling_skips_before_the_cap() {
+        use head_guard::test_support::{bucket_count, guard, with_counters};
+        let (hg, _, buckets) = with_counters(&[guard("CapHead", None, Some(1), None)]).await;
+        let (sw, sw_store) = loaded(&[]).await;
+        sw_store.fail_put.store(true, Ordering::SeqCst);
+        let (dc, tickets) = config(json!({})).await;
+        let s = score("CapHead", "clf_v1");
+
+        assert!(
+            run_guarded(&sw, &hg, &dc, &s, &composite(), false)
+                .await
+                .outcome
+                .is_none()
+        );
+        let r = run_guarded(&sw, &hg, &dc, &s, &composite(), false).await;
+        let outcome = r.outcome.expect("at the ceiling");
+        assert_eq!(outcome.status, off_switch::STATUS_SWITCHED_OFF);
+        assert_eq!(outcome.info["head_guard_scope"], "head");
+        assert_eq!(outcome.info["head_guard_window"], "1h");
+        assert_eq!(outcome.info["head_guard_limit"], "1");
+        assert_eq!(outcome.info["head_guard_count"], "1");
+        assert_eq!(outcome.info["head_guard_version"], "1");
+        assert_eq!(tickets.load(Ordering::Relaxed), 1);
+        assert_eq!(sw_store.puts.load(Ordering::SeqCst), 0);
+
+        let (killed, _) = config(json!({off_switch::CONFIG_KEY: {"enabled": false}})).await;
+        assert!(
+            run_guarded(&sw, &hg, &killed, &s, &composite(), false)
+                .await
+                .outcome
+                .is_none()
+        );
+        assert_eq!(bucket_count(&buckets, "h/CapHead"), 1, "not counted");
+    }
 }
 
 #[cfg(test)]
 mod hold_gate_trigger_tests {
     use super::*;
     use crate::decision::ActionSpec;
-    use crate::facts::RequestedActionFacts;
-    use crate::generic_actions::GenericActionAllowlist;
     use crate::overturn_hold::{GateKind, GateMode, GatedAction, HoldGateConfig};
 
     fn suspend() -> ActionSpec {
@@ -4429,84 +5550,6 @@ mod hold_gate_trigger_tests {
         assert_eq!(specs, vec![labels_spec(&["SpamMediumRecall"])]);
     }
 
-                    #[test]
-    fn suspend_detection_covers_generic_suspend_and_suspend_author() {
-        let user_allow = GenericActionAllowlist {
-            kinds: ["suspend"].iter().map(|s| (*s).to_owned()).collect(),
-            suspend_policies: ["PlatformManipulation"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            labels: Default::default(),
-        };
-        let mut facts = ScoreFacts::from_score(&abuse_proto::ScoreResult::default());
-        facts.requested_actions = vec![RequestedActionFacts {
-            kind: "suspend".into(),
-            policy: "PlatformManipulation".into(),
-            head: "IsSpammer".into(),
-            ..Default::default()
-        }];
-        let (decision, _) =
-            expand_requested_actions_decision(EntityType::User, &facts, &user_allow);
-        let c = suspend_only_cfg();
-        match decision {
-            ExpandedDecision::Act(specs) => assert_eq!(
-                gated_actions(&specs, &c),
-                vec![GatedAction::TEMPORARY_SUSPEND]
-            ),
-            other => panic!("expected Act, got {other:?}"),
-        }
-
-        let post_allow = GenericActionAllowlist {
-            kinds: ["post_label", "suspend_author"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            suspend_policies: ["Cse"].iter().map(|s| (*s).to_owned()).collect(),
-            labels: ["Cse"].iter().map(|s| (*s).to_owned()).collect(),
-        };
-        let mut facts = ScoreFacts::from_score(&abuse_proto::ScoreResult::default());
-        facts.requested_actions = vec![
-            RequestedActionFacts {
-                kind: "post_label".into(),
-                labels: vec!["Cse".into()],
-                head: "NearDupEmbeddingCseMatch".into(),
-                ..Default::default()
-            },
-            RequestedActionFacts {
-                kind: "suspend_author".into(),
-                perm: true,
-                policy: "Cse".into(),
-                head: "NearDupEmbeddingCseMatch".into(),
-                ..Default::default()
-            },
-        ];
-        let (decision, _) =
-            expand_requested_actions_decision(EntityType::Post, &facts, &post_allow);
-        match decision {
-            ExpandedDecision::Act(specs) => {
-                assert_eq!(specs.len(), 2, "label + author suspend");
-                assert_eq!(
-                    gated_actions(&specs, &c),
-                    vec![GatedAction::PERMANENT_SUSPEND],
-                    "suspend_author perm:true → permanent shape"
-                );
-            }
-            other => panic!("expected Act, got {other:?}"),
-        }
-
-        facts.requested_actions.truncate(1);
-        let (decision, _) =
-            expand_requested_actions_decision(EntityType::Post, &facts, &post_allow);
-        match decision {
-            ExpandedDecision::Act(specs) => {
-                assert!(gated_actions(&specs, &c).is_empty());
-                assert!(gated_actions(&specs, &label_cfg(&["Cse"])).is_empty());
-            }
-            other => panic!("expected Act, got {other:?}"),
-        }
-    }
-
                 #[test]
     fn hold_skip_propagates_global_dry_run_and_audit_keys() {
         let score = abuse_proto::ScoreResult {
@@ -4540,7 +5583,6 @@ mod hold_gate_trigger_tests {
                 global_dry_run,
                 &facts,
                 &score,
-                Some(r#"[{"kind":"label"}]"#.to_owned()),
             );
             assert_eq!(out.status, "hold_overturned");
             assert_eq!(
@@ -4554,10 +5596,6 @@ mod hold_gate_trigger_tests {
             assert_eq!(out.info["overturn_hold_mode"], "enforce");
             assert_eq!(out.info["overturn_hold_probe_ms"], "2");
             assert!(out.info.contains_key("overturn_hold_expires_at"));
-            assert_eq!(
-                out.info["requested_actions_skipped"],
-                r#"[{"kind":"label"}]"#
-            );
             assert!(
                 out.info.contains_key("cred_is_high"),
                 "{:?}",
@@ -4586,7 +5624,6 @@ mod hold_gate_trigger_tests {
             false,
             &facts,
             &score,
-            None,
         );
         assert_eq!(out.status, "hold_overturned");
         assert!(!out.dry_run);
@@ -4610,7 +5647,6 @@ mod hold_gate_trigger_tests {
             false,
             &facts,
             &score,
-            None,
         );
         assert_eq!(out.info["overturn_hold_kind"], "suspend");
         assert_eq!(out.info["overturn_hold_id"], "77");
@@ -4622,127 +5658,11 @@ mod hold_gate_trigger_tests {
             true,
             &facts,
             &score,
-            None,
         );
         assert_eq!(out.status, "hold_lookup_failed");
         assert!(out.dry_run);
-        assert!(!out.info.contains_key("requested_actions_skipped"));
         assert!(!outcome_holds_full_dedup(&out.status));
         assert_eq!(dedup_retention_for(&out.status), DedupRetention::Release);
-    }
-}
-
-#[cfg(test)]
-mod generic_dispatch_tests {
-    use super::*;
-    use crate::decision::ActionSpec;
-    use crate::facts::RequestedActionFacts;
-    use crate::generic_actions::GenericActionAllowlist;
-
-    fn score_facts_with(requested: Vec<RequestedActionFacts>) -> ScoreFacts {
-        let mut f = ScoreFacts::from_score(&abuse_proto::ScoreResult::default());
-        f.requested_actions = requested;
-        f
-    }
-
-    fn user_allowlist() -> GenericActionAllowlist {
-        GenericActionAllowlist {
-            kinds: ["suspend", "label"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            suspend_policies: ["PlatformManipulation"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            labels: ["SpamHighRecall"].iter().map(|s| (*s).to_owned()).collect(),
-        }
-    }
-
-            #[test]
-    fn expand_allowed_requested_actions_yields_plain_act_decision() {
-        let facts = score_facts_with(vec![RequestedActionFacts {
-            kind: "suspend".into(),
-            perm: false,
-            policy: "PlatformManipulation".into(),
-            head: "IsSpammer".into(),
-            ..Default::default()
-        }]);
-        let (decision, skipped) =
-            expand_requested_actions_decision(EntityType::User, &facts, &user_allowlist());
-        assert_eq!(
-            decision,
-            ExpandedDecision::Act(vec![ActionSpec::SuspendUser {
-                perm: false,
-                policy: "PlatformManipulation".into(),
-            }])
-        );
-        assert!(skipped.is_none());
-    }
-
-    #[test]
-    fn expand_denied_requested_actions_yields_skip_with_reason() {
-        let facts = score_facts_with(vec![RequestedActionFacts {
-            kind: "suspend".into(),
-            policy: "PlatformManipulation".into(),
-            head: "IsSpammer".into(),
-            ..Default::default()
-        }]);
-        let (decision, skipped) = expand_requested_actions_decision(
-            EntityType::User,
-            &facts,
-            &GenericActionAllowlist::default(),
-        );
-        assert_eq!(
-            decision,
-            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into())
-        );
-        let skipped = skipped.expect("refused entries must be reported");
-        assert!(skipped.contains("kind_not_allowlisted"), "{skipped}");
-    }
-
-    #[test]
-    fn expand_empty_requested_actions_yields_skip() {
-        let (decision, skipped) = expand_requested_actions_decision(
-            EntityType::User,
-            &score_facts_with(vec![]),
-            &user_allowlist(),
-        );
-        assert_eq!(
-            decision,
-            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into())
-        );
-        assert!(skipped.is_none());
-    }
-
-    #[test]
-    fn expand_partial_allowlist_dispatches_allowed_and_reports_skipped() {
-        let facts = score_facts_with(vec![
-            RequestedActionFacts {
-                kind: "label".into(),
-                labels: vec!["SpamHighRecall".into()],
-                ttl_msec: 1000,
-                head: "IsLabelHead".into(),
-                ..Default::default()
-            },
-            RequestedActionFacts {
-                kind: "bounce_captcha".into(),
-                head: "IsCuspHead".into(),
-                ..Default::default()
-            },
-        ]);
-        let (decision, skipped) =
-            expand_requested_actions_decision(EntityType::User, &facts, &user_allowlist());
-        assert_eq!(
-            decision,
-            ExpandedDecision::Act(vec![ActionSpec::AddLabelsV2 {
-                labels: vec!["SpamHighRecall".into()],
-                ttl_msec: Some(1000),
-            }])
-        );
-        let skipped = skipped.expect("refused entry must be reported");
-        assert!(skipped.contains("bounce_captcha"), "{skipped}");
-        assert!(skipped.contains("kind_not_allowlisted"), "{skipped}");
     }
 }
 
@@ -4809,6 +5729,66 @@ mod decision_outcome_json_tests {
         let v = serde_json::to_value(&outcome).expect("DecisionOutcome serializes to JSON");
         assert_eq!(v["score_id"], "");
     }
+
+    #[test]
+    fn decision_outcome_carries_the_reply_target_only_when_sent() {
+        let reply = ScoreResult {
+            user_id: 100,
+            entity_type: ProtoEntityType::Post as i32,
+            entity_id: 555,
+            in_reply_to_user_id: 777,
+            in_reply_to_post_id: 888,
+            ..Default::default()
+        };
+        let outcome = decision_outcome(
+            &reply,
+            "some.topic",
+            "success".into(),
+            true,
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            (outcome.in_reply_to_user_id, outcome.in_reply_to_post_id),
+            (777, 888)
+        );
+        let v = serde_json::to_value(&outcome).expect("DecisionOutcome serializes to JSON");
+        assert_eq!(
+            (
+                v["in_reply_to_user_id"].as_i64(),
+                v["in_reply_to_post_id"].as_i64()
+            ),
+            (Some(777), Some(888))
+        );
+        let back = abuse_proto::DecisionOutcome::decode(outcome.encode_to_vec().as_slice())
+            .expect("decodes");
+        assert_eq!(
+            (back.in_reply_to_user_id, back.in_reply_to_post_id),
+            (777, 888)
+        );
+
+        let other = ScoreResult {
+            in_reply_to_user_id: 0,
+            in_reply_to_post_id: 0,
+            ..reply
+        };
+        let outcome = decision_outcome(
+            &other,
+            "some.topic",
+            "success".into(),
+            true,
+            BTreeMap::new(),
+        );
+        let v = serde_json::to_value(&outcome).expect("DecisionOutcome serializes to JSON");
+        assert!(
+            v.get("in_reply_to_user_id").is_none() && v.get("in_reply_to_post_id").is_none(),
+            "{v}"
+        );
+        let sv = serde_json::to_value(&other).expect("ScoreResult serializes to JSON");
+        assert!(
+            sv.get("in_reply_to_user_id").is_none() && sv.get("in_reply_to_post_id").is_none(),
+            "{sv}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4824,7 +5804,8 @@ mod health_tests {
 
     #[test]
     fn fresh_consumer_is_ready() {
-        let (ready, del) = health_decision(true, S5, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(true, S5, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(ready);
         assert!(!del);
     }
@@ -4832,7 +5813,8 @@ mod health_tests {
     #[test]
     fn stale_under_threshold_is_notready_not_deleted() {
         let s = Duration::from_secs(130);
-        let (ready, del) = health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(!ready);
         assert!(!del);
     }
@@ -4840,7 +5822,8 @@ mod health_tests {
     #[test]
     fn fully_dead_no_progress_self_deletes_at_stale_window() {
         let s = Duration::from_secs(241);
-        let (ready, del) = health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(!ready);
         assert!(del);
     }
@@ -4855,6 +5838,7 @@ mod health_tests {
             STALE_DELETE,
             ERR_DELETE,
             true,
+            false,
         );
         assert!(!ready);
         assert!(del);
@@ -4866,6 +5850,7 @@ mod health_tests {
             STALE_DELETE,
             ERR_DELETE,
             true,
+            false,
         );
         assert!(!ready);
         assert!(!del);
@@ -4880,6 +5865,51 @@ mod health_tests {
             STALE,
             STALE_DELETE,
             ERR_DELETE,
+            true,
+            false,
+        );
+        assert!(!ready);
+        assert!(!del);
+    }
+
+    #[test]
+    fn backfill_pod_on_an_empty_topic_is_ready_and_stays() {
+        for s in [Z, Duration::from_secs(241), Duration::from_secs(86_400)] {
+            let (ready, del) =
+                health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, true);
+            assert!(ready, "not ready after {s:?} of silence");
+            assert!(!del, "self-deleted after {s:?} of silence");
+        }
+        let s = Duration::from_secs(3_600);
+        let (ready, del) =
+            health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, true);
+        assert!(ready);
+        assert!(!del);
+    }
+
+    #[test]
+    fn backfill_pod_still_leaves_on_an_error_flood() {
+        let s = Duration::from_secs(86_400);
+        let (ready, del) = health_decision(
+            false,
+            s,
+            Duration::from_secs(61),
+            STALE,
+            STALE_DELETE,
+            ERR_DELETE,
+            true,
+            true,
+        );
+        assert!(!ready);
+        assert!(del);
+        let (ready, del) = health_decision(
+            false,
+            s,
+            Duration::from_secs(10),
+            STALE,
+            STALE_DELETE,
+            ERR_DELETE,
+            true,
             true,
         );
         assert!(!ready);
@@ -5153,6 +6183,10 @@ rules:
                 grey_badge: column("grey"),
             },
             uas_strato: column("uas"),
+            reply_parents: invited_reply::ReplyParents::new(
+                column("reply_parent"),
+                Duration::from_secs(1),
+            ),
             dynamic_config,
             rules_cache: Arc::new(rules::RulesCache::new()),
             allowlist: None,
@@ -5163,11 +6197,21 @@ rules:
                 Arc::new(off_switch::test_support::MemStore::default()),
                 Arc::new(off_switch::test_support::MemStore::default()),
             )),
+            head_guard: Arc::new(head_guard::HeadGuard::new(
+                Arc::new(action_control::test_support::MemControlStore::default()),
+                None,
+            )),
             action_control: Arc::new(action_control::ActionControl::new(
                 Arc::new(action_control::test_support::MemControlStore::default()),
                 "test".into(),
                 String::new(),
             )),
+            backfill: Arc::new(backfill::Backfill::new(
+                Arc::new(action_control::test_support::MemControlStore::default()),
+                None,
+                String::new(),
+            )),
+            post_labels: None,
             outcome_log: None,
         };
         Harness {
@@ -5206,6 +6250,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5234,6 +6280,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5256,6 +6304,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5281,6 +6331,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5302,6 +6354,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5327,6 +6381,8 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap_err();

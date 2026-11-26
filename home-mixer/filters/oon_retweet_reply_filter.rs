@@ -14,7 +14,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for OONRetweetReplyFilter {
     ) -> FilterResult<PostCandidate> {
         let allow_phoenix_oon_replies = query.params.get(EnablePhoenixOonReplies);
         let root_only = query.params.get(PhoenixOonRepliesRootOnly);
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        FilterResult::partition(candidates, |c| {
             let is_reply = c.in_reply_to_tweet_id.is_some();
             let is_retweet = c.retweeted_tweet_id.is_some();
             let replies_to_root =
@@ -23,11 +23,9 @@ impl Filter<ScoredPostsQuery, PostCandidate> for OONRetweetReplyFilter {
                 && !(allow_phoenix_oon_replies
                     && is_phoenix_home_retrieval(c)
                     && (!root_only || replies_to_root));
-            (c.in_network == Some(false) && (is_retweet || oon_reply_dropped))
-                || (is_reply && c.ancestors.is_empty())
-        });
-
-        FilterResult { kept, removed }
+            !((c.in_network == Some(false) && (is_retweet || oon_reply_dropped))
+                || (is_reply && c.ancestors.is_empty()))
+        })
     }
 }
 
@@ -82,7 +80,7 @@ mod tests {
     async fn integrates_with_in_network_hydrator() {
         use crate::candidate_hydrators::in_network_candidate_hydrator::InNetworkCandidateHydrator;
         use crate::models::user_features::UserFeatures;
-        use xai_candidate_pipeline::hydrator::Hydrator;
+        use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 
         let query = ScoredPostsQuery {
             user_id: 1,
@@ -117,10 +115,8 @@ mod tests {
         ];
 
         let hydrator = InNetworkCandidateHydrator;
-        let hydrated = hydrator.hydrate(&query, &candidates).await;
-        for (c, h) in candidates.iter_mut().zip(hydrated) {
-            hydrator.update(c, h.expect("hydrate ok"));
-        }
+        let fetched = hydrator.fetch(&query, &candidates).await.expect("fetch ok");
+        hydrator.apply(&query, &mut candidates, fetched);
         assert_eq!(candidates[0].in_network, Some(false));
         assert_eq!(candidates[1].in_network, Some(false));
         assert_eq!(candidates[2].in_network, Some(true));

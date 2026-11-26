@@ -106,6 +106,26 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 0, env = "TAIL_MIN_FAV_COUNT")]
     pub tail_min_fav_count: i64,
+
+    #[arg(long, default_value_t = 10_000, env = "POPULAR_VIDEO_MIN_VIEW_COUNT")]
+    pub popular_video_min_view_count: i64,
+
+    #[arg(long, default_value_t = 100, env = "POPULAR_VIDEO_MIN_FAV_COUNT")]
+    pub popular_video_min_fav_count: i64,
+
+    #[arg(
+        long,
+        default_value = "/data/phoenix_index/prod/post_sid_v8_256x6_snapshots/nsfw_video_7day.parquet",
+        env = "POPULAR_VIDEO_EXCLUDE_POSTS_IN"
+    )]
+    pub popular_video_exclude_posts_in: PathBuf,
+
+    #[arg(
+        long,
+        default_value = "/data/phoenix_index/prod/post_sid_v8_256x6_snapshots/video_2day.parquet",
+        env = "POPULAR_VIDEO_REQUIRE_POSTS_IN"
+    )]
+    pub popular_video_require_posts_in: PathBuf,
 }
 
 impl Cli {
@@ -139,6 +159,8 @@ pub enum PipelineKind {
     Sid,
     #[value(name = "sid-tail")]
     SidTail,
+    #[value(name = "sid-popular-video")]
+    SidPopularVideo,
     Ads,
     Analysis,
 }
@@ -148,7 +170,9 @@ impl PipelineKind {
         match self {
             Self::Main | Self::Sid => "phoenix_rank_all_indexing_event",
             Self::Topic => "phoenix_rank_all_indexing_event_backup",
-            Self::Metadata | Self::SidTail => "phoenix_rankall_metadata_event",
+            Self::Metadata | Self::SidTail | Self::SidPopularVideo => {
+                "phoenix_rankall_metadata_event"
+            }
             Self::Analysis => "home_mixer_phoenix_scored_candidates",
             Self::Ads => "",
         }
@@ -157,12 +181,18 @@ impl PipelineKind {
     pub fn is_implemented(&self) -> bool {
         matches!(
             self,
-            Self::Main | Self::Topic | Self::Metadata | Self::Analysis | Self::Sid | Self::SidTail
+            Self::Main
+                | Self::Topic
+                | Self::Metadata
+                | Self::Analysis
+                | Self::Sid
+                | Self::SidTail
+                | Self::SidPopularVideo
         )
     }
 
     pub fn needs_sid_endpoint(&self) -> bool {
-        matches!(self, Self::Sid | Self::SidTail)
+        matches!(self, Self::Sid | Self::SidTail | Self::SidPopularVideo)
     }
 
     pub fn window_configs(&self) -> Vec<WindowConfig> {
@@ -209,6 +239,8 @@ impl PipelineKind {
                 WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
+                WindowConfig::new("video", 6),
+                WindowConfig::bounded("video", 6, 48),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 24 * 14),
@@ -217,10 +249,17 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 24 * 14),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("imagine", 96),
+                WindowConfig::new("ai_video_self", 24).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_self", 48).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_self", 24 * 7).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 24).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 48).excluding_posts_in("nsfw_video"),
+                WindowConfig::new("ai_video_detected", 24 * 7).excluding_posts_in("nsfw_video"),
                 WindowConfig::bounded("video", 24 * 4, 24 * 14),
                 WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14),
             ],
             Self::SidTail => vec![WindowConfig::new("tail", 24)],
+            Self::SidPopularVideo => vec![WindowConfig::new("popular_video", 48)],
             Self::Analysis | Self::Ads => vec![],
         }
     }
@@ -236,6 +275,7 @@ impl fmt::Display for PipelineKind {
             Self::Analysis => write!(f, "analysis"),
             Self::Sid => write!(f, "sid"),
             Self::SidTail => write!(f, "sid-tail"),
+            Self::SidPopularVideo => write!(f, "sid-popular-video"),
         }
     }
 }
@@ -245,6 +285,9 @@ pub struct WindowConfig {
     pub name: String,
     pub retention: Duration,
     pub min_age: Option<Duration>,
+    pub exclude_posts_in: Option<String>,
+    pub exclude_posts_in_file: Option<PathBuf>,
+    pub require_posts_in_file: Option<PathBuf>,
 }
 
 impl WindowConfig {
@@ -253,7 +296,25 @@ impl WindowConfig {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: None,
+            exclude_posts_in: None,
+            exclude_posts_in_file: None,
+            require_posts_in_file: None,
         }
+    }
+
+    pub fn excluding_posts_in(mut self, index_name: impl Into<String>) -> Self {
+        self.exclude_posts_in = Some(index_name.into());
+        self
+    }
+
+    pub fn excluding_posts_in_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.exclude_posts_in_file = Some(path.into());
+        self
+    }
+
+    pub fn requiring_posts_in_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.require_posts_in_file = Some(path.into());
+        self
     }
 
     pub fn bounded(name: impl Into<String>, min_age_hours: u64, retention_hours: u64) -> Self {
@@ -262,15 +323,34 @@ impl WindowConfig {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
             min_age: Some(Duration::from_secs(min_age_hours * 3600)),
+            exclude_posts_in: None,
+            exclude_posts_in_file: None,
+            require_posts_in_file: None,
         }
     }
 
     pub fn window_name(&self) -> String {
-        let days = self.retention.as_secs() / 86400;
+        let (ret_n, ret_unit) = span_parts(self.retention);
         match self.min_age {
-            Some(min) => format!("{}_{}to{days}day", self.name, min.as_secs() / 86400),
-            None => format!("{}_{days}day", self.name),
+            None => format!("{}_{ret_n}{ret_unit}", self.name),
+            Some(min) => {
+                let (min_n, min_unit) = span_parts(min);
+                if min_unit == ret_unit {
+                    format!("{}_{min_n}to{ret_n}{ret_unit}", self.name)
+                } else {
+                    format!("{}_{min_n}{min_unit}to{ret_n}{ret_unit}", self.name)
+                }
+            }
         }
+    }
+}
+
+fn span_parts(d: Duration) -> (u64, &'static str) {
+    let secs = d.as_secs();
+    if secs.is_multiple_of(86400) {
+        (secs / 86400, "day")
+    } else {
+        (secs / 3600, "h")
     }
 }
 
@@ -294,6 +374,19 @@ mod tests {
         assert_eq!(
             WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14).window_name(),
             "nsfw_video_4to14day"
+        );
+    }
+
+    #[test]
+    fn window_name_formatting_sub_day() {
+        assert_eq!(WindowConfig::new("video", 6).window_name(), "video_6h");
+        assert_eq!(
+            WindowConfig::bounded("video", 6, 48).window_name(),
+            "video_6hto2day"
+        );
+        assert_eq!(
+            WindowConfig::bounded("video", 6, 12).window_name(),
+            "video_6to12h"
         );
     }
 
@@ -408,6 +501,21 @@ mod tests {
             );
         }
         assert!(!names.iter().any(|n| n.contains("evergreen_video_grok")));
+    }
+
+    #[test]
+    fn sid_pipeline_includes_video_6h_windows() {
+        let names: Vec<String> = PipelineKind::Sid
+            .window_configs()
+            .iter()
+            .map(|w| w.window_name())
+            .collect();
+        for w in ["video_6h", "video_6hto2day"] {
+            assert!(
+                names.contains(&w.to_string()),
+                "Sid window list missing {w}: {names:?}",
+            );
+        }
     }
 
     #[test]

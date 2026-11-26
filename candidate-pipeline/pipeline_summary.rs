@@ -46,10 +46,9 @@ pub async fn scope<F: Future>(
     if nested {
         with_active(|parent| {
             if let Some(stage) = parent.trace.stages.last_mut() {
-                stage.nested.extend(trace);
+                stage.nested.extend(trace.clone());
             }
         });
-        return (output, None);
     }
     (output, trace)
 }
@@ -61,6 +60,53 @@ pub fn emit(pipeline: &str, start: Instant, result_size: usize) {
             result_size, "{} Summary:{}", pipeline, summary.trace
         );
     });
+}
+
+#[derive(Clone, Copy)]
+pub struct SummaryFork {
+    stage: PipelineStage,
+    start: Option<Instant>,
+}
+
+pub fn fork(stage: PipelineStage) -> SummaryFork {
+    let mut start = None;
+    with_active(|summary| start = Some(summary.start));
+    SummaryFork { stage, start }
+}
+
+impl SummaryFork {
+    pub async fn capture<F: Future>(self, fut: F) -> (F::Output, Option<StageTrace>) {
+        let Some(start) = self.start else {
+            return (fut.await, None);
+        };
+        let mut summary = PipelineSummary {
+            start,
+            trace: PipelineTrace::default(),
+        };
+        summary.stage_mut(self.stage);
+        ACTIVE
+            .scope(RefCell::new(Some(summary)), async {
+                let output = fut.await;
+                let stage = ACTIVE.with(|active| {
+                    active
+                        .borrow_mut()
+                        .take()
+                        .and_then(|summary| summary.trace.stages.into_iter().next())
+                });
+                (output, stage)
+            })
+            .await
+    }
+
+    pub fn merge(self, captured: Option<StageTrace>) {
+        if let Some(captured) = captured {
+            with_active(|summary| {
+                let stage = summary.stage_mut(self.stage);
+                stage.components.extend(captured.components);
+                stage.nested.extend(captured.nested);
+            });
+        }
+    }
 }
 
 pub struct StageStats {
@@ -173,6 +219,23 @@ impl ComponentStats {
         self.record();
     }
 
+    pub fn finish_failed(mut self) {
+        self.component.errors = Some(1);
+        self.record();
+    }
+
+    pub fn finish_with_results<C>(mut self, results: &[Result<C, String>]) {
+        self.component.input_count = Some(results.len());
+        self.component.errors = Some(results.iter().filter(|result| result.is_err()).count());
+        self.record();
+    }
+
+    pub fn finish_with_errors(mut self, input: usize, errors: usize) {
+        self.component.input_count = Some(input);
+        self.component.errors = Some(errors);
+        self.record();
+    }
+
     pub fn finish_filter(mut self, kept: usize, removed: usize) {
         self.component.input_count = Some(kept + removed);
         self.component.kept = Some(kept);
@@ -229,7 +292,7 @@ impl PipelineSummary {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PipelineTrace {
     pub pipeline: &'static str,
     pub type_name: &'static str,
@@ -237,7 +300,7 @@ pub struct PipelineTrace {
     pub stages: Vec<StageTrace>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StageTrace {
     pub name: &'static str,
     pub total: usize,
@@ -251,7 +314,7 @@ pub struct StageTrace {
     pub nested: Vec<PipelineTrace>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ComponentTrace {
     pub name: &'static str,
     pub type_name: &'static str,
@@ -261,6 +324,36 @@ pub struct ComponentTrace {
     pub fetched: Option<usize>,
     pub kept: Option<usize>,
     pub removed: Option<usize>,
+    pub errors: Option<usize>,
+}
+
+pub struct ComponentFailure {
+    pub name: &'static str,
+    pub errors: usize,
+    pub total: usize,
+}
+
+impl PipelineTrace {
+    pub fn failures(&self) -> Vec<ComponentFailure> {
+        self.stages
+            .iter()
+            .flat_map(|stage| {
+                let own = stage.components.iter().filter_map(ComponentTrace::failure);
+                own.chain(stage.nested.iter().flat_map(PipelineTrace::failures))
+            })
+            .collect()
+    }
+}
+
+impl ComponentTrace {
+    fn failure(&self) -> Option<ComponentFailure> {
+        let errors = self.errors.filter(|errors| *errors > 0)?;
+        Some(ComponentFailure {
+            name: self.name,
+            errors,
+            total: self.input_count.unwrap_or(1),
+        })
+    }
 }
 
 impl fmt::Display for PipelineTrace {

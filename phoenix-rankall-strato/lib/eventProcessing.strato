@@ -245,6 +245,10 @@ def isSelfReply(post: Tweet): Boolean = {
   }.getOrElse(false)
 }
 
+def inReplyToPostId(post: Tweet): Option[Long] = {
+  post.coreData.flatMap { core => core.reply.flatMap { reply => reply.inReplyToStatus } }
+}
+
 def hasMinFavoriteCount(engagementCount: Option[EngagementCount], minFavorites: Long): Boolean = {
   engagementCount.flatMap { ec => ec.favoriteCount }.getOrElse(0L) >= minFavorites
 }
@@ -651,6 +655,7 @@ Library({
     getAuthorId = getAuthorId,
     isReply = isReply,
     isSelfReply = isSelfReply,
+    inReplyToPostId = inReplyToPostId,
     hasMinFavoriteCount = hasMinFavoriteCount,
     isCommunityPost = isCommunityPost,
     isAdultPost = isAdultPost,

@@ -1,9 +1,10 @@
 use crate::hydration::fallback_cache::{Column, FallbackCache};
 use crate::models::{
-    AuthorId, MediaFeature, NsfwFeature, PureCore, ReplyTo, TweetFeatures, TweetId,
+    AuthorId, MediaFeature, NsfwFeature, PostText, PureCore, ReactionContext, ReplyTo,
+    TweetFeatures, TweetId,
 };
 use std::num::NonZeroU64;
-use xai_core_entities::entities::{EditControl, EditControlInitial, PureCoreData, TakedownReason};
+use xai_core_entities::entities::{PureCoreData, TakedownReason};
 
 #[derive(Clone)]
 pub(crate) struct CachedTweet {
@@ -111,20 +112,22 @@ pub(crate) struct CachedTweetRow {
     latest_edit_tweet_id: Option<NonZeroU64>,
     exclusive_conversation_author_id: Option<NonZeroU64>,
     article_id: Option<NonZeroU64>,
-    restrictions: Option<Box<Restrictions>>,
+    sparse: Option<Box<Sparse>>,
 }
 
 #[derive(Clone, Default)]
-struct Restrictions {
+struct Sparse {
     geo_allow_list: Vec<String>,
     geo_deny_list: Vec<String>,
     takedown_reasons: Vec<TakedownReason>,
     narrowcast_place_id: Option<u64>,
+    reaction_context: Option<ReactionContext>,
 }
 
 impl CachedTweetRow {
     fn new(tweet: &TweetFeatures) -> Self {
         let TweetFeatures {
+            text: _,
             media:
                 MediaFeature {
                     has_media,
@@ -138,15 +141,17 @@ impl CachedTweetRow {
             is_nullcast,
             community_id,
             trusted_friends_list_id,
-            edit_control: _,
+            latest_edit_tweet_id,
             exclusive_conversation_author_id,
             article_id,
             narrowcast_place_id,
+            reaction_context,
         } = tweet;
-        let restricted = !(geo_allow_list.is_empty()
+        let is_sparse = !(geo_allow_list.is_empty()
             && geo_deny_list.is_empty()
             && takedown_reasons.is_empty()
-            && narrowcast_place_id.is_none());
+            && narrowcast_place_id.is_none()
+            && reaction_context.is_none());
         Self {
             has_media: *has_media,
             has_uploaded_media: *has_uploaded_media,
@@ -157,28 +162,31 @@ impl CachedTweetRow {
             is_trusted_friends_tweet: trusted_friends_list_id.is_some(),
             trusted_friends_list_id: trusted_friends_list_id.unwrap_or_default(),
             community_id: *community_id,
-            latest_edit_tweet_id: tweet.latest_edit_tweet_id().map(stored_id),
+            latest_edit_tweet_id: latest_edit_tweet_id.map(stored_id),
             exclusive_conversation_author_id: exclusive_conversation_author_id.map(stored_id),
             article_id: *article_id,
-            restrictions: restricted.then(|| {
-                Box::new(Restrictions {
+            sparse: is_sparse.then(|| {
+                Box::new(Sparse {
                     geo_allow_list: geo_allow_list.clone(),
                     geo_deny_list: geo_deny_list.clone(),
                     takedown_reasons: takedown_reasons.clone(),
                     narrowcast_place_id: *narrowcast_place_id,
+                    reaction_context: *reaction_context,
                 })
             }),
         }
     }
 
     fn features(&self) -> TweetFeatures {
-        let Restrictions {
+        let Sparse {
             geo_allow_list,
             geo_deny_list,
             takedown_reasons,
             narrowcast_place_id,
-        } = self.restrictions.as_deref().cloned().unwrap_or_default();
+            reaction_context,
+        } = self.sparse.as_deref().cloned().unwrap_or_default();
         TweetFeatures {
+            text: PostText::default(),
             media: MediaFeature {
                 has_media: self.has_media,
                 has_uploaded_media: self.has_uploaded_media,
@@ -196,15 +204,11 @@ impl CachedTweetRow {
             trusted_friends_list_id: self
                 .is_trusted_friends_tweet
                 .then_some(self.trusted_friends_list_id),
-            edit_control: self.latest_edit_tweet_id.map(|latest| {
-                EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![read_id(latest)],
-                    ..Default::default()
-                })
-            }),
+            latest_edit_tweet_id: self.latest_edit_tweet_id.map(read_id),
             exclusive_conversation_author_id: self.exclusive_conversation_author_id.map(read_id),
             article_id: self.article_id,
             narrowcast_place_id,
+            reaction_context,
         }
     }
 }
@@ -248,9 +252,9 @@ fn reply_to(core: &PureCoreData) -> Option<ReplyTo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Placement;
     use crate::rules::fixtures::{candidate, dropped, logged_out_viewer};
     use crate::rules::{RuleEngine, SafetyLevel};
-    use xai_core_entities::entities::EditControlEdit;
     use xai_visibility_filtering::models::FilteredReason;
 
     #[test]
@@ -307,12 +311,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_row_keeps_the_place_of_a_local_post_with_no_other_restriction() {
+    fn a_cached_row_keeps_a_place_or_a_reaction_context_set_alone() {
         let local = TweetFeatures {
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
             ..Default::default()
         };
+        let reaction = crate::scenario::reaction_to(9, 10);
         assert_eq!(CachedTweetRow::new(&local).features(), local);
+        assert_eq!(CachedTweetRow::new(&reaction).features(), reaction);
     }
 
     #[test]
@@ -321,42 +327,26 @@ mod tests {
             exclusive_conversation_author_id: Some(0),
             ..Default::default()
         };
-        let stale = TweetFeatures {
-            edit_control: Some(EditControl::Initial(EditControlInitial {
-                edit_tweet_ids: vec![0],
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let engine = RuleEngine::for_tests();
-        for (tweet, expected) in [
-            (
-                exclusive,
-                dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-            ),
-            (
-                stale,
-                dropped(
-                    FilteredReason::UnspecifiedReason,
-                    "stale_tweet/drop/unspecified",
-                ),
-            ),
-        ] {
-            let cached = CachedTweetRow::new(&tweet).features();
-            assert_eq!(cached, tweet);
-            let post = candidate().with_tweet_features(cached).build();
-            assert_eq!(
-                engine
-                    .evaluate(SafetyLevel::TimelineHome, &logged_out_viewer(), &post)
-                    .into_verdict(),
-                expected
-            );
-        }
+        let cached = CachedTweetRow::new(&exclusive).features();
+        assert_eq!(cached, exclusive);
+        let post = candidate().with_tweet_features(cached).build();
+        assert_eq!(
+            RuleEngine::for_tests()
+                .evaluate(
+                    SafetyLevel::TimelineHome,
+                    &logged_out_viewer(),
+                    &post,
+                    Placement::Standalone,
+                )
+                .into_verdict(),
+            dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop")
+        );
     }
 
     #[test]
-    fn a_cached_row_reads_as_its_tweet_with_only_the_latest_edit() {
+    fn a_cached_row_reads_as_its_tweet_without_its_text() {
         let tweet = TweetFeatures {
+            text: PostText::from("post text"),
             media: MediaFeature {
                 has_media: true,
                 has_uploaded_media: true,
@@ -372,33 +362,23 @@ mod tests {
             is_nullcast: true,
             community_id: NonZeroU64::new(500),
             trusted_friends_list_id: Some(8),
-            edit_control: Some(EditControl::Edit(EditControlEdit {
-                initial_tweet_id: 10,
-                edit_control_initial: Some(EditControlInitial {
-                    edit_tweet_ids: vec![10, 20, 30],
-                    ..Default::default()
-                }),
-            })),
+            latest_edit_tweet_id: Some(30),
             exclusive_conversation_author_id: Some(7),
             article_id: NonZeroU64::new(8),
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
+            reaction_context: Some(ReactionContext {
+                reacted_to_post_id: 9,
+                reacted_to_user_id: 10,
+            }),
         };
 
-        let cached = CachedTweetRow::new(&tweet).features();
-
         assert_eq!(
-            cached,
+            CachedTweetRow::new(&tweet).features(),
             TweetFeatures {
-                edit_control: Some(EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![30],
-                    ..Default::default()
-                })),
+                text: PostText::default(),
                 ..tweet.clone()
             }
         );
-        for id in [10, 20, 30] {
-            assert_eq!(cached.is_superseded_edit(id), tweet.is_superseded_edit(id));
-        }
         assert_eq!(
             CachedTweetRow::new(&TweetFeatures::default()).features(),
             TweetFeatures::default()

@@ -1,6 +1,6 @@
+use crate::filters::drop_duplicates_filter::deduplicate;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use rustc_hash::FxHashMap;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 pub struct RetweetDeduplicationFilter;
@@ -11,25 +11,73 @@ impl Filter<ScoredPostsQuery, PostCandidate> for RetweetDeduplicationFilter {
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let mut kept_index: FxHashMap<u64, usize> =
-            FxHashMap::with_capacity_and_hasher(candidates.len(), Default::default());
-        let mut kept: Vec<PostCandidate> = Vec::with_capacity(candidates.len());
-        let mut removed = Vec::new();
+        deduplicate(candidates, |candidate| {
+            candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id)
+        })
+    }
+}
 
-        for mut candidate in candidates {
-            let dedup_id = candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id);
-            if let Some(&idx) = kept_index.get(&dedup_id) {
-                kept[idx]
-                    .retrieval_sources
-                    .append(&mut candidate.retrieval_sources);
-                removed.push(candidate);
-            } else {
-                kept_index.insert(dedup_id, kept.len());
-                kept.push(candidate);
+#[cfg(test)]
+mod dedup_benchmark {
+    use super::*;
+    use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
+    use crate::models::candidate::RetrievalSource;
+    use xai_home_mixer_proto::ServedType;
+
+    fn candidates() -> Vec<PostCandidate> {
+        (0..3000u64)
+            .map(|i| PostCandidate {
+                tweet_id: 1 + if i.is_multiple_of(10) { i / 2 } else { i },
+                retweeted_tweet_id: (i.is_multiple_of(9)).then_some(100_000 + i % 400),
+                author_id: 1000 + i % 600,
+                tweet_text: format!("dedup post {i} with timeline text café"),
+                retrieval_sources: vec![
+                    RetrievalSource {
+                        served_type: ServedType::ForYouPhoenixRetrieval,
+                        cluster: None,
+                        score: Some((i % 100) as f32 / 100.0),
+                        position: Some(i as u32),
+                    };
+                    1 + (i % 2) as usize
+                ],
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn benchmark(name: &str, filter: &impl Filter<ScoredPostsQuery, PostCandidate>) {
+        let candidates = candidates();
+        let query = ScoredPostsQuery::default();
+        let expected = filter.filter(&query, candidates.clone()).kept.len();
+        assert!(expected > 0 && expected < candidates.len());
+        let mut samples = Vec::with_capacity(50);
+        for iteration in 0..55 {
+            let input = candidates.clone();
+            let start = std::time::Instant::now();
+            let result = std::hint::black_box(filter.filter(&query, input));
+            let ns = start.elapsed().as_nanos();
+            assert_eq!(result.kept.len(), expected);
+            assert_eq!(result.kept.len() + result.removed.len(), candidates.len());
+            if iteration >= 5 {
+                samples.push(ns);
+                println!("{name} sample={} ns={ns}", iteration - 5);
             }
         }
+        samples.sort_unstable();
+        println!(
+            "{name} warmup=5 samples=50 median_ns={}",
+            samples[samples.len() / 2]
+        );
+    }
 
-        FilterResult { kept, removed }
+    #[test]
+    fn benchmark_drop_duplicates_filter_3000() {
+        benchmark("drop_duplicates_filter", &DropDuplicatesFilter);
+    }
+
+    #[test]
+    fn benchmark_retweet_deduplication_filter_3000() {
+        benchmark("retweet_deduplication_filter", &RetweetDeduplicationFilter);
     }
 }
 

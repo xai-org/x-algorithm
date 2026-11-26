@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import faulthandler
+import io
 import logging
 import os
 import resource
@@ -332,26 +334,60 @@ def alarm_after(timeout):
         signal.alarm(0)
 
 
+_FAULTHANDLER_MAX_THREADS = 100
+
+
 class PreemptionNotifier:
-    def __init__(self):
+    _SIGNALS = (signal.SIGTERM, signal.SIGQUIT)
+
+    def __init__(self, stack_file=None):
         self.preempted = threading.Event()
+        self._stack_file = stack_file
+        self._faulthandler_registered = False
+        self._set_handlers(None)
+
+    def _out(self):
+        return self._stack_file if self._stack_file is not None else sys.stderr
+
+    def _set_handlers(self, handler):
+        for signum in self._SIGNALS:
+            faulthandler.unregister(signum)
+            if handler is not None:
+                signal.signal(signum, handler)
+        try:
+            for signum in self._SIGNALS:
+                faulthandler.register(signum, file=self._out(), all_threads=True, chain=True)
+            self._faulthandler_registered = True
+        except (AttributeError, ValueError, OSError, io.UnsupportedOperation):
+            for signum in self._SIGNALS:
+                faulthandler.unregister(signum)
+            self._faulthandler_registered = False
 
     def enable(self):
         self.preempted.clear()
-        signal.signal(signal.SIGTERM, self._on_signal)
-        signal.signal(signal.SIGQUIT, self._on_signal)
+        self._set_handlers(self._on_signal)
 
     def disable(self):
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+        self._set_handlers(signal.SIG_DFL)
 
     def _on_signal(self, signum, frame):
         self.preempted.set()
+        out = self._out()
         name = signal.Signals(signum).name
-        sys.stderr.write(f"Received {name} (preemption), setting flag for checkpoint\n")
-        if frame is not None:
-            traceback.print_stack(frame, file=sys.stderr)
-        sys.stderr.flush()
+        out.write(f"Received {name} (preemption), setting flag for checkpoint\n")
+        frames = sys._current_frames()
+        capped = self._faulthandler_registered and len(frames) >= _FAULTHANDLER_MAX_THREADS
+        if capped:
+            out.write(
+                f"faulthandler lists at most {_FAULTHANDLER_MAX_THREADS} of the {len(frames)}"
+                " threads; every thread follows:\n"
+            )
+        if capped or not self._faulthandler_registered:
+            names = {t.ident: t.name for t in threading.enumerate()}
+            for ident, thread_frame in frames.items():
+                out.write(f"Thread {ident:#x} ({names.get(ident, '?')}):\n")
+                traceback.print_stack(thread_frame, file=out)
+        out.flush()
 
 
 def gelu_fn(x: jnp.ndarray, approximate: bool = False):

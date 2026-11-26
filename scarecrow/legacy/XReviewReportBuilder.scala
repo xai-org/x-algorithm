@@ -9,15 +9,21 @@ import scala.jdk.CollectionConverters._
 object XReviewReportBuilder {
 
   val ReportSurfaceValue = "x_app"
+  val LiveReportSurfaceValue = "live"
+  val SourceSystemValue = "botmaker"
   val ReportSourceValue = "proactive"
   val Subject = "Botmaker report"
 
   val ReporterIdValue = "0"
 
   val DescriptionKey = "description"
+  val SourceSystemKey = "source_system"
+  val SourceEventIdKey = "source_event_id"
+  val ReportedUserIdsKey = "reported_user_ids"
 
   val PostEntityType = "post"
   val ProfileEntityType = "profile"
+  val SpaceEntityType = "space"
   val SupportedEntityTypes: Set[String] = Set(PostEntityType, ProfileEntityType)
 
   def normalizeEntityType(entityType: String): Option[String] = {
@@ -26,7 +32,7 @@ object XReviewReportBuilder {
 
   def toSubmitReportRequest(
     entityType: String,
-    entityId: Long,
+    entityId: String,
     userId: Long,
     reportType: String,
     botId: Long,
@@ -34,17 +40,26 @@ object XReviewReportBuilder {
     victimId: Option[JLong],
     detectionTimestampMs: Long
   ): SubmitReportRequest = {
+    val space = entityType == SpaceEntityType
     val reportFields = Seq(
       pb(XReviewReportKeys.Subject, Subject),
-      pb(XReviewReportKeys.ReportSurface, ReportSurfaceValue),
+      pb(
+        XReviewReportKeys.ReportSurface,
+        if (space) LiveReportSurfaceValue else ReportSurfaceValue),
       pb(XReviewReportKeys.ReportType, reportType),
       pb(XReviewReportKeys.ReportSource, ReportSourceValue),
       pb(XReviewReportKeys.ReportedEntityType, entityType),
-      pb(XReviewReportKeys.ReportedEntityId, entityId.toString),
+      pb(XReviewReportKeys.ReportedEntityId, entityId),
       pb(XReviewReportKeys.ReportedUserId, userId.toString),
       pb(XReviewReportKeys.DetectionBotId, botId.toString),
       pb(XReviewReportKeys.DetectionTimestampMs, detectionTimestampMs.toString)
     ) ++
+      (if (space)
+         Seq(
+           pb(SourceSystemKey, SourceSystemValue),
+           pb(SourceEventIdKey, s"$botId:$entityId:$detectionTimestampMs"),
+           pb(ReportedUserIdsKey, s"""["$userId"]"""))
+       else Nil) ++
       note.filter(_.nonEmpty).map(n => pb(DescriptionKey, n)).toSeq ++
       victimId.filter(_ != null).map(id => pb(XReviewReportKeys.VictimUserId, id.toString)).toSeq
 

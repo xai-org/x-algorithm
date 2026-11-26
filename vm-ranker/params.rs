@@ -100,9 +100,15 @@ param!(
     false
 );
 param!(
-    ReactWithVideoWeight,
+    PostVideoWeight,
     f64,
-    "rust_home_mixer_react_with_video_weight",
+    "rust_home_mixer_post_video_weight",
+    0.0
+);
+param!(
+    GrokAnalyzeWeight,
+    f64,
+    "rust_home_mixer_grok_analyze_weight",
     0.0
 );
 param!(
@@ -129,6 +135,30 @@ param!(
     f64,
     "rust_home_mixer_not_dwelled_weight",
     -0.02
+);
+param!(
+    NotDwelledPowerExponent,
+    f64,
+    "rust_home_mixer_not_dwelled_power_exponent",
+    0.0
+);
+param!(
+    NotDwelledPowerOffset,
+    f64,
+    "rust_home_mixer_not_dwelled_power_offset",
+    0.0
+);
+param!(
+    ValueModelMode,
+    String,
+    "rust_home_mixer_value_model_mode",
+    "weighted"
+);
+param!(
+    MultiplicativeVmEngageBias,
+    f64,
+    "rust_home_mixer_multiplicative_vm_engage_bias",
+    0.0
 );
 param!(
     MinVideoDurationMs,
@@ -215,6 +245,30 @@ param!(
     0.75
 );
 param!(
+    OonEngagementWeightFactor,
+    f64,
+    "rust_home_mixer_oon_engagement_weight_factor",
+    -1.0
+);
+param!(
+    OonDwellTimeWeightFactor,
+    f64,
+    "rust_home_mixer_oon_dwell_time_weight_factor",
+    -1.0
+);
+param!(
+    InNetworkEngagementWeightFactor,
+    f64,
+    "rust_home_mixer_in_network_engagement_weight_factor",
+    -1.0
+);
+param!(
+    InNetworkDwellTimeWeightFactor,
+    f64,
+    "rust_home_mixer_in_network_dwell_time_weight_factor",
+    -1.0
+);
+param!(
     NewUserAgeThresholdSecs,
     u64,
     "rust_home_mixer_new_user_age_threshold_secs",
@@ -250,4 +304,71 @@ param!(
     u32,
     "rust_home_mixer_vm_ranker_dpp_max_selected_rank",
     150
+);
+param!(
+    DppGreedyOrder,
+    bool,
+    "rust_home_mixer_vm_ranker_dpp_greedy_order",
+    false
+);
+param!(DppWindow, u32, "rust_home_mixer_vm_ranker_dpp_window", 0);
+param!(
+    DppWindowHalfDistance,
+    f64,
+    "rust_home_mixer_vm_ranker_dpp_window_half_distance",
+    0.0
+);
+param!(
+    DppWindowSidLambda,
+    f64,
+    "rust_home_mixer_vm_ranker_dpp_window_sid_lambda",
+    0.0
+);
+param!(
+    ExcludeIneligibleEngagementHeads,
+    bool,
+    "rust_home_mixer_vm_ranker_exclude_ineligible_engagement_heads",
+    false
+);
+param!(
+    UserDebiasEnabled,
+    bool,
+    "rust_home_mixer_vm_ranker_user_debias_enabled",
+    false
+);
+param!(
+    UserDebiasAlpha,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_alpha",
+    0.0
+);
+param!(
+    UserDebiasClipLogit,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_clip_logit",
+    2.0
+);
+param!(
+    UserDebiasHeads,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_heads",
+    ""
+);
+param!(
+    UserDebiasHeadAlpha,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_head_alpha",
+    ""
+);
+param!(
+    UserDebiasHeadClipLogit,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_head_clip_logit",
+    ""
+);
+param!(
+    UserDebiasMaxArtifactAgeSecs,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_max_artifact_age_secs",
+    3600.0
 );

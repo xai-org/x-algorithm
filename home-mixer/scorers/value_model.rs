@@ -7,7 +7,7 @@ use xai_value_model::{fuse_heads, CandidateScoringInputs, ValueModelWeights};
 
 pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
     let params = &query.params;
-    ValueModelWeights {
+    let mut weights = ValueModelWeights {
         favorite: params.get(FavoriteWeight),
         reply: params.get(ReplyWeight),
         retweet: params.get(RetweetWeight),
@@ -27,7 +27,8 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
         follow_author: params.get(FollowAuthorWeight),
         post_unexplored: params.get(PostUnexploredWeight),
         post_unexplored_include_out_of_network: false,
-        react_with_video: params.get(ReactWithVideoWeight),
+        post_video: params.get(PostVideoWeight),
+        grok_analyze: params.get(GrokAnalyzeWeight),
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),
@@ -47,7 +48,15 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
         author_diversity_floor: 1.0,
         oon_rescore_in_network_replies_retweets: false,
         multiplier_pre_offset: false,
-    }
+        ..Default::default()
+    };
+    weights.set_multiplicative(
+        &params.get(ValueModelMode),
+        params.get(NotDwelledPowerExponent),
+        params.get(NotDwelledPowerOffset),
+        params.get(MultiplicativeVmEngageBias),
+    );
+    weights
 }
 
 pub(crate) fn applied_weights(query: &ScoredPostsQuery) -> HashMap<String, f64> {
@@ -112,7 +121,8 @@ fn shared_phoenix_scores(s: &PhoenixScores) -> xai_value_model::PhoenixScores {
         report_score: s.report_score,
         not_dwelled_score: s.not_dwelled_score,
         post_unexplored_score: s.post_unexplored_score,
-        react_with_video_score: s.react_with_video_score,
+        post_video_score: s.post_video_score,
+        grok_analyze_score: s.grok_analyze_score,
         dwell_time: s.dwell_time,
         click_dwell_time: s.click_dwell_time,
         home_video_continuation_secs: s.home_video_continuation_secs,

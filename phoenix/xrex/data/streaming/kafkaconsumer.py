@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import asyncio
+import concurrent.futures
+import contextlib
 import dataclasses
 import enum
 import gc
@@ -8,18 +10,25 @@ import io
 import logging
 import os
 import queue
+import random
 import ssl
+import sys
 import tempfile
 import threading
 import time
 import traceback
 import typing
-from typing import Any, Callable
+from functools import partial
+from numbers import Integral
+from typing import Any, Callable, Mapping
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
 from aiokafka import AIOKafkaConsumer, ConsumerRecord
-from aiokafka.coordinator.assignors.sticky.sticky_assignor import StickyPartitionAssignor
+from aiokafka.coordinator.assignors.sticky.sticky_assignor import (
+    StickyPartitionAssignor,
+)
+from aiokafka.errors import KafkaConnectionError
 from aiokafka.structs import TopicPartition
 
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
@@ -31,6 +40,27 @@ def parse_positive_action_indices(value: str) -> tuple[int, ...]:
     if not value:
         return ()
     return tuple(int(part) for part in value.split(",") if part)
+
+
+@dataclasses.dataclass(frozen=True)
+class KafkaBootstrapOffsets:
+    topic_name: str
+    offsets: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if type(self.topic_name) is not str or not self.topic_name:
+            raise ValueError("Kafka bootstrap requires a topic identity")
+        if type(self.offsets) is not tuple or any(
+            type(pair) is not tuple or len(pair) != 2 for pair in self.offsets
+        ):
+            raise ValueError("Kafka bootstrap offsets must be immutable partition/offset pairs")
+        if len({pair[0] for pair in self.offsets}) != len(self.offsets):
+            raise ValueError("Duplicate Kafka bootstrap partition")
+        normalized = validate_offset_map(dict(self.offsets))
+        object.__setattr__(self, "offsets", tuple(sorted(normalized.items())))
+
+
+KafkaQueueItem = tuple[RecsysFeaturesBatch, dict[int, int]] | Exception | KafkaBootstrapOffsets
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,6 +178,7 @@ _consumer_poll_latency = None
 _consumer_uptime_gauge = None
 _consumer_dropped_records = None
 _consumer_deserialize_errors = None
+_consumer_width_mismatch_drops = None
 _consumer_end_offsets_polled_count = None
 _consumer_drop_mode_active = None
 _consumer_partition_lag = None
@@ -165,7 +196,7 @@ def _init_consumer_metrics(
     lag_tracker: "PartitionLagTracker | None" = None, metric_attrs: dict[str, str] | None = None
 ) -> bool:
     global _consumer_messages_per_poll, _consumer_poll_latency, _consumer_uptime_gauge
-    global _consumer_dropped_records, _consumer_deserialize_errors
+    global _consumer_dropped_records, _consumer_deserialize_errors, _consumer_width_mismatch_drops
     global _consumer_drop_mode_active, _consumer_partition_lag
     global _consumer_partition_consumed_offset, _consumer_partition_end_offset
     global _consumer_metrics_initialized, _consumer_end_offsets_polled_count
@@ -202,6 +233,12 @@ def _init_consumer_metrics(
         _consumer_deserialize_errors = meter.create_counter(
             name="recsys_kafka_consumer_deserialize_errors_total",
             description="Total number of Kafka messages that failed Arrow IPC deserialization",
+            unit="1",
+        )
+
+        _consumer_width_mismatch_drops = meter.create_counter(
+            name="recsys_kafka_consumer_width_mismatch_dropped_total",
+            description="Kafka messages dropped because a nested list width differs from the model's",
             unit="1",
         )
 
@@ -332,11 +369,101 @@ KAFKA_RESET_SENTINEL_PATH = os.environ.get(
 )
 
 MESSAGE_QUEUE_SIZE = 1000
+KAFKA_BATCH_BUILD_WORKERS = 2
+KAFKA_DECODE_CHUNK = 64
 FETCH_END_OFFSETS_INTERVAL_IN_CONSUMER_ROUNDS = 8
 
 MAX_COMMIT_FAILURES = 3
 COMMIT_FAILURE_SLEEP_TIME = 15.0
 GC_INTERVAL = 8192
+
+
+KAFKA_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+KAFKA_START_ATTEMPTS = 8
+KAFKA_START_RETRY_BASE_SECONDS = 1.0
+KAFKA_START_RETRY_MAX_SECONDS = 20.0
+
+
+def _maybe_periodic_gc() -> None:
+    if gc.isenabled():
+        gc.collect()
+
+
+async def _wait_for_stop(stop_event: threading.Event | None) -> None:
+    if stop_event is None:
+        await asyncio.Future()
+    while not stop_event.is_set():
+        await asyncio.sleep(0.05)
+
+
+async def _stop_consumer(consumer: AIOKafkaConsumer, *, discovery: bool = False) -> None:
+    primary = sys.exception()
+    try:
+        await asyncio.wait_for(consumer.stop(), KAFKA_SHUTDOWN_TIMEOUT_SECONDS)
+    except TimeoutError:
+        rank_logger.error(
+            "Kafka consumer cleanup exceeded %.1f seconds", KAFKA_SHUTDOWN_TIMEOUT_SECONDS
+        )
+    except asyncio.CancelledError as cleanup:
+        if primary is not None:
+            primary.add_note(f"Kafka consumer cleanup cancelled: {cleanup!r}")
+        elif not discovery:
+            raise
+    except Exception as cleanup:
+        if primary is None:
+            raise
+        primary.add_note(f"Kafka consumer cleanup failed: {cleanup!r}")
+
+
+async def _start_consumer_with_retry(
+    factory: Callable[[], AIOKafkaConsumer],
+    stop_event: threading.Event | None = None,
+) -> AIOKafkaConsumer:
+    for attempt in range(1, KAFKA_START_ATTEMPTS + 1):
+        if stop_event and stop_event.is_set():
+            raise asyncio.CancelledError
+        consumer = factory()
+        try:
+            await consumer.start()
+            return consumer
+        except KafkaConnectionError as error:
+            await _stop_consumer(consumer)
+            if attempt == KAFKA_START_ATTEMPTS:
+                raise
+            delay = min(
+                KAFKA_START_RETRY_MAX_SECONDS,
+                KAFKA_START_RETRY_BASE_SECONDS * 2 ** (attempt - 1),
+            ) * random.uniform(0.5, 1.0)
+            rank_logger.warning(
+                "Kafka consumer start failed (attempt %d/%d): %s; retrying in %.1fs",
+                attempt,
+                KAFKA_START_ATTEMPTS,
+                error,
+                delay,
+            )
+            stopping = asyncio.create_task(_wait_for_stop(stop_event))
+            try:
+                done, _ = await asyncio.wait({stopping}, timeout=delay)
+                if done:
+                    raise asyncio.CancelledError
+            finally:
+                stopping.cancel()
+                await asyncio.gather(stopping, return_exceptions=True)
+        except BaseException:
+            await _stop_consumer(consumer)
+            raise
+    raise RuntimeError("Kafka startup attempts exhausted")
+
+
+@contextlib.asynccontextmanager
+async def _started(
+    factory: Callable[[], AIOKafkaConsumer], stop_event: threading.Event | None = None
+):
+    consumer = await _start_consumer_with_retry(factory, stop_event)
+    try:
+        yield consumer
+    finally:
+        await _stop_consumer(consumer)
 
 
 def deserialize_arrow_ipc(data: bytes) -> pa.RecordBatch:
@@ -355,35 +482,79 @@ def deserialize_arrow_ipc(data: bytes) -> pa.RecordBatch:
         raise err
 
 
-async def _deserialize_messages(
-    batch: list[tuple[pa.RecordBatch, int, int]],
-    batch_size: int,
-    msg_queue: asyncio.Queue[ConsumerRecord],
-    example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
-    post_process_fn: Callable[[list[pa.RecordBatch]], RecsysFeaturesBatch],
-    count: int = 0,
-    sampling_factor: int = 1,
-    negative_downsample_rate: int = 1,
-    positive_action_indices: tuple[int, ...] = (),
-) -> tuple[list[tuple[pa.RecordBatch, int, int]], int]:
-    msg = await msg_queue.get()
+_expected_inner_list_widths: dict[str, int] = {}
+_MAX_WIDTH_MISMATCH_LOGS = 20
+_width_mismatch_logs = 0
 
-    value = msg.value
-    value = typing.cast(bytes, value)
+
+def set_expected_inner_list_widths(widths: typing.Mapping[str, int]) -> None:
+    global _expected_inner_list_widths
+    _expected_inner_list_widths = dict(widths)
+
+
+def inner_list_width_mismatch(
+    rb: pa.RecordBatch, expected: typing.Mapping[str, int]
+) -> tuple[str, int, int] | None:
+    for name, want in expected.items():
+        index = rb.schema.get_field_index(name)
+        if index < 0:
+            continue
+        field_type = rb.schema.field(index).type
+        if not (
+            pa.types.is_list(field_type)
+            or pa.types.is_large_list(field_type)
+            or pa.types.is_fixed_size_list(field_type)
+        ):
+            continue
+        element = field_type.value_type
+        if pa.types.is_fixed_size_list(element) and element.list_size != want:
+            return name, want, element.list_size
+    return None
+
+
+def _drop_width_mismatched(rb: pa.RecordBatch, partition: int, offset: int) -> bool:
+    global _width_mismatch_logs
+    if not _expected_inner_list_widths:
+        return False
+    mismatch = inner_list_width_mismatch(rb, _expected_inner_list_widths)
+    if mismatch is None:
+        return False
+    if _consumer_width_mismatch_drops is not None:
+        _consumer_width_mismatch_drops.add(1, {"partition": str(partition)})
+    if _width_mismatch_logs < _MAX_WIDTH_MISMATCH_LOGS:
+        _width_mismatch_logs += 1
+        column, want, got = mismatch
+        rank_logger.warning(
+            f"[width-guard {_width_mismatch_logs}/{_MAX_WIDTH_MISMATCH_LOGS}] dropping "
+            f"partition={partition} offset={offset}: {column} element width {got}, model expects {want}"
+        )
+    return True
+
+
+def _decode_chunk(
+    msgs: list[ConsumerRecord],
+    negative_downsample_rate: int,
+    positive_action_indices: tuple[int, ...],
+) -> tuple[list[pa.RecordBatch | None], Exception | None]:
+    decoded: list[pa.RecordBatch | None] = []
+    for msg in msgs:
+        try:
+            decoded.append(
+                _decode_training_message(msg, negative_downsample_rate, positive_action_indices)
+            )
+        except Exception as err:
+            return decoded, err
+    return decoded, None
+
+
+def _decode_training_message(
+    msg: ConsumerRecord, negative_downsample_rate: int, positive_action_indices: tuple[int, ...]
+) -> pa.RecordBatch | None:
+    value = typing.cast(bytes, msg.value)
     partition, offset = msg.partition, msg.offset
-    count += 1
-    if count % sampling_factor != 0:
-        msg_queue.task_done()
-        return batch, count
-
     try:
-        user_action_sequence = await asyncio.to_thread(deserialize_arrow_ipc, value)
-    except RuntimeError as e:
-        if "cannot schedule new futures after shutdown" in str(e):
-            msg_queue.task_done()
-            raise _ExecutorShutdown() from e
-        raise
-    except Exception as e:
+        user_action_sequence = deserialize_arrow_ipc(value)
+    except (pa.ArrowException, OSError, ValueError, TypeError) as e:
         headers_str = ", ".join(f"{k}={v!r}" for k, v in (msg.headers or []))
         payload_preview = repr(value[:100]) if value else "<empty>"
         rank_logger.warning(
@@ -394,8 +565,10 @@ async def _deserialize_messages(
         )
         if _consumer_deserialize_errors is not None:
             _consumer_deserialize_errors.add(1, {"partition": str(partition)})
-        msg_queue.task_done()
-        return batch, count
+        return None
+
+    if _drop_width_mismatched(user_action_sequence, partition, offset):
+        return None
 
     if negative_downsample_rate > 1:
         if not positive_action_indices:
@@ -406,8 +579,7 @@ async def _deserialize_messages(
         sample_weight = 1.0
         if not _has_positive_candidate(user_action_sequence, positive_action_indices):
             if hash((partition, offset)) % negative_downsample_rate != 0:
-                msg_queue.task_done()
-                return batch, count
+                return None
             sample_weight = float(negative_downsample_rate)
         n = user_action_sequence.num_rows
         weight_array = pa.array([sample_weight] * n, type=pa.float32())
@@ -420,33 +592,202 @@ async def _deserialize_messages(
             weight_array,
         )
 
-    batch.append((user_action_sequence, partition, offset))
-    msg_queue.task_done()
-
-    if len(batch) < batch_size:
-        return batch, count
-
-    while example_queue.full():
-        await asyncio.sleep(0.1)
-
-    records: list[pa.RecordBatch] = []
-    offsets: dict[int, int] = {}
-    for record, tp, ts in batch:
-        offsets[tp] = max(offsets.get(tp, ts), ts)
-        records.append(record)
-
-    batch_processed = (post_process_fn(records), offsets)
-    example_queue.put_nowait(batch_processed)
-    return [], count
+    return user_action_sequence
 
 
-class _ExecutorShutdown(Exception):
-    pass
+async def _deserialize_messages(
+    batch: list[tuple[pa.RecordBatch, int, int]],
+    batch_size: int,
+    msg_queue: asyncio.Queue[ConsumerRecord],
+    example_queue: queue.Queue[KafkaQueueItem],
+    post_process_fn: Callable[[list[pa.RecordBatch]], RecsysFeaturesBatch],
+    count: int = 0,
+    sampling_factor: int = 1,
+    negative_downsample_rate: int = 1,
+    positive_action_indices: tuple[int, ...] = (),
+    builder: "_OrderedBatchBuilder | None" = None,
+) -> tuple[list[tuple[pa.RecordBatch, int, int]], int]:
+    messages = [await msg_queue.get()]
+    while len(messages) < KAFKA_DECODE_CHUNK and not msg_queue.empty():
+        messages.append(msg_queue.get_nowait())
+
+    to_decode: list[ConsumerRecord] = []
+    for msg in messages:
+        count += 1
+        if count % sampling_factor != 0:
+            msg_queue.task_done()
+        else:
+            to_decode.append(msg)
+
+    if to_decode:
+        decoded, error = await asyncio.to_thread(
+            _decode_chunk, to_decode, negative_downsample_rate, positive_action_indices
+        )
+    else:
+        decoded, error = [], None
+
+    for msg, user_action_sequence in zip(to_decode, decoded):
+        if user_action_sequence is not None:
+            batch.append((user_action_sequence, msg.partition, msg.offset))
+        msg_queue.task_done()
+        if len(batch) < batch_size:
+            continue
+
+        records: list[pa.RecordBatch] = []
+        offsets: dict[int, int] = {}
+        for record, tp, ts in batch:
+            offsets[tp] = max(offsets.get(tp, ts), ts)
+            records.append(record)
+        batch = []
+
+        if builder is not None:
+            await builder.submit(records, offsets)
+        else:
+            while example_queue.full():
+                await asyncio.sleep(0.1)
+            example_queue.put_nowait((post_process_fn(records), offsets))
+    if error is not None:
+        raise error
+    return batch, count
+
+
+class _OrderedBatchBuilder:
+    def __init__(
+        self,
+        post_process_fn: Callable[[list[pa.RecordBatch]], RecsysFeaturesBatch],
+        example_queue: queue.Queue[KafkaQueueItem],
+        workers: int = KAFKA_BATCH_BUILD_WORKERS,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self._fn = post_process_fn
+        self._example_queue = example_queue
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            workers, thread_name_prefix="kafka-batch-build"
+        )
+        self._slots = asyncio.Semaphore(workers + 1)
+        self._pending: asyncio.Queue[tuple[asyncio.Future, dict[int, int]]] = asyncio.Queue(
+            maxsize=workers + 1
+        )
+        self._builds: set[concurrent.futures.Future] = set()
+        self._stopping = asyncio.create_task(_wait_for_stop(stop_event))
+        self._emitter = asyncio.create_task(self._emit_in_order())
+        self._closed = False
+
+    def raise_if_failed(self) -> None:
+        if self._emitter.done():
+            self._emitter.result()
+            raise RuntimeError("Kafka batch emitter stopped")
+
+    async def submit(self, records: list[pa.RecordBatch], offsets: dict[int, int]) -> None:
+        if self._closed:
+            raise RuntimeError("Kafka batch builder is closed")
+        slot = asyncio.create_task(self._slots.acquire())
+        enqueued = False
+        try:
+            await asyncio.wait(
+                {slot, self._emitter, self._stopping}, return_when=asyncio.FIRST_COMPLETED
+            )
+            self.raise_if_failed()
+            if self._stopping.done():
+                raise asyncio.CancelledError
+            if self._closed:
+                raise RuntimeError("Kafka batch builder is closed")
+            await slot
+            loop = asyncio.get_running_loop()
+            build = self._executor.submit(self._fn, records)
+            self._builds.add(build)
+
+            def finished(future):
+                try:
+                    loop.call_soon_threadsafe(self._builds.discard, future)
+                except RuntimeError:
+                    pass
+
+            build.add_done_callback(finished)
+            self._pending.put_nowait((asyncio.wrap_future(build), dict(offsets)))
+            enqueued = True
+        finally:
+            if not slot.done():
+                slot.cancel()
+            await asyncio.gather(slot, return_exceptions=True)
+            if not enqueued and not slot.cancelled() and slot.exception() is None:
+                self._slots.release()
+
+    async def _emit_in_order(self) -> None:
+        while True:
+            future, offsets = await self._pending.get()
+            try:
+                result = await future
+                while not self._stopping.done():
+                    try:
+                        self._example_queue.put_nowait((result, offsets))
+                        break
+                    except queue.Full:
+                        await asyncio.sleep(0.05)
+            finally:
+                self._pending.task_done()
+                self._slots.release()
+
+    async def close(self, *, drain: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        deadline = asyncio.get_running_loop().time() + KAFKA_SHUTDOWN_TIMEOUT_SECONDS
+        primary = sys.exception()
+        try:
+            if drain:
+                joined = asyncio.create_task(self._pending.join())
+                try:
+                    done, _ = await asyncio.wait(
+                        {joined, self._emitter, self._stopping},
+                        timeout=KAFKA_SHUTDOWN_TIMEOUT_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    self.raise_if_failed()
+                    if not done:
+                        rank_logger.error(
+                            "Kafka batch drain exceeded %.1f seconds",
+                            KAFKA_SHUTDOWN_TIMEOUT_SECONDS,
+                        )
+                finally:
+                    joined.cancel()
+                    await asyncio.gather(joined, return_exceptions=True)
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            primary.add_note(f"Kafka batch drain failed: {cleanup!r}")
+        finally:
+            self._emitter.cancel()
+            self._stopping.cancel()
+            await asyncio.gather(self._emitter, self._stopping, return_exceptions=True)
+            while not self._pending.empty():
+                future, _ = self._pending.get_nowait()
+                future.cancel()
+                if future.done() and not future.cancelled():
+                    future.exception()
+                self._pending.task_done()
+                self._slots.release()
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            builds = [asyncio.wrap_future(build) for build in self._builds]
+            if builds:
+                done, pending = await asyncio.wait(builds, timeout=remaining)
+                for future in done:
+                    if not future.cancelled():
+                        future.exception()
+                if pending:
+                    rank_logger.error(
+                        "Kafka batch shutdown left %d running builds after %.1f seconds",
+                        len(pending),
+                        KAFKA_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                for future in pending:
+                    future.cancel()
 
 
 async def deserialize_messages(
     msg_queue: asyncio.Queue[ConsumerRecord],
-    example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
+    example_queue: queue.Queue[KafkaQueueItem],
     batch_size: int,
     post_process_fn: Callable[[list[pa.RecordBatch]], RecsysFeaturesBatch],
     sampling_factor: int = 1,
@@ -464,8 +805,11 @@ async def deserialize_messages(
             "negative_downsample_positive_action_indices must be non-empty "
             "when negative_downsample_rate > 1"
         )
-    while not (stop_event and stop_event.is_set()):
-        try:
+    builder = _OrderedBatchBuilder(post_process_fn, example_queue, stop_event=stop_event)
+
+    async def read_messages() -> None:
+        nonlocal batch, count
+        while not (stop_event and stop_event.is_set()):
             batch, count = await _deserialize_messages(
                 batch,
                 batch_size,
@@ -476,16 +820,43 @@ async def deserialize_messages(
                 sampling_factor,
                 negative_downsample_rate,
                 positive_action_indices,
+                builder=builder,
             )
-        except _ExecutorShutdown:
-            rank_logger.info(
-                "Kafka deserializer stopping: ThreadPoolExecutor shut down (process exiting)"
-            )
-            return
-        except Exception as e:
-            rank_logger.info(f"Error in deserialization loop at offset {e}")
-            traceback.print_exc()
-            raise
+
+    async def wait_for_stop() -> None:
+        while not (stop_event and stop_event.is_set()):
+            await asyncio.sleep(0.05)
+
+    read_task = asyncio.create_task(read_messages())
+    stop_task = asyncio.create_task(wait_for_stop())
+    try:
+        done, _ = await asyncio.wait(
+            {read_task, stop_task, builder._emitter}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            task.result()
+    finally:
+        primary = sys.exception()
+        read_task.cancel()
+        stop_task.cancel()
+        await asyncio.gather(read_task, stop_task, return_exceptions=True)
+        closing = asyncio.create_task(
+            builder.close(drain=primary is None and not (stop_event and stop_event.is_set()))
+        )
+        try:
+            while not closing.done():
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    if primary is None:
+                        primary = sys.exception()
+            closing.result()
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            primary.add_note(f"Kafka batch cleanup failed: {cleanup!r}")
+        if primary is not None and sys.exception() is None:
+            raise primary
 
 
 async def force_kafka_metadata_update(
@@ -515,15 +886,17 @@ async def discover_partition_count(
     sasl_plain_username: str,
     sasl_plain_password: str,
     auth: KafkaAuth | None = None,
+    stop_event: threading.Event | None = None,
 ) -> int:
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
-    consumer = AIOKafkaConsumer(
+    consumer_factory = partial(
+        AIOKafkaConsumer,
         bootstrap_servers=bootstrap_servers,
         **auth.consumer_kwargs(),
         request_timeout_ms=30000,
     )
-    await consumer.start()
+    consumer = await _start_consumer_with_retry(consumer_factory, stop_event)
     try:
         partitions = consumer.partitions_for_topic(topic)
         if not partitions:
@@ -537,10 +910,11 @@ async def discover_partition_count(
         rank_logger.info(f"Discovered {count} partitions for topic '{topic}' from Kafka metadata.")
         return count
     finally:
-        try:
-            await consumer.stop()
-        except asyncio.CancelledError:
-            pass
+        await _stop_discovery_consumer(consumer)
+
+
+async def _stop_discovery_consumer(consumer: AIOKafkaConsumer) -> None:
+    await _stop_consumer(consumer, discovery=True)
 
 
 def _range_partitions(total_partitions: int, shard_index: int, num_shards: int) -> list[int]:
@@ -551,6 +925,158 @@ def _range_partitions(total_partitions: int, shard_index: int, num_shards: int) 
     start = shard_index * total_partitions // num_shards
     end = (shard_index + 1) * total_partitions // num_shards
     return list(range(start, end))
+
+
+@dataclasses.dataclass(frozen=True)
+class KafkaSourceIdentity:
+    bootstrap_servers: str
+    topic_name: str
+    num_partitions: int
+
+    def __post_init__(self) -> None:
+        if not self.bootstrap_servers or not self.topic_name:
+            raise ValueError("Kafka source requires broker and topic identity")
+        if type(self.num_partitions) is not int or self.num_partitions <= 0:
+            raise ValueError("Kafka source num_partitions must be a positive integer")
+
+
+def validate_offset_map[K, V](
+    offsets: Mapping[K, V],
+    *,
+    num_partitions: int | None = None,
+    required_partitions: set[int] | None = None,
+    offset_ranges: Mapping[int, tuple[int, int]] | None = None,
+    max_offset: int = 2**31 - 1,
+) -> dict[int, int]:
+    normalized: dict[int, int] = {}
+    for partition, offset in offsets.items():
+        if isinstance(partition, bool) or not isinstance(partition, Integral):
+            raise ValueError(f"Invalid Kafka partition {partition!r}")
+        partition_id = int(partition)
+        if partition_id < 0:
+            raise ValueError(f"Invalid Kafka partition {partition!r}")
+        if num_partitions is not None and partition_id >= num_partitions:
+            raise ValueError(f"Kafka partition {partition} outside source partition range")
+        if isinstance(offset, bool) or not isinstance(offset, Integral):
+            raise ValueError(
+                f"Kafka offset {offset!r} for partition {partition} must be an integer"
+            )
+        offset_value = int(offset)
+        if not 0 <= offset_value <= max_offset:
+            raise ValueError(
+                f"Kafka offset {offset!r} for partition {partition} outside range [0, {max_offset}]"
+            )
+        normalized[partition_id] = offset_value
+    if required_partitions is not None and set(normalized) != required_partitions:
+        raise ValueError("Kafka offset keyset differs from required partitions")
+    if offset_ranges is not None:
+        if set(offset_ranges) != set(normalized):
+            raise ValueError("Kafka retained-range keyset differs from offsets")
+        for partition, (begin, end) in offset_ranges.items():
+            if type(begin) is not int or type(end) is not int or not 0 <= begin < end:
+                raise ValueError(f"Invalid retained range for Kafka partition {partition}")
+            if not begin <= normalized[partition] < end:
+                raise ValueError(f"Kafka offset for partition {partition} outside retained range")
+    return normalized
+
+
+def validate_seek_options(
+    seek_to_timestamp_ms: int | None, seek_to_offset: Mapping[int, int] | None
+) -> None:
+    if seek_to_timestamp_ms is not None and seek_to_offset is not None:
+        raise ValueError("seek_to_timestamp_ms and seek_to_offset cannot both be set")
+    if seek_to_offset is not None:
+        validate_offset_map(seek_to_offset, max_offset=2**63 - 1)
+
+
+async def _native_bootstrap_positions(
+    consumer: AIOKafkaConsumer,
+    assigned_partitions: list[TopicPartition],
+    seek_to_timestamp_ms: int | None,
+    seek_to_offset: dict[int, int] | None,
+) -> dict[int, int]:
+    if len({tp.partition for tp in assigned_partitions}) != len(assigned_partitions):
+        raise ValueError("Duplicate native Kafka partition assignment")
+    if len({tp.topic for tp in assigned_partitions}) > 1:
+        raise ValueError("Mixed native Kafka topic assignment")
+    required = {tp.partition for tp in assigned_partitions}
+    if not required:
+        return {}
+    if seek_to_timestamp_ms is not None:
+        resolved = await consumer.offsets_for_times(
+            {tp: seek_to_timestamp_ms for tp in assigned_partitions}
+        )
+        if set(resolved) != set(assigned_partitions) or any(
+            resolved[tp] is None for tp in assigned_partitions
+        ):
+            raise ValueError("Missing Kafka timestamp bootstrap positions")
+        offsets = {tp.partition: resolved[tp].offset for tp in assigned_partitions}
+    elif seek_to_offset is not None:
+        validate_offset_map(seek_to_offset)
+        if not required.issubset(seek_to_offset):
+            raise ValueError("Missing Kafka native restart positions")
+        offsets = {partition: seek_to_offset[partition] for partition in required}
+    else:
+        raise ValueError("Native Kafka bootstrap requires explicit timestamp or offset positions")
+    offsets = validate_offset_map(offsets, required_partitions=required)
+    for tp in assigned_partitions:
+        consumer.seek(tp, offsets[tp.partition])
+    return offsets
+
+
+async def _publish_bootstrap_offsets(
+    output: queue.Queue[KafkaQueueItem],
+    event: KafkaBootstrapOffsets,
+    stop_event: threading.Event | None,
+) -> None:
+    while not (stop_event and stop_event.is_set()):
+        try:
+            output.put_nowait(event)
+            return
+        except queue.Full:
+            await asyncio.sleep(0.05)
+    raise asyncio.CancelledError
+
+
+class _KafkaBootstrapFence:
+    topic: str
+    partitions: set[int]
+    output: queue.Queue[KafkaQueueItem]
+    stop_event: threading.Event | None
+    ready: asyncio.Event
+
+    def __init__(
+        self,
+        topic: str,
+        partitions: set[int],
+        output: queue.Queue[KafkaQueueItem],
+        stop_event: threading.Event | None,
+    ) -> None:
+        self.topic = topic
+        self.partitions = partitions
+        self.output = output
+        self.stop_event = stop_event
+        self.positions: dict[int, int] = {}
+        self.ready = asyncio.Event()
+
+    async def report(self, assigned: list[TopicPartition], offsets: dict[int, int]) -> None:
+        if any(tp.topic != self.topic for tp in assigned):
+            raise ValueError("Kafka bootstrap topic mismatch")
+        required = {tp.partition for tp in assigned}
+        if len(required) != len(assigned):
+            raise ValueError("Duplicate Kafka bootstrap assignment")
+        offsets = validate_offset_map(offsets, required_partitions=required)
+        if not required.issubset(self.partitions) or required & self.positions.keys():
+            raise ValueError("Duplicate or unexpected Kafka bootstrap report")
+        self.positions.update(offsets)
+        if self.positions.keys() == self.partitions:
+            await _publish_bootstrap_offsets(
+                self.output,
+                KafkaBootstrapOffsets(self.topic, tuple(self.positions.items())),
+                self.stop_event,
+            )
+            self.ready.set()
+        await self.ready.wait()
 
 
 def _subsample_partitions(partition_ids: list[int], partition_sampling_factor: int) -> list[int]:
@@ -572,11 +1098,11 @@ async def handle_topic_offset(
     reset_to_latest: bool,
     seek_to_timestamp_ms: int | None = None,
     seek_to_offset: dict[int, int] | None = None,
+    bootstrap_output: queue.Queue[KafkaQueueItem] | None = None,
+    stop_event: threading.Event | None = None,
     partition_sampling_factor: int = 1,
 ) -> list[TopicPartition]:
-    assert seek_to_timestamp_ms is None or seek_to_offset is None, (
-        "seek_to_timestamp_ms and seek_to_offset cannot both be set"
-    )
+    validate_seek_options(seek_to_timestamp_ms, seek_to_offset)
     assert not (seek_to_timestamp_ms is not None and reset_to_latest), (
         "seek_to_timestamp_ms and reset_to_latest cannot both be set"
     )
@@ -599,7 +1125,13 @@ async def handle_topic_offset(
         )
 
     total_partitions = len(partitions)
+    if bootstrap_output is not None and partitions != set(range(total_partitions)):
+        raise ValueError("Native Kafka partition metadata must be a complete range")
 
+    if bootstrap_output is not None and partition_sampling_factor != 1:
+        raise ValueError("Native Kafka requires unsampled partitions")
+    if bootstrap_output is not None and num_shards > total_partitions:
+        raise ValueError("Native Kafka requires at least one partition per shard")
     partition_ids = _subsample_partitions(
         _range_partitions(total_partitions, shard_index, num_shards), partition_sampling_factor
     )
@@ -619,7 +1151,14 @@ async def handle_topic_offset(
         f"{len(assigned_partitions)} of {total_partitions} partitions"
         + (f" ({partition_ids[0]}..{partition_ids[-1]})" if partition_ids else "")
     )
-    if reset_to_latest:
+    if bootstrap_output is not None:
+        offsets = await _native_bootstrap_positions(
+            consumer, assigned_partitions, seek_to_timestamp_ms, seek_to_offset
+        )
+        await _publish_bootstrap_offsets(
+            bootstrap_output, KafkaBootstrapOffsets(topic, tuple(offsets.items())), stop_event
+        )
+    elif reset_to_latest:
         for tp in assigned_partitions:
             await consumer.seek_to_end(tp)
             rank_logger.info(f"Reset partition {tp} to latest offset")
@@ -648,13 +1187,14 @@ async def seek_to_timestamp(
 async def seek_consumer_to_offset(
     consumer: AIOKafkaConsumer, assigned_partitions: list[TopicPartition], offsets: dict[int, int]
 ):
+    validate_offset_map(offsets, max_offset=2**63 - 1)
+    missing = {tp.partition for tp in assigned_partitions} - set(offsets)
+    if missing:
+        raise ValueError(f"No Kafka offset found for assigned partitions {sorted(missing)}")
     for tp in assigned_partitions:
-        if tp.partition in offsets:
-            offset = offsets[tp.partition]
-            rank_logger.info(f"Seeking to offset {offset} for {tp}")
-            consumer.seek(tp, offset)
-        else:
-            raise ValueError(f"No offset found for {tp} at timestamp {offsets}")
+        offset = offsets[tp.partition]
+        rank_logger.info(f"Seeking to offset {offset} for {tp}")
+        consumer.seek(tp, offset)
 
 
 class PartitionLagTracker:
@@ -842,12 +1382,15 @@ async def _consumer_poll_loop(
     metric_attrs: dict[str, str],
     reset_to_latest_event: asyncio.Event | None = None,
     auth: KafkaAuth | None = None,
+    bootstrap_fence: _KafkaBootstrapFence | None = None,
 ) -> None:
+    validate_seek_options(seek_to_timestamp_ms, seek_to_offset)
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
     consumer_metric_attrs = {**metric_attrs, "consumer_index": str(consumer_index)}
 
-    consumer = AIOKafkaConsumer(
+    consumer_factory = partial(
+        AIOKafkaConsumer,
         bootstrap_servers=bootstrap_servers,
         group_id=group_id,
         group_instance_id=group_instance_id,
@@ -865,7 +1408,7 @@ async def _consumer_poll_loop(
         rebalance_timeout_ms=KAFKA_REBALANCE_TIMEOUT,
     )
 
-    async with consumer:
+    async with _started(consumer_factory, stop_event) as consumer:
         consumer.assign(assigned_partitions)
         rank_logger.info(
             f"Consumer c{consumer_index} assigned "
@@ -874,20 +1417,19 @@ async def _consumer_poll_loop(
             f"group_instance_id={group_instance_id}"
         )
 
-        if reset_to_latest:
+        if bootstrap_fence is not None:
+            offsets = await _native_bootstrap_positions(
+                consumer, assigned_partitions, seek_to_timestamp_ms, seek_to_offset
+            )
+            await bootstrap_fence.report(assigned_partitions, offsets)
+        elif reset_to_latest:
             for tp in assigned_partitions:
                 await consumer.seek_to_end(tp)
                 rank_logger.info(f"Consumer c{consumer_index}: reset {tp} to latest")
         elif seek_to_timestamp_ms is not None:
             await seek_to_timestamp(consumer, assigned_partitions, seek_to_timestamp_ms)
         elif seek_to_offset is not None:
-            for tp in assigned_partitions:
-                if tp.partition in seek_to_offset:
-                    consumer.seek(tp, seek_to_offset[tp.partition])
-                    rank_logger.info(
-                        f"Consumer c{consumer_index}: seeked {tp} to offset "
-                        f"{seek_to_offset[tp.partition]}"
-                    )
+            await seek_consumer_to_offset(consumer, assigned_partitions, seek_to_offset)
 
         if drop_controller is not None:
             rank_logger.info(
@@ -925,7 +1467,9 @@ async def _consumer_poll_loop(
                 _last_reset_ts = sentinel_mtime
                 should_reset = True
             if should_reset:
-                await _seek_all_to_end(consumer, assigned_partitions)
+                await _apply_external_reset(
+                    consumer, assigned_partitions, native=bootstrap_fence is not None
+                )
 
             try:
                 poll_start = time.time()
@@ -949,7 +1493,11 @@ async def _consumer_poll_loop(
                 poll_count += 1
                 if poll_count % FETCH_END_OFFSETS_INTERVAL_IN_CONSUMER_ROUNDS == 0:
                     await _fetch_and_update_partition_lag(
-                        consumer, assigned_partitions, lag_tracker, drop_controller, metric_attrs
+                        consumer,
+                        assigned_partitions,
+                        lag_tracker,
+                        drop_controller,
+                        metric_attrs,
                     )
 
                 dropped_in_poll = 0
@@ -971,7 +1519,7 @@ async def _consumer_poll_loop(
                         drop_controller.record_dropped(partition, count, metric_attrs=metric_attrs)
 
                 if total_fetched % GC_INTERVAL == 0:
-                    gc.collect()
+                    _maybe_periodic_gc()
 
             except asyncio.TimeoutError:
                 continue
@@ -1023,7 +1571,7 @@ async def _round_robin_merger(
 async def _consume_multi_consumer(
     topic: str,
     group_id: str,
-    example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
+    example_queue: queue.Queue[KafkaQueueItem],
     batch_size: int,
     shard_index: int,
     num_shards: int,
@@ -1047,15 +1595,17 @@ async def _consume_multi_consumer(
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
     partition_sampling_factor: int = 1,
     auth: KafkaAuth | None = None,
+    native_bootstrap: bool = False,
 ) -> None:
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
-    discovery_consumer = AIOKafkaConsumer(
+    discovery_factory = partial(
+        AIOKafkaConsumer,
         bootstrap_servers=bootstrap_servers,
         **auth.consumer_kwargs(),
         request_timeout_ms=30000,
     )
-    await discovery_consumer.start()
+    discovery_consumer = await _start_consumer_with_retry(discovery_factory, stop_event)
     try:
         all_partitions = discovery_consumer.partitions_for_topic(topic)
         if not all_partitions:
@@ -1068,12 +1618,15 @@ async def _consume_multi_consumer(
                 f"No partitions found for topic {topic}, available topics: {available}"
             )
     finally:
-        try:
-            await discovery_consumer.stop()
-        except asyncio.CancelledError:
-            pass
+        await _stop_discovery_consumer(discovery_consumer)
 
     total_partitions = len(all_partitions)
+    if native_bootstrap and all_partitions != set(range(total_partitions)):
+        raise ValueError("Native Kafka partition metadata must be a complete range")
+    if native_bootstrap and partition_sampling_factor != 1:
+        raise ValueError("Native Kafka requires unsampled partitions")
+    if native_bootstrap and num_shards > total_partitions:
+        raise ValueError("Native Kafka requires at least one partition per shard")
     partition_ids = _subsample_partitions(
         _range_partitions(total_partitions, shard_index, num_shards), partition_sampling_factor
     )
@@ -1090,6 +1643,17 @@ async def _consume_multi_consumer(
         + (f" ({partition_ids[0]}..{partition_ids[-1]})" if partition_ids else "")
     )
 
+    if not shard_partitions:
+        if native_bootstrap:
+            await _publish_bootstrap_offsets(
+                example_queue, KafkaBootstrapOffsets(topic, ()), stop_event
+            )
+        return
+    bootstrap_fence = (
+        _KafkaBootstrapFence(topic, set(partition_ids), example_queue, stop_event)
+        if native_bootstrap
+        else None
+    )
     consumer_partition_groups = [[tp] for tp in shard_partitions]
     num_consumers = len(consumer_partition_groups)
     for ci, parts in enumerate(consumer_partition_groups):
@@ -1145,6 +1709,7 @@ async def _consume_multi_consumer(
                 drop_controller=drop_controller,
                 metric_attrs=metric_attrs,
                 reset_to_latest_event=per_consumer_reset_events[ci],
+                bootstrap_fence=bootstrap_fence,
             )
         )
         consumer_tasks.append(task)
@@ -1215,6 +1780,15 @@ def _check_reset_sentinel(last_reset_ts: float) -> float | None:
     return None
 
 
+async def _apply_external_reset(
+    consumer: AIOKafkaConsumer, assigned_partitions: list[TopicPartition], *, native: bool
+) -> None:
+    if native:
+        rank_logger.error("Ignoring external Kafka reset to preserve the native bootstrap frontier")
+        return
+    await _seek_all_to_end(consumer, assigned_partitions)
+
+
 async def _seek_all_to_end(
     consumer: AIOKafkaConsumer,
     assigned_partitions: list[TopicPartition],
@@ -1230,7 +1804,7 @@ async def _seek_all_to_end(
 async def consume_messages(
     topic: str,
     group_id: str,
-    example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
+    example_queue: queue.Queue[KafkaQueueItem],
     batch_size: int,
     shard_index: int,
     num_shards: int,
@@ -1254,8 +1828,35 @@ async def consume_messages(
     reset_to_latest_event: threading.Event | None = None,
     negative_downsample_rate: int = 1,
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
+    fresh_training_bootstrap: bool = False,
+    native_checkpoint_restart: bool = False,
     partition_sampling_factor: int = 1,
 ):
+    validate_seek_options(seek_to_timestamp_ms, seek_to_offset)
+    if type(fresh_training_bootstrap) is not bool or type(native_checkpoint_restart) is not bool:
+        raise ValueError("Native Kafka bootstrap flags must be exact Booleans")
+    native_bootstrap = fresh_training_bootstrap or native_checkpoint_restart
+    if native_bootstrap:
+        if partition_sampling_factor != 1:
+            raise ValueError("Native Kafka requires unsampled partitions")
+        if (
+            type(shard_index) is not int
+            or type(num_shards) is not int
+            or not 0 <= shard_index < num_shards
+        ):
+            raise ValueError("Invalid native Kafka shard assignment")
+        if (fresh_training_bootstrap and native_checkpoint_restart) or reset_to_latest:
+            raise ValueError("Conflicting native Kafka bootstrap modes")
+        if auto_offset_reset != "none":
+            raise ValueError("Native Kafka bootstrap requires disabled offset fallback")
+        if fresh_training_bootstrap and (
+            type(seek_to_timestamp_ms) is not int or seek_to_timestamp_ms <= 0
+        ):
+            raise ValueError("Fresh Kafka bootstrap requires a positive timestamp")
+        if native_checkpoint_restart and (
+            seek_to_offset is None or seek_to_timestamp_ms is not None
+        ):
+            raise ValueError("Native Kafka restart requires only restored offsets")
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
     metric_attrs = {
         "training_name": training_name,
@@ -1292,6 +1893,7 @@ async def consume_messages(
             reset_to_latest_event=reset_to_latest_event,
             negative_downsample_rate=negative_downsample_rate,
             negative_downsample_positive_action_indices=negative_downsample_positive_action_indices,
+            native_bootstrap=native_bootstrap,
             partition_sampling_factor=partition_sampling_factor,
         )
         return
@@ -1299,7 +1901,8 @@ async def consume_messages(
     group_instance_id = f"shard_{shard_index}_of_{num_shards}"
     total_fetched_batch_count = 0
 
-    consumer = AIOKafkaConsumer(
+    consumer_factory = partial(
+        AIOKafkaConsumer,
         bootstrap_servers=bootstrap_servers,
         group_id=group_id,
         group_instance_id=group_instance_id,
@@ -1319,6 +1922,161 @@ async def consume_messages(
 
     message_queue: asyncio.Queue[ConsumerRecord] = asyncio.Queue(maxsize=MESSAGE_QUEUE_SIZE)
 
+    async def poll_messages() -> None:
+        nonlocal total_fetched_batch_count
+        async with _started(consumer_factory, stop_event) as consumer:
+            rank_logger.info(
+                f"Consumer started, topic: {topic}, group_id: {group_id}, group_instance_id: {group_instance_id}, listening for messages..."
+            )
+
+            poll_count = 0
+
+            assigned_partitions: list[TopicPartition] = await handle_topic_offset(
+                consumer=consumer,
+                topic=topic,
+                shard_index=shard_index,
+                num_shards=num_shards,
+                reset_to_latest=reset_to_latest,
+                seek_to_timestamp_ms=seek_to_timestamp_ms,
+                seek_to_offset=seek_to_offset,
+                bootstrap_output=example_queue if native_bootstrap else None,
+                stop_event=stop_event,
+                partition_sampling_factor=partition_sampling_factor,
+            )
+            if not assigned_partitions:
+                return
+            assigned_partitions_array_index = 0
+            assigned_partitions_array_len = len(assigned_partitions)
+
+            if drop_controller is not None:
+                rank_logger.info(
+                    f"Drop mode enabled, high watermark: {drop_controller.high_watermark_offsets} offsets, "
+                    f"low watermark: {drop_controller.low_watermark_offsets} offsets"
+                )
+                for partition in assigned_partitions:
+                    drop_controller.record_dropped(
+                        partition.partition, 0, metric_attrs=metric_attrs
+                    )
+                    part_attrs: dict[str, str] = {}
+                    if metric_attrs is not None:
+                        part_attrs.update(metric_attrs)
+                    part_attrs["partition"] = str(partition.partition)
+                    if _consumer_drop_mode_active is not None:
+                        _consumer_drop_mode_active.add(0, part_attrs)
+                    if _consumer_end_offsets_polled_count is not None:
+                        _consumer_end_offsets_polled_count.add(0, part_attrs)
+            else:
+                rank_logger.info("Drop mode disabled (lag tracking still active)")
+
+            effective_lag_tracker = lag_tracker or PartitionLagTracker()
+
+            _last_reset_ts = time.time()
+
+            while not (stop_event and stop_event.is_set()):
+                should_reset = False
+
+                if reset_to_latest_event is not None and reset_to_latest_event.is_set():
+                    rank_logger.info("Live reset triggered via HTTP endpoint")
+                    reset_to_latest_event.clear()
+                    should_reset = True
+
+                sentinel_mtime = _check_reset_sentinel(_last_reset_ts)
+                if sentinel_mtime is not None:
+                    rank_logger.info(
+                        "Live reset triggered via sentinel file (mtime=%.3f, last_reset=%.3f)",
+                        sentinel_mtime,
+                        _last_reset_ts,
+                    )
+                    _last_reset_ts = sentinel_mtime
+                    should_reset = True
+
+                if should_reset:
+                    await _apply_external_reset(
+                        consumer, assigned_partitions, native=native_bootstrap
+                    )
+
+                rank_logger.info(f"{message_queue.qsize()=} | {example_queue.qsize()=}")
+
+                try:
+                    poll_start = time.time()
+                    if per_partition_poll:
+                        messages: Any = await consumer.getmany(
+                            assigned_partitions[assigned_partitions_array_index],
+                            timeout_ms=KAFKA_PER_PARTITION_POLL_TIMEOUT,
+                        )
+                        assigned_partitions_array_index = (
+                            assigned_partitions_array_index + 1
+                        ) % assigned_partitions_array_len
+                    else:
+                        messages = await consumer.getmany(
+                            timeout_ms=KAFKA_POLL_TIMEOUT,
+                        )
+                    poll_latency = time.time() - poll_start
+
+                    if _consumer_poll_latency is not None:
+                        _consumer_poll_latency.record(poll_latency, metric_attrs)
+                except asyncio.TimeoutError:
+                    rank_logger.info("Polling timeout")
+                    continue
+                except Exception as e:
+                    rank_logger.error(f"Error while polling: {str(e)}")
+                    raise
+                else:
+                    if not messages:
+                        if _consumer_messages_per_poll is not None:
+                            _consumer_messages_per_poll.record(0, metric_attrs)
+                        rank_logger.info("Nothing received")
+                        continue
+
+                    total_messages = sum(len(msg_list) for msg_list in messages.values())
+                    if _consumer_messages_per_poll is not None:
+                        _consumer_messages_per_poll.record(total_messages, metric_attrs)
+
+                    total_fetched_batch_count += 1
+
+                effective_lag_tracker.record_consumed_offsets(messages)
+                poll_count += 1
+                if poll_count % FETCH_END_OFFSETS_INTERVAL_IN_CONSUMER_ROUNDS == 0:
+                    await _fetch_and_update_partition_lag(
+                        consumer,
+                        assigned_partitions,
+                        effective_lag_tracker,
+                        drop_controller,
+                        metric_attrs,
+                    )
+
+                dropped_in_poll = 0
+
+                dropped_by_partition: dict[int, int] = {}
+                for _, msg_list in messages.items():
+                    for msg in msg_list:
+                        if drop_controller is not None and drop_controller.should_drop_message(
+                            msg.partition, msg.offset
+                        ):
+                            dropped_in_poll += 1
+                            dropped_by_partition[msg.partition] = (
+                                dropped_by_partition.get(msg.partition, 0) + 1
+                            )
+                            continue
+                        await message_queue.put(msg)
+
+                if drop_controller is not None and dropped_in_poll > 0:
+                    for partition, count in dropped_by_partition.items():
+                        drop_controller.record_dropped(partition, count, metric_attrs=metric_attrs)
+                    rank_logger.debug(
+                        f"Dropped {dropped_in_poll}/{total_messages} messages due to lag; "
+                        f"partitions with drop: {sorted(dropped_by_partition.keys())}, "
+                        f"high_watermark={drop_controller.high_watermark_offsets} offsets, "
+                        f"low_watermark={drop_controller.low_watermark_offsets} offsets"
+                    )
+
+                if total_fetched_batch_count % GC_INTERVAL == 0:
+                    _maybe_periodic_gc()
+
+    async def wait_for_stop() -> None:
+        while not (stop_event and stop_event.is_set()):
+            await asyncio.sleep(0.5)
+
     deserialization_task = asyncio.create_task(
         deserialize_messages(
             message_queue,
@@ -1331,152 +2089,19 @@ async def consume_messages(
             negative_downsample_positive_action_indices=negative_downsample_positive_action_indices,
         )
     )
-
-    async with consumer:
-        rank_logger.info(
-            f"Consumer started, topic: {topic}, group_id: {group_id}, group_instance_id: {group_instance_id}, listening for messages..."
-        )
-
-        poll_count = 0
-
-        assigned_partitions: list[TopicPartition] = await handle_topic_offset(
-            consumer=consumer,
-            topic=topic,
-            shard_index=shard_index,
-            num_shards=num_shards,
-            reset_to_latest=reset_to_latest,
-            seek_to_timestamp_ms=seek_to_timestamp_ms,
-            seek_to_offset=seek_to_offset,
-            partition_sampling_factor=partition_sampling_factor,
-        )
-        assigned_partitions_array_index = 0
-        assigned_partitions_array_len = len(assigned_partitions)
-
-        if drop_controller is not None:
-            rank_logger.info(
-                f"Drop mode enabled, high watermark: {drop_controller.high_watermark_offsets} offsets, "
-                f"low watermark: {drop_controller.low_watermark_offsets} offsets"
-            )
-            for partition in assigned_partitions:
-                drop_controller.record_dropped(partition.partition, 0, metric_attrs=metric_attrs)
-                part_attrs: dict[str, str] = {}
-                if metric_attrs is not None:
-                    part_attrs.update(metric_attrs)
-                part_attrs["partition"] = str(partition.partition)
-                if _consumer_drop_mode_active is not None:
-                    _consumer_drop_mode_active.add(0, part_attrs)
-                if _consumer_end_offsets_polled_count is not None:
-                    _consumer_end_offsets_polled_count.add(0, part_attrs)
-        else:
-            rank_logger.info("Drop mode disabled (lag tracking still active)")
-
-        effective_lag_tracker = lag_tracker or PartitionLagTracker()
-
-        _last_reset_ts = time.time()
-
-        while not (stop_event and stop_event.is_set()):
-            should_reset = False
-
-            if reset_to_latest_event is not None and reset_to_latest_event.is_set():
-                rank_logger.info("Live reset triggered via HTTP endpoint")
-                reset_to_latest_event.clear()
-                should_reset = True
-
-            sentinel_mtime = _check_reset_sentinel(_last_reset_ts)
-            if sentinel_mtime is not None:
-                rank_logger.info(
-                    "Live reset triggered via sentinel file (mtime=%.3f, last_reset=%.3f)",
-                    sentinel_mtime,
-                    _last_reset_ts,
-                )
-                _last_reset_ts = sentinel_mtime
-                should_reset = True
-
-            if should_reset:
-                await _seek_all_to_end(consumer, assigned_partitions)
-
-            rank_logger.info(f"{message_queue.qsize()=} | {example_queue.qsize()=}")
-
-            try:
-                poll_start = time.time()
-                if per_partition_poll:
-                    messages: Any = await consumer.getmany(
-                        assigned_partitions[assigned_partitions_array_index],
-                        timeout_ms=KAFKA_PER_PARTITION_POLL_TIMEOUT,
-                    )
-                    assigned_partitions_array_index = (
-                        assigned_partitions_array_index + 1
-                    ) % assigned_partitions_array_len
-                else:
-                    messages = await consumer.getmany(
-                        timeout_ms=KAFKA_POLL_TIMEOUT,
-                    )
-                poll_latency = time.time() - poll_start
-
-                if _consumer_poll_latency is not None:
-                    _consumer_poll_latency.record(poll_latency, metric_attrs)
-            except asyncio.TimeoutError:
-                rank_logger.info("Polling timeout")
-                continue
-            except Exception as e:
-                rank_logger.error(f"Error while polling: {str(e)}")
-                raise
-            else:
-                if not messages:
-                    if _consumer_messages_per_poll is not None:
-                        _consumer_messages_per_poll.record(0, metric_attrs)
-                    rank_logger.info("Nothing received")
-                    continue
-
-                total_messages = sum(len(msg_list) for msg_list in messages.values())
-                if _consumer_messages_per_poll is not None:
-                    _consumer_messages_per_poll.record(total_messages, metric_attrs)
-
-                total_fetched_batch_count += 1
-
-            effective_lag_tracker.record_consumed_offsets(messages)
-            poll_count += 1
-            if poll_count % FETCH_END_OFFSETS_INTERVAL_IN_CONSUMER_ROUNDS == 0:
-                await _fetch_and_update_partition_lag(
-                    consumer,
-                    assigned_partitions,
-                    effective_lag_tracker,
-                    drop_controller,
-                    metric_attrs,
-                )
-
-            dropped_in_poll = 0
-
-            dropped_by_partition: dict[int, int] = {}
-            for _, msg_list in messages.items():
-                for msg in msg_list:
-                    if drop_controller is not None and drop_controller.should_drop_message(
-                        msg.partition, msg.offset
-                    ):
-                        dropped_in_poll += 1
-                        dropped_by_partition[msg.partition] = (
-                            dropped_by_partition.get(msg.partition, 0) + 1
-                        )
-                        continue
-                    await message_queue.put(msg)
-
-            if drop_controller is not None and dropped_in_poll > 0:
-                for partition, count in dropped_by_partition.items():
-                    drop_controller.record_dropped(partition, count, metric_attrs=metric_attrs)
-                rank_logger.debug(
-                    f"Dropped {dropped_in_poll}/{total_messages} messages due to lag; "
-                    f"partitions with drop: {sorted(dropped_by_partition.keys())}, "
-                    f"high_watermark={drop_controller.high_watermark_offsets} offsets, "
-                    f"low_watermark={drop_controller.low_watermark_offsets} offsets"
-                )
-
-            if total_fetched_batch_count % GC_INTERVAL == 0:
-                gc.collect()
-
-    deserialization_task.cancel()
+    poll_task = asyncio.create_task(poll_messages())
+    stop_task = asyncio.create_task(wait_for_stop())
+    tasks = [deserialization_task, poll_task, stop_task]
     try:
-        await deserialization_task
-    except asyncio.CancelledError:
-        pass
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    raise error
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     rank_logger.info("Consumer stopped.")

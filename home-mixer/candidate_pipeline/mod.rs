@@ -10,11 +10,15 @@ use std::sync::Arc;
 use crate::clients::author_brand_safety_client::{
     AuthorBrandSafetyClient, ProdAuthorBrandSafetyClient,
 };
-use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PhoenixPredictionClient;
+use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
+    PhoenixPredictionClient, PhoenixProduct,
+};
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
+use xai_candidate_pipeline::component_library::clients::redis_client::RedisClient;
 use xai_candidate_pipeline::component_library::clients::{
     build_phoenix_xds_prediction_client, build_phoenix_xds_retrieval_client_boxed,
 };
+use xai_redis_client::{XdsRedisClient, XdsRedisConfig};
 
 pub use xai_candidate_pipeline::component_library::clients::{PhoenixXdsConfig, XdsP2cConfig};
 
@@ -22,24 +26,24 @@ pub type VmRankerXdsConfig = XdsP2cConfig;
 
 pub(crate) async fn build_phoenix_xds_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixPredictionClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixPredictionClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_CLIENT
-        .get_or_init(|| build_phoenix_xds_prediction_client(config))
+        .get_or_init(|| build_phoenix_xds_prediction_client(config, PhoenixProduct::Home))
         .await
         .clone()
 }
 
 pub(crate) async fn build_phoenix_xds_retrieval_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_RETRIEVAL_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_RETRIEVAL_CLIENT
-        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config))
+        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config, PhoenixProduct::Home))
         .await
         .clone()
 }
@@ -94,6 +98,53 @@ async fn build_vm_ranker_xds_client_uncached(
         }
         None => None,
     }
+}
+
+const ATLA_PHOENIX_REQUEST_CACHE_EDS: &str = "xdstp://discovery-atla/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.candidates-inference-requests.prod.twemcache:redis";
+const PDXA_PHOENIX_REQUEST_CACHE_EDS: &str = "xdstp://discovery-pdxa/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.candidates-inference-requests.prod.twemcache:redis";
+
+type SharedRedisClient = Arc<dyn RedisClient + Send + Sync>;
+
+const ATLA_TEACHER_CACHE_EDS: &str = "xdstp://discovery-atla/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.home-teacher-scores-cache.prod.cache:redis";
+
+pub(crate) async fn teacher_cache_redis_client() -> SharedRedisClient {
+    let client = XdsRedisClient::new(XdsRedisConfig {
+        eds_resource_name: ATLA_TEACHER_CACHE_EDS.into(),
+    })
+    .await
+    .expect("Failed to create xDS Redis client for atla teacher cache");
+    Arc::new(client)
+}
+
+async fn phoenix_request_cache_redis_client(
+    eds_resource_name: &str,
+    datacenter: &str,
+) -> SharedRedisClient {
+    let client = XdsRedisClient::new(XdsRedisConfig {
+        eds_resource_name: eds_resource_name.into(),
+    })
+    .await
+    .unwrap_or_else(|e| {
+        panic!("Failed to create xDS Redis client for {datacenter} phoenix cache: {e:?}")
+    });
+    Arc::new(client)
+}
+
+pub(crate) async fn shared_phoenix_request_cache_redis_clients(
+) -> (SharedRedisClient, SharedRedisClient) {
+    static PHOENIX_REQUEST_CACHE_REDIS_CLIENTS: tokio::sync::OnceCell<(
+        SharedRedisClient,
+        SharedRedisClient,
+    )> = tokio::sync::OnceCell::const_new();
+    PHOENIX_REQUEST_CACHE_REDIS_CLIENTS
+        .get_or_init(|| async {
+            tokio::join!(
+                phoenix_request_cache_redis_client(ATLA_PHOENIX_REQUEST_CACHE_EDS, "atla"),
+                phoenix_request_cache_redis_client(PDXA_PHOENIX_REQUEST_CACHE_EDS, "pdxa"),
+            )
+        })
+        .await
+        .clone()
 }
 
 pub(crate) async fn shared_author_brand_safety_client(

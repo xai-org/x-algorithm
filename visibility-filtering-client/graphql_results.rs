@@ -1,4 +1,5 @@
 use include_dir::{include_dir, Dir};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use xai_x_thrift::action::{self, Action, AnyInterstitial, MediaInterstitial};
@@ -41,10 +42,18 @@ static COPY: LazyLock<HashMap<String, HashMap<String, String>>> = LazyLock::new(
     by_lang
 });
 
+fn ascii_lowercase(lang: &str) -> Cow<'_, str> {
+    if lang.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(lang.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(lang)
+    }
+}
+
 pub fn translate(resname: &str, lang: &str) -> Option<&'static str> {
-    let lang = lang.to_ascii_lowercase();
+    let lang = ascii_lowercase(lang);
     let primary = lang.split(['-', '_']).next().unwrap_or(&lang);
-    [lang.as_str(), primary, DEFAULT_LANG]
+    [&*lang, primary, DEFAULT_LANG]
         .into_iter()
         .find_map(|l| COPY.get(l).and_then(|m| m.get(resname)))
         .map(String::as_str)
@@ -68,12 +77,20 @@ static RTL_LANGS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
 });
 
 pub fn is_rtl(lang: &str) -> bool {
-    let lang = lang.to_ascii_lowercase();
+    let lang = ascii_lowercase(lang);
     let primary = lang.split(['-', '_']).next().unwrap_or(&lang);
-    [lang.as_str(), primary]
+    [&*lang, primary]
         .into_iter()
         .find_map(|l| RTL_LANGS.get(l).copied())
         .unwrap_or(false)
+        || icu_rtl(primary)
+}
+
+fn icu_rtl(primary: &str) -> bool {
+    matches!(
+        primary,
+        "ar" | "ckb" | "dv" | "fa" | "he" | "iw" | "ji" | "ps" | "sd" | "ug" | "ur" | "yi"
+    )
 }
 
 pub fn get_safety_result(reason: &FilteredReason) -> Option<&SafetyResult> {
@@ -110,12 +127,9 @@ pub fn get_tweet_visibility_nudge(sr: &SafetyResult) -> Option<&action::TweetVis
 pub fn get_limited_actions_policy(sr: &SafetyResult) -> Option<&action::LimitedActionsPolicy> {
     match &sr.action {
         Action::LimitedEngagements(le) => le.limited_actions_policy.as_ref(),
-        Action::TweetInterstitial(ti) if ti.limited_engagements.is_some() => ti
-            .limited_engagements
-            .as_ref()
-            .and_then(|le| le.limited_actions_policy.as_ref()),
-        Action::TweetInterstitial(ti) => match ti.interstitial.as_ref() {
-            Some(AnyInterstitial::InterstitialLimitedEngagements(ile)) => {
+        Action::TweetInterstitial(ti) => match (&ti.limited_engagements, &ti.interstitial) {
+            (Some(le), _) => le.limited_actions_policy.as_ref(),
+            (None, Some(AnyInterstitial::InterstitialLimitedEngagements(ile))) => {
                 ile.limited_actions_policy.as_ref()
             }
             _ => None,
@@ -143,9 +157,7 @@ pub fn get_media_interstitial(sr: &SafetyResult) -> Option<&MediaInterstitial> {
     }
 }
 
-fn interstitial_reason_for_media_blur(
-    ti: &action::TweetInterstitial,
-) -> Option<action::InterstitialReason> {
+fn has_media_blur_reason(ti: &action::TweetInterstitial) -> bool {
     let candidates = [
         ti.interstitial.as_ref().and_then(|any| match any {
             AnyInterstitial::Interstitial(i) => i.reason.as_ref(),
@@ -159,8 +171,7 @@ fn interstitial_reason_for_media_blur(
     candidates
         .into_iter()
         .flatten()
-        .find(|reason| blurred_image_interstitial_resnames(reason).is_some())
-        .cloned()
+        .any(|reason| blurred_image_interstitial_resnames(reason).is_some())
 }
 
 pub fn resolve_blurred_image_interstitial(
@@ -179,7 +190,7 @@ pub fn is_dropped_media_blur(reason: &FilteredReason) -> bool {
     get_media_interstitial(sr).is_none()
         && matches!(
             &sr.action,
-            Action::TweetInterstitial(ti) if interstitial_reason_for_media_blur(ti).is_some()
+            Action::TweetInterstitial(ti) if has_media_blur_reason(ti)
         )
 }
 
@@ -187,17 +198,11 @@ pub fn get_fosnr_limited_engagement_appealable_reason(
     reason: &FilteredReason,
 ) -> Option<&action::AppealableReason> {
     let sr = get_safety_result(reason)?;
-    match &sr.action {
-        Action::TweetInterstitial(ti) if ti.limited_engagements.is_some() => {
-            match ti
-                .limited_engagements
-                .as_ref()
-                .and_then(|le| le.reason.as_ref())
-            {
-                Some(action::LimitedEngagementReason::FosnrReason(ar)) => Some(ar),
-                _ => None,
-            }
-        }
+    let Action::TweetInterstitial(ti) = &sr.action else {
+        return None;
+    };
+    match ti.limited_engagements.as_ref()?.reason.as_ref()? {
+        action::LimitedEngagementReason::FosnrReason(ar) => Some(ar),
         _ => None,
     }
 }
@@ -372,6 +377,33 @@ mod tests {
                 None,
             )),
         )
+    }
+
+    #[test]
+    fn language_tags_match_case_insensitively_with_primary_and_english_fallback() {
+        for lang in ["pt", "PT", "pt-BR", "PT_br"] {
+            assert_eq!(
+                translate("learn_more_link", lang),
+                Some("Saiba mais"),
+                "{lang}"
+            );
+        }
+        assert_eq!(translate("learn_more_link", "zh-TW"), Some("了解更多"));
+        for lang in ["", "xx", "XX-YY"] {
+            assert_eq!(
+                translate("learn_more_link", lang),
+                Some("Learn more"),
+                "{lang}"
+            );
+        }
+        assert_eq!(translate("no_such_resname", "pt"), None);
+
+        for lang in ["ar", "AR", "ar-EG", "He", "ur", "UR-pk", "ckb"] {
+            assert!(is_rtl(lang), "{lang}");
+        }
+        for lang in ["en", "EN-gb", "", "xx"] {
+            assert!(!is_rtl(lang), "{lang}");
+        }
     }
 
     #[test]

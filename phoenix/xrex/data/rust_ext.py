@@ -8,13 +8,11 @@ from types import ModuleType
 _BUILD_HINT = {
     "xai_recsys_kafka_reader": "reading the training topics straight off Kafka",
     "xai_recsys_parquet_reader": "reading sharded parquet batch files",
-    "xai_recsys_dataloader": "the gRPC data-loader service client",
 }
 
 _PURE_PYTHON_ALTERNATIVE = {
     "xai_recsys_kafka_reader": "xrex.data.streaming.kafkaloader.PhoenixKafkaDataset",
     "xai_recsys_parquet_reader": "xrex.data.parquet_recsys.PhoenixDataset",
-    "xai_recsys_dataloader": "xrex.data.streaming.kafkaloader.PhoenixKafkaDataset",
 }
 
 

@@ -235,7 +235,8 @@ pub struct Sender {
     bytez: Mutex<BTreeMap<String, (Bytes, MRs)>>,
     contexts: Vec<(ibverbs::Context, ibverbs::ProtectionDomain)>,
     max_entries: usize,
-    peer_serve: Option<PeerServeState>,
+    peer_serve: Option<Arc<PeerServeState>>,
+    manifest_only: bool,
 }
 
 pub const DEFAULT_MAX_ENTRIES: usize = 12;
@@ -247,24 +248,50 @@ impl Default for Sender {
 }
 
 impl Sender {
+    pub fn forget(self: &Arc<Self>, prefix: &str) {
+        let (sender, owned) = (self.clone(), prefix.to_string());
+        let forget = async move {
+            let dropped = forget_prefix(&mut *sender.bytez.lock().await, &owned);
+            if !dropped.is_empty() {
+                task::spawn_blocking(move || drop(dropped));
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(forget);
+            }
+            Err(_) => log::warn!("copy: no runtime to drop the cached files under {prefix}"),
+        }
+    }
+
     pub fn new(max_entries: usize) -> Self {
         Self {
             bytez: Mutex::new(BTreeMap::new()),
             contexts: make_ib_contexts().unwrap(),
             max_entries,
             peer_serve: None,
+            manifest_only: false,
         }
     }
 
     pub fn with_peer_serve(
-        mut self,
+        self,
         max_concurrent_sends: usize,
         rate_limit_bytes_per_sec: Option<f64>,
     ) -> Self {
-        self.peer_serve = Some(PeerServeState::new(
+        self.with_peer_state(Arc::new(PeerServeState::new(
             max_concurrent_sends,
             rate_limit_bytes_per_sec,
-        ));
+        )))
+    }
+
+    pub fn with_peer_state(mut self, peer_serve: Arc<PeerServeState>) -> Self {
+        self.peer_serve = Some(peer_serve);
+        self
+    }
+
+    pub fn manifest_only(mut self) -> Self {
+        self.manifest_only = true;
         self
     }
 
@@ -357,6 +384,18 @@ fn mmap_file(
     })
 }
 
+pub fn forget_prefix<V>(bytez: &mut BTreeMap<String, V>, prefix: &str) -> Vec<V> {
+    let keys: Vec<String> = bytez
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.iter().filter_map(|k| bytez.remove(k)).collect()
+}
+
 fn cleanup<'a>(mut bytez: MutexGuard<'a, BTreeMap<String, (Bytes, MRs)>>, max_entries: usize) {
     let mut prev = "";
     let mut splits = Vec::new();
@@ -391,8 +430,12 @@ impl Sender {
     pub async fn handle_list(self: Arc<Self>, body: body::Body) -> Result<body::Body, Status> {
         parse(proto![], body, BodyKind::Request).await?;
 
-        let mut paths = walk_dir(Path::new(ROOT_DIR), ROOT_DIR.len(), self.max_entries)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let mut paths = if self.manifest_only {
+            Vec::new()
+        } else {
+            walk_dir(Path::new(ROOT_DIR), ROOT_DIR.len(), self.max_entries)
+                .map_err(|e| Status::from_error(Box::new(e)))?
+        };
         if let Some(manifest) = self.manifest() {
             paths.extend(manifest.list());
         }
@@ -489,6 +532,13 @@ impl Sender {
             let (bytes, mrs) = if let Some(bytes) = virtual_entry {
                 peer_backed = true;
                 (bytes, no_mrs.clone())
+            } else if self.manifest_only {
+                if let Some(peer_serve) = self.peer_serve.as_ref().filter(|_| manifest.is_none()) {
+                    peer_serve.note_send_while_revoked();
+                }
+                return Err(Status::not_found(format!(
+                    "{name} is not in the peer manifest"
+                )));
             } else if let Some((bytes, mrs)) = bytez.get(&name) {
                 (bytes.clone(), mrs.clone())
             } else {
@@ -613,6 +663,11 @@ impl Sender {
     }
 
     pub async fn handle_register(self: Arc<Self>, body: body::Body) -> Result<body::Body, Status> {
+        if self.manifest_only {
+            return Err(Status::unimplemented(
+                "Register is disabled on a manifest-only copy server",
+            ));
+        }
         let mut path = Vec::new();
         let mut name = Vec::new();
         let mut device_indexes = Vec::new();
@@ -970,10 +1025,84 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manifest_only_never_reaches_the_filesystem() {
+        let state = Arc::new(PeerServeState::new(4, None));
+        let sender = Arc::new(
+            Sender::new(DEFAULT_MAX_ENTRIES)
+                .with_peer_state(state.clone())
+                .manifest_only(),
+        );
+        state
+            .publish_with_memory(
+                vec![],
+                vec![("elapsed_test/run/w/c/0".into(), Bytes::from_static(b"abcd"))],
+            )
+            .unwrap();
+
+        assert_eq!(
+            vec![("elapsed_test/run/w/c/0".to_owned(), 4)],
+            list_names(&sender).await
+        );
+        let got = send_and_read(&sender, vec!["elapsed_test/run/w/c/0"], vec![1], vec![2])
+            .await
+            .unwrap();
+        assert_eq!(b"bc".to_vec(), got);
+
+        let err = send_and_read(&sender, vec!["elapsed_x/run/f"], vec![0], vec![1])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (
+                tonic::Code::NotFound,
+                "elapsed_x/run/f is not in the peer manifest"
+            ),
+            (err.code(), err.message())
+        );
+
+        let err = sender
+            .clone()
+            .handle_register(empty_frame_body())
+            .await
+            .unwrap_err();
+        assert_eq!(tonic::Code::Unimplemented, err.code());
+    }
+
     #[test]
     fn publish_refused_and_revoke_noop_when_disabled() {
         let disabled = Sender::new(DEFAULT_MAX_ENTRIES);
         assert!(disabled.publish_manifest(vec![], vec![]).is_err());
         assert!(disabled.revoke_manifest(Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_a_prefix_drops_only_its_files() {
+        let mut bytez: BTreeMap<String, u32> = [
+            "elapsed_samples_000000000000001000/run-0/w",
+            "gateway/held/elapsed_samples_000000000000001000/run-0/w",
+            "gateway/held/elapsed_samples_000000000000001000/run-0/emb/c/0/0",
+            "gateway/held/elapsed_samples_000000000000001000/run-01/w",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| (k.to_string(), i as u32))
+        .collect();
+        let dropped = forget_prefix(
+            &mut bytez,
+            "gateway/held/elapsed_samples_000000000000001000/run-0/",
+        );
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(
+            bytez.keys().collect::<Vec<_>>(),
+            [
+                "elapsed_samples_000000000000001000/run-0/w",
+                "gateway/held/elapsed_samples_000000000000001000/run-01/w",
+            ]
+        );
     }
 }

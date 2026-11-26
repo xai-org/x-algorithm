@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from collections import abc
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from xrex.models.model_utils import get_parameter
+from xrex.models.scaling import ScaleConfig
 from xrex.utils.sharding import with_sharding_constraint_unless_manual
 
 
@@ -32,28 +34,18 @@ def rms_norm_fn(
     return x
 
 
-def all_heads_qk_norm_fn(
-    x: jax.Array,
-    name: str,
-    lr_multiplier: float = 1.0,
-    eps: float = 1e-5,
-    create_scale: bool = True,
-    weight_decay_mask: float = 0.0,
-) -> jax.Array:
-    x_shape = x.shape
-    x = jnp.reshape(x, (x_shape[0], x_shape[1], -1))
-
-    x = RMSNorm(
+def qk_norm(name: str, scale_config: ScaleConfig) -> "RMSNorm":
+    return RMSNorm(
         axis=-1,
-        create_scale=create_scale,
-        pspec=P(None),
-        lr_multiplier=lr_multiplier,
+        lr_multiplier=scale_config.qk_norm_lr_multiplier(),
         name=name,
-        eps=eps,
-        weight_decay_mask=weight_decay_mask,
-    )(x)
-    x = jnp.reshape(x, x_shape)
-    return x
+        weight_decay_mask=scale_config.ln_weight_decay_mask,
+    )
+
+
+def all_heads_qk_norm(name: str, scale_config: ScaleConfig) -> Callable[[jax.Array], jax.Array]:
+    norm = qk_norm(name, scale_config)
+    return lambda x: jnp.reshape(norm(jnp.reshape(x, (*x.shape[:2], -1))), x.shape)
 
 
 class RMSNorm(hk.Module):
@@ -95,31 +87,36 @@ class RMSNorm(hk.Module):
         self.lr_multiplier = lr_multiplier
         self.weight_decay_mask = weight_decay_mask
 
-    def __call__(self, inputs: jax.Array):
-        fprop_dtype = inputs.dtype
-        param_shape = (inputs.shape[-1],)
-        if self.create_scale:
-            scale = get_parameter(
-                "scale",
-                param_shape,
-                dtype=jnp.float32,
-                init=self.scale_init,
-                pspec=self.pspec,
-                lr_multiplier=self.lr_multiplier,
-                weight_decay_mask=self.weight_decay_mask,
-            )
-            if self.pspec:
-                scale = with_sharding_constraint_unless_manual(scale, self.pspec)
-            scale = jnp.broadcast_to(scale.astype(jnp.float32), inputs.shape)
-            gain = 1.0 + scale if self.reparameterize else scale
-        else:
-            gain = 1.0
+    def __call__(self, inputs: jax.Array, stats_name: Optional[str] = None):
+        gain = self.gain(inputs.shape[-1]) if self.create_scale else 1.0
+        return rms_normalize(inputs, gain, self.eps, stats_name)
 
-        inputs = inputs.astype(jnp.float32)
-        mean_squared = jnp.mean(jnp.square(inputs), axis=[-1], keepdims=True)
-        mean_squared = jnp.broadcast_to(mean_squared, inputs.shape)
+    def gain(self, size: int) -> jax.Array:
+        scale = get_parameter(
+            "scale",
+            (size,),
+            dtype=jnp.float32,
+            init=self.scale_init,
+            pspec=self.pspec,
+            lr_multiplier=self.lr_multiplier,
+            weight_decay_mask=self.weight_decay_mask,
+        )
+        if self.pspec:
+            scale = with_sharding_constraint_unless_manual(scale, self.pspec)
+        scale = scale.astype(jnp.float32)
+        return 1.0 + scale if self.reparameterize else scale
 
-        normed_inputs = inputs * jax.lax.rsqrt(mean_squared + self.eps)
-        outputs = gain * normed_inputs
 
-        return outputs.astype(fprop_dtype)
+def rms_normalize(
+    inputs: jax.Array, gain: jax.Array | float, eps: float, stats_name: Optional[str] = None
+) -> jax.Array:
+    fprop_dtype = inputs.dtype
+    inputs = inputs.astype(jnp.float32)
+    mean_squared = jnp.mean(jnp.square(inputs), axis=-1, keepdims=True)
+    if stats_name is not None:
+        mean_squared = checkpoint_name(mean_squared, stats_name)
+
+    normed_inputs = inputs * jax.lax.rsqrt(mean_squared + eps)
+    outputs = gain * normed_inputs
+
+    return outputs.astype(fprop_dtype)

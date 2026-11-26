@@ -347,6 +347,7 @@ def varlen_kernels(
     arch = cutedsl_arch()
     score_mod, score_mod_bwd = create_cap_scoremods(cap, cap_method)
     cap_key = (float(cap), cap_method) if score_mod is not None else None
+    centered_stats = arch in (90, 100)
     batch_size, packed_S, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
     qpk = num_q_heads // num_kv_heads
@@ -354,19 +355,18 @@ def varlen_kernels(
     hdr = ((head_dim + 31) // 32) * 32
     sr_q = ((packed_S + block_size - 1) // block_size) * block_size
     sr_k = sr_q
+    qhead_loop = arch == 90 and qpk > 1
+    dKV_postprocess = qpk > 1 and not qhead_loop
     if arch == 80:
         assert packed_S % block_size == 0, (
             "SM80 cutedsl ranker varlen attention requires packed_S % 128 == 0"
         )
         assert score_mod is None, "SM80 rejects score_mod with block sparsity; use cap <= 0"
         bwd_tile_m = 64
-        dKV_postprocess = qpk > 1
     elif arch == 90:
         bwd_tile_m = 64
-        dKV_postprocess = qpk > 1
     else:
         bwd_tile_m = block_size
-        dKV_postprocess = True
     use_pack_gqa = qpk > 1 and (block_size % qpk == 0)
 
     fwd_bs, _ = block_sparse_layout
@@ -478,6 +478,7 @@ def varlen_kernels(
             mValidLower,
             mO,
             mLSE,
+            *softmax_stats,
             softmax_scale: cutlass.Float32,
         ):
             bs = BlockSparseTensors(
@@ -495,23 +496,37 @@ def varlen_kernels(
                 valid_block_upper=mValidUpper,
                 valid_block_lower=mValidLower,
             )
-            fa_fwd(
-                mQ,
-                mK,
-                mV,
-                mO,
-                mLSE,
-                softmax_scale,
-                blocksparse_tensors=bs,
-                stream=stream,
-            )
+            if cutlass.const_expr(centered_stats):
+                fa_fwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mO,
+                    mLSE,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    mSoftmaxStats=softmax_stats,
+                    stream=stream,
+                )
+            else:
+                fa_fwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mO,
+                    mLSE,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    stream=stream,
+                )
 
         fwd_call = cutlass_call(
             launch_fwd,
             output_shape_dtype=[
                 jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
                 jax.ShapeDtypeStruct(lse_shape, jnp.float32),
-            ],
+            ]
+            + ([jax.ShapeDtypeStruct(lse_shape, jnp.float32)] * 2 if centered_stats else []),
             use_static_tensors=False,
             softmax_scale=cutlass.Float32(sm_scale),
         )
@@ -571,6 +586,7 @@ def varlen_kernels(
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
                 subtile_factor=block_size // bwd_tile_m,
+                qhead_loop=qhead_loop,
             )
             post_threads = 256
             post_dq_atom_layout = 1
@@ -596,6 +612,7 @@ def varlen_kernels(
             dk_accum_shape if dKV_postprocess else k_shape,
             jnp.float32 if dKV_postprocess else jnp.bfloat16,
         )
+        bwd_accumulators = [jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32), dkv_out, dkv_out]
 
         @cute.jit
         def launch_bwd(
@@ -614,11 +631,10 @@ def varlen_kernels(
             mDiagIdx,
             mValidUpper,
             mValidLower,
-            mdQa,
-            mdKa,
-            mdVa,
+            *rest,
             softmax_scale: cutlass.Float32,
         ):
+            mdQa, mdKa, mdVa = rest[-3], rest[-2], rest[-1]
             bs = BlockSparseTensors(
                 mask_block_cnt=mMaskCnt,
                 mask_block_idx=mMaskIdx,
@@ -634,29 +650,44 @@ def varlen_kernels(
                 valid_block_upper=mValidUpper,
                 valid_block_lower=mValidLower,
             )
-            fa_bwd(
-                mQ,
-                mK,
-                mV,
-                mdO,
-                mLSE,
-                mdPsum,
-                mdQa,
-                mdKa,
-                mdVa,
-                softmax_scale,
-                blocksparse_tensors=bs,
-                stream=stream,
-            )
+            if cutlass.const_expr(centered_stats):
+                fa_bwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mdO,
+                    mLSE,
+                    mdPsum,
+                    mdQa,
+                    mdKa,
+                    mdVa,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    mSoftmaxStats=(rest[0], rest[1]),
+                    stream=stream,
+                )
+            else:
+                fa_bwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mdO,
+                    mLSE,
+                    mdPsum,
+                    mdQa,
+                    mdKa,
+                    mdVa,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    stream=stream,
+                )
 
         bwd_call = cutlass_call(
             launch_bwd,
-            output_shape_dtype=[
-                jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),
-                dkv_out,
-                dkv_out,
-            ],
-            input_output_aliases={14: 0, 15: 1, 16: 2},
+            output_shape_dtype=bwd_accumulators,
+            input_output_aliases=(
+                {16: 0, 17: 1, 18: 2} if centered_stats else {14: 0, 15: 1, 16: 2}
+            ),
             use_static_tensors=False,
             softmax_scale=cutlass.Float32(sm_scale),
         )
@@ -730,9 +761,7 @@ def varlen_kernels(
             post_dk_call=post_dk_call,
             post_dv_call=post_dv_call,
             dKV_postprocess=dKV_postprocess,
-            dq_accum_shape=dq_accum_shape,
-            dkv_shape=dkv_out.shape,
-            dkv_dtype=dkv_out.dtype,
+            bwd_accumulators=bwd_accumulators,
             sr_q=sr_q,
             hdr=hdr,
         )
@@ -746,28 +775,31 @@ def varlen_kernels(
     )
 
 
-def zeros_after(shape, dtype, anchor: jax.Array) -> jax.Array:
-    zero, _ = jax.lax.optimization_barrier((jnp.zeros((), dtype), anchor))
-    return jnp.broadcast_to(zero, shape)
+def zeros_after(anchor: jax.Array, *structs: jax.ShapeDtypeStruct) -> list[jax.Array]:
+    zeros = []
+    for i, struct in enumerate(structs):
+        zero, _ = jax.lax.optimization_barrier((jnp.zeros(i + 1, struct.dtype), anchor))
+        zeros.append(jnp.broadcast_to(zero[0], struct.shape))
+    return zeros
 
 
 def varlen_forward(kernels, q, k, v, bs_args):
-    return kernels["fwd_call"](q, k, v, *bs_args[:6], *bs_args[12:])
+    out, lse, *softmax_stats = kernels["fwd_call"](q, k, v, *bs_args[:6], *bs_args[12:])
+    return out, lse, tuple(softmax_stats)
 
 
-def varlen_backward(kernels, q, k, v, out, lse, bs_args, g):
+def varlen_backward(kernels, q, k, v, out, lse, softmax_stats, bs_args, g):
+    from xrex.cutedsl.ranker_attention_fa4 import attention_delta, pad_softmax_stats
+
     bbs = bs_args[6:12]
     valid_bounds = bs_args[12:]
-    dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
-    if dpsum.shape[-1] < kernels["sr_q"]:
-        dpsum = jnp.pad(dpsum, ((0, 0), (0, 0), (0, kernels["sr_q"] - dpsum.shape[-1])))
+    dpsum = attention_delta(out, g, kernels["sr_q"])
+    softmax_stats = pad_softmax_stats(softmax_stats, kernels["sr_q"])
     lse_log2 = lse * jnp.float32(math.log2(math.e))
     if lse_log2.shape[-1] < kernels["sr_q"]:
         lse_log2 = jnp.pad(lse_log2, ((0, 0), (0, 0), (0, kernels["sr_q"] - lse_log2.shape[-1])))
 
-    dq_accum_init = zeros_after(kernels["dq_accum_shape"], jnp.float32, g)
-    dk_init = zeros_after(kernels["dkv_shape"], kernels["dkv_dtype"], g)
-    dv_init = zeros_after(kernels["dkv_shape"], kernels["dkv_dtype"], g)
+    dq_accum_init, dk_init, dv_init = zeros_after(g, *kernels["bwd_accumulators"])
     dq_accum, dk, dv = kernels["bwd_call"](
         q,
         k,
@@ -777,6 +809,7 @@ def varlen_backward(kernels, q, k, v, out, lse, bs_args, g):
         dpsum,
         *bbs,
         *valid_bounds,
+        *softmax_stats,
         dq_accum_init,
         dk_init,
         dv_init,
@@ -816,14 +849,17 @@ def ranker_attention_varlen_fa4(
         return varlen_forward(kernels, q, k, v, bs_args)[0]
 
     def _attention_fwd(q, k, v, *bs_args):
-        out, lse = varlen_forward(kernels, q, k, v, bs_args)
+        out, lse, softmax_stats = varlen_forward(kernels, q, k, v, bs_args)
         out = checkpoint_name(out, "cutedsl_attn_outputs")
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
-        return out, (q, k, v, out, lse, bs_args)
+        softmax_stats = tuple(checkpoint_name(t, "cutedsl_attn_outputs") for t in softmax_stats)
+        return out, (q, k, v, out, lse, softmax_stats, bs_args)
 
     def _attention_bwd(res, g):
-        q, k, v, out, lse, bs_args = res
-        return varlen_backward(kernels, q, k, v, out, lse, bs_args, g) + (None,) * len(bs_args)
+        q, k, v, out, lse, softmax_stats, bs_args = res
+        return varlen_backward(kernels, q, k, v, out, lse, softmax_stats, bs_args, g) + (
+            None,
+        ) * len(bs_args)
 
     _attention.defvjp(_attention_fwd, _attention_bwd)
     return _attention(q, k, v, *bs_args)

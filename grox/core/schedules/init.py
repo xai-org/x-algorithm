@@ -9,6 +9,7 @@ from grox.config.config import grox_config
 from grox.core.schedules.context import prevent_default
 from monitor.logging import Logging
 from monitor.metrics import Metrics
+from strato_http.strato import configure_default_strato_config
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 async def init_proc(proc_name: str, defer_metrics: bool = False):
     prevent_default()
     Logging.config(grox_config.logging)
+    if grox_config.strato is not None:
+        overrides = grox_config.strato.model_dump(exclude_none=True)
+        if overrides:
+            configure_default_strato_config(**overrides)
+            logger.info(f"Configured default Strato client overrides: {overrides}")
     if not defer_metrics:
         Metrics.init(proc_name, grox_config.metrics)
     setproctitle.setproctitle(proc_name)

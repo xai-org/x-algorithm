@@ -9,7 +9,7 @@ use tonic::{async_trait, Status};
 use xai_candidate_pipeline::component_library::clients::XdsHealthProbe;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 use xai_vm_ranker_proto::vm_ranker_service_client::VmRankerServiceClient;
-use xai_vm_ranker_proto::{RankRequest, RankResponse};
+use xai_vm_ranker_proto::{GetCarouselModelRequest, RankRequest, RankResponse};
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
 use xai_x_rpc::grpc_client::{insecure_tls_config, Dscp};
 use xai_x_rpc::service_probe::KeepAlive;
@@ -43,14 +43,20 @@ pub enum VMRankerCluster {
     Experiment5,
     #[strum(props(host = "experiment-6.prod.fou"))]
     Experiment6,
+    #[strum(props(host = "experiment-7.prod.fou"))]
+    Experiment7,
+    #[strum(props(host = "experiment-8.prod.fou"))]
+    Experiment8,
 }
 
 impl VMRankerCluster {
+    pub fn host(&self) -> &'static str {
+        self.get_str("host")
+            .expect("every variant must have a host")
+    }
+
     pub fn endpoint(&self) -> String {
-        let host = self
-            .get_str("host")
-            .expect("every variant must have a host");
-        format!("https://xai-vm-ranker-{host}.twitter.biz:443")
+        format!("https://xai-vm-ranker-{}.twitter.biz:443", self.host())
     }
 
     pub fn xds_eds_resource(&self, authority: &str) -> String {
@@ -81,6 +87,10 @@ pub trait VMRankerClient: Send + Sync {
         cluster: VMRankerCluster,
         request: RankRequest,
     ) -> Result<RankResponse, Status>;
+
+    async fn get_carousel_model(&self, _name: &str) -> Result<Vec<u8>, Status> {
+        Err(Status::unimplemented("get_carousel_model"))
+    }
 }
 
 pub struct ProdVMRankerClient {
@@ -140,6 +150,26 @@ impl VMRankerClient for ProdVMRankerClient {
         }
 
         result
+    }
+
+    async fn get_carousel_model(&self, name: &str) -> Result<Vec<u8>, Status> {
+        let mut last_error = Status::unavailable("no vm-ranker channels");
+        for cluster in VMRankerCluster::VARIANTS {
+            let Some(ch) = self.channels.get(cluster) else {
+                continue;
+            };
+            let request = GetCarouselModelRequest {
+                name: name.to_string(),
+            };
+            match VmRankerServiceClient::new((*ch.next()).clone())
+                .get_carousel_model(request)
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner().model_json.to_vec()),
+                Err(status) => last_error = status,
+            }
+        }
+        Err(last_error)
     }
 }
 

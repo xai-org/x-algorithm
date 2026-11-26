@@ -14,9 +14,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoFilter {
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(has_video);
-
-        FilterResult { kept, removed }
+        FilterResult::partition(candidates, |c| !has_video(c))
     }
 }
 

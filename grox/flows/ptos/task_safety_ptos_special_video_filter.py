@@ -14,23 +14,33 @@ class TaskSafetyPtosSpecialVideoFilter(TaskFilterWithPost):
     @override
     @classmethod
     async def _eligible_with_post(cls, post: Post, ctx: TaskContext) -> bool:
-        reason = cls._skip_reason(post)
+        videos = cls._videos(post)
+        reason = cls._skip_reason(post, videos)
         if reason is not None:
             Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
                 1, attributes={"reason": reason}
             )
             return False
+        for video in videos:
+            video.motion_reveal = True
         Metrics.counter(f"{_METRIC_PREFIX}.eligible.count").add(1)
         return True
 
     @classmethod
-    def _skip_reason(cls, post: Post) -> str | None:
+    def _videos(cls, post: Post) -> list[Video]:
+        return [
+            m
+            for p in (post, post.quoted_post)
+            if p is not None
+            for m in p.media or []
+            if isinstance(m, Video)
+        ]
+
+    @classmethod
+    def _skip_reason(cls, post: Post, videos: list[Video]) -> str | None:
         if not post.user:
             return "no_user"
-        media = list(post.media or [])
-        if post.quoted_post and post.quoted_post.media:
-            media.extend(post.quoted_post.media)
-        if not any(isinstance(medium, Video) for medium in media):
+        if not videos:
             return "no_video"
         if (
             post.get_fav_count()

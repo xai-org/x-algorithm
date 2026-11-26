@@ -3,14 +3,24 @@ use crate::models::candidate::{PostCandidate, SlateContext};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
+use crate::scorers::phoenix_scorer::record_ranker_vm_rank;
 use crate::scorers::value_model;
+use crate::scorers::vm_ranker_engagement_labels::{
+    fetch_engagement_ineligible, EngagementIneligible,
+};
 use crate::scorers::vm_ranker_request::RequestShape;
+use crate::side_effects::redis_post_candidate_cache_side_effect::REDIS_TTL_SECONDS;
+use crate::util::post_annotations::fetch_post_topics;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::scorer::Scorer;
 use xai_stats_receiver::global_stats_receiver;
-use xai_vm_ranker_proto::{RankRequest, RankResponse};
+use xai_visibility_filtering::tweet_safety_label::TweetSafetyLabelClient;
+use xai_vm_ranker_proto::experiment::PostTopics;
+use xai_vm_ranker_proto::{RankRequest, RankResponse, RankedCandidate};
 
 const METRIC_PREFIX: &str = "VMRanker";
 
@@ -18,6 +28,8 @@ pub struct VMRanker {
     pub client: Arc<dyn VMRankerClient>,
     pub xds_client: Option<Arc<dyn VMRankerClient>>,
     pub author_cold_start: AuthorColdStart,
+    pub strato_client: Arc<dyn StratoClient + Send + Sync>,
+    pub safety_label_client: Arc<dyn TweetSafetyLabelClient>,
 }
 
 struct LocalScores {
@@ -61,8 +73,8 @@ impl VMRanker {
         let weighted: Vec<f64> = candidates
             .iter()
             .map(|c| match c.weighted_score {
-                Some(cached) => cached,
-                None => value_model::weighted_score(query, &weights, c),
+                Some(cached) if !weights.multiplicative => cached,
+                _ => value_model::weighted_score(query, &weights, c),
             })
             .collect();
         let cold_start = self
@@ -73,6 +85,60 @@ impl VMRanker {
             cold_start,
         }
     }
+
+    async fn candidate_topics(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        weighted: &[f64],
+    ) -> Vec<Option<PostTopics>> {
+        let order = top_by_weighted(weighted, query.params.get(PostTopicsMaxCandidates));
+        let ids: Vec<u64> = order.iter().map(|&i| source_id(&candidates[i])).collect();
+        let Some(by_id) = fetch_post_topics(
+            self.strato_client.as_ref(),
+            &ids,
+            Duration::from_millis(query.params.get(PostTopicsTimeoutMs)),
+        )
+        .await
+        else {
+            record_post_topics("timeout");
+            return Vec::new();
+        };
+        record_post_topics("hydrated");
+        let mut topics = vec![None; candidates.len()];
+        for i in order {
+            topics[i] = by_id.get(&source_id(&candidates[i])).cloned();
+        }
+        topics
+    }
+
+    async fn engagement_ineligible(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        weighted: &[f64],
+    ) -> Vec<EngagementIneligible> {
+        let ids = top_by_weighted(weighted, query.params.get(EngagementLabelsMaxCandidates))
+            .into_iter()
+            .map(|i| source_id(&candidates[i]))
+            .collect();
+        let by_id = fetch_engagement_ineligible(self.safety_label_client.as_ref(), ids).await;
+        candidates
+            .iter()
+            .map(|c| by_id.get(&source_id(c)).copied().unwrap_or_default())
+            .collect()
+    }
+}
+
+fn top_by_weighted(weighted: &[f64], limit: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..weighted.len()).collect();
+    order.sort_by(|&a, &b| weighted[b].total_cmp(&weighted[a]));
+    order.truncate(limit);
+    order
+}
+
+fn source_id(candidate: &PostCandidate) -> u64 {
+    candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id)
 }
 
 #[async_trait]
@@ -95,36 +161,73 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
                 weighted_score: Some(local.weighted[i]),
                 score: Some(local.cold_start.scores[i]),
                 cold_start_lift_to_rank: local.cold_start.lift_to_rank(i),
-                slate_context: slate_contexts.as_ref().map(|contexts| contexts[i]),
+                slate_context: slate_contexts
+                    .as_ref()
+                    .map(|contexts| Box::new(contexts[i])),
                 ..Default::default()
             })
             .collect();
 
-        let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let request = shape.build(query, candidates, &scored);
-        record_request(&cluster);
-
-        let response = match self.rank(query, cluster, request).await {
-            Ok(resp) => resp,
-            Err(msg) => {
-                tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
-                record_fallback("rpc_error", candidates.len());
-                return scored.into_iter().map(Ok).collect();
+        let response = match candidates.first().and_then(|c| c.ranker_vm_rank.clone()) {
+            Some(ranked) => {
+                record_ranker_vm_rank("used");
+                ranked.response.clone()
+            }
+            None => {
+                let topics = async {
+                    if shape.sends_post_topics() {
+                        self.candidate_topics(query, candidates, &local.weighted)
+                            .await
+                    } else {
+                        Vec::new()
+                    }
+                };
+                let ineligible = async {
+                    if shape.sends_engagement_ineligible() {
+                        self.engagement_ineligible(query, candidates, &local.weighted)
+                            .await
+                    } else {
+                        Vec::new()
+                    }
+                };
+                let (topics, ineligible) = tokio::join!(topics, ineligible);
+                let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
+                let request = shape.build(query, candidates, &scored, &topics, &ineligible);
+                record_request(&cluster);
+                if shape.sends_dpp_history()
+                    && query.has_cached_posts
+                    && !has_recent_served_response(query)
+                {
+                    record_dpp_history_stale_cached();
+                }
+                match self.rank(query, cluster, request).await {
+                    Ok(resp) => resp,
+                    Err(msg) => {
+                        tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
+                        record_fallback("rpc_error", candidates.len());
+                        return scored.into_iter().map(Ok).collect();
+                    }
+                }
             }
         };
 
-        let returned: FxHashMap<u64, (f64, Option<f64>)> = response
+        let mut returned: FxHashMap<u64, RankedCandidate> = response
             .candidates
-            .iter()
-            .map(|sc| (sc.tweet_id, (sc.score, sc.weighted_score)))
+            .into_iter()
+            .map(|sc| (sc.tweet_id, sc))
             .collect();
 
         let mut missing = 0;
         for (c, out) in candidates.iter().zip(scored.iter_mut()) {
-            match returned.get(&c.tweet_id) {
-                Some(&(score, weighted)) => {
-                    out.score = Some(score);
-                    out.weighted_score = weighted.or(out.weighted_score);
+            match returned.remove(&c.tweet_id) {
+                Some(sc) => {
+                    out.score = Some(sc.score);
+                    out.weighted_score = sc.weighted_score.or(out.weighted_score);
+                    out.top_heads = sc
+                        .top_heads
+                        .into_iter()
+                        .map(|h| (h.head, h.contribution, h.share))
+                        .collect();
                 }
                 None => missing += 1,
             }
@@ -140,6 +243,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         candidate.score = scored.score;
         candidate.cold_start_lift_to_rank = scored.cold_start_lift_to_rank;
         candidate.slate_context = scored.slate_context;
+        candidate.top_heads = scored.top_heads;
     }
 }
 
@@ -147,12 +251,19 @@ fn slate_contexts(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
 ) -> Option<Vec<SlateContext>> {
-    let served: Option<Vec<SlateContext>> =
-        candidates.iter().map(|c| c.served_slate_context).collect();
+    let served: Option<Vec<SlateContext>> = candidates
+        .iter()
+        .map(|c| c.served_slate_context.as_deref().copied())
+        .collect();
     served.or_else(|| {
         query
             .has_cached_posts
-            .then(|| candidates.iter().map(|c| c.slate_context).collect())
+            .then(|| {
+                candidates
+                    .iter()
+                    .map(|c| c.slate_context.as_deref().copied())
+                    .collect()
+            })
             .flatten()
     })
 }
@@ -162,6 +273,30 @@ fn record_request(cluster: &VMRankerCluster) {
         receiver.incr(
             &format!("{METRIC_PREFIX}.request"),
             &[("vm_cluster", &format!("{cluster:?}"))],
+            1,
+        );
+    }
+}
+
+fn has_recent_served_response(query: &ScoredPostsQuery) -> bool {
+    let cutoff_ms = query.request_time_ms - REDIS_TTL_SECONDS as i64 * 1_000;
+    query
+        .served_history
+        .iter()
+        .any(|response| response.served_time_ms.is_some_and(|t| t > cutoff_ms))
+}
+
+fn record_dpp_history_stale_cached() {
+    if let Some(receiver) = global_stats_receiver() {
+        receiver.incr(&format!("{METRIC_PREFIX}.dpp_history_stale_cached"), &[], 1);
+    }
+}
+
+fn record_post_topics(outcome: &str) {
+    if let Some(receiver) = global_stats_receiver() {
+        receiver.incr(
+            &format!("{METRIC_PREFIX}.post_topics"),
+            &[("outcome", outcome)],
             1,
         );
     }

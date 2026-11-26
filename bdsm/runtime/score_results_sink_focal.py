@@ -24,6 +24,30 @@ log = logging.getLogger("results_sink")
 
 import sys as _sys
 
+
+def kafka_cert_config(bootstrap: str) -> dict:
+    if not bootstrap or ":9094" in bootstrap or "scram" in bootstrap:
+        raise SystemExit(
+            f"Kafka bootstrap {bootstrap!r} is the password listener or empty; "
+            "use the certificate listener (port 9095)"
+        )
+    cert = os.environ.get("KAFKA_SSL_CERTIFICATE_LOCATION", "/etc/ssl/s2s/client/tls.crt")
+    key = os.environ.get("KAFKA_SSL_KEY_LOCATION", "/etc/ssl/s2s/client/tls.key")
+    missing = [p for p in (cert, key) if not os.path.isfile(p)]
+    if missing:
+        raise SystemExit(
+            f"Kafka certificate login: {', '.join(missing)} not found (mount the client "
+            "certificate, or set KAFKA_SSL_CERTIFICATE_LOCATION and KAFKA_SSL_KEY_LOCATION)"
+        )
+    return {
+        "bootstrap.servers": bootstrap,
+        "security.protocol": "SSL",
+        "ssl.certificate.location": cert,
+        "ssl.key.location": key,
+        **kafka_ssl_config(),
+    }
+
+
 _sys.path.insert(0, os.environ.get("ABUSE_TRACE_LIB", ""))
 try:
     import abuse_trace as _abuse_trace
@@ -328,8 +352,6 @@ class _Decision:
 def _parse_args():
     parser = argparse.ArgumentParser(description="Score results sink (BQ + Redis)")
     parser.add_argument("--kafka-bootstrap", default=DEFAULT_BOOTSTRAP)
-    parser.add_argument("--kafka-username", default="kafka-user")
-    parser.add_argument("--kafka-password", required=True)
     parser.add_argument("--kafka-topic", default="abuse_scored_results")
     parser.add_argument("--kafka-group", default="abuse-results-sink")
     parser.add_argument("--redis-host", default="abuse-score-redis")
@@ -1465,15 +1487,10 @@ def main():
 
     consumer = Consumer(
         {
-            "bootstrap.servers": args.kafka_bootstrap,
+            **kafka_cert_config(args.kafka_bootstrap),
             "group.id": args.kafka_group,
             "auto.offset.reset": "latest",
             "enable.auto.commit": True,
-            "security.protocol": "SASL_SSL",
-            "sasl.mechanism": "SCRAM-SHA-512",
-            "sasl.username": args.kafka_username,
-            "sasl.password": args.kafka_password,
-            **kafka_ssl_config(),
             "fetch.wait.max.ms": 100,
         }
     )
@@ -1482,12 +1499,7 @@ def main():
 
     score_producer = Producer(
         {
-            "bootstrap.servers": args.kafka_bootstrap,
-            "security.protocol": "SASL_SSL",
-            "sasl.mechanism": "SCRAM-SHA-512",
-            "sasl.username": args.kafka_username,
-            "sasl.password": args.kafka_password,
-            **kafka_ssl_config(),
+            **kafka_cert_config(args.kafka_bootstrap),
             "message.max.bytes": 1 * 1024 * 1024,
             "linger.ms": 5,
             "batch.num.messages": 500,

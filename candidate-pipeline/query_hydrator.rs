@@ -21,10 +21,13 @@ where
     async fn run(&self, query: &Q, stage: PipelineStage) -> Result<Q, String> {
         let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         let result = self.hydrate(query).await;
-        stats.finish();
         match result {
-            Ok(hydrated) => Ok(hydrated),
+            Ok(hydrated) => {
+                stats.finish();
+                Ok(hydrated)
+            }
             Err(err) => {
+                stats.finish_failed();
                 error!("{} Failed: {}", self.name(), err);
                 Err(err)
             }

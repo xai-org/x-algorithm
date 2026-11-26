@@ -68,8 +68,7 @@ sid-train = [
     "safetensors>=0.4.0",
 ]
 fa4 = [
-    "nvidia-cutlass-dsl>=4.4.2,<4.6 ; sys_platform == 'linux'",
-    "quack-kernels>=0.4.0,<0.5 ; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]>=4.7.1,<4.8 ; sys_platform == 'linux'",
     "cuda-python>=12.9,<13 ; sys_platform == 'linux'",
     "torch>=2.8.0 ; sys_platform == 'linux'",
 ]

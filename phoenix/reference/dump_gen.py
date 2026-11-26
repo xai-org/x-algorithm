@@ -607,6 +607,7 @@ def _check_with_trainer(out: Path, sid: bool = False) -> None:
     if (cwd / "xrex" / "__init__.py").exists() and str(cwd) not in sys.path:
         sys.path.append(str(cwd))
     try:
+        from xrex.data.recsys.array_allocator import ArrayAllocator
         from xrex.data.recsys.feature_config import CategoricalFeature, Int64Feature
         from xrex.data.recsys.recsys_batch import from_record_batch
         from xrex.models.recsys_embedding import HashKeys, HashTable
@@ -626,6 +627,7 @@ def _check_with_trainer(out: Path, sid: bool = False) -> None:
         num_continuous_actions=NUM_CONTINUOUS,
         hash_table=HashTable(output_vocab_size=LABEL_WIDTH, hash_keys=HashKeys()),
         sid_num_levels=SID_NUM_LEVELS if sid else 0,
+        alloc=ArrayAllocator(),
     )
     bsz = rb.num_rows
     hist, cand = batch["history_seq"], batch["candidate_seq"]

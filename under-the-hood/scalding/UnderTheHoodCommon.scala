@@ -132,6 +132,19 @@ object UnderTheHoodCommon {
     raw.flatMap(s => Try(s.toLong).toOption).toSet
   }
 
+  def parsePostIdLabels(args: Args, default: Set[String]): Set[String] =
+    args.optional("postIdLabels") match {
+      case None => default
+      case Some("none") => Set.empty
+      case Some(_) =>
+        args.list("postIdLabels").flatMap(_.split(",")).map(_.trim).filter(_.nonEmpty).toSet
+    }
+
+  val DefaultMaxPostIdsPerLabel = 500
+
+  def newestPostIds(ids: Seq[Long], max: Int): Seq[Long] =
+    ids.distinct.sorted(Ordering[Long].reverse).take(max)
+
   def preferredInt(args: Args, preferred: String, deprecated: String, default: Int): Int = {
     val raw = args.optional(preferred).orElse(args.optional(deprecated))
     raw match {

@@ -73,6 +73,7 @@ pub struct GrpcConfig<L = tower::layer::util::Identity> {
     pub http2_adaptive_window: Option<bool>,
     pub accept_http1: bool,
     pub serve_readyz: bool,
+    pub dscp: Option<u8>,
     pub layer: L,
 }
 
@@ -95,6 +96,7 @@ impl Default for GrpcConfig {
             http2_adaptive_window: None,
             accept_http1: false,
             serve_readyz: false,
+            dscp: None,
             layer: tower::layer::util::Identity::new(),
         }
     }
@@ -136,6 +138,7 @@ impl<L> GrpcConfig<L> {
             http2_adaptive_window: self.http2_adaptive_window,
             accept_http1: self.accept_http1,
             serve_readyz: self.serve_readyz,
+            dscp: self.dscp,
             layer: tower::layer::util::Stack::new(new_layer, self.layer),
         }
     }
@@ -157,6 +160,11 @@ impl<L> GrpcConfig<L> {
 
     pub fn with_http2_max_header_list_size(mut self, size: u32) -> Self {
         self.http2_max_header_list_size = Some(size);
+        self
+    }
+
+    pub fn with_dscp(mut self, dscp: u8) -> Self {
+        self.dscp = Some(dscp);
         self
     }
 }
@@ -316,7 +324,7 @@ impl HttpServer {
         );
         let is_accepting = server_state.is_accepting.clone();
         let (http_handle, http_port) = {
-            let http_listener = bind_listener(http_port, net, so_reuseaddr)
+            let http_listener = bind_listener(http_port, net, so_reuseaddr, None)
                 .map_err(|e| map_bind_error(e, "http", http_port))?;
             let http_port = http_listener.local_addr()?.port();
             let http_handle = spawn_http_server(
@@ -329,7 +337,7 @@ impl HttpServer {
         };
         let (tx_terminated, rx_terminated) = watch::channel(false);
         let (grpc_handle, grpc_port) = if let Some(grpc) = grpc {
-            let grpc_listener = bind_listener(grpc.port, net, so_reuseaddr)
+            let grpc_listener = bind_listener(grpc.port, net, so_reuseaddr, grpc.dscp)
                 .map_err(|e| map_bind_error(e, "grpc", grpc.port))?;
             let grpc_port = grpc_listener.local_addr()?.port();
             let grpc_handle =
@@ -413,7 +421,12 @@ fn bind_addr(port: u16, net: NetConfig) -> SocketAddr {
     }
 }
 
-fn bind_listener(port: u16, net: NetConfig, so_reuseaddr: bool) -> std::io::Result<TcpListener> {
+fn bind_listener(
+    port: u16,
+    net: NetConfig,
+    so_reuseaddr: bool,
+    dscp: Option<u8>,
+) -> std::io::Result<TcpListener> {
     let addr = bind_addr(port, net);
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
@@ -421,6 +434,23 @@ fn bind_listener(port: u16, net: NetConfig, so_reuseaddr: bool) -> std::io::Resu
     };
     if so_reuseaddr {
         socket.set_reuseaddr(true)?;
+    }
+    if let Some(dscp) = dscp {
+        if dscp > 63 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("dscp must be 0-63, got {dscp}"),
+            ));
+        }
+        let tos = u32::from(dscp) << 2;
+        match addr {
+            SocketAddr::V4(_) => socket.set_tos_v4(tos)?,
+            SocketAddr::V6(_) => {
+                socket.set_tclass_v6(tos)?;
+                #[cfg(target_os = "linux")]
+                socket.set_tos_v4(tos)?;
+            }
+        }
     }
     socket.bind(addr)?;
     socket.listen(1024)
@@ -633,7 +663,7 @@ fn spawn_http_mtls_server(
         http_mtls.port,
         http_mtls.tls_config.is_some()
     );
-    let listener = bind_listener(http_mtls.port, net, so_reuseaddr)
+    let listener = bind_listener(http_mtls.port, net, so_reuseaddr, None)
         .map_err(|e| map_bind_error(e, "http-mtls", http_mtls.port))?;
     let port = listener.local_addr()?.port();
 
@@ -803,4 +833,25 @@ async fn statusz_handler(State(state): State<ServerState>) -> Html<String> {
         format!("{} {} </body></html>", content, extra)
     };
     Html(html)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn dscp_marks_accepted_connections() {
+        let listener = bind_listener(0, NetConfig::Ipv4Only, true, Some(1)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let accepted = TcpSocket::from_std_stream(accepted.unwrap().0.into_std().unwrap());
+        assert_eq!(accepted.tos_v4().unwrap(), 1 << 2);
+    }
+
+    #[tokio::test]
+    async fn dscp_out_of_range_is_rejected() {
+        let err = bind_listener(0, NetConfig::Ipv4Only, true, Some(64)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

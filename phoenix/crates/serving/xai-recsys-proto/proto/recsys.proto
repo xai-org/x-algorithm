@@ -21,6 +21,9 @@ service RecsysRetrievalPredictor {
 
   rpc ScorePosts(ScorePostsRequest) returns (ScorePostsResponse) {}
 
+  rpc RetrieveTopKUsers(RetrieveTopKUsersRequest)
+      returns (RetrieveTopKUsersResponse) {}
+
   rpc ReloadModel(ReloadModelRequest) returns (ReloadModelResponse) {}
 }
 
@@ -72,6 +75,13 @@ message ClientContext {
   string client_version = 20;
   string time_zone = 21;
   string device_network_type = 23;
+  DeviceOrientation device_orientation = 24;
+}
+
+enum DeviceOrientation {
+  DEVICE_ORIENTATION_UNSPECIFIED = 0;
+  DEVICE_ORIENTATION_PORTRAIT = 1;
+  DEVICE_ORIENTATION_LANDSCAPE = 2;
 }
 
 message UserContext {
@@ -95,6 +105,7 @@ message UserContext {
   bool is_nsfw_user = 18;
   bool is_nsfw_mode = 19;
   bytes id_list_features_ipc = 20;
+  RecentSearchQueries recent_search_queries = 21;
 }
 
 message EngagementCountRow {
@@ -123,6 +134,16 @@ message ConversionHistoryContext {
   repeated float per_candidate_features = 7;
 
   repeated int32 per_candidate_account_hashes = 8;
+}
+
+message RecentSearchQueries {
+  repeated RecentSearchQuery queries = 1;
+}
+
+message RecentSearchQuery {
+  string query = 1;
+  int64 timestamp_ms = 2;
+  bytes embedding_bf16 = 3;
 }
 
 message PredictNextActionsRequest {
@@ -175,6 +196,25 @@ message PredictNextActionsRequest {
 
   FeedRequestContext feed_request_context = 25;
   FeedCursorDirection feed_cursor_direction = 26;
+
+  bool hydrate_history_url_embeddings = 27;
+
+  ScoreCacheInfo score_cache = 28;
+
+  VmRankSpec vmRank = 29;
+  bool getScoreCacheLogits = 30;
+}
+
+message ScoreCacheInfo {
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_RANKER = 1;
+    SOURCE_SCORE_CACHE = 2;
+  }
+  Source source = 1;
+  int64 scoring_request_id = 2;
+  uint32 rows_cached = 3;
+  uint32 rows_reused = 4;
 }
 
 message PurchaseValueBaseline {
@@ -186,6 +226,11 @@ message PurchaseValueBaseline {
   double mean_add_to_cart_usd_28d = 6;
   double mean_content_view_usd_28d_vt = 7;
   double mean_add_to_cart_usd_28d_vt = 8;
+  double mean_app_purchase_usd_28d = 9;
+  double mean_app_add_to_cart_usd_28d = 10;
+  double mean_app_level_achieved_usd_28d = 11;
+  double mean_app_tutorial_complete_usd_28d = 12;
+  double mean_app_sign_up_usd_28d = 13;
 }
 
 message PageDecodeParams {
@@ -194,6 +239,40 @@ message PageDecodeParams {
   uint32 steps = 2;
 
   float temperature = 3;
+
+  RankingScoreWeights rankingScoreWeights = 4;
+
+  optional float diversityWeight = 5;
+
+  optional uint32 rewardHead = 6;
+
+  optional float eta = 7;
+  optional float nuAuthor = 8;
+  optional float nuSid = 9;
+  optional float priorTau = 10;
+  optional float notDwelledPowerExponent = 11;
+  optional float notDwelledPowerOffset = 12;
+  optional float engageBias = 13;
+  optional float multiplicative = 14;
+}
+
+message RankingScoreWeights {
+  float favoriteWeight = 1;
+  float replyWeight = 2;
+  float retweetWeight = 3;
+  float clickWeight = 4;
+  float profileClickWeight = 5;
+  float vqvWeight = 6;
+  float shareWeight = 7;
+  float quoteWeight = 8;
+  float contDwellTimeWeight = 9;
+  float notInterestedWeight = 10;
+  float reportWeight = 11;
+  float notDwelledWeight = 12;
+  float minVideoDurationMs = 13;
+  float shareViaDmWeight = 14;
+  float shareViaCopyLinkWeight = 15;
+  float completionWeight = 16;
 }
 
 message PageDecodeResult {
@@ -202,6 +281,17 @@ message PageDecodeResult {
   repeated float pickedProbs = 2;
 
   repeated float pickedScores = 3;
+}
+
+message VmRankSpec {
+  string vmRankerHost = 1;
+  float eta = 2;
+  float priorTau = 3;
+}
+
+message VmRankResult {
+  bytes rankResponse = 1;
+  string error = 2;
 }
 
 message ConvAssetIds {
@@ -225,6 +315,7 @@ message ReloadModelRequest {
   bool do_reload = 1;
   repeated string copy_urls = 2;
   string target_prefix = 3;
+  bool peer_progressive = 4;
 }
 
 message ReloadModelResponse {
@@ -232,6 +323,7 @@ message ReloadModelResponse {
   double current_checkpoint_timestamp = 2;
   string serving_prefix = 3;
   bool peer_ready = 4;
+  string staging_prefix = 5;
 }
 
 message RetrieveTopKCandidatesRequest {
@@ -266,6 +358,14 @@ message RetrieveTopKCandidatesRequest {
   repeated ExcludedPostsBloomFilter excluded_posts_bloom_filters = 15;
 
   repeated uint64 excluded_post_ids = 16;
+
+  map<string, float> value_model_weights = 17;
+
+  repeated uint64 include_author_ids = 18;
+
+  repeated uint64 exclude_author_ids = 19;
+
+  map<string, uint32> dataset_top_k = 20;
 }
 
 message ExcludedPostsBloomFilter {
@@ -291,6 +391,26 @@ message ScorePostsRequest {
 
 message ScorePostsResponse {
   PostActionScores scores = 1;
+}
+
+message RetrieveTopKUsersRequest {
+  repeated TweetInfo posts = 1;
+  uint32 top_k = 2;
+  uint32 max_age_seconds = 3;
+}
+
+message ScoredUser {
+  uint64 user_id = 1;
+  float score = 2;
+}
+
+message ScoredUsers {
+  uint64 post_id = 1;
+  repeated ScoredUser users = 2;
+}
+
+message RetrieveTopKUsersResponse {
+  repeated ScoredUsers results = 1;
 }
 
 message PostActionScores {
@@ -322,6 +442,8 @@ message CandidateSet {
   repeated float searchQueryEmbedding = 4;
 
   DeviceFeature deviceFeature = 5;
+
+  optional int64 requestTimestampMs = 6;
 }
 
 message CandidateDistributionSet {
@@ -333,6 +455,8 @@ message CandidateDistributionSet {
   string intermediateTensorsPath = 4;
 
   PageDecodeResult pageDecodeResult = 5;
+
+  VmRankResult vmRankResult = 6;
 }
 
 message ScoredCandidates {
@@ -358,6 +482,19 @@ enum RetrievalDatasetType {
   RETRIEVAL_DATASET_TYPE_HOME_COLD = 13;
   RETRIEVAL_DATASET_TYPE_HOME_HOT = 14;
   RETRIEVAL_DATASET_TYPE_ZERO_FAV = 16;
+  reserved 17, 18;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_32FAV_VIDEO_14_TO_30_DAY = 19;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_1DAY = 20;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_2DAY = 21;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_SELF_7DAY = 22;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_1DAY = 23;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_2DAY = 24;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_DETECTED_7DAY = 25;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_1DAY = 26;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_2DAY = 27;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_7DAY = 28;
+  RETRIEVAL_DATASET_TYPE_AI_VIDEO_MODEL_14DAY = 29;
+  RETRIEVAL_DATASET_TYPE_POPULAR_VIDEO_2DAY = 30;
 }
 
 message ScoredCandidate {
@@ -446,7 +583,7 @@ enum ActionName {
   CLIENT_TWEET_TRANSLATE_CLICK = 41;
   CLIENT_TWEET_NOT_RELEVANT = 42;
   CLIENT_TWEET_UNDO_NOT_RELEVANT = 43;
-  SERVER_TWEET_REACT_WITH_VIDEO = 44;
+  SERVER_TWEET_POST_VIDEO = 44;
   CLIENT_TWEET_SHOW_MORE_EXPAND = 45;
   CLIENT_TWEET_CLICK_GROK_ANALYZE = 46;
   CLIENT_TWEET_VIDEO_OPEN = 47;
@@ -513,6 +650,11 @@ enum ActionName {
   LLM_JUDGE_RELEVANT_TO_SEARCH = 108;
   LLM_JUDGE_NOT_RELEVANT_TO_SEARCH = 109;
   CLIENT_NOTIFICATION_SETTING_OPT_OUT = 110;
+  CLIENT_TWEET_VIDEO_SESSION = 111;
+  ADS_OPEN_LINK_LATE_WINDOW = 112;
+  ADS_LONG_DWELL_LATE_WINDOW = 113;
+  DISTILLED_FEEDBACK_RELEVANT_TO_SEARCH = 114;
+  CLIENT_TWEET_SWIPE_TO_PROFILE = 115;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -582,6 +724,7 @@ enum ActionName {
   P_LONG_DWELL_AND_PIXEL_FIRE = 193;
   ADS_ATTRIBUTED_MACT_MMP_CLICK_INSTALL = 194;
   ADS_ATTRIBUTED_MACT_MMP_VIEW_INSTALL = 195;
+  ADS_LEADGEN_CONVERSION = 196;
   ADS_PURCHASE_CONVERSION = 200;
   ADS_MID_FUNNEL_CONVERSION = 201;
   ADS_ADD_TO_CART_CONVERSION = 202;
@@ -647,8 +790,25 @@ enum ContinuousActionName {
   HOME_VIDEO_CONTINUATION_SECS = 3;
   BRIDGE_PROBABILITY = 4;
   ADS_WEB_CT_PURCHASE_VALUE = 5;
-  WEB_CONV_VALUE_USD = 6;
-  WEB_CONV_VALUE_RATIO = 7;
+  ADS_VIDEO_WATCH_TIME_SECS = 6;
+  ADS_VIDEO_LENGTH_SECS = 7;
+}
+
+enum AppConversionLabelEvent {
+  APP_CONVERSION_LABEL_EVENT_INSTALL = 0;
+  APP_CONVERSION_LABEL_EVENT_PURCHASE = 1;
+  APP_CONVERSION_LABEL_EVENT_ADD_TO_CART = 2;
+  APP_CONVERSION_LABEL_EVENT_LEVEL_ACHIEVED = 3;
+  APP_CONVERSION_LABEL_EVENT_TUTORIAL_COMPLETE = 4;
+  APP_CONVERSION_LABEL_EVENT_SIGN_UP = 5;
+  APP_CONVERSION_LABEL_EVENT_CUSTOM = 6;
+}
+
+enum AppConversionLabelAdvancedMatchType {
+  APP_CONVERSION_LABEL_ADVANCED_MATCH_TYPE_NO_APP_CONVERSION = 0;
+  APP_CONVERSION_LABEL_ADVANCED_MATCH_TYPE_UNSPECIFIED = 1;
+  APP_CONVERSION_LABEL_ADVANCED_MATCH_TYPE_ID_MATCHING = 2;
+  APP_CONVERSION_LABEL_ADVANCED_MATCH_TYPE_PROBABILISTIC = 3;
 }
 
 enum ActionGroup {
@@ -1360,6 +1520,8 @@ message UserActionMeta {
   uint64 safetyLabelMask = 27;
   optional uint32 percent_screen_height_100k = 28;
   optional uint64 fair_view_time_ms = 29;
+  optional bool is_broadcast = 30;
+  optional uint64 kafka_timestamp_ms = 31;
 }
 
 message TweetInfo {
@@ -1403,11 +1565,34 @@ message TweetInfo {
   ContentFeatures contentFeatures = 36;
   ContentFeatures quotedContentFeatures = 37;
   SearchLexicalMatch searchLexicalMatch = 38;
+  PostEngagerFeatures postEngagers = 39;
+  uint64 notInterestedCount = 40;
+  uint64 notificationSentCount = 41;
+  uint64 notificationOpenCount = 42;
+  uint64 notificationClickCount = 43;
+  uint64 notificationDismissCount = 44;
+  uint64 notificationSeeLessOftenCount = 45;
+  SearchAuthorMatch searchAuthorMatch = 46;
+  bool hasVideo = 47;
+  bool hasImage = 48;
+  EngagementCounts authorEngagementCounts = 49;
 }
 
 message SearchLexicalMatch {
   float matchedWordFraction = 1;
   bool exactPhrase = 2;
+}
+
+message SearchAuthorMatch {
+  bool authorHandleExact = 1;
+  float authorNameOverlap = 2;
+}
+
+message PostEngagerFeatures {
+  repeated uint64 userIds = 1;
+  repeated uint32 actionBits = 2;
+  repeated uint32 ageSecs = 3;
+  uint32 numPositive = 4;
 }
 
 message ContentFeatures {
@@ -1430,6 +1615,7 @@ message ScoreInfo {
   optional double pageDecodeSlotProb = 7;
   repeated uint32 predictionHeads = 8;
   repeated float predictionValues = 9;
+  optional bool pageDecoded = 10;
 }
 
 message SlateContext {
@@ -1564,6 +1750,14 @@ message AdActionInfo {
   map<string, bool> booleanFeatures = 14;
 }
 
+enum MediaContentType {
+  MEDIA_CONTENT_TYPE_NONE = 0;
+  MEDIA_CONTENT_TYPE_IMAGE = 1;
+  MEDIA_CONTENT_TYPE_VIDEO = 2;
+  MEDIA_CONTENT_TYPE_OTHER = 3;
+  MEDIA_CONTENT_TYPE_UNKNOWN = 4;
+}
+
 enum UnifiedCardType {
   UNIFIED_CARD_TYPE_UNSPECIFIED = 0;
   IMAGE_WEBSITE = 1;
@@ -1628,6 +1822,7 @@ message AdInfo {
 
   int64 fundingInstrumentId = 16;
 
+  MediaContentType media_content_type = 17;
   UnifiedCardType unified_card_type = 18;
 
   int64 product_set_id = 19;
@@ -1644,6 +1839,23 @@ message AdInfo {
   EngagementCounts viewer_advertiser_conversion_counts = 25;
 
   repeated int64 post_video_media_ids = 26;
+
+  string url_domain = 27;
+
+  AdTargeting targeting = 28;
+
+  int64 ad_taxonomy_id = 29;
+
+  int64 advertiser_first_delivery_ms = 30;
+
+  EngagementCounts viewer_ad_engagement_counts = 31;
+}
+
+message AdTargeting {
+  repeated int64 interest_category_ids = 1;
+  repeated LanguageCode languages = 2;
+  optional Gender gender = 3;
+  repeated int32 os_types = 4;
 }
 
 message UserAdActionMeta {
@@ -1865,8 +2077,14 @@ enum UserActionAggregationType {
   ADS_WITH_KV_AD_HISTORY = 28;
   IMMERSIVE_LONG_DWELL = 29;
   DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
-  PLACEHOLDER_31 = 31;
-  PLACEHOLDER_32 = 32;
+  IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
+  DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
+  DENSE_WITH_RECENT_IMPRESSIONS = 34;
+  IMMERSIVE_LONG_DWELL_GALLERY_3S = 36;
+  IMMERSIVE_RECENT_IMPRESSIONS = 37;
+  DENSE_WITH_LONG_DWELL_AUTHOR_PROFILE = 38;
+  IMMERSIVE_LONG_DWELL_HOME_POSITIVES = 39;
+  reserved 33, 35;
 }
 
 message UserActionAggregationResponse {
@@ -1874,6 +2092,27 @@ message UserActionAggregationResponse {
   repeated UserActionSequence sequences = 2;
   repeated UserActionAggregationType aggregation_types = 3;
   repeated bytes columnar_sequences = 4;
+  repeated RawHistoryInfo raw_histories = 5;
+}
+
+message RawHistoryInfo {
+  uint32 length = 1;
+  optional uint64 first_engagement_time_ms = 2;
+  optional uint64 last_engagement_time_ms = 3;
+  optional uint64 first_added_time_ms = 4;
+  optional uint64 last_added_time_ms = 5;
+  optional HistorySourceInfo chad_ad_history = 6;
+  optional HistorySourceInfo web_conversions = 7;
+  optional uint64 first_kafka_timestamp_ms = 8;
+  optional uint64 last_kafka_timestamp_ms = 9;
+}
+
+message HistorySourceInfo {
+  uint32 length = 1;
+  optional uint64 first_event_ms = 2;
+  optional uint64 last_event_ms = 3;
+  optional uint64 first_kafka_timestamp_ms = 4;
+  optional uint64 last_kafka_timestamp_ms = 5;
 }
 
 service UserActionAggregationService {

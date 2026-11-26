@@ -7,7 +7,9 @@ use quick_cache::OptionsBuilder;
 use crate::hydration::batch::{Hydrated, RawHydrationBatch};
 use crate::hydration::decode::author::AuthorFallbackCache;
 use crate::hydration::decode::tweet::TweetFallbackCache;
-use crate::hydration::metrics::{record_fallback_cache_entries, FallbackCacheCounts};
+use crate::hydration::metrics::FallbackCacheCounts;
+use crate::metrics::families::FALLBACK_CACHE_ENTRIES;
+use crate::metrics::Metrics;
 
 const CACHE_SHARDS: usize = 64;
 const OCCUPANCY_SAMPLE_INTERVAL: u64 = 1024;
@@ -68,61 +70,49 @@ impl<E: Clone> FallbackCache<E> {
 
     pub(crate) fn resolve_hydration_batch<C: Column<Entry = E>>(
         &self,
+        metrics: &Metrics,
         batch: RawHydrationBatch<C::Value>,
     ) -> RawHydrationBatch<C::Value> {
         let mut counts = FallbackCacheCounts::default();
-        let resolved = batch
-            .into_hydrated()
-            .into_iter()
-            .map(|(key, hydrated)| {
-                let hydrated = match hydrated {
-                    Hydrated::Found(value) => {
-                        counts.resident += usize::from(self.set::<C>(key, &value));
-                        counts.fresh += 1;
-                        Hydrated::Found(value)
+        let mut resolved = batch.into_hydrated();
+        for (&key, hydrated) in &mut resolved {
+            match hydrated {
+                Hydrated::Found(value) => {
+                    counts.resident += usize::from(self.set::<C>(key, value));
+                    counts.fresh += 1;
+                }
+                Hydrated::NotFound => {
+                    counts.resident += usize::from(self.clear::<C>(key));
+                    counts.not_found += 1;
+                }
+                Hydrated::Partial(_) => match self.entries.get(&key).as_ref().and_then(C::get) {
+                    Some(cached) => {
+                        counts.resident += 1;
+                        counts.partial_stale += 1;
+                        *hydrated = Hydrated::Found(cached);
                     }
-                    Hydrated::NotFound => {
-                        counts.resident += usize::from(self.clear::<C>(key));
-                        counts.not_found += 1;
-                        Hydrated::NotFound
-                    }
-                    Hydrated::Partial(value) => {
-                        match self.entries.get(&key).as_ref().and_then(C::get) {
-                            Some(cached) => {
-                                counts.resident += 1;
-                                counts.partial_stale += 1;
-                                Hydrated::Found(cached)
-                            }
-                            None => {
-                                counts.partial += 1;
-                                Hydrated::Partial(value)
-                            }
+                    None => counts.partial += 1,
+                },
+                Hydrated::Failed | Hydrated::Unanswered => {
+                    match self.entries.get(&key).as_ref().and_then(C::get) {
+                        Some(value) => {
+                            counts.stale += 1;
+                            *hydrated = Hydrated::Found(value);
                         }
+                        None => counts.unavailable += 1,
                     }
-                    Hydrated::Failed(error) => {
-                        match self.entries.get(&key).as_ref().and_then(C::get) {
-                            Some(value) => {
-                                counts.stale += 1;
-                                Hydrated::Found(value)
-                            }
-                            None => {
-                                counts.unavailable += 1;
-                                Hydrated::Failed(error)
-                            }
-                        }
-                    }
-                };
-                (key, hydrated)
-            })
-            .collect();
+                }
+            }
+        }
 
-        counts.record(self.cache, C::NAME);
+        counts.record(metrics, self.cache, C::NAME);
         if self
             .resolved_batches
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(OCCUPANCY_SAMPLE_INTERVAL)
         {
-            record_fallback_cache_entries(self.cache, self.entries.len());
+            let entries = self.entries.len() as f64;
+            metrics.set(&FALLBACK_CACHE_ENTRIES, [self.cache], entries);
         }
         RawHydrationBatch::from_hydrated(resolved)
     }
@@ -176,7 +166,7 @@ impl<E: Clone> FallbackCache<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::batch::{HydrationBatch, HydrationError};
+    use crate::hydration::batch::HydrationBatch;
 
     type Pair = (Option<String>, Option<String>);
 
@@ -256,16 +246,17 @@ mod tests {
     }
 
     fn failed() -> Hydrated<String> {
-        Hydrated::Failed(HydrationError::Timeout)
+        Hydrated::Failed
     }
 
     #[test]
     fn a_later_value_replaces_the_cached_one() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("old"))]));
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("new"))]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, found("old"))]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, found("new"))]));
 
-        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
+        let failed =
+            cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, failed())]));
 
         assert_eq!(failed.get(&1), Some(&"new".to_string()));
     }
@@ -273,13 +264,13 @@ mod tests {
     #[test]
     fn a_partial_answer_takes_the_complete_entry_and_leaves_it() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("complete"))]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, found("complete"))]));
 
-        let partial = cache.resolve_hydration_batch::<Left>(batch([(
-            1,
-            Hydrated::Partial("partial".to_string()),
-        )]));
-        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
+        let partial = cache.resolve_hydration_batch::<Left>(
+            &Metrics::none(),
+            batch([(1, Hydrated::Partial("partial".to_string()))]),
+        );
+        let later = cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, failed())]));
 
         assert_eq!(partial.hydrated(&1), Some(&found("complete")));
         assert_eq!(later.hydrated(&1), Some(&found("complete")));
@@ -288,12 +279,12 @@ mod tests {
     #[test]
     fn a_partial_answer_creates_no_entry() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(
-            1,
-            Hydrated::Partial("partial".to_string()),
-        )]));
+        cache.resolve_hydration_batch::<Left>(
+            &Metrics::none(),
+            batch([(1, Hydrated::Partial("partial".to_string()))]),
+        );
 
-        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
+        let later = cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, failed())]));
 
         assert_eq!(later.hydrated(&1), Some(&failed()));
     }
@@ -301,22 +292,32 @@ mod tests {
     #[test]
     fn authoritative_not_found_invalidates_stale_value() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("cached"))]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, found("cached"))]));
 
-        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));
-        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, Hydrated::NotFound)]));
+        let failed =
+            cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, failed())]));
 
-        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed(_))));
+        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed)));
     }
 
     #[test]
     fn each_column_serves_only_what_its_own_source_wrote() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("left")), (2, found("left"))]));
-        cache.resolve_hydration_batch::<Right>(batch([(1, found("right"))]));
+        cache.resolve_hydration_batch::<Left>(
+            &Metrics::none(),
+            batch([(1, found("left")), (2, found("left"))]),
+        );
+        cache.resolve_hydration_batch::<Right>(&Metrics::none(), batch([(1, found("right"))]));
 
-        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed()), (2, failed())]));
-        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed()), (2, failed())]));
+        let left = cache.resolve_hydration_batch::<Left>(
+            &Metrics::none(),
+            batch([(1, failed()), (2, failed())]),
+        );
+        let right = cache.resolve_hydration_batch::<Right>(
+            &Metrics::none(),
+            batch([(1, failed()), (2, failed())]),
+        );
 
         assert_eq!(left.hydrated(&1), Some(&found("left")));
         assert_eq!(left.hydrated(&2), Some(&found("left")));
@@ -327,17 +328,18 @@ mod tests {
     #[test]
     fn a_not_found_clears_only_its_own_column() {
         let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("left"))]));
-        cache.resolve_hydration_batch::<Right>(batch([(1, found("right"))]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, found("left"))]));
+        cache.resolve_hydration_batch::<Right>(&Metrics::none(), batch([(1, found("right"))]));
 
-        cache.resolve_hydration_batch::<Right>(batch([(1, Hydrated::NotFound)]));
-        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
-        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed())]));
+        cache.resolve_hydration_batch::<Right>(&Metrics::none(), batch([(1, Hydrated::NotFound)]));
+        let left = cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, failed())]));
+        let right =
+            cache.resolve_hydration_batch::<Right>(&Metrics::none(), batch([(1, failed())]));
 
         assert_eq!(left.hydrated(&1), Some(&found("left")));
         assert_eq!(right.hydrated(&1), Some(&failed()));
 
-        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));
+        cache.resolve_hydration_batch::<Left>(&Metrics::none(), batch([(1, Hydrated::NotFound)]));
         assert!(cache.entries.is_empty());
     }
 }

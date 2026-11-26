@@ -1,12 +1,7 @@
 use anyhow::anyhow;
 use std::collections::HashMap;
-use std::sync::Arc;
-use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult};
+use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, UserResponseState};
 use xai_core_entities::gizmoduck_client::{GizmoduckClient, LookupContext, QueryFields};
-
-pub struct GizmoduckLookup {
-    inner: Arc<dyn GizmoduckClient + Send + Sync>,
-}
 
 fn author_hydration_lookup_context() -> LookupContext {
     LookupContext {
@@ -16,6 +11,7 @@ fn author_hydration_lookup_context() -> LookupContext {
         include_erased: true,
         include_no_screen_name_users: true,
         include_offboarded: true,
+        include_soft_users: true,
         ..Default::default()
     }
 }
@@ -23,48 +19,46 @@ fn author_hydration_lookup_context() -> LookupContext {
 fn viewer_lookup_context(viewer_id: i64) -> LookupContext {
     LookupContext {
         for_user_id: Some(viewer_id),
-        include_soft_users: true,
         ..author_hydration_lookup_context()
     }
 }
 
-impl GizmoduckLookup {
-    pub fn new(inner: Arc<dyn GizmoduckClient + Send + Sync>) -> Self {
-        Self { inner }
-    }
+pub async fn get_users(
+    gizmoduck: &(dyn GizmoduckClient + Send + Sync),
+    user_ids: &[u64],
+    fields: &[QueryFields],
+) -> HashMap<u64, anyhow::Result<Option<GizmoduckUserResult>>> {
+    let ids: Vec<i64> = user_ids.iter().map(|&id| id.cast_signed()).collect();
+    gizmoduck
+        .get_users_with_context(ids, Some(author_hydration_lookup_context()), fields)
+        .await
+        .into_iter()
+        .map(|(id, result)| (id.cast_unsigned(), result))
+        .collect()
+}
 
-    pub async fn get_users(
-        &self,
-        user_ids: Vec<u64>,
-        fields: &[QueryFields],
-    ) -> HashMap<u64, anyhow::Result<Option<GizmoduckUserResult>>> {
-        let ids: Vec<i64> = user_ids.into_iter().map(u64::cast_signed).collect();
-        self.inner
-            .get_users_with_context(ids, Some(author_hydration_lookup_context()), fields)
-            .await
-            .into_iter()
-            .map(|(id, result)| (id.cast_unsigned(), result))
-            .collect()
-    }
-
-    pub async fn get_viewer(
-        &self,
-        viewer_id: u64,
-        fields: &[QueryFields],
-    ) -> anyhow::Result<Option<GizmoduckUser>> {
-        let viewer_id = viewer_id.cast_signed();
-        let result = self
-            .inner
-            .get_users_with_context(
-                vec![viewer_id],
-                Some(viewer_lookup_context(viewer_id)),
-                fields,
-            )
-            .await
-            .into_values()
-            .next()
-            .ok_or_else(|| anyhow!("Empty batch response from gizmoduck"))??;
-        Ok(result.and_then(|result| result.user))
+pub async fn get_viewer(
+    gizmoduck: &(dyn GizmoduckClient + Send + Sync),
+    viewer_id: u64,
+    fields: &[QueryFields],
+) -> anyhow::Result<Option<GizmoduckUser>> {
+    let viewer_id = viewer_id.cast_signed();
+    let result = gizmoduck
+        .get_users_with_context(
+            vec![viewer_id],
+            Some(viewer_lookup_context(viewer_id)),
+            fields,
+        )
+        .await
+        .into_values()
+        .next()
+        .ok_or_else(|| anyhow!("Empty batch response from gizmoduck"))??;
+    match result {
+        Some(GizmoduckUserResult {
+            response_state: Some(state @ (UserResponseState::Failed | UserResponseState::Filtered)),
+            ..
+        }) => Err(anyhow!("Gizmoduck answered the viewer {state:?}")),
+        result => Ok(result.and_then(|result| result.user)),
     }
 }
 
@@ -79,18 +73,30 @@ mod tests {
     type Users = HashMap<i64, anyhow::Result<Option<GizmoduckUserResult>>>;
 
     #[derive(Default)]
-    struct Recording(Mutex<Vec<Option<LookupContext>>>);
+    struct Recording {
+        contexts: Mutex<Vec<Option<LookupContext>>>,
+        state_without_user: Option<UserResponseState>,
+    }
 
     #[async_trait]
     impl GizmoduckClient for Recording {
         async fn get_users_with_context(
             &self,
-            _: Vec<i64>,
+            ids: Vec<i64>,
             context: Option<LookupContext>,
             _: &[QueryFields],
         ) -> Users {
-            self.0.lock().unwrap().push(context);
-            HashMap::new()
+            self.contexts.lock().unwrap().push(context);
+            let Some(state) = self.state_without_user else {
+                return HashMap::new();
+            };
+            let answer = || {
+                Ok(Some(GizmoduckUserResult {
+                    user: None,
+                    response_state: Some(state),
+                }))
+            };
+            ids.into_iter().map(|id| (id, answer())).collect()
         }
 
         async fn get_users(&self, _: Vec<i64>) -> Users {
@@ -138,28 +144,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn author_lookups_include_deactivated_erased_and_offboarded_users() {
-        let client = Arc::new(Recording::default());
-        GizmoduckLookup::new(Arc::<Recording>::clone(&client))
-            .get_users(vec![10], &[QueryFields::SAFETY])
-            .await;
-        let contexts = client.0.lock().unwrap();
+    async fn author_lookups_include_deactivated_erased_offboarded_and_soft_users() {
+        let client = Recording::default();
+        get_users(&client, &[10], &[QueryFields::SAFETY]).await;
+        let contexts = client.contexts.lock().unwrap();
         let [Some(context)] = contexts.as_slice() else {
             panic!("one lookup with a context: {contexts:?}")
         };
         assert!(context.include_deactivated);
         assert!(context.include_erased);
         assert!(context.include_offboarded);
+        assert!(context.include_soft_users);
     }
 
     #[tokio::test]
     async fn viewer_lookups_include_every_user_state_tweetypie_reads() {
-        let client = Arc::new(Recording::default());
-        let viewer = GizmoduckLookup::new(Arc::<Recording>::clone(&client))
-            .get_viewer(10, &[QueryFields::SAFETY])
-            .await;
+        let client = Recording::default();
+        let viewer = get_viewer(&client, 10, &[QueryFields::SAFETY]).await;
         assert!(viewer.is_err(), "an empty batch is an error");
-        let contexts = client.0.lock().unwrap();
+        let contexts = client.contexts.lock().unwrap();
         let [Some(context)] = contexts.as_slice() else {
             panic!("one lookup with a context: {contexts:?}")
         };
@@ -170,5 +173,17 @@ mod tests {
         assert!(context.include_no_screen_name_users);
         assert!(context.include_soft_users);
         assert_eq!(context.for_user_id, Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_gizmoduck_failed_or_filtered_is_a_failed_lookup() {
+        for state in [UserResponseState::Failed, UserResponseState::Filtered] {
+            let client = Recording {
+                state_without_user: Some(state),
+                ..Recording::default()
+            };
+            let viewer = get_viewer(&client, 10, &[]).await;
+            assert!(viewer.is_err(), "{state:?}: {viewer:?}");
+        }
     }
 }

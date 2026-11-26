@@ -100,7 +100,7 @@ class UthDailyPostsBackfillApp {
         observationMs,
         config)
         .map {
-          case (userId, authoredDay, label, asOfDay, carried, removed) =>
+          case (userId, authoredDay, label, asOfDay, carried, removed, postIds) =>
             val age = calendarDaysBetween(authoredDay, asOfDay)
             UthDailyPostLabel(
               userId = Some(userId),
@@ -111,7 +111,8 @@ class UthDailyPostsBackfillApp {
               asOfYyyymmdd = Some(asOfDay),
               observationAgeDays = Some(age),
               isFinal = Some(age >= config.postObservationDays),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Option(postIds).filter(_.nonEmpty)
             )
         }
 
@@ -123,9 +124,11 @@ class UthDailyPostsBackfillApp {
           config.tweetFlagLabels,
           rangeStartMs,
           rangeEndMs,
-          config.reducers)
+          config.reducers,
+          config.postIdLabels,
+          config.maxPostIdsPerLabel)
         .map {
-          case (userId, authoredDay, label, carried) =>
+          case (userId, authoredDay, label, carried, postIds) =>
             UthDailyPostLabel(
               userId = Some(userId),
               authoredYyyymmdd = Some(authoredDay),
@@ -135,7 +138,8 @@ class UthDailyPostsBackfillApp {
               asOfYyyymmdd = Some(authoredDay),
               observationAgeDays = Some(0),
               isFinal = Some(true),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Option(postIds).filter(_.nonEmpty)
             )
         }
 
@@ -240,7 +244,7 @@ object UthDailyPostsBackfillApp {
     rangeEndMs: Long,
     observationMs: Long,
     config: UthDailyPostsConfig
-  ): TypedPipe[(Long, Int, String, Int, Long, Long)] = {
+  ): TypedPipe[(Long, Int, String, Int, Long, Long, Seq[Long])] = {
     val postByTweetId = applyReducers(
       posts.map {
         case (tweetId, userId, day, logicalId, createdMs) =>
@@ -292,22 +296,27 @@ object UthDailyPostsBackfillApp {
       (everApply, last._1, last._2, last._3)
     }.toTypedPipe
 
-    applyReducers(
-      reduced.collect {
-        case ((_, userId, day, label, asOfDay, createdMs), (everApply, _, lastApply, lastExpires))
-            if everApply =>
-          val deadline = math.min(createdMs + observationMs, yyyymmddToMs(asOfDay) + DayMs)
-          val removed =
-            if (UthDailyPostsApp
-                .removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L
-            else 0L
-          ((userId, day, label, asOfDay), (1L, removed))
-      }.group,
-      config.reducers
-    ).sum.toTypedPipe.map {
-      case ((userId, day, label, asOfDay), (carried, removed)) =>
-        (userId, day, label, asOfDay, carried, removed)
+    val perPost = reduced.collect {
+      case (
+            (logicalId, userId, day, label, asOfDay, createdMs),
+            (everApply, _, lastApply, lastExpires)) if everApply =>
+        val deadline = math.min(createdMs + observationMs, yyyymmddToMs(asOfDay) + DayMs)
+        val removed =
+          if (UthDailyPostsApp
+              .removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L
+          else 0L
+        val ids: Seq[Long] = if (config.postIdLabels.contains(label)) Seq(logicalId) else Seq.empty
+        ((userId, day, label, asOfDay), (1L, removed, ids))
     }
+    applyReducers(perPost.group, config.reducers)
+      .reduce { (a, b) =>
+        (a._1 + b._1, a._2 + b._2, newestPostIds(a._3 ++ b._3, config.maxPostIdsPerLabel))
+      }
+      .toTypedPipe
+      .map {
+        case ((userId, day, label, asOfDay), (carried, removed, ids)) =>
+          (userId, day, label, asOfDay, carried, removed, ids)
+      }
   }
 }
 

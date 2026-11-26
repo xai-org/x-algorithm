@@ -13,14 +13,8 @@ impl XService for StagingServer {
 
     async fn build(ctx: ServiceContext<Option<MetadataMap>>) -> Self {
         let deps = server_deps::build(&ctx.datacenter, ctx.config.as_ref()).await;
-        let comparator = reference::build(
-            &ctx.datacenter,
-            deps.init_deadline,
-            &deps.filter_tweets,
-            &deps.client_switches,
-            ctx.config.as_ref(),
-        )
-        .await;
+        let comparator =
+            reference::build(deps.init_deadline, &deps.metrics, ctx.config.as_ref()).await;
         Self(Arc::new(deps.into_server(comparator)))
     }
 

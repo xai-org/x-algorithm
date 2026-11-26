@@ -3,7 +3,10 @@ import logging
 import time
 
 from grox.core.tasks.task import Task
-from grox.flows.ptos.constants import HIGH_FAV_THRESHOLD
+from grox.flows.ptos.constants import (
+    HIGH_FAV_THRESHOLD,
+    SAFETY_PTOS_REALTIME_WITH_SIGNALS,
+)
 from grox.flows.ptos.disable_rules import DisableTaskForNonPtosProd
 from monitor.metrics import Metrics
 from grox.core.schedules.types import TaskContext
@@ -232,20 +235,51 @@ class TaskWriteSafetyPostAnnotationsResultSink(Task):
 
             if category == SafetyPolicyCategory.Spam:
                 should_label_for_spam = False
+                should_add_promote_label = False
                 if policy_type in (
                     SafetyPolicyType.SpamEngagementBaiting,
                     SafetyPolicyType.SpamEngagementFarming,
                     SafetyPolicyType.SpamCardManipulation,
+                    SafetyPolicyType.SpamPromotesShares,
                 ):
                     should_label_for_spam = True
-                elif policy_type != SafetyPolicyType.NoViolation:
+                elif policy_type in (
+                    SafetyPolicyType.NoViolation,
+                    SafetyPolicyType.SpamPromotesClicks,
+                    SafetyPolicyType.SpamPromotesReplies,
+                ):
+                    should_label_for_spam = False
+                else:
                     should_label_for_spam = not is_high_page_rank_user
+
+                if policy_type in (
+                    SafetyPolicyType.SpamPromotesClicks,
+                    SafetyPolicyType.SpamPromotesReplies,
+                    SafetyPolicyType.SpamPromotesShares,
+                ):
+                    should_add_promote_label = True
 
                 if should_label_for_spam:
                     await cls._strato_apply_label_from_ptos.apply(
                         tweet_id, SafetyLabelType.SpamHighRecall
                     )
                     applied.append(SafetyLabelType.SpamHighRecall.value)
+                if should_add_promote_label:
+                    if policy_type == SafetyPolicyType.SpamPromotesClicks:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesClicks
+                        )
+                        applied.append(SafetyLabelType.PromotesClicks.value)
+                    elif policy_type == SafetyPolicyType.SpamPromotesReplies:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesReplies
+                        )
+                        applied.append(SafetyLabelType.PromotesReplies.value)
+                    elif policy_type == SafetyPolicyType.SpamPromotesShares:
+                        await cls._strato_apply_label_from_ptos.apply(
+                            tweet_id, SafetyLabelType.PromotesShares
+                        )
+                        applied.append(SafetyLabelType.PromotesShares.value)
 
             if category == SafetyPolicyCategory.IllegalAndRegulatedBehaviors:
                 if policy_type != SafetyPolicyType.NoViolation:
@@ -312,6 +346,10 @@ class TaskWriteSafetyPostAnnotationsResultSink(Task):
         applied.append(SafetyLabelType.PtosReviewed.value)
 
         return applied
+
+    @staticmethod
+    def _should_delete_labels(identifier: str) -> bool:
+        return identifier != SAFETY_PTOS_REALTIME_WITH_SIGNALS
 
     @classmethod
     async def _exec(cls, ctx: TaskContext) -> None:
@@ -463,22 +501,30 @@ class TaskWriteSafetyPostAnnotationsResultSink(Task):
             safetyBoolMetadata=merged_bool_metadata,
         )
 
-        delete_labels_result = await cls._strato_grok_ptos_delete_labels.execute(
-            final_result
-        )
-        if delete_labels_result:
-            logger.info(
-                f"grokPtosDeleteLabels returned '{delete_labels_result}' for post {post_id} (result_sink)"
+        if cls._should_delete_labels(identifier):
+            delete_labels_result = await cls._strato_grok_ptos_delete_labels.execute(
+                final_result
             )
-            Metrics.counter(
-                "task.write_safety_post_annotations_result_sink.grok_ptos_delete_labels.count"
-            ).add(1)
+            if delete_labels_result:
+                logger.info(
+                    f"grokPtosDeleteLabels returned '{delete_labels_result}' for post {post_id} (result_sink)"
+                )
+                Metrics.counter(
+                    "task.write_safety_post_annotations_result_sink.grok_ptos_delete_labels.count"
+                ).add(1)
+            else:
+                logger.info(
+                    f"grokPtosDeleteLabels returned no result for post {post_id} (result_sink)"
+                )
+                Metrics.counter(
+                    "task.write_safety_post_annotations_result_sink.grok_ptos_delete_labels.empty.count"
+                ).add(1)
         else:
             logger.info(
-                f"grokPtosDeleteLabels returned no result for post {post_id} (result_sink)"
+                f"Skipping grokPtosDeleteLabels for post {post_id} (identifier={identifier})"
             )
             Metrics.counter(
-                "task.write_safety_post_annotations_result_sink.grok_ptos_delete_labels.empty.count"
+                "task.write_safety_post_annotations_result_sink.grok_ptos_delete_labels.skipped.count"
             ).add(1)
 
         await cls._strato_mh.put(post_id, final_result)

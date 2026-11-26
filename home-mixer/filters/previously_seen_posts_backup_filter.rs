@@ -21,11 +21,9 @@ impl Filter<ScoredPostsQuery, PostCandidate> for PreviouslySeenPostsBackupFilter
 
         let impressed_ids: HashSet<u64> = query.impressed_post_ids.iter().copied().collect();
 
-        let (removed, kept): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(|c| related_post_ids_iter(c).any(|id| impressed_ids.contains(&id)));
-
-        FilterResult { kept, removed }
+        FilterResult::partition(candidates, |c| {
+            !related_post_ids_iter(c).any(|id| impressed_ids.contains(&id))
+        })
     }
 }
 

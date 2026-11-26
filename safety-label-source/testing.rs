@@ -1,0 +1,209 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use tonic::async_trait;
+use xai_cache::{KVCacheError, Key, Value};
+use xai_manhattan::ManhattanError;
+use xai_safety_label_store::types::encode_lkey;
+use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
+use xai_visibility_filtering_proto as vf_pb;
+use xai_x_thrift::servo_repo::{CachedValue, CachedValueStatus};
+use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
+
+use crate::decode::RawSafetyLabel;
+use crate::metrics::LabelMetrics;
+use crate::mh_client::{FetchResult, ManhattanLabelFetcher};
+use crate::remote::{cache_key, CacheRead, RemoteSource};
+use crate::source::SafetyLabelSource;
+
+const EXPIRED_CAPACITY: usize = 1024;
+
+#[derive(Default)]
+pub struct FakeLabels {
+    labels: HashMap<u64, Vec<(SafetyLabelType, SafetyLabel)>>,
+    cached: HashMap<u64, Vec<u8>>,
+    not_found: HashSet<u64>,
+    failing: HashSet<u64>,
+    hanging: HashSet<u64>,
+    cache_hanging: HashSet<u64>,
+    expired: HashMap<u64, vf_pb::SafetyLabelMap>,
+}
+
+impl FakeLabels {
+    #[must_use]
+    pub fn label(mut self, tweet_id: u64, label_type: SafetyLabelType, label: SafetyLabel) -> Self {
+        self.labels
+            .entry(tweet_id)
+            .or_default()
+            .push((label_type, label));
+        self
+    }
+
+    #[must_use]
+    pub fn cached(mut self, tweet_id: u64, mval: Vec<u8>) -> Self {
+        self.cached.insert(tweet_id, mval);
+        self
+    }
+
+    #[must_use]
+    pub fn not_found(mut self, tweet_id: u64) -> Self {
+        self.not_found.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn failing(mut self, tweet_id: u64) -> Self {
+        self.failing.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn hanging(mut self, tweet_id: u64) -> Self {
+        self.hanging.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn cache_hanging(mut self, tweet_id: u64) -> Self {
+        self.cache_hanging.insert(tweet_id);
+        self
+    }
+
+    #[must_use]
+    pub fn expired(mut self, tweet_id: u64, labels: vf_pb::SafetyLabelMap) -> Self {
+        self.expired.insert(tweet_id, labels);
+        self
+    }
+
+    pub fn into_source(mut self) -> SafetyLabelSource {
+        let expired = std::mem::take(&mut self.expired);
+        let backends = Arc::new(self);
+        let remote = RemoteSource::new(
+            Some(Arc::<Self>::clone(&backends) as _),
+            None,
+            backends,
+            LabelMetrics::default(),
+        );
+        let capacity = (!expired.is_empty()).then_some(EXPIRED_CAPACITY);
+        let source = SafetyLabelSource::new(Arc::new(remote), capacity, LabelMetrics::default());
+        for (tweet_id, labels) in expired {
+            source.hold_expired(tweet_id, Arc::new(labels));
+        }
+        source
+    }
+}
+
+#[async_trait]
+impl CacheRead for FakeLabels {
+    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, Result<Option<Value>, KVCacheError>> {
+        if self
+            .cache_hanging
+            .iter()
+            .any(|&id| keys.contains(&cache_key(id)))
+        {
+            std::future::pending::<()>().await;
+        }
+        let not_found: Vec<Key> = self.not_found.iter().map(|&id| cache_key(id)).collect();
+        let cached: HashMap<Key, &Vec<u8>> = self
+            .cached
+            .iter()
+            .map(|(&id, mval)| (cache_key(id), mval))
+            .collect();
+        let answer = |key: &Key| {
+            let value = if not_found.contains(key) {
+                cached_value_not_found()
+            } else if let Some(mval) = cached.get(key) {
+                cached_value_found(mval)
+            } else {
+                return Ok(None);
+            };
+            value
+                .map(Some)
+                .map_err(|e| KVCacheError::Client(e.to_string()))
+        };
+        keys.iter().map(|key| (key.clone(), answer(key))).collect()
+    }
+}
+
+#[async_trait]
+impl ManhattanLabelFetcher for FakeLabels {
+    async fn fetch_labels(&self, tweet_ids: &[u64]) -> Result<Vec<FetchResult>, ManhattanError> {
+        if tweet_ids.iter().any(|id| self.hanging.contains(id)) {
+            std::future::pending::<()>().await;
+        }
+        let fetch = |id: &u64| {
+            if self.failing.contains(id) || self.not_found.contains(id) {
+                return Err(ManhattanError::NativeProtocol("fake failure".to_owned()));
+            }
+            let labels = self.labels.get(id).map_or(&[][..], Vec::as_slice);
+            labels
+                .iter()
+                .map(|(label_type, label)| raw_label(*label_type, label))
+                .collect::<thrift::Result<_>>()
+                .map_err(|e| ManhattanError::NativeProtocol(e.to_string()))
+        };
+        Ok(tweet_ids.iter().map(fetch).collect())
+    }
+}
+
+#[derive(Default)]
+pub struct RecordedStats(Mutex<HashMap<String, u64>>);
+
+impl RecordedStats {
+    pub fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        let counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        counts
+            .get(&format!("{name}{labels:?}"))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl StatsReceiverExt for RecordedStats {
+    fn incr(&self, name: &str, labels: &[(&str, &str)], value: u64) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(format!("{name}{labels:?}"))
+            .or_default() += value;
+    }
+    fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
+    fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+}
+
+pub async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
+}
+
+pub(crate) fn mval(label: &SafetyLabel) -> thrift::Result<Vec<u8>> {
+    let mut buf = vec![0x0C, 0x00, 0x04];
+    buf.extend(xai_x_thrift::serialize_binary(label)?);
+    buf.push(0x00);
+    Ok(buf)
+}
+
+fn raw_label(label_type: SafetyLabelType, label: &SafetyLabel) -> thrift::Result<RawSafetyLabel> {
+    Ok(RawSafetyLabel {
+        lkey: encode_lkey(label_type),
+        mval: mval(label)?,
+    })
+}
+
+fn cached_value_found(mval: &[u8]) -> thrift::Result<Vec<u8>> {
+    xai_x_thrift::serialize_binary(&CachedValue {
+        value: Some(mval.to_vec()),
+        status: Some(CachedValueStatus::FOUND),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn cached_value_not_found() -> thrift::Result<Vec<u8>> {
+    xai_x_thrift::serialize_binary(&CachedValue {
+        status: Some(CachedValueStatus::NOT_FOUND),
+        ..Default::default()
+    })
+}

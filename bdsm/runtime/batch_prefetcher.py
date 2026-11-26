@@ -51,6 +51,30 @@ except Exception as _e:
 
 import heads
 
+
+def kafka_cert_config(bootstrap: str) -> dict:
+    if not bootstrap or ":9094" in bootstrap or "scram" in bootstrap:
+        raise SystemExit(
+            f"Kafka bootstrap {bootstrap!r} is the password listener or empty; "
+            "use the certificate listener (port 9095)"
+        )
+    cert = os.environ.get("KAFKA_SSL_CERTIFICATE_LOCATION", "/etc/ssl/s2s/client/tls.crt")
+    key = os.environ.get("KAFKA_SSL_KEY_LOCATION", "/etc/ssl/s2s/client/tls.key")
+    missing = [p for p in (cert, key) if not os.path.isfile(p)]
+    if missing:
+        raise SystemExit(
+            f"Kafka certificate login: {', '.join(missing)} not found (mount the client "
+            "certificate, or set KAFKA_SSL_CERTIFICATE_LOCATION and KAFKA_SSL_KEY_LOCATION)"
+        )
+    return {
+        "bootstrap.servers": bootstrap,
+        "security.protocol": "SSL",
+        "ssl.certificate.location": cert,
+        "ssl.key.location": key,
+        **kafka_ssl_config(),
+    }
+
+
 N_MODEL_LABELS = heads.N_HEADS
 
 
@@ -112,8 +136,6 @@ def prefetcher_loop(
     redis_key: str,
     mh_endpoint: str,
     kafka_bootstrap: str,
-    kafka_username: str,
-    kafka_password: str,
     kafka_topic: str,
     batch_size: int,
     seq_len: int,
@@ -207,12 +229,7 @@ def prefetcher_loop(
         log.info("Rust module not available, using Python fallback")
 
     producer_conf = {
-        "bootstrap.servers": kafka_bootstrap,
-        "security.protocol": "SASL_SSL",
-        "sasl.mechanism": "SCRAM-SHA-512",
-        "sasl.username": kafka_username,
-        "sasl.password": kafka_password,
-        **kafka_ssl_config(),
+        **kafka_cert_config(kafka_bootstrap),
         "message.max.bytes": 10 * 1024 * 1024,
         "compression.type": "none",
         "linger.ms": 0,
@@ -976,8 +993,6 @@ def main():
         help="Read-window headroom before the sequence watermark.",
     )
     parser.add_argument("--kafka-bootstrap", default="localhost:9092")
-    parser.add_argument("--kafka-username", default="kafka-user")
-    parser.add_argument("--kafka-password", required=True)
     parser.add_argument("--kafka-topic", default="abuse_ready_batches")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -1005,8 +1020,6 @@ def main():
         redis_key=args.redis_key,
         mh_endpoint=args.mh_endpoint,
         kafka_bootstrap=args.kafka_bootstrap,
-        kafka_username=args.kafka_username,
-        kafka_password=args.kafka_password,
         kafka_topic=args.kafka_topic,
         batch_size=args.batch_size,
         seq_len=args.seq_len,

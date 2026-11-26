@@ -8,6 +8,7 @@ mod pb {
 
 pub use pb::*;
 
+pub mod brand_engagement;
 pub mod grok_topics;
 pub mod installed_apps;
 pub mod purchase_value;
@@ -15,6 +16,10 @@ pub mod starter_packs;
 
 pub const SAFETY_BIT_AUTHOR_NSFW: u64 = 1 << 2;
 pub const SAFETY_BIT_TWEET_NSFW: u64 = 1 << 3;
+pub const SAFETY_BIT_TWEET_NSFW_HIGH_RECALL: u64 = 1 << 4;
+pub const SAFETY_BIT_TWEET_SOFT_NSFW: u64 = 1 << 5;
+
+pub const AD_TARGETING_MAX_INTEREST_CATEGORY_IDS: usize = 8;
 
 pub fn timezone_string_to_enum(tz: &str) -> Timezone {
     match tz {
@@ -99,9 +104,97 @@ pub fn is_video_card_type(card_type: i32) -> bool {
     }
 }
 
+impl HistorySourceInfo {
+    pub fn of(event_times_ms: impl IntoIterator<Item = i64>) -> Self {
+        let mut length = 0u32;
+        let mut span: Option<(u64, u64)> = None;
+        for ms in event_times_ms {
+            length += 1;
+            if ms > 0 {
+                let ms = ms as u64;
+                span = Some(span.map_or((ms, ms), |(lo, hi)| (lo.min(ms), hi.max(ms))));
+            }
+        }
+        Self {
+            length,
+            first_event_ms: span.map(|(lo, _)| lo),
+            last_event_ms: span.map(|(_, hi)| hi),
+            first_kafka_timestamp_ms: None,
+            last_kafka_timestamp_ms: None,
+        }
+    }
+
+    pub fn with_kafka_timestamps(
+        self,
+        kafka_timestamps_ms: impl IntoIterator<Item = Option<i64>>,
+    ) -> Self {
+        let mut span: Option<(u64, u64)> = None;
+        let mut missing = false;
+        for ms in kafka_timestamps_ms {
+            match ms {
+                Some(ms) if ms > 0 => {
+                    let ms = ms as u64;
+                    span = Some(span.map_or((ms, ms), |(lo, hi)| (lo.min(ms), hi.max(ms))));
+                }
+                _ => missing = true,
+            }
+        }
+        Self {
+            first_kafka_timestamp_ms: span.map(|(lo, _)| if missing { 0 } else { lo }),
+            last_kafka_timestamp_ms: span.map(|(_, hi)| hi),
+            ..self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_counts_every_entry_and_spans_the_positive_times() {
+        assert_eq!(
+            HistorySourceInfo::of([5_000, 0, 2_000, -1, 9_000]),
+            HistorySourceInfo {
+                length: 5,
+                first_event_ms: Some(2_000),
+                last_event_ms: Some(9_000),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            HistorySourceInfo::of([0, 0]),
+            HistorySourceInfo {
+                length: 2,
+                first_event_ms: None,
+                last_event_ms: None,
+                ..Default::default()
+            }
+        );
+        assert_eq!(HistorySourceInfo::of([]), HistorySourceInfo::default());
+    }
+
+    #[test]
+    fn the_kafka_range_spans_the_positive_timestamps() {
+        let kafka = |timestamps: &[Option<i64>]| {
+            let s = HistorySourceInfo::of([1_000]).with_kafka_timestamps(timestamps.to_vec());
+            (s.first_kafka_timestamp_ms, s.last_kafka_timestamp_ms)
+        };
+        assert_eq!(
+            kafka(&[Some(7_000), Some(3_000)]),
+            (Some(3_000), Some(7_000))
+        );
+        assert_eq!(
+            kafka(&[Some(7_000), None, Some(0), Some(3_000), Some(-1)]),
+            (Some(0), Some(7_000))
+        );
+        assert_eq!(kafka(&[None, Some(0)]), (None, None));
+
+        let source =
+            HistorySourceInfo::of([1_000, 2_000]).with_kafka_timestamps([Some(1_500), None]);
+        assert_eq!(source.length, 2);
+        assert_eq!(source.first_event_ms, Some(1_000));
+    }
 
     #[test]
     fn test_language_code_string_to_enum() {
@@ -179,6 +272,34 @@ mod tests {
         assert_eq!(RetrievalDatasetType::HomeCold as i32, 13);
         assert_eq!(RetrievalDatasetType::HomeHot as i32, 14);
         assert_eq!(RetrievalDatasetType::Trending as i32, 12);
+    }
+
+    #[test]
+    fn ranking_score_weights_completion_field_is_wire_compatible() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct RankingScoreWeightsBeforeCompletion {
+            #[prost(float, tag = "1")]
+            favorite_weight: f32,
+            #[prost(float, tag = "15")]
+            share_via_copy_link_weight: f32,
+        }
+
+        let new = RankingScoreWeights {
+            favorite_weight: 0.5,
+            share_via_copy_link_weight: 2.0,
+            completion_weight: 3.0,
+            ..Default::default()
+        };
+        let old =
+            RankingScoreWeightsBeforeCompletion::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(old.favorite_weight, 0.5);
+        assert_eq!(old.share_via_copy_link_weight, 2.0);
+
+        let from_old = RankingScoreWeights::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(from_old.favorite_weight, 0.5);
+        assert_eq!(from_old.completion_weight, 0.0);
     }
 
     #[test]

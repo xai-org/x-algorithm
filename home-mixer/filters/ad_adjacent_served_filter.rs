@@ -747,7 +747,7 @@ mod tests {
             "fallback must never drop an organic post"
         );
         assert_eq!(kept_post_ids(&result.kept), vec![1, 2, 3]);
-        let drops = query.ad_drops.take();
+        let drops = query.ad_drops.read(<[DroppedAd]>::to_vec);
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].drop_reason(), AdDropReason::ServedNeighbour);
         assert_eq!(drops[0].blocking_tweet_id, 1);

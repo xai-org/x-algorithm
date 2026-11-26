@@ -6,12 +6,17 @@ use crate::candidate_hydrators::media_info_hydrator::MediaInfoHydrator;
 use crate::candidate_hydrators::quote_hydrator::QuoteHydrator;
 use crate::candidate_hydrators::semantic_id_hydrator::SemanticIdHydrator;
 use crate::clients::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient};
+use crate::clients::recent_search_queries_store_client::{
+    MockRecentSearchQueriesStoreClient, ProdRecentSearchQueriesStoreClient,
+    RecentSearchQueriesStoreClient,
+};
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};
 use crate::clients::user_action_aggregation_client::{
     MockUserActionAggregationClient, ProdUserActionAggregationClient, UserActionAggregationClient,
 };
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
+use crate::filters::fair_share_ranking_filter::FairShareRankingFilter;
 use crate::filters::result_size_filter::ResultSizeFilter;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
@@ -19,6 +24,7 @@ use crate::query_hydrators::followed_grok_topics_query_hydrator::FollowedGrokTop
 use crate::query_hydrators::followed_starter_packs_query_hydrator::FollowedStarterPacksQueryHydrator;
 use crate::query_hydrators::followed_user_ids_query_hydrator::FollowedUserIdsQueryHydrator;
 use crate::query_hydrators::ip_query_hydrator::IpQueryHydrator;
+use crate::query_hydrators::recent_search_queries_query_hydrator::RecentSearchQueriesQueryHydrator;
 use crate::query_hydrators::scoring_sequence_query_hydrator::ScoringSequenceQueryHydrator;
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
@@ -46,7 +52,7 @@ use xai_candidate_pipeline::component_library::clients::media_info_cache_client:
     MediaInfoCacheClient, MockMediaInfoCacheClient, ProdMediaInfoCacheClient,
 };
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
-    MockPredictClient, PhoenixPredictionClient, ProdPhoenixPredictionClient,
+    MockPredictClient, PhoenixPredictionClient,
 };
 use xai_candidate_pipeline::component_library::clients::user_demographics_client::{
     MockUserDemographicsClient, ProdUserDemographicsClient, UserDemographicsClient,
@@ -92,7 +98,6 @@ impl PhoenixScoresPipeline {
     pub(crate) async fn build_with_clients(
         user_action_aggregation_client: Arc<dyn UserActionAggregationClient + Send + Sync>,
         phoenix_client: Arc<dyn PhoenixPredictionClient + Send + Sync>,
-        xds_client: Option<Arc<dyn PhoenixPredictionClient + Send + Sync>>,
         tes_client: Arc<dyn TESClient + Send + Sync>,
         media_info_cache_client: Arc<dyn MediaInfoCacheClient + Send + Sync>,
         gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
@@ -104,6 +109,7 @@ impl PhoenixScoresPipeline {
         followed_grok_topics_client: Arc<dyn FollowedGrokTopicsStoreClient>,
         followed_starter_packs_client: Arc<dyn FollowedStarterPacksStoreClient>,
         user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient>,
+        recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient>,
         sid_client: Arc<dyn SidClient>,
     ) -> PhoenixScoresPipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
@@ -129,6 +135,9 @@ impl PhoenixScoresPipeline {
             Box::new(UserInstalledAppsQueryHydrator::new(
                 user_installed_apps_client,
             )),
+            Box::new(RecentSearchQueriesQueryHydrator::new(
+                recent_search_queries_client,
+            )),
             Box::new(IpQueryHydrator { client: ip_client }),
         ];
 
@@ -147,27 +156,18 @@ impl PhoenixScoresPipeline {
             Box::new(SemanticIdHydrator::new(sid_client)),
         ];
 
-        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> =
-            vec![Box::new(CoreDataHydrationFilter)];
+        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
+            Box::new(CoreDataHydrationFilter),
+            Box::new(FairShareRankingFilter),
+        ];
 
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(PhoenixScorer {
-                dispatch: {
-                    let mut paths = Vec::new();
-                    if let Some(xds) = xds_client {
-                        paths.push(crate::util::egress::PredictionPath {
-                            name: "xDS",
-                            gate: crate::util::xds::XDS_GATE,
-                            client: xds,
-                            config: crate::util::egress::EgressConfig::DEFAULT,
-                        });
-                    }
-                    crate::util::egress::PredictionDispatch {
-                        prod: phoenix_client,
-                        paths,
-                        max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
-                        enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
-                    }
+                dispatch: crate::util::egress::PredictionDispatch {
+                    client: phoenix_client,
+                    max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                    uncompressed_clusters_key:
+                        "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
                 },
             }),
             Box::new(PhoenixScoresRankingScorer),
@@ -193,12 +193,13 @@ impl PhoenixScoresPipeline {
         datacenter: &str,
         phoenix_xds: &super::PhoenixXdsConfig,
     ) -> PhoenixScoresPipeline {
-        let xds_client = build_phoenix_xds_client(phoenix_xds).await;
+        let phoenix_client = build_phoenix_xds_client(phoenix_xds)
+            .await
+            .expect("Failed to build Phoenix xDS ranking client");
 
         let (
             socialgraph_client,
             user_action_aggregation_client,
-            phoenix_client,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,
@@ -209,6 +210,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             sid_client,
         ) = tokio::join!(
             async {
@@ -229,13 +231,6 @@ impl PhoenixScoresPipeline {
                         .await
                         .expect("Failed to create User Action Aggregation client"),
                 ) as Arc<dyn UserActionAggregationClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    ProdPhoenixPredictionClient::new()
-                        .await
-                        .expect("Failed to create Phoenix prediction client"),
-                ) as Arc<dyn PhoenixPredictionClient + Send + Sync>
             },
             async {
                 Arc::new(
@@ -341,13 +336,22 @@ impl PhoenixScoresPipeline {
                         .expect("Failed to create UserInstalledAppsStore client"),
                 ) as Arc<dyn UserInstalledAppsStoreClient>
             },
+            async {
+                match ProdRecentSearchQueriesStoreClient::new(datacenter).await {
+                    Ok(client) => Arc::new(client) as Arc<dyn RecentSearchQueriesStoreClient>,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RecentSearchQueriesStore client unavailable; hydration disabled");
+                        Arc::new(MockRecentSearchQueriesStoreClient)
+                            as Arc<dyn RecentSearchQueriesStoreClient>
+                    }
+                }
+            },
             async { Arc::new(ProdSidClient::new()) as Arc<dyn SidClient> },
         );
 
         PhoenixScoresPipeline::build_with_clients(
             user_action_aggregation_client,
             phoenix_client,
-            xds_client,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,
@@ -359,6 +363,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             sid_client,
         )
         .await
@@ -385,10 +390,11 @@ impl PhoenixScoresPipeline {
             Arc::new(MockFollowedStarterPacksStoreClient);
         let user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient> =
             Arc::new(MockUserInstalledAppsStoreClient);
+        let recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient> =
+            Arc::new(MockRecentSearchQueriesStoreClient);
         PhoenixScoresPipeline::build_with_clients(
             user_action_aggregation_client,
             phoenix_client,
-            None,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,
@@ -400,6 +406,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             Arc::new(MockSidClient) as Arc<dyn SidClient>,
         )
         .await

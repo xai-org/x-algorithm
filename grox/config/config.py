@@ -1,21 +1,21 @@
-import os
 import logging
+import os
 from pathlib import Path
 
-from pydantic import Field, BaseModel, ConfigDict
-from monitor.config import LoggingConfig, MetricsConfig
+from embed.embed_http import EmbeddingModelConfig
+from grok_sampler.config import OaiModelConfig
 from grox.config.env import grox_env
 from kafka_cli.config import KafkaConsumerConfig, KafkaProducerConfig
 from kafka_cli.multi_region_consumer import MultiRegionKafkaConsumerConfig
 from kafka_cli.multi_region_producer import MultiRegionKafkaProducerConfig
+from monitor.config import LoggingConfig, MetricsConfig
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
     BaseSettings,
+    PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
-    PydanticBaseSettingsSource,
 )
-from embed.embed_http import EmbeddingModelConfig
-from grok_sampler.config import OaiModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +84,11 @@ class ModelName:
     GROK_4_1_FAST_X_ALGO_EXTRA = "grok-4-1-fast-x-algo-extra"
     GROK_4_MINI_CRITICAL = "grok-4-mini-critical"
     GROK_4_MINI_CRITICAL_SAFETY = "critical-safety"
-    EAPI_GROK_420_REASONING_X_ALGO = "eapi-grok-420-reasoning-x-algo"
-    EAPI_GROK_420_REASONING_INTERNAL = "eapi-grok-420-reasoning-internal"
     EAPI_GROK_4_1_FAST_X_ALGO = "eapi-grok-4-1-fast-x-algo"
     EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"
     EAPI_GROK_4_3_X_ALGO = "eapi-grok-4-3-x-algo"
     EAPI_GROK_4_5_X_ALGO = "eapi-grok-4-5-x-algo"
+    EAPI_GROK_4_5_INTERNAL = "eapi-grok-4-5-internal"
     EAPI_GROK_4_6_INTERNAL = "eapi-grok-4-6-internal"
 
 
@@ -106,14 +105,18 @@ class MediaHydrationConfig(BaseModel):
     max_workers: int = 4
     max_post_count: int = 9
     video_max_frames: int = 20
+    video_sharp_frames: bool = False
     video_max_frames_light: int = 2
     video_tile_size: int = 448
     image_tile_size: int = 448
     enable_light_dark_enhancement: bool = False
     enable_clahe_enhancement: bool = False
-    enable_motion_reveal: bool = False
     enable_local_broadcast_frame_extraction: bool = False
     enable_video_preview_image: bool = False
+    enable_screenshot: bool = True
+    enable_combined_view: bool = False
+    enable_url_videos: bool = True
+    highest_video_bitrate: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
@@ -136,6 +139,7 @@ class GroxKafkaLoaderConfig(BaseModel):
     prefetching_threshold: int = 256
     prefetching_batch_size: int = 1024
     max_qps_per_partition: int | None = None
+    commit_interval_sec: float = 5.0
 
 
 class GrpcServerConfig(BaseModel):
@@ -216,6 +220,26 @@ class MediaReferenceBundleConfig(BaseModel):
     refresh_interval_s: int = 900
 
 
+class XReviewIntakeConfig(BaseModel):
+    endpoint: str
+    timeout: float = 10.0
+
+
+class XReviewReportingConfig(BaseModel):
+    endpoint: str
+    timeout: float = 20.0
+
+
+class StratoPoolConfig(BaseModel):
+    model_config = _FROZEN
+
+    max_connections: int | None = None
+    max_keepalive_connections: int | None = None
+    keepalive_expiry_sec: int | None = None
+    connection_timeout_sec: int | None = None
+    timeout_sec: int | None = None
+
+
 class GroxConfig(BaseSettings):
     metrics: MetricsConfig = MetricsConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -246,6 +270,9 @@ class GroxConfig(BaseSettings):
     kerberos: KerberosConfig = KerberosConfig()
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
+    xreview_intake: XReviewIntakeConfig | None = None
+    strato: StratoPoolConfig | None = None
+    xreview_reporting: XReviewReportingConfig | None = None
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)
 

@@ -22,17 +22,20 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pyarrow.parquet import ParquetFile
 
 from xai_configlib import configclass
 from xrex.configs.config import Dataset
 from xrex.data import conversion_labels
 from xrex.data.parquet_recsys_metadata import (
     DataPosition,
+    is_file,
+    is_iceberg_path,
     load_batch_manifest,
+    parquet_file,
     parse_date_bound,
     parse_date_time,
     remaining_steps_from_manifest,
+    stamp_data_file,
 )
 from xrex.data.parquet_recsys_metadata import (
     batch_path as _batch_path,
@@ -43,14 +46,21 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
-from xrex.data.recsys import reply_features
+from xrex.data.recsys import ad_fields_sidecar, iceberg_layout, reply_features, sidecar
+from xrex.data.recsys import ad_side_ids as ad_side
+from xrex.data.recsys import id_list_features as id_lists
+from xrex.data.recsys import long_term_author_profile as author_profile
+from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
+    NUM_ADS_COUNT_FEATURES,
+    NUM_ADS_CTR_FEATURES,
     NUM_USER_INSTALLED_APPS,
     PAGE_RECORD_COLUMNS,
     POST_INT64_FEATURE_SIZE,
     USER_INT64_FEATURE_SIZE,
+    VALUE_LABEL_DTYPES,
     CandidateNegativeFilter,
     CandidateNegativeMode,
     EmbeddingType,
@@ -59,9 +69,11 @@ from xrex.data.recsys.recsys_batch import (
     RecsysFeaturesBatch,
     empty_conversion_delays,
     empty_feature_arrays,
+    empty_history_url_embedding,
     empty_page_record_arrays,
     empty_user_feature_arrays,
     from_record_batch,
+    value_label_dtypes,
 )
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE
 from xrex.models.recsys_embedding import HashTable
@@ -97,6 +109,12 @@ def load_global_ids_from_parquet_file(
     start = time.time()
     rank_logger.info(f"Loading global ids from {file_path}")
 
+    if read_creation_datetime and "created_at" not in pq.read_schema(str(file_path)).names:
+        rank_logger.warning(
+            f"Global ids file {file_path} has no created_at column: global negatives are "
+            "sampled from every post in it, not only those created within 24 hours of the data"
+        )
+        read_creation_datetime = False
     columns = ["post_id", "author_id"]
     if read_creation_datetime:
         columns.append("created_at")
@@ -146,6 +164,18 @@ def load_global_ids_from_parquet_file(
     return post_ids, author_ids, post_creation_datetimes, post_sids
 
 
+class _IdListSourceCounter:
+    def __init__(self, every: int = 1000):
+        self._counter = sidecar.SourceCounter(id_lists.COLUMN, "id-list features", every)
+
+    def note(self, fname: str, source: str) -> None:
+        self._counter.note(fname, {id_lists.COLUMN: source})
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return self._counter.counts[id_lists.COLUMN]
+
+
 class LazyRecordBatchIterator:
     def __init__(
         self,
@@ -154,6 +184,12 @@ class LazyRecordBatchIterator:
         fname: str,
         conversion_delay_columns: list[str] | None = None,
         include_action_delay_columns: bool = False,
+        id_list_sidecar_root: str | None = None,
+        id_list_prefer_sidecar: bool = True,
+        id_list_sidecar_strict: bool = False,
+        id_list_sources: _IdListSourceCounter | None = None,
+        ad_fields_sidecar_root: str | None = None,
+        ad_fields_sources: ad_fields_sidecar.SourceCounter | None = None,
     ):
         self.pf: pq.ParquetFile = pf
         self.iter: Iterator[pa.RecordBatch] | None = None
@@ -164,6 +200,15 @@ class LazyRecordBatchIterator:
         self.conversion_delay_columns: list[str] | None = conversion_delay_columns
         self.include_action_delay_columns: bool = include_action_delay_columns
         self._sidecar_delays: dict[str, np.ndarray] | None = None
+        self.id_list_sidecar_root: str | None = id_list_sidecar_root
+        self.id_list_prefer_sidecar: bool = id_list_prefer_sidecar
+        self.id_list_sidecar_strict: bool = id_list_sidecar_strict
+        self._id_list_sources: _IdListSourceCounter | None = id_list_sources
+        self._id_list_sidecar: pa.Array | None = None
+        self._id_list_source: str | None = None
+        self.ad_fields_sidecar_root: str | None = ad_fields_sidecar_root
+        self._ad_fields_sources: ad_fields_sidecar.SourceCounter | None = ad_fields_sources
+        self._ad_fields: ad_fields_sidecar.FileJoin | None = None
         self._row_pos: int = 0
 
     def seek(self):
@@ -186,6 +231,29 @@ class LazyRecordBatchIterator:
                         f"batch file has {self.num_rows}"
                     )
 
+        if self.id_list_sidecar_root is not None:
+            has_native = id_lists.COLUMN in arrow_schema.names
+            sidecar = id_lists.sidecar_path_for(self.fname, self.id_list_sidecar_root)
+            has_sidecar = os.path.exists(sidecar)
+            if self.id_list_sidecar_strict and not has_sidecar:
+                raise FileNotFoundError(f"id-list sidecar missing for {self.fname}: {sidecar}")
+            if has_sidecar and (self.id_list_prefer_sidecar or not has_native):
+                self._id_list_sidecar = id_lists.canonical_column(
+                    id_lists.load_sidecar_column(sidecar, expected_rows=self.num_rows)
+                )
+                self._id_list_source = "sidecar"
+            else:
+                self._id_list_source = "native" if has_native else "none"
+            if self._id_list_sources is not None:
+                self._id_list_sources.note(self.fname, self._id_list_source)
+
+        if self.ad_fields_sidecar_root is not None:
+            self._ad_fields = ad_fields_sidecar.FileJoin(
+                self.fname, self.ad_fields_sidecar_root, arrow_schema.names, self.num_rows
+            )
+            if self._ad_fields_sources is not None:
+                self._ad_fields_sources.note(self.fname, self._ad_fields.sources)
+
         cnt = 0
         while cnt < self.rows_to_skip:
             skipped = next(self.iter)
@@ -207,6 +275,19 @@ class LazyRecordBatchIterator:
                 for name, mat in self._sidecar_delays.items()
             }
             batch = conversion_labels.attach_delays(batch, window)
+        if self._id_list_source == "sidecar":
+            assert self._id_list_sidecar is not None
+            batch = id_lists.set_column(
+                batch, self._id_list_sidecar.slice(self._row_pos, batch.num_rows)
+            )
+        elif self._id_list_source == "native":
+            batch = id_lists.set_column(
+                batch, id_lists.canonical_column(batch.column(id_lists.COLUMN))
+            )
+        elif self._id_list_source == "none":
+            batch = id_lists.set_column(batch, id_lists.null_column(batch.num_rows))
+        if self._ad_fields is not None:
+            batch = self._ad_fields.apply(batch, self._row_pos)
         self._row_pos += batch.num_rows
         return batch
 
@@ -217,8 +298,48 @@ class LazyRecordBatchIterator:
         return False
 
 
+class PrereadRecordBatchIterator:
+    def __init__(self, batch_iterator, batches: list[pa.RecordBatch]) -> None:
+        self._batches = deque(batches)
+        self.fname: str = batch_iterator.fname
+
+    def read(self) -> pa.RecordBatch:
+        if not self._batches:
+            raise StopIteration
+        return self._batches.popleft()
+
+    def skip_batch(self) -> bool:
+        if not self._batches:
+            return False
+        self._batches.popleft()
+        return True
+
+
+class RowSplitRecordBatchIterator:
+    def __init__(
+        self,
+        partition_batch_iterator: LazyRecordBatchIterator,
+        shards_per_partition: int,
+        rank_in_partition: int,
+    ):
+        assert 0 <= rank_in_partition < shards_per_partition
+        self._partition_batch_iterator = partition_batch_iterator
+        self._shards_per_partition = shards_per_partition
+        self._rank_in_partition = rank_in_partition
+        self.fname: str = partition_batch_iterator.fname
+
+    def read(self) -> pa.RecordBatch:
+        batch = self._partition_batch_iterator.read()
+        usable = batch.num_rows - batch.num_rows % self._shards_per_partition
+        rows = np.arange(self._rank_in_partition, usable, self._shards_per_partition)
+        return batch.take(pa.array(rows))
+
+    def skip_batch(self) -> bool:
+        return self._partition_batch_iterator.skip_batch()
+
+
 def _resolve_file_path(base_path: str, file_entry: str) -> str:
-    if os.path.isabs(file_entry):
+    if os.path.isabs(file_entry) or is_iceberg_path(file_entry):
         return file_entry
     return os.path.join(base_path, file_entry)
 
@@ -323,6 +444,18 @@ def _block_shuffle_order(
         range(window_blocks),
         key=lambda j: (hashlib.blake2b(f"{tag}:{j}".encode(), digest_size=8).digest(), j),
     )
+
+
+_BLOCK_LOOKAHEAD_FILES = 4
+
+
+def _block_lookahead_plan(files_per_batch_id: int) -> list[int]:
+    files_per_batch_id = max(1, files_per_batch_id)
+    plan, budget = [], max(0, _BLOCK_LOOKAHEAD_FILES)
+    while budget > 0:
+        plan.append(min(files_per_batch_id, budget))
+        budget -= plan[-1]
+    return plan
 
 
 def _block_shuffle_fingerprint(
@@ -697,9 +830,22 @@ class InterleavingRecordBatchProvider:
         shuffle_mode: ShuffleMode | str = ShuffleMode.NONE,
         block_shuffle_block_time_slices: int = 0,
         block_shuffle_order_per_shard: bool = False,
+        id_list_sidecar_root: str | None = None,
+        id_list_prefer_sidecar: bool = True,
+        id_list_sidecar_strict: bool = False,
+        ad_fields_sidecar_root: str | None = None,
+        end_batch_id: int | None = None,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
+        self._id_list_sidecar_root = id_list_sidecar_root
+        self._id_list_prefer_sidecar = id_list_prefer_sidecar
+        self._id_list_sidecar_strict = id_list_sidecar_strict
+        self._id_list_sources = _IdListSourceCounter() if id_list_sidecar_root is not None else None
+        self._ad_fields_sidecar_root = ad_fields_sidecar_root
+        self._ad_fields_sources = (
+            ad_fields_sidecar.SourceCounter() if ad_fields_sidecar_root is not None else None
+        )
         if metadata_path is None and index_path is None:
             raise ValueError("Either metadata_path or index_path must be provided")
 
@@ -746,7 +892,7 @@ class InterleavingRecordBatchProvider:
                 raise ValueError("block_shuffle requires metadata mode (.valid_batches.json)")
             if continuous:
                 raise ValueError("block_shuffle is not supported with continuous=True")
-            if num_kafka_partitions % num_shards:
+            if num_kafka_partitions % num_shards and num_shards % num_kafka_partitions:
                 rank_logger.warning(
                     "block_shuffle: %d partitions over %d shards gives shards unequal file "
                     "counts, so they drift apart and resume from one checkpoint is approximate",
@@ -783,13 +929,30 @@ class InterleavingRecordBatchProvider:
         if metadata_path is not None:
             if topic_dir is None:
                 topic_dir = str(Path(metadata_path).parent)
-            topic_dir = os.path.abspath(topic_dir)
+            if not is_iceberg_path(topic_dir):
+                topic_dir = os.path.abspath(topic_dir)
             self._topic_dir = topic_dir
         self._path = str(Path(index_path).parent) if index_path else topic_dir or ""
         self._batch_size = batch_size
         self._num_shards = num_shards
         self._shard_index = shard_index
         self._interleave_k = interleave_k
+        self._shards_per_partition = 1
+        if num_kafka_partitions and num_shards > num_kafka_partitions:
+            if num_shards % num_kafka_partitions:
+                raise ValueError(
+                    f"{num_shards} shards over {num_kafka_partitions} partitions: the shard "
+                    "count must be a multiple of the partition count"
+                )
+            if shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
+                raise ValueError(
+                    f"{num_shards} shards over {num_kafka_partitions} partitions splits rows, "
+                    "which only shuffle_mode=block_shuffle supports"
+                )
+            self._shards_per_partition = num_shards // num_kafka_partitions
+        self._num_partition_owners = num_shards // self._shards_per_partition
+        self._partition_owner_index = shard_index // self._shards_per_partition
+        self._rank_in_partition = shard_index % self._shards_per_partition
         self._date_range = date_range
         self._continuous = continuous
         self._poll_interval_s = poll_interval_s
@@ -805,7 +968,7 @@ class InterleavingRecordBatchProvider:
             meta = _load_valid_batches_metadata(metadata_path)
             if meta is None:
                 raise ValueError(f"Cannot load metadata from {metadata_path}")
-            start_batch_id, end_batch_id = _resolve_time_range(
+            start_batch_id, range_end_batch_id = _resolve_time_range(
                 self._topic_dir,
                 meta["min_valid_batch"],
                 meta["max_valid_batch"],
@@ -813,11 +976,18 @@ class InterleavingRecordBatchProvider:
                 max_timestamp_ms,
             )
             if max_timestamp_ms is not None:
-                self._end_batch_id = end_batch_id
+                self._end_batch_id = range_end_batch_id
+        if end_batch_id is not None:
+            self._end_batch_id = (
+                end_batch_id
+                if self._end_batch_id is None
+                else min(self._end_batch_id, end_batch_id)
+            )
 
         self._shuffle_skip_rows: int = 0
         self._shuffle_skip_spans_windows: bool = False
         self._rows_in_window: int = 0
+        self._window_end: int | None = None
         self._range_start_batch_id: int = start_batch_id
         self._block_resume: tuple[int, list[list[int]]] | None = None
         self._block_drop_in_progress: bool = False
@@ -861,7 +1031,15 @@ class InterleavingRecordBatchProvider:
                 saved_reads = resume_position["rows_read_in_batch"]
                 saved_batch_size = resume_position.get("batch_size")
 
-                if saved_batch_size is not None and saved_batch_size != batch_size:
+                if (rows_in_file := resume_position.get("rows_in_file")) is not None:
+                    ahead = saved_reads % self._interleave_k
+                    reads = -(-rows_in_file // batch_size)
+                    lead_reads = -(-(rows_in_file + (saved_batch_size or batch_size)) // batch_size)
+                    if not ahead or lead_reads <= reads:
+                        self._record_batches_to_skip = reads * self._interleave_k
+                    else:
+                        self._record_batches_to_skip = (lead_reads - 1) * self._interleave_k + ahead
+                elif saved_batch_size is not None and saved_batch_size != batch_size:
                     assert saved_batch_size > 0, (
                         f"saved_batch_size must be positive, got {saved_batch_size}"
                     )
@@ -957,7 +1135,7 @@ class InterleavingRecordBatchProvider:
             my_files = [
                 _batch_path(self._topic_dir, p, bid)
                 for p in range(num_partitions)
-                if p % self._num_shards == self._shard_index
+                if p % self._num_partition_owners == self._partition_owner_index
             ]
             ready.append(my_files)
             self._next_batch_id = bid + 1
@@ -1007,7 +1185,8 @@ class InterleavingRecordBatchProvider:
                 my_files = [
                     f
                     for f in files_for_batch
-                    if (_extract_partition_id(f) or 0) % self._num_shards == self._shard_index
+                    if (_extract_partition_id(f) or 0) % self._num_partition_owners
+                    == self._partition_owner_index
                 ]
                 ready.append(my_files)
                 self._next_batch_id = bid + 1
@@ -1016,20 +1195,38 @@ class InterleavingRecordBatchProvider:
 
         return ready
 
-    def _open_file(self, file: str, pool: ThreadPoolExecutor, active: deque) -> None:
+    def _open_file(
+        self, file: str, pool: ThreadPoolExecutor, active: deque, read_all: bool = False
+    ) -> None:
         rank_logger.info(f"Worker {self._shard_index}/{self._num_shards} opening file {file}")
         path = _resolve_file_path(self._path, file)
 
         def _impl():
             try:
-                pf = ParquetFile(path)
-                return LazyRecordBatchIterator(
+                pf = parquet_file(path)
+                holder = LazyRecordBatchIterator(
                     pf,
-                    self._batch_size,
+                    self._batch_size * self._shards_per_partition,
                     path,
                     self._conversion_delay_columns,
                     self._include_action_delay_columns,
+                    id_list_sidecar_root=self._id_list_sidecar_root,
+                    id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                    id_list_sidecar_strict=self._id_list_sidecar_strict,
+                    id_list_sources=self._id_list_sources,
+                    ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                    ad_fields_sources=self._ad_fields_sources,
                 )
+                if self._shards_per_partition > 1:
+                    holder = RowSplitRecordBatchIterator(
+                        holder, self._shards_per_partition, self._rank_in_partition
+                    )
+                if read_all:
+                    batches = []
+                    while (batch := self._safe_read(holder)) is not None:
+                        batches.append(batch)
+                    return PrereadRecordBatchIterator(holder, batches)
+                return holder
             except Exception as e:
                 if "No such file or directory" in str(e):
                     rank_logger.warning(f"Skipping missing file {file}")
@@ -1058,6 +1255,7 @@ class InterleavingRecordBatchProvider:
         pending: deque[Future[LazyRecordBatchIterator | None]] = deque()
         ready: deque[LazyRecordBatchIterator] = deque()
         active: deque[LazyRecordBatchIterator] = deque()
+        read_ahead: dict[int, Future[pa.RecordBatch | None]] = {}
         file_idx = 0
 
         def _submit_opens() -> None:
@@ -1088,6 +1286,7 @@ class InterleavingRecordBatchProvider:
         if prefetched:
             pending.extend(prefetched)
             file_idx = len(prefetched)
+            _submit_opens()
             _fill_active_blocking()
 
             if prefetched_batches:
@@ -1120,7 +1319,9 @@ class InterleavingRecordBatchProvider:
                 continue
 
             holders = list(active)
-            futures = [pool.submit(self._safe_read, h) for h in holders]
+            futures = [
+                read_ahead.pop(id(h), None) or pool.submit(self._safe_read, h) for h in holders
+            ]
             active.clear()
 
             for holder, fut in zip(holders, futures):
@@ -1128,6 +1329,7 @@ class InterleavingRecordBatchProvider:
                 if batch is not None:
                     self._reads_in_current_batch += 1
                     active.append(holder)
+                    read_ahead[id(holder)] = pool.submit(self._safe_read, holder)
                     yield batch
 
             _submit_opens()
@@ -1150,11 +1352,17 @@ class InterleavingRecordBatchProvider:
         path = _resolve_file_path(self._path, file)
         try:
             holder = LazyRecordBatchIterator(
-                ParquetFile(path),
+                parquet_file(path),
                 _SHUFFLE_READ_CHUNK_ROWS,
                 path,
                 self._conversion_delay_columns,
                 self._include_action_delay_columns,
+                id_list_sidecar_root=self._id_list_sidecar_root,
+                id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                id_list_sidecar_strict=self._id_list_sidecar_strict,
+                id_list_sources=self._id_list_sources,
+                ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                ad_fields_sources=self._ad_fields_sources,
             )
         except Exception as e:
             if "No such file or directory" in str(e):
@@ -1242,13 +1450,14 @@ class InterleavingRecordBatchProvider:
                     (bid, _batch_path(self._topic_dir, p, bid))
                     for bid in range(window_start, window_end)
                     for p in range(meta["num_partitions"])
-                    if p % self._num_shards == self._shard_index
+                    if p % self._num_partition_owners == self._partition_owner_index
                 ]
                 rng = np.random.default_rng((self._shuffle_seed, self._shard_index, window_start))
                 order = rng.permutation(len(entries))
                 files = [entries[i][1] for i in order if entries[i][0] >= min_valid]
 
                 self._current_drain_batch_id = window_start
+                self._window_end = window_end
                 self._rows_in_window = 0
                 rank_logger.info(
                     f"Shard {self._shard_index}: shuffled window [{window_start}, {window_end}), "
@@ -1284,8 +1493,14 @@ class InterleavingRecordBatchProvider:
         resume = self._block_resume
         window_start = resume[0] if resume else (self._next_batch_id // window) * window
 
+        files_per_batch_id = max(1, self._interleave_k)
         pool = ThreadPoolExecutor(
-            max_workers=max(1, self._interleave_k), thread_name_prefix="block_shuffle_parquet"
+            max_workers=files_per_batch_id, thread_name_prefix="block_shuffle_parquet"
+        )
+        lookahead_plan = _block_lookahead_plan(files_per_batch_id)
+        lookahead_pool = ThreadPoolExecutor(
+            max_workers=max(1, sum(lookahead_plan)),
+            thread_name_prefix="block_shuffle_lookahead",
         )
         try:
             while True:
@@ -1368,13 +1583,31 @@ class InterleavingRecordBatchProvider:
                     lo=lo,
                     hi=hi,
                 )
-                for bid in sequence:
-                    if bid in done:
-                        continue
+                pending_bids = [bid for bid in sequence if bid not in done]
+                prefetched_by_position: dict[
+                    int, deque[Future[LazyRecordBatchIterator | None]]
+                ] = {}
+                for position, bid in enumerate(pending_bids):
                     if carry:
                         self._remaining_skips, carry = carry, 0
+                    for offset, files_to_read in enumerate(lookahead_plan, start=1):
+                        ahead = position + offset
+                        if ahead >= len(pending_bids):
+                            break
+                        if ahead not in prefetched_by_position:
+                            opened: deque[Future[LazyRecordBatchIterator | None]] = deque()
+                            files = self._files_for_batch_id(pending_bids[ahead], num_partitions)
+                            for file in files[:files_to_read]:
+                                self._open_file(file, lookahead_pool, opened, read_all=True)
+                            prefetched_by_position[ahead] = opened
+                    prefetched = prefetched_by_position.pop(position, None)
                     block_log.batch_id(bid)
-                    yield from self._drain_batch_id(bid, num_partitions, pool)
+                    yield from self._drain_batch_id(
+                        bid,
+                        num_partitions,
+                        pool,
+                        prefetched=prefetched if self._remaining_skips == 0 else None,
+                    )
                     segments[-1][2] += 1
                     self._reads_in_current_batch = 0
                 if hi < window_start + window and _block_window_grew(
@@ -1386,26 +1619,48 @@ class InterleavingRecordBatchProvider:
                 self._next_batch_id = window_start
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+            lookahead_pool.shutdown(wait=False, cancel_futures=True)
 
-    def _drain_batch_id(
-        self, bid: int, num_partitions: int, pool: ThreadPoolExecutor
-    ) -> Iterator[pa.RecordBatch]:
-        files = [
+    def _files_for_batch_id(self, bid: int, num_partitions: int) -> list[str]:
+        return [
             _batch_path(self._topic_dir, p, bid)
             for p in range(num_partitions)
-            if p % self._num_shards == self._shard_index
+            if p % self._num_partition_owners == self._partition_owner_index
         ]
+
+    def _drain_batch_id(
+        self,
+        bid: int,
+        num_partitions: int,
+        pool: ThreadPoolExecutor,
+        prefetched: deque[Future[LazyRecordBatchIterator | None]] | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        files = self._files_for_batch_id(bid, num_partitions)
         self._current_drain_batch_id = bid
         self._reads_in_current_batch = 0
-        yield from self._drain_files(files, pool=pool)
+        yield from self._drain_files(files, pool=pool, prefetched=prefetched)
+
+    def set_end_batch_id(self, end_batch_id: int) -> None:
+        if self._end_batch_id is not None and end_batch_id < self._end_batch_id:
+            raise ValueError(
+                f"end_batch_id can only move forward: {self._end_batch_id} -> {end_batch_id}"
+            )
+        self._end_batch_id = end_batch_id
+
+    def block_shuffle_window_start(self) -> int | None:
+        state = self._block_state
+        return None if state is None else state[0]
 
     def get_position(self) -> DataPosition:
         if self._shuffle_window_time_slices > 0 and self._shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
-            return DataPosition(
+            position = DataPosition(
                 last_batch_id=self._current_drain_batch_id,
                 rows_read_in_batch=self._rows_in_window,
                 batch_size=1,
             )
+            if self._window_end is not None:
+                position["shuffle_window_end"] = self._window_end
+            return position
         rank_logger.debug(
             "Saving data position: batch_id=%d, rows_read=%d, batch_size=%d, "
             "total_rows=%d, shard_index=%d, num_shards=%d",
@@ -1461,13 +1716,19 @@ class InterleavingRecordBatchProvider:
                     file_path: str,
                 ) -> tuple[LazyRecordBatchIterator | None, pa.RecordBatch | None]:
                     try:
-                        pf = pq.ParquetFile(file_path)
+                        pf = parquet_file(file_path)
                         holder = LazyRecordBatchIterator(
                             pf,
                             self._batch_size,
                             file_path,
                             self._conversion_delay_columns,
                             self._include_action_delay_columns,
+                            id_list_sidecar_root=self._id_list_sidecar_root,
+                            id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                            id_list_sidecar_strict=self._id_list_sidecar_strict,
+                            id_list_sources=self._id_list_sources,
+                            ad_fields_sidecar_root=self._ad_fields_sidecar_root,
+                            ad_fields_sources=self._ad_fields_sources,
                         )
                         batch = holder.read()
                         return holder, batch
@@ -1579,15 +1840,26 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             padded["head_eligible_mask"] = np.pad(
                 _hem, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
             )
-        if (value_valid := post_seq.get("value_label_valid")) is not None:
-            padded["value_label_valid"] = pad_array(value_valid)
-        if (value_baseline := post_seq.get("value_baseline_mean_usd")) is not None:
-            padded["value_baseline_mean_usd"] = pad_array(value_baseline)
+        for key in VALUE_LABEL_DTYPES:
+            if (value_labels := post_seq.get(key)) is not None:
+                padded[key] = pad_array(value_labels)
+        if (ads_counts := post_seq.get("ads_count_buckets")) is not None:
+            padded["ads_count_buckets"] = pad_array(ads_counts)
+        if (ads_ctr := post_seq.get("ads_ctr_buckets")) is not None:
+            padded["ads_ctr_buckets"] = pad_array(ads_ctr)
+        if (sample_weight := post_seq.get("sample_weight")) is not None:
+            padded["sample_weight"] = pad_array(sample_weight)
+        if (ad_side := post_seq.get("ad_side_ids")) is not None:
+            padded["ad_side_ids"] = pad_array(ad_side)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
             padded["conversion_delay_ms"] = np.pad(
                 delays,
                 ((0, batch_size - num_rows), (0, 0), (0, 0)),
                 constant_values=CONVERSION_DELAY_NONE,
+            )
+        if (probs := post_seq.get("teacher_probs")) is not None:
+            padded["teacher_probs"] = np.pad(
+                probs, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=np.nan
             )
         for key, (_, _, fill) in PAGE_RECORD_COLUMNS.items():
             if (values := post_seq.get(key)) is not None:
@@ -1596,6 +1868,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 )
         if (impressed := post_seq.get("rl_impressed")) is not None:
             padded["rl_impressed"] = pad_array(impressed)
+        if (is_broadcast := post_seq.get("is_broadcast")) is not None:
+            padded["is_broadcast"] = pad_array(is_broadcast)
         return padded
 
     def _pad_post_seq_fields(post_seq: PostSeq) -> PostSeq:
@@ -1656,6 +1930,14 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
     }
     if (cp := batch_unpadded.get("candidate_positions")) is not None:
         padded["candidate_positions"] = pad_array(cp)
+    if (il := batch_unpadded.get("user_id_list_hashes")) is not None and (
+        ilm := batch_unpadded.get("user_id_list_mask")
+    ) is not None:
+        padded["user_id_list_hashes"] = pad_array(il)
+        padded["user_id_list_mask"] = pad_array(ilm)
+    cast(dict[str, np.ndarray], padded).update(
+        {key: pad_array(arr) for key, arr in author_profile.present(batch_unpadded).items()}
+    )
 
     extras = cast(dict[str, np.ndarray], batch_unpadded)
     padded_dict = cast(dict[str, np.ndarray], padded)
@@ -1688,6 +1970,10 @@ class PhoenixDataset(Dataset):
     include_candidate_post_ids: bool = False
     date_range: tuple[str, str] | None = None
     search_query_embedding_dim: int = 0
+    aux_value_events: tuple[str, ...] = ()
+    distill_teacher: str = ""
+    distill_actions: tuple[int, ...] = ()
+    distill_bad_spans_ms: tuple[tuple[int, int], ...] = ()
 
     candidate_negative_filter: CandidateNegativeFilter | None = None
     candidate_negative_mode: CandidateNegativeMode | None = None
@@ -1697,6 +1983,9 @@ class PhoenixDataset(Dataset):
     global_author_ids: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_post_creation_datetimes: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_post_sids: np.ndarray | None = dataclasses.field(init=False, default=None)
+    _alloc: ArrayAllocator = dataclasses.field(
+        init=False, default_factory=ArrayAllocator, repr=False, compare=False
+    )
     global_ids_file_path: Path = (
         PHOENIX_INDEX_BASE / "post_creation_snapshots/post_creation_1day.parquet"
     )
@@ -1705,20 +1994,48 @@ class PhoenixDataset(Dataset):
     sid_num_levels: int = 0
 
     compute_post_unexplored_label: bool = False
+    ld_label_exclude_clicks: bool = False
     enable_stale_post: bool = False
     enable_stale_post_30d: bool = False
+    user_history_stats_dim: int = 0
 
     ads_head_masking: bool = False
+    dump_keep_rate_per_10000: int | None = None
     ads_pixel_head_masking: bool = False
+    ads_late_window_heads: bool = False
     page_records: bool = False
+    read_video_duration: bool = False
+    read_ads_engagement_counts: bool = False
+    read_ads_ctr_features: bool = False
+    per_candidate_sample_weight: bool = False
+    read_ad_side_ids: bool = False
+    ad_side_fields: str = "campaign,line_item,creative"
+    ad_fields_sidecar_root: str | None = None
 
     multimodal_embedding_type: EmbeddingType | None = None
+
+    history_url_embedding_dim: int = 0
 
     use_conversion_labels: bool = False
     conversion_label_window_ms: int = 7 * 24 * 60 * 60 * 1000
     conversion_label_types: tuple[str, ...] = ()
     fold_conversion_actions_into_multihot: bool = True
     emit_conversion_label_keys: bool = False
+
+    id_list_features: str = ""
+    id_list_sidecar_root: str | None = None
+    id_list_prefer_sidecar: bool = True
+    id_list_sidecar_strict: bool = False
+
+    long_term_author_profile_size: int = 0
+
+    @property
+    def id_list_specs(self) -> tuple[id_lists.IdListFeatureSpec, ...]:
+        return id_lists.parse_specs(self.id_list_features)
+
+    @property
+    def ad_side_field_names(self) -> tuple[str, ...]:
+        return ad_side.parse_ad_side_fields(self.ad_side_fields)
 
     @property
     def multimodal_embedding_dim(self) -> int:
@@ -1762,11 +2079,16 @@ class PhoenixDataset(Dataset):
         batch_size: int,
         current_step: int,
         resume_position: DataPosition | None = None,
+        end_batch_id: int | None = None,
+        start_batch_id: int | None = None,
     ) -> int | None:
-        if self.date_range is None or self.path is None:
+        if self.path is None:
             return None
-        max_ts = self._parse_date_bound(self.date_range[1])
-        if max_ts is None:
+        min_ts = max_ts = None
+        if self.date_range is not None:
+            min_ts = self._parse_date_bound(self.date_range[0])
+            max_ts = self._parse_date_bound(self.date_range[1])
+        if end_batch_id is None and max_ts is None:
             return None
 
         topic_dir = self.path
@@ -1775,14 +2097,17 @@ class PhoenixDataset(Dataset):
         if meta is None:
             return None
 
-        min_ts = self._parse_date_bound(self.date_range[0])
-        start_bid, end_bid = _resolve_time_range(
-            topic_dir,
-            meta["min_valid_batch"],
-            meta["max_valid_batch"],
-            min_ts,
-            max_ts,
-        )
+        if end_batch_id is None:
+            start_bid, end_bid = _resolve_time_range(
+                topic_dir,
+                meta["min_valid_batch"],
+                meta["max_valid_batch"],
+                min_ts,
+                max_ts,
+            )
+        else:
+            start_bid = self.start_batch_id() if start_batch_id is None else start_batch_id
+            end_bid = min(end_batch_id, meta["max_valid_batch"] + 1)
         resume_bid: int | None = None
         saved_reads = 0
         saved_bs: int | None = None
@@ -1793,7 +2118,13 @@ class PhoenixDataset(Dataset):
 
         manifest = load_batch_manifest(topic_dir) if self._counts_steps_from_manifest() else None
         num_partitions = meta["num_partitions"]
-        files_per_shard = (self.num_kafka_partitions or 0) // num_shards
+        partitions = self.num_kafka_partitions or num_partitions
+        shards_per_partition = 1
+        if partitions and num_shards > partitions and num_shards % partitions == 0:
+            shards_per_partition = num_shards // partitions
+        num_partition_owners = num_shards // shards_per_partition
+        rows_per_step = batch_size * shards_per_partition
+        files_per_shard = (self.num_kafka_partitions or 0) // num_partition_owners
 
         if (
             self.shuffle_window_time_slices > 0
@@ -1849,15 +2180,18 @@ class PhoenixDataset(Dataset):
         ):
             if manifest is not None:
                 rows = manifest.rows_matrix(topic_dir, start_bid, end_bid, num_partitions)
-                full, tail = np.divmod(rows, batch_size)
-                steps = full + ((tail > 0) & (tail * 2 >= batch_size))
-                shard_of = np.arange(num_partitions) % num_shards
-                per_bid = [steps[:, shard_of == s].sum(axis=1) for s in range(num_shards)]
+                full, tail = np.divmod(rows, rows_per_step)
+                kept_tail = tail // shards_per_partition
+                steps = full + ((kept_tail > 0) & (kept_tail * 2 >= batch_size))
+                owner_of = np.arange(num_partitions) % num_partition_owners
+                per_bid = [steps[:, owner_of == o].sum(axis=1) for o in range(num_partition_owners)]
                 source = "batch manifest, block shuffle"
             else:
                 dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
-                uniform = np.full(end_bid - start_bid, files_per_shard * (dump_rows // batch_size))
-                per_bid = [uniform] * num_shards
+                uniform = np.full(
+                    end_bid - start_bid, files_per_shard * (dump_rows // rows_per_step)
+                )
+                per_bid = [uniform] * num_partition_owners
                 source = f"{dump_rows}-row sample file, block shuffle"
             block = self.block_shuffle_block_time_slices
             remaining = None
@@ -1870,7 +2204,7 @@ class PhoenixDataset(Dataset):
                     shard=shard if self.block_shuffle_order_per_shard else None,
                     segments=block_resume.segments,
                 )
-                counts = per_bid[shard]
+                counts = per_bid[shard // shards_per_partition]
                 left_steps = sum(
                     int(counts[b - start_bid])
                     for b in range(max(start_bid, block_resume.window_start), end_bid)
@@ -1892,17 +2226,18 @@ class PhoenixDataset(Dataset):
                     topic_dir,
                     manifest,
                     num_partitions=num_partitions,
-                    num_shards=num_shards,
+                    num_shards=num_partition_owners,
                     batch_size=batch_size,
                     start_batch_id=start_bid,
                     end_batch_id=end_bid,
                     resume_batch_id=resume_bid,
                     resume_reads_in_batch=adjusted_reads,
+                    shards_per_partition=shards_per_partition,
                 )
                 source = "batch manifest"
             else:
                 dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
-                batches_per_bid = files_per_shard * (dump_rows // batch_size)
+                batches_per_bid = files_per_shard * (dump_rows // rows_per_step)
                 total_batches = (end_bid - start_bid) * batches_per_bid
                 consumed = 0
                 if resume_bid is not None and resume_bid >= start_bid:
@@ -1923,6 +2258,49 @@ class PhoenixDataset(Dataset):
             source,
         )
         return data_end_step
+
+    def supports_follow_data_end(self) -> bool:
+        return True
+
+    @property
+    def _topic_dir(self) -> str:
+        assert self.path is not None, "follow_data_end requires dataset.path"
+        return self.path
+
+    def start_batch_id(self) -> int:
+        meta = _load_valid_batches_metadata(os.path.join(self._topic_dir, ".valid_batches.json"))
+        if meta is None:
+            raise RuntimeError(f"could not read the dataset index under {self._topic_dir}")
+        min_ts = None if self.date_range is None else self._parse_date_bound(self.date_range[0])
+        if min_ts is None:
+            return meta["min_valid_batch"]
+        start_bid, _ = _resolve_time_range(
+            self._topic_dir, meta["min_valid_batch"], meta["max_valid_batch"], min_ts, None
+        )
+        return start_bid
+
+    def available_end_batch_id(self, after_end_batch_id: int = -1) -> int | None:
+        meta = _load_valid_batches_metadata(os.path.join(self._topic_dir, ".valid_batches.json"))
+        if meta is None:
+            return None
+        end = meta["max_valid_batch"] + 1
+        if end <= after_end_batch_id:
+            return None
+        manifest = (
+            load_batch_manifest(self._topic_dir) if self._counts_steps_from_manifest() else None
+        )
+        if manifest is not None:
+            end = min(end, manifest.first_batch + manifest.rows.shape[0])
+        return end if end > after_end_batch_id else None
+
+    def set_end_batch_id(self, end_batch_id: int) -> None:
+        self._end_batch_id = end_batch_id
+        if self._rb_provider is not None:
+            self._rb_provider.set_end_batch_id(end_batch_id)
+
+    def reader_window_start(self) -> int | None:
+        provider = self._rb_provider
+        return None if provider is None else provider.block_shuffle_window_start()
 
     def shutdown(self):
         stop_event = self._producer_stop
@@ -1947,10 +2325,139 @@ class PhoenixDataset(Dataset):
     _producer_queue: Queue | None = dataclasses.field(init=False, default=None, repr=False)
     _producer_stop: Event | None = dataclasses.field(init=False, default=None, repr=False)
     _producer_thread: Thread | None = dataclasses.field(init=False, default=None, repr=False)
+    _end_batch_id: int | None = dataclasses.field(init=False, default=None, repr=False)
+
+    def _conversion_delay_columns(self) -> list[str] | None:
+        if not self.use_conversion_labels:
+            return None
+        return [conversion_labels.DELAY_COLUMN] + [
+            conversion_labels.type_delay_column(t) for t in self.conversion_label_types
+        ]
+
+    def _record_batches(
+        self,
+        *,
+        batch_size: int,
+        shard_index: int,
+        num_shards: int,
+        skip_rows: int,
+        resume_position: DataPosition | None,
+    ) -> Iterator[pa.RecordBatch]:
+        assert self.path is not None
+        assert self.num_kafka_partitions is not None
+        assert (
+            self.num_kafka_partitions % num_shards == 0
+            or num_shards % self.num_kafka_partitions == 0
+        ), (
+            self.num_kafka_partitions,
+            num_shards,
+        )
+        interleave_k = max(1, self.num_kafka_partitions // num_shards)
+
+        topic_dir = self.path
+        metadata_path = str(Path(topic_dir) / ".valid_batches.json")
+        index_path = str(Path(topic_dir) / ".index")
+        if is_iceberg_path(topic_dir):
+            metadata_path = os.path.join(topic_dir, ".valid_batches.json")
+            self._check_iceberg_readable(metadata_path)
+        conversion_delay_columns = self._conversion_delay_columns()
+
+        min_timestamp_ms: int | None = None
+        max_timestamp_ms: int | None = None
+        if self.date_range is not None:
+            min_timestamp_ms = self._parse_date_bound(self.date_range[0])
+            max_timestamp_ms = self._parse_date_bound(self.date_range[1])
+
+        shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
+        shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
+        shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
+
+        if is_file(metadata_path):
+            rank_logger.info(f"Using metadata mode: {metadata_path}")
+            rb_provider = InterleavingRecordBatchProvider(
+                metadata_path=metadata_path,
+                topic_dir=topic_dir,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                shard_index=shard_index,
+                interleave_k=interleave_k,
+                skip_rows=skip_rows if not self.is_eval else 0,
+                date_range=self.date_range,
+                continuous=self.continuous,
+                num_kafka_partitions=self.num_kafka_partitions,
+                resume_position=resume_position,
+                min_timestamp_ms=min_timestamp_ms,
+                max_timestamp_ms=max_timestamp_ms,
+                conversion_delay_columns=conversion_delay_columns,
+                include_action_delay_columns=self.use_conversion_labels
+                and self.fold_conversion_actions_into_multihot,
+                id_list_sidecar_root=self.id_list_sidecar_root,
+                id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                id_list_sidecar_strict=self.id_list_sidecar_strict,
+                ad_fields_sidecar_root=self.ad_fields_sidecar_root,
+                shuffle_window_time_slices=shuffle_window,
+                shuffle_in_memory_buffer_rows=shuffle_buffer,
+                shuffle_seed=self.shuffle_seed,
+                shuffle_mode=shuffle_mode,
+                block_shuffle_block_time_slices=self.block_shuffle_block_time_slices,
+                block_shuffle_order_per_shard=(
+                    self.block_shuffle_order_per_shard and not self.is_eval
+                ),
+                end_batch_id=self._end_batch_id,
+            )
+        else:
+            if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:
+                raise ValueError(
+                    f"read-time shuffle needs metadata mode; {metadata_path} does not exist"
+                )
+            if resume_position is not None:
+                rank_logger.warning(
+                    "resume_position was provided but dataset is in index mode; "
+                    "ignoring resume_position and falling back to skip_rows."
+                )
+            rank_logger.info(f"Using index mode: {index_path}")
+            rb_provider = InterleavingRecordBatchProvider(
+                index_path=index_path,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                shard_index=shard_index,
+                interleave_k=interleave_k,
+                skip_rows=skip_rows if not self.is_eval else 0,
+                date_range=self.date_range,
+                continuous=self.continuous,
+                num_kafka_partitions=self.num_kafka_partitions,
+                conversion_delay_columns=conversion_delay_columns,
+                include_action_delay_columns=self.use_conversion_labels
+                and self.fold_conversion_actions_into_multihot,
+                id_list_sidecar_root=self.id_list_sidecar_root,
+                id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                id_list_sidecar_strict=self.id_list_sidecar_strict,
+                ad_fields_sidecar_root=self.ad_fields_sidecar_root,
+            )
+        self._rb_provider = rb_provider
+        return rb_provider.get_record_batches()
+
+    def _check_iceberg_readable(self, metadata_path: str) -> None:
+        meta = _load_valid_batches_metadata(metadata_path)
+        if meta is not None and meta["num_partitions"] != self.num_kafka_partitions:
+            raise ValueError(
+                f"num_kafka_partitions={self.num_kafka_partitions}, but {self.path} is read as "
+                f"{meta['num_partitions']} partitions: make them equal"
+            )
+        sidecars = {
+            "use_conversion_labels": self.use_conversion_labels,
+            "id_list_sidecar_root": self.id_list_sidecar_root is not None,
+            "ad_fields_sidecar_root": self.ad_fields_sidecar_root is not None,
+        }
+        if any(sidecars.values()):
+            raise ValueError(
+                f"{[name for name, on in sidecars.items() if on]} join sidecar files by a "
+                f"dump's batch file paths, which the Iceberg table {self.path} does not have"
+            )
 
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
-            return self._rb_provider.get_position()
+            return stamp_data_file(self._rb_provider.get_position(), self.path)
         return None
 
     def make(
@@ -1998,96 +2505,52 @@ class PhoenixDataset(Dataset):
                         sid_num_levels=self.sid_num_levels,
                     )
 
-                assert self.num_kafka_partitions is not None
-                assert self.num_kafka_partitions % num_shards == 0, (
-                    self.num_kafka_partitions,
-                    num_shards,
-                )
-                interleave_k = self.num_kafka_partitions // num_shards
-
-                topic_dir = self.path
-                metadata_path = str(Path(topic_dir) / ".valid_batches.json")
-                index_path = str(Path(topic_dir) / ".index")
-
-                conversion_delay_columns: list[str] | None = None
-                if self.use_conversion_labels:
-                    conversion_delay_columns = [conversion_labels.DELAY_COLUMN] + [
-                        conversion_labels.type_delay_column(t) for t in self.conversion_label_types
-                    ]
-
-                min_timestamp_ms: int | None = None
-                max_timestamp_ms: int | None = None
-                if self.date_range is not None:
-                    min_timestamp_ms = self._parse_date_bound(self.date_range[0])
-                    max_timestamp_ms = self._parse_date_bound(self.date_range[1])
-
-                shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
-                shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
-                shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
-
-                if os.path.isfile(metadata_path):
-                    rank_logger.info(f"Using metadata mode: {metadata_path}")
-                    rb_provider = InterleavingRecordBatchProvider(
-                        metadata_path=metadata_path,
-                        topic_dir=topic_dir,
-                        batch_size=batch_size,
-                        num_shards=num_shards,
-                        shard_index=shard_index,
-                        interleave_k=interleave_k,
-                        skip_rows=skip_rows if not self.is_eval else 0,
-                        date_range=self.date_range,
-                        continuous=self.continuous,
-                        num_kafka_partitions=self.num_kafka_partitions,
-                        resume_position=resume_position,
-                        min_timestamp_ms=min_timestamp_ms,
-                        max_timestamp_ms=max_timestamp_ms,
-                        conversion_delay_columns=conversion_delay_columns,
-                        include_action_delay_columns=self.use_conversion_labels
-                        and self.fold_conversion_actions_into_multihot,
-                        shuffle_window_time_slices=shuffle_window,
-                        shuffle_in_memory_buffer_rows=shuffle_buffer,
-                        shuffle_seed=self.shuffle_seed,
-                        shuffle_mode=shuffle_mode,
-                        block_shuffle_block_time_slices=self.block_shuffle_block_time_slices,
-                        block_shuffle_order_per_shard=(
-                            self.block_shuffle_order_per_shard and not self.is_eval
-                        ),
+                conversion_delay_columns = self._conversion_delay_columns()
+                id_list_specs = self.id_list_specs or None
+                if id_list_specs:
+                    rank_logger.info(
+                        f"id-list features: {[f'{x.name}:{x.k}' for x in id_list_specs]} "
+                        f"(sidecar root {self.id_list_sidecar_root!r}, "
+                        f"prefer sidecar {self.id_list_prefer_sidecar}, "
+                        f"strict {self.id_list_sidecar_strict})"
                     )
-                else:
-                    if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:
-                        raise ValueError(
-                            f"read-time shuffle needs metadata mode; {metadata_path} does not exist"
-                        )
-                    if resume_position is not None:
-                        rank_logger.warning(
-                            "resume_position was provided but dataset is in index mode; "
-                            "ignoring resume_position and falling back to skip_rows."
-                        )
-                    rank_logger.info(f"Using index mode: {index_path}")
-                    rb_provider = InterleavingRecordBatchProvider(
-                        index_path=index_path,
-                        batch_size=batch_size,
-                        num_shards=num_shards,
-                        shard_index=shard_index,
-                        interleave_k=interleave_k,
-                        skip_rows=skip_rows if not self.is_eval else 0,
-                        date_range=self.date_range,
-                        continuous=self.continuous,
-                        num_kafka_partitions=self.num_kafka_partitions,
-                        conversion_delay_columns=conversion_delay_columns,
-                        include_action_delay_columns=self.use_conversion_labels
-                        and self.fold_conversion_actions_into_multihot,
+                if self.id_list_sidecar_root is not None and not os.path.isdir(
+                    self.id_list_sidecar_root
+                ):
+                    raise FileNotFoundError(
+                        f"id_list_sidecar_root does not exist: {self.id_list_sidecar_root!r}"
                     )
-                self._rb_provider = rb_provider
-                data_iter = self._rb_provider.get_record_batches()
+                if self.ad_fields_sidecar_root is not None:
+                    if not self.read_ad_side_ids:
+                        raise ValueError("ad_fields_sidecar_root needs read_ad_side_ids=True")
+                    if not os.path.isdir(self.ad_fields_sidecar_root):
+                        raise FileNotFoundError(
+                            f"ad_fields_sidecar_root does not exist: "
+                            f"{self.ad_fields_sidecar_root!r}"
+                        )
+                    rank_logger.info(
+                        f"ad-side ids {self.ad_side_field_names}: ad-field sidecar root "
+                        f"{self.ad_fields_sidecar_root!r}"
+                    )
+                id_list_fill_logged = False
+                no_recent_global_posts_logged = False
 
-                for record_batch in data_iter:
+                for record_batch in self._record_batches(
+                    batch_size=batch_size,
+                    shard_index=shard_index,
+                    num_shards=num_shards,
+                    skip_rows=skip_rows,
+                    resume_position=resume_position,
+                ):
+                    if is_iceberg_path(self.path):
+                        record_batch = iceberg_layout.dump_layout(record_batch)
                     if record_batch.num_rows * 2 < batch_size:
                         rank_logger.warning(
                             "Skipping record batch that doesn't contain enough rows"
                         )
                         continue
 
+                    qualified_indices = None
                     if self.global_post_creation_datetimes is not None:
                         assert self.global_post_ids is not None
                         assert self.global_author_ids is not None
@@ -2103,6 +2566,18 @@ class PhoenixDataset(Dataset):
                         rank_logger.info(
                             f"Only select {len(qualified_indices)}/{len(self.global_post_ids)} global posts created within 24 hours of the data datetime: {data_datetime}"
                         )
+                        if len(qualified_indices) == 0:
+                            qualified_indices = None
+                            if not no_recent_global_posts_logged:
+                                no_recent_global_posts_logged = True
+                                rank_logger.warning(
+                                    f"No post in {self.global_ids_file_path} was created within "
+                                    f"24 hours of the data datetime {data_datetime}: global "
+                                    "negatives are sampled from the whole snapshot"
+                                )
+                    if qualified_indices is not None:
+                        assert self.global_post_ids is not None
+                        assert self.global_author_ids is not None
                         global_post_ids = self.global_post_ids[qualified_indices]
                         global_author_ids = self.global_author_ids[qualified_indices]
                         global_post_sids = (
@@ -2139,12 +2614,29 @@ class PhoenixDataset(Dataset):
                         global_post_sids=global_post_sids,
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
+                        ld_label_exclude_clicks=self.ld_label_exclude_clicks,
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                         stale_post_30d=self.enable_stale_post_30d,
                         ads_head_masking=self.ads_head_masking,
+                        dump_keep_rate_per_10000=self.dump_keep_rate_per_10000,
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
+                        ads_late_window_heads=self.ads_late_window_heads,
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
+                        id_list_specs=id_list_specs,
+                        history_url_embedding_dim=self.history_url_embedding_dim,
+                        read_ads_engagement_counts=self.read_ads_engagement_counts,
+                        read_ads_ctr_features=self.read_ads_ctr_features,
+                        per_candidate_sample_weight=self.per_candidate_sample_weight,
+                        long_term_author_profile_size=self.long_term_author_profile_size,
+                        user_history_stats_dim=self.user_history_stats_dim,
+                        alloc=self._alloc,
+                        aux_value_events=self.aux_value_events,
+                        read_ad_side_ids=self.read_ad_side_ids,
+                        ad_side_fields=self.ad_side_field_names,
+                        distill_teacher=self.distill_teacher,
+                        distill_actions=self.distill_actions,
+                        distill_bad_spans_ms=self.distill_bad_spans_ms,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2168,6 +2660,23 @@ class PhoenixDataset(Dataset):
                                     delays, self.conversion_label_window_ms
                                 )
                             )
+
+                    if (
+                        id_list_specs
+                        and not id_list_fill_logged
+                        and (id_list_mask := batch.get("user_id_list_mask")) is not None
+                    ):
+                        id_list_fill_logged = True
+                        stats = id_lists.fill_stats(id_list_mask, id_list_specs)
+                        rank_logger.info(
+                            "id-list features in the first batch (users>=1 / full at k / "
+                            "mean fill): "
+                            + ", ".join(
+                                f"{n}={a:.3f}/{b:.3f}/{c:.3f}" for n, (a, b, c) in stats.items()
+                            )
+                        )
+                        for warning in id_lists.fill_warnings(stats):
+                            rank_logger.warning(f"id-list features: {warning}")
 
                     if record_batch.num_rows < batch_size:
                         rank_logger.warning(
@@ -2195,15 +2704,17 @@ class PhoenixDataset(Dataset):
         thread.start()
 
         def generator():
-            while True:
-                item = queue.get()
-                if item is SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item, None
-
-            thread.join()
+            try:
+                while True:
+                    item = queue.get()
+                    if item is SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item, None
+                thread.join()
+            finally:
+                stop_event.set()
 
         return generator()
 
@@ -2273,6 +2784,15 @@ class PhoenixDataset(Dataset):
             batch_shape["candidate_positions"] = jax.ShapeDtypeStruct(
                 candidate_seq["impr_ts"].shape, np.int32
             )
+        if (il := example_data.get("user_id_list_hashes")) is not None and (
+            ilm := example_data.get("user_id_list_mask")
+        ) is not None:
+            batch_shape["user_id_list_hashes"] = jax.ShapeDtypeStruct(il.shape, il.dtype)
+            batch_shape["user_id_list_mask"] = jax.ShapeDtypeStruct(ilm.shape, ilm.dtype)
+        for key, arr in author_profile.present(example_data).items():
+            batch_shape[key] = jax.ShapeDtypeStruct(arr.shape, arr.dtype)
+        if (stats := example_data.get("user_history_stats")) is not None:
+            batch_shape["user_history_stats"] = jax.ShapeDtypeStruct(stats.shape, stats.dtype)
 
         return batch_shape
 
@@ -2286,6 +2806,14 @@ class PhoenixDataset(Dataset):
                 (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
             )
         }
+
+    def _example_teacher_probs(
+        self, batch_size: int, candidate_seq_len: int
+    ) -> dict[str, np.ndarray]:
+        if not self.distill_teacher:
+            return {}
+        shape = (batch_size, candidate_seq_len, len(self.distill_actions))
+        return {"teacher_probs": np.full(shape, np.nan, np.float32)}
 
     def example_data(
         self,
@@ -2326,7 +2854,9 @@ class PhoenixDataset(Dataset):
                 promoted_ids=None,
                 line_item_objective=None,
                 safety_label_mask=np.zeros((batch_size, history_seq_len), dtype=np.int64),
-                embedding=None,
+                embedding=empty_history_url_embedding(
+                    batch_size, history_seq_len, self.history_url_embedding_dim
+                ),
                 search_query_embeddings=None,
                 post_creation_ts_sec=np.zeros((batch_size, history_seq_len), dtype=np.int32),
                 post_sids=np.zeros(
@@ -2356,13 +2886,17 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+                is_broadcast=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
                 **self._example_head_eligible_mask(batch_size, candidate_seq_len),
-                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
-                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                **{
+                    key: np.zeros((batch_size, candidate_seq_len), dtype=dtype)
+                    for key, dtype in value_label_dtypes(self.aux_value_events).items()
+                },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
+                **self._example_teacher_probs(batch_size, candidate_seq_len),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -2404,6 +2938,37 @@ class PhoenixDataset(Dataset):
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
             sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
+        if self.read_ads_engagement_counts:
+            batch["candidate_seq"]["ads_count_buckets"] = np.zeros(
+                (batch_size, candidate_seq_len, NUM_ADS_COUNT_FEATURES), dtype=np.uint8
+            )
+        if self.read_ads_ctr_features:
+            batch["candidate_seq"]["ads_ctr_buckets"] = np.zeros(
+                (batch_size, candidate_seq_len, NUM_ADS_CTR_FEATURES), dtype=np.uint8
+            )
+        if self.per_candidate_sample_weight:
+            batch["candidate_seq"]["sample_weight"] = np.ones(
+                (batch_size, candidate_seq_len), dtype=np.float32
+            )
+        if self.read_ad_side_ids:
+            batch["candidate_seq"]["ad_side_ids"] = np.zeros(
+                (batch_size, candidate_seq_len, len(self.ad_side_field_names)), dtype=np.int32
+            )
+        if specs := self.id_list_specs:
+            ids, batch["user_id_list_mask"] = id_lists.empty_arrays(batch_size, specs)
+            batch["user_id_list_hashes"] = id_lists.hash_id_lists(
+                ids, specs, self.hash_table.get_item_hash, self.hash_table.get_author_hash
+            )
+        if self.long_term_author_profile_size > 0:
+            cast(dict[str, np.ndarray], batch).update(
+                author_profile.empty(
+                    batch_size, self.long_term_author_profile_size, self.hash_table.get_author_hash
+                )
+            )
+        if self.user_history_stats_dim:
+            batch["user_history_stats"] = np.zeros(
+                (batch_size, self.user_history_stats_dim), dtype=np.float32
+            )
         return batch
 
     def get_latest_datetime(self, time_ms_seq) -> datetime:
@@ -2482,7 +3047,9 @@ class PhoenixToyDataset(PhoenixDataset):
                 promoted_ids=None,
                 line_item_objective=None,
                 safety_label_mask=np.zeros((batch_size, self.history_seq_len), dtype=np.int64),
-                embedding=None,
+                embedding=empty_history_url_embedding(
+                    batch_size, self.history_seq_len, self.history_url_embedding_dim
+                ),
                 search_query_embeddings=None,
                 post_creation_ts_sec=np.zeros((batch_size, self.history_seq_len), dtype=np.int32),
                 **empty_feature_arrays(batch_size, self.history_seq_len),
@@ -2498,13 +3065,17 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                is_broadcast=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
                 **self._example_head_eligible_mask(batch_size, candidate_seq_len),
-                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
-                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                **{
+                    key: np.zeros((batch_size, candidate_seq_len), dtype=dtype)
+                    for key, dtype in value_label_dtypes(self.aux_value_events).items()
+                },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
+                **self._example_teacher_probs(batch_size, candidate_seq_len),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,

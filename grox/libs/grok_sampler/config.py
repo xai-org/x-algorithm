@@ -32,4 +32,5 @@ class EapiModelConfig(BaseModel):
     log_reasoning_trace: bool = False
     enable_search: bool = False
     open_search: bool = False
+    x_search: bool = False
     reasoning_effort: str | None = None

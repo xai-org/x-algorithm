@@ -5,6 +5,9 @@ This repository contains the core code that determines which posts a viewer sees
 ## Table of Contents
 
 - [Notable Updates](#notable-updates)
+  - [October 26th, 2026](#october-26th-2026)
+  - [October 13th, 2026](#october-13th-2026)
+  - [October 8th, 2026](#october-8th-2026)
   - [September 18th, 2026](#september-18th-2026)
   - [August 14th, 2026](#august-14th-2026)
   - [August 13th, 2026](#august-13th-2026)
@@ -28,6 +31,18 @@ This repository contains the core code that determines which posts a viewer sees
 
 ## Notable Updates
 
+### October 26th, 2026
+
+- **Brazil 2026 Elections filter removed.** With the 2026 Brazilian elections over, we have removed `Brazil2026ElectionFilter` from For You. Posts from the accounts it covered are no longer filtered out because of it. See the [August 14th, 2026](#august-14th-2026) update for what the filter did.
+
+### October 13th, 2026
+
+- ***Retrieval trained to surface posts people read all the way through.*** [Phoenix retrieval](phoenix/xrex/models/recsys_two_tower_model.py) is now also trained to surface posts that people read all the way through.
+
+### October 8th, 2026
+
+- ***Ranking predicts time spent much better.*** The [Phoenix ranking model](phoenix/xrex/models/recsys_model.py) now does a better job of estimating how long you'll spend on each post: see the [code](phoenix/xrex/models/loss_recsys.py).
+
 ### September 18th, 2026
 
 - **[Under the Hood](#under-the-hood-label-transparency-tool).** Reports now include information about whether one's account or posts have had their visibility limited because of required compliance with law(s). For example, you'll be able to see if any of your posts were withheld from showing in a country following a legal demand — and which country.
@@ -37,7 +52,7 @@ This repository contains the core code that determines which posts a viewer sees
 Notable updates:
 
 - **How weights work.** There's a common misconception about how weights related to actions (e.g. Like, Share, Block, Report, etc) work in ranking. The weights scale the predicted probabilities of such actions (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior. We've [added comments](home-mixer/params/param.rs) [to the code](xai-value-model/scoring.rs) so that LLMs or people reading it are more likely to understand it correctly.
-- **Brazil 2026 Elections.** As [announced by X](https://x.com/XBR/status/2088341967864320507?s=20), in accordance with Brazilian electoral law, For You now runs `Brazil2026ElectionFilter`, which removes posts from accounts reported to Brazil's Electoral Court for the 2026 election, unless the viewer explicitly follows the account. *(Account list updated October 13, 2026.)* A benefit of open-source is that you can see that changes like this exist, and exactly how they work — take a [look at the code](home-mixer/filters/brazil_2026_election_filter.rs).
+- **Brazil 2026 Elections.** As [announced by X](https://x.com/XBR/status/2088341967864320507?s=20), in accordance with Brazilian electoral law, For You began running `Brazil2026ElectionFilter`, which removed posts from accounts reported to Brazil's Electoral Court for the 2026 election, unless the viewer explicitly follows the account. *(Removed after the election; see the [October 26th, 2026](#october-26th-2026) update.)*
 
 ### August 13th, 2026
 
@@ -382,7 +397,6 @@ Three adjustments follow:
 | `PreviouslyServedPostsFilter`     | Posts already served earlier in the session                                                       |
 | `MutedKeywordFilter`              | Posts matching the viewer's muted keywords                                                        |
 | `AuthorSocialgraphFilter`         | Posts from accounts the viewer blocks or mutes                                                    |
-| `Brazil2026ElectionFilter`        | Posts from accounts reported to Brazil's Electoral Court — see [Notable Updates](#august-14th-2026) |
 | `VideoFilter`                     | Video posts, when the request excludes video                                                      |
 | `TopicIdsFilter`                  | Posts outside the requested topics, and posts in excluded topics                                  |
 | `NewUserMinEngagementFilter`      | For new accounts, out-of-network posts below an engagement threshold                              |

@@ -39,10 +39,11 @@ async fn main() -> anyhow::Result<()> {
     let api_keys = ApiKeys::from_config(&cfg)?;
     if api_keys.is_empty() {
         tracing::warn!(
-            "API_KEYS_JSON is empty — every request to the protected admin \
-             endpoints (/api/action, /api/config*, /api/allowlist*) will return \
-             401. The admin UI calls those routes directly from the browser, so \
-             every UI write will also be rejected with 401 until a key map is set."
+            "API_KEYS_JSON is empty — every /api route except GET /api/dry_run, \
+             GET /api/rate_limit/{{entity_type}}, GET /api/dedup/* and the API docs \
+             will return 401. The admin UI calls those routes directly from the \
+             browser, so every protected UI read and every UI write will also be \
+             rejected with 401 until a key map is set."
         );
     } else {
         info!(

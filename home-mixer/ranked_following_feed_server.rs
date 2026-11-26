@@ -73,6 +73,7 @@ impl RankedFollowingFeedServer {
             None,
             request_type,
             request_id,
+            false,
         );
 
         xai_urt_thrift::serialize_binary(&timeline_response)

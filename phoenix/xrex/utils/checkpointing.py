@@ -229,6 +229,7 @@ def save_checkpoint(
     chunked=True,
     compressed=True,
     chunk_byte_size: int = 1024 * 1024 * 4,
+    ocdbt_target_data_file_size: int | None = None,
     tracer: Tracer | None = None,
     save_concurrent_gb: int | None = None,
     kms_client: object | None = None,
@@ -329,13 +330,21 @@ def save_checkpoint(
             state,
         )
         if kms_client is not None:
-            checkpointer.save(dest, args=ocp.args.PyTreeSave(state, save_args=save_args))
+            checkpointer.save(
+                dest,
+                args=ocp.args.PyTreeSave(
+                    state,
+                    save_args=save_args,
+                    ocdbt_target_data_file_size=ocdbt_target_data_file_size,
+                ),
+            )
         else:
             checkpointer.save(
                 dest,
                 args=ocp.args.PyTreeSave(
                     state,
                     save_args=save_args,
+                    ocdbt_target_data_file_size=ocdbt_target_data_file_size,
                 ),
             )
 

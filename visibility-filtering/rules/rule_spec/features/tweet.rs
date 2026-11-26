@@ -1,6 +1,6 @@
-use super::{Feature, Leaf, Meaning};
+use super::{Feature, Leaf, Meaning, Reads};
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::TweetFeatures;
+use crate::models::{PostCandidate, TweetFeatures};
 use crate::rules::context::At;
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::Predicate;
@@ -10,7 +10,9 @@ pub(in crate::rules) enum Tweet {}
 impl Feature for Tweet {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::Tweet);
     type Value<'a> = &'a TweetFeatures;
+}
 
+impl Reads<PostCandidate> for Tweet {
     #[inline]
     fn read<'a>(at: At<'_, 'a>) -> &'a TweetFeatures {
         &at.post().tweet_features

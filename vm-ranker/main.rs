@@ -9,12 +9,15 @@ use xai_http_server::{CancellationToken, GrpcConfig, HttpServer};
 
 use xai_vm_ranker::{
     args::Args,
+    carousel_model::CarouselModelStore,
     config_sync::{ConfigSync, ConfigSyncOptions},
     dpp::DppConfig,
     embedding_store,
     ranker_service::VMRankerServiceImpl,
     ranking_config::RankingConfig,
     scoring::DppContext,
+    sid_client::SidClient,
+    user_debias_store::UserDebiasStore,
 };
 
 #[tokio::main]
@@ -34,20 +37,38 @@ async fn main() -> Result<()> {
             theta: args.dpp_theta,
             max_selected_rank: args.dpp_max_selected_rank,
             debug_viewer_id: args.dpp_debug_viewer_id,
+            greedy_order: false,
+            window: None,
         };
+        let sid = args
+            .sid_endpoint
+            .as_deref()
+            .map(SidClient::connect_lazy)
+            .transpose()
+            .context("invalid --sid-endpoint")?;
         info!(
-            "DPP enabled: top_k={}, theta={}, max_selected_rank={}, embedding_dim={}, debug_viewer_id={}",
+            "DPP enabled: top_k={}, theta={}, max_selected_rank={}, embedding_dim={}, debug_viewer_id={}, sid_endpoint={:?}",
             config.top_k,
             config.theta,
             config.max_selected_rank,
             args.embedding_dim,
             config.debug_viewer_id,
+            args.sid_endpoint,
         );
-        (Some(DppContext { store, config }), Some(preload_future))
+        (
+            Some(DppContext { store, config, sid }),
+            Some(preload_future),
+        )
     } else {
         info!("DPP rescoring disabled");
         (None, None)
     };
+
+    let user_debias = args.user_debias_artifact_path.clone().map(|path| {
+        let store = UserDebiasStore::load(path);
+        store.spawn_reloader(Duration::from_secs(args.user_debias_reload_secs.max(1)));
+        store
+    });
 
     let process_overrides = xai_feature_switches::parse_fs_overrides(
         &std::env::var("XAI_FS_OVERRIDES").unwrap_or_default(),
@@ -89,8 +110,18 @@ async fn main() -> Result<()> {
         None
     };
 
-    let ranker_service =
-        VMRankerServiceImpl::new(args.max_concurrent_requests, dpp, ranking_config);
+    let carousel_models = args.carousel_model_dir.clone().map(|dir| {
+        let store = CarouselModelStore::load(dir);
+        store.spawn_reloader(Duration::from_secs(args.carousel_model_reload_secs.max(1)));
+        store
+    });
+    let ranker_service = VMRankerServiceImpl::new(
+        args.max_concurrent_requests,
+        dpp,
+        user_debias,
+        ranking_config,
+    )
+    .with_carousel_models(carousel_models);
     info!(
         "Initialized VMRankerService with max_concurrent_requests={}",
         args.max_concurrent_requests

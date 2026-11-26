@@ -1,8 +1,8 @@
-use super::builders::{nsfw_high_precision_media, on_client, viewer_in_country};
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::TombstoneReason;
 use crate::rules::fixtures::{
-    author_viewer, blurred, sensitive_opt_in_viewer, tombstoned, viewer, VIEWER_ID,
+    author_viewer, blurred, nsfw_high_precision_media, on_client, sensitive_opt_in_viewer,
+    tombstoned, viewer, viewer_in_country, VIEWER_ID,
 };
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_x_thrift::action::InterstitialReason;
@@ -26,26 +26,20 @@ pub(super) fn rows() -> Vec<Row> {
     };
     vec![Row {
         name: "nsfw_high_precision_media_in_a_local_regulations_country",
-        post: nsfw_high_precision_media(),
-        expect: vec![
-            (
-                TimelineHomeHydration,
+        subject: Subject::Post(nsfw_high_precision_media()),
+        expect: vec![(
+            Role::each([
                 web_in_in(),
-                high_precision_tombstone(),
-            ),
-            (
-                TimelineHomeHydration,
                 Role::As(
                     "sensitive_opt_in_web_in_in",
                     on_client("web", "in", sensitive_opt_in_viewer()),
                 ),
-                high_precision_tombstone(),
-            ),
-            (
-                TimelineHomeHydration,
                 Role::As("no_client_context_in_in", viewer_in_country("in")),
-                high_precision_tombstone(),
-            ),
+            ]),
+            high_precision_tombstone(),
+        )],
+        at: vec![
+            (TimelineHome, web_in_in(), plain_high_precision()),
             (
                 TimelineHomeHydration,
                 Role::As("author_web_in_in", on_client("web", "in", author_viewer())),
@@ -56,7 +50,6 @@ pub(super) fn rows() -> Vec<Row> {
                 Role::As("web_in_us", on_client("web", "us", viewer(VIEWER_ID))),
                 plain_high_precision(),
             ),
-            (TimelineHome, web_in_in(), plain_high_precision()),
         ],
     }]
 }

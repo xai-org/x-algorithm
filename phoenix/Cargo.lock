@@ -5014,9 +5014,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -5235,6 +5235,7 @@ dependencies = [
  "prometheus 0.14.0",
  "serde_json",
  "xai-recsys-proto",
+ "xai-user-debias",
 ]
 
 [[package]]
@@ -5401,6 +5402,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "xai-user-debias"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "indexmap 2.14.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

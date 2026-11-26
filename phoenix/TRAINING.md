@@ -19,7 +19,7 @@ Two dense-parameter optimizer families ship in this export:
   `home_direct_packed_nano` select it (`optim="muon"`), so the nano trains
   with the same dense-optimizer recipe production runs.
 - **Standard Optax AdamW**: the slot used by the remaining shipped configs
-  (two-tower retrieval, gen-recs, and the legacy ranking presets). The
+  (two-tower retrieval and the legacy ranking presets). The
   internal deployment uses a tuned RMS-normalized-Adam derivative in that
   slot; AdamW is the validated equivalent for those released recipes, and
   every config on that slot trains with it end to end.

@@ -1,7 +1,6 @@
 namespace java com.twitter.visibility.under_the_hood.thriftjava
 namespace py gen.twitter.visibility.under_the_hood.uth_serving
 
-
 struct UthDayCount {
   1: optional i32 dayOfMonth
   2: optional i64 count
@@ -54,6 +53,7 @@ struct UthPostLabelAggregate {
   1: optional string label (personalDataType = 'TweetSafetyLabels')
   2: optional list<UthDayCarriedRemoved> days
   3: optional list<string> countryCodes
+  4: optional list<i64> postIds (personalDataType = 'TweetId')
 }(persisted = 'true', hasPersonalData = 'true')
 
 struct UthAccountLabelAggregate {
@@ -131,6 +131,7 @@ struct UthDailyPostLabel {
   7: optional i32 observationAgeDays
   8: optional bool isFinal
   9: optional i32 postObservationDays
+  10: optional list<i64> postIds (personalDataType = 'TweetId')
 }(persisted = 'true', hasPersonalData = 'true')
 
 struct UthDailyAccountLabel {

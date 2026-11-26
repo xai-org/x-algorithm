@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::num::NonZeroU64;
-use xai_core_entities::entities::{EditControl, TakedownReason};
+use xai_core_entities::entities::TakedownReason;
+use xai_strato::Bytes;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaFeature {
@@ -26,16 +28,44 @@ pub enum ArticleLifecycle {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TweetFeatures {
+    pub text: PostText,
     pub media: MediaFeature,
     pub takedown_reasons: Vec<TakedownReason>,
     pub nsfw: NsfwFeature,
     pub is_nullcast: bool,
     pub community_id: Option<NonZeroU64>,
     pub trusted_friends_list_id: Option<u64>,
-    pub edit_control: Option<EditControl>,
+    pub latest_edit_tweet_id: Option<u64>,
     pub exclusive_conversation_author_id: Option<u64>,
     pub article_id: Option<NonZeroU64>,
     pub narrowcast_place_id: Option<u64>,
+    pub reaction_context: Option<ReactionContext>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostText(Bytes);
+
+impl PostText {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    pub fn lossy(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for PostText {
+    fn from(text: &str) -> Self {
+        Self(Bytes::copy_from_slice(text.as_bytes()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReactionContext {
+    pub reacted_to_post_id: u64,
+    pub reacted_to_user_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,17 +90,8 @@ impl TweetFeatures {
     }
 
     pub fn is_superseded_edit(&self, tweet_id: u64) -> bool {
-        self.latest_edit_tweet_id()
-            .is_some_and(|latest| latest != tweet_id)
-    }
-
-    pub fn latest_edit_tweet_id(&self) -> Option<u64> {
-        let initial = match &self.edit_control {
-            Some(EditControl::Initial(initial)) => initial,
-            Some(EditControl::Edit(edit)) => edit.edit_control_initial.as_ref()?,
-            None => return None,
-        };
-        initial.edit_tweet_ids.last().copied()
+        self.latest_edit_tweet_id
+            .is_some_and(|latest| latest > tweet_id)
     }
 
     pub fn legal_takedown_in(&self, request_country: Option<&str>) -> bool {
@@ -137,52 +158,5 @@ fn local_laws_takedown_country(reason: &TakedownReason) -> Option<&str> {
         | TakedownReason::HatefulImagery
         | TakedownReason::SensitiveImagery
         | TakedownReason::Unknown => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use xai_core_entities::entities::{EditControlEdit, EditControlInitial};
-
-    #[test]
-    fn is_superseded_edit_only_when_a_later_edit_exists() {
-        for (edit_control, superseded) in [
-            (
-                EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![20],
-                    ..Default::default()
-                }),
-                false,
-            ),
-            (
-                EditControl::Edit(EditControlEdit {
-                    initial_tweet_id: 10,
-                    edit_control_initial: Some(EditControlInitial {
-                        edit_tweet_ids: vec![10, 20, 30],
-                        ..Default::default()
-                    }),
-                }),
-                true,
-            ),
-            (
-                EditControl::Edit(EditControlEdit {
-                    initial_tweet_id: 10,
-                    edit_control_initial: None,
-                }),
-                false,
-            ),
-        ] {
-            let features = TweetFeatures {
-                edit_control: Some(edit_control),
-                ..Default::default()
-            };
-            assert_eq!(
-                features.is_superseded_edit(20),
-                superseded,
-                "{:?}",
-                features.edit_control
-            );
-        }
     }
 }

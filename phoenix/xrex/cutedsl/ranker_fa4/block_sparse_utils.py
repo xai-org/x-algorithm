@@ -828,7 +828,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     sScale: cute.Tensor,
     stats: list,
     correction_epilogue: Callable,
-    thr_mma_pv: cute.core.ThrMma,
+    thr_mma_pv: cute.ThrMma,
     tOtO: cute.Tensor,
     sO: cute.Tensor,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
@@ -897,6 +897,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
             mO_cur,
             gO_stage,
             gmem_tiled_copy_O,
+            zero_fill=True,
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)
@@ -1389,6 +1390,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
     Q_stage_eq_dO_stage: cutlass.Constexpr,
     subtile_factor: cutlass.Constexpr,
     m_block_max: int,
+    kv_loaded=False,
 ):
     (
         curr_q_cnt,
@@ -1402,7 +1404,6 @@ def produce_block_sparse_q_loads_bwd_sm90(
         blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
     )
 
-    kv_loaded = False
     load_args = (
         pipeline_Q,
         pipeline_dO,
@@ -1451,7 +1452,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
                 )
                 kv_loaded = True
 
-    return producer_state_Q, producer_state_dO
+    return producer_state_Q, producer_state_dO, kv_loaded
 
 
 @cute.jit
@@ -1474,6 +1475,7 @@ def consume_block_sparse_mma_bwd_sm90(
     m_block_max: int = 0,
     aux_tensors=None,
     fastdiv_mods=(None, None),
+    dKV_accumulate=False,
 ):
     (
         curr_q_cnt,
@@ -1491,8 +1493,6 @@ def consume_block_sparse_mma_bwd_sm90(
         blocksparse_tensors.valid_block_upper is not None
         and blocksparse_tensors.valid_block_lower is not None
     )
-
-    dKV_accumulate = False
 
     mask_fn_base = partial(
         mask.apply_mask,
@@ -1571,7 +1571,7 @@ def consume_block_sparse_mma_bwd_sm90(
                 )
                 dKV_accumulate = True
 
-    return consumer_state_Q, consumer_state_dO
+    return consumer_state_Q, consumer_state_dO, dKV_accumulate
 
 
 @cute.jit

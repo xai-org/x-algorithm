@@ -6,8 +6,6 @@ from pathlib import Path
 
 from xrex import settings
 from xrex.configs import config_registry
-from xrex.data.grpc_recsys import PhoenixGrpcDataset
-from xrex.data.parquet_recsys import PhoenixDataset
 from xrex.data.rust_kafka_recsys import RustKafkaDataset
 from xrex.data.rust_parquet_recsys import RustParquetDataset
 from xrex.data.streaming.kafkadispatcherloader import PhoenixKafkaDispatcherDataset
@@ -26,7 +24,6 @@ _KAFKA_CLUSTER = settings.KAFKA_CLUSTER
 _OTEL_ENDPOINT = settings.OTEL_ENDPOINT
 _RUST_BOOTSTRAP = settings.KAFKA_RUST_BOOTSTRAP
 _DISPATCHER_HOST_TEMPLATE = settings.KAFKA_DISPATCHER_HOST_TEMPLATE
-_GRPC_DATALOADER_ADDRESS = settings.GRPC_DATALOADER_ADDRESS
 
 
 def kafka_kwargs(cluster: str = _KAFKA_CLUSTER) -> dict:
@@ -68,13 +65,15 @@ GROUP_IDS: dict[str, str] = {
     "home_direct_packed_gb300": "user_action_sequence_home_direct_packed",
     "home_direct_packed_nano": "user_action_sequence_home_direct_packed_nano",
     "immersive_page_rl": "user_action_sequence_immersive_page_rl",
+    "immersive_page_rl_cread": "user_action_sequence_immersive_page_rl_cread",
+    "immersive_page_rl_cread_critic_only": "user_action_sequence_immersive_page_rl_cread_critic_only",
     "xrecsys_two_tower": "user_action_sequence_xrecsys_two_tower",
     "xrecsys_two_tower_combined": "user_action_sequence_xrecsys_two_tower_combined",
     "xrecsys_two_tower_combined_gb300": "user_action_sequence_xrecsys_two_tower_combined",
+    "xrecsys_two_tower_home_only": "user_action_sequence_xrecsys_two_tower_home_only",
     "xrecsys_two_tower_immersive_only": "user_action_sequence_xrecsys_two_tower_immersive_only",
     "xrecsys_two_tower_immersive_only_gb300": "user_action_sequence_xrecsys_two_tower_immersive_only",
     "xrecsys_two_tower_nano": "user_action_sequence_xrecsys_two_tower_nano",
-    "xrecsys_sid_gen_rec": "sid_gen_rec",
     "reply_two_tower_v2_main": "reply_two_tower_v2_main",
 }
 
@@ -144,7 +143,13 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
+        read_ads_engagement_counts=mparams.get("read_ads_engagement_counts", False),
+        read_ads_ctr_features=mparams.get("read_ads_ctr_features", False),
+        per_candidate_sample_weight=mparams.get("per_candidate_sample_weight", False),
+        read_ad_side_ids=mparams.get("read_ad_side_ids", False),
+        ad_side_fields=mparams.get("ad_side_fields", "campaign,line_item,creative"),
         page_records=_page_records(mparams),
     )
 
@@ -162,6 +167,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         history_seq_len=mparams["history_seq_len"],
         candidate_seq_len=mparams["candidate_seq_len"],
         input_vocab_size=mparams["input_vocab_size"],
+        output_vocab_size=mparams["output_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         pad_token=PAD_TOKEN,
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
@@ -174,6 +180,13 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
+        max_redistribution_bytes=mparams.get("max_redistribution_bytes", 256 << 20),
+        read_ads_engagement_counts=mparams.get("read_ads_engagement_counts", False),
+        read_ads_ctr_features=mparams.get("read_ads_ctr_features", False),
+        per_candidate_sample_weight=mparams.get("per_candidate_sample_weight", False),
+        read_ad_side_ids=mparams.get("read_ad_side_ids", False),
+        ad_side_fields=mparams.get("ad_side_fields", "campaign,line_item,creative"),
         page_records=_page_records(mparams),
     )
 
@@ -189,6 +202,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         history_seq_len=mparams["history_seq_len"],
         candidate_seq_len=mparams["candidate_seq_len"],
         input_vocab_size=mparams["input_vocab_size"],
+        output_vocab_size=mparams["output_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         pad_token=PAD_TOKEN,
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
@@ -207,34 +221,16 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
+        read_ads_ctr_features=mparams.get("read_ads_ctr_features", False),
+        per_candidate_sample_weight=mparams.get("per_candidate_sample_weight", False),
+        read_ad_side_ids=mparams.get("read_ad_side_ids", False),
+        ad_side_fields=mparams.get("ad_side_fields", "campaign,line_item,creative"),
         page_records=_page_records(mparams),
     )
 
 
 def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
-    del config_name
-    return PhoenixDataset(
-        hash_table=hash_table,
-        path=_RANKING_DUMP_PATH,
-        history_seq_len=mparams["history_seq_len"],
-        candidate_seq_len=mparams["candidate_seq_len"],
-        input_vocab_size=mparams["input_vocab_size"],
-        num_continuous_actions=mparams["num_continuous_actions"],
-        num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-        num_kafka_partitions=1024,
-        output_vocab_size=mparams["output_vocab_size"],
-        multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
-        use_post_sid=use_post_sid,
-        sid_num_levels=sid_num_levels,
-        compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
-        enable_stale_post=mparams.get("enable_stale_post", False),
-        ads_head_masking=mparams.get("ads_head_masking", False),
-        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
-        page_records=_page_records(mparams),
-    )
-
-
-def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
     del config_name
     return RustParquetDataset(
         hash_table=hash_table,
@@ -253,33 +249,8 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        ads_late_window_heads=mparams.get("ads_late_window_heads", False),
         page_records=_page_records(mparams),
-    )
-
-
-def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
-    del config_name
-    if mparams.get("enable_stale_post", False):
-        raise ValueError(
-            "enable_stale_post is unsupported on grpc_recsys, which does not transport per-post feature arrays (int64/bool/categorical/float)"
-        )
-    return PhoenixGrpcDataset(
-        hash_table=hash_table,
-        history_seq_len=mparams["history_seq_len"],
-        candidate_seq_len=mparams["candidate_seq_len"],
-        server_address=_GRPC_DATALOADER_ADDRESS,
-        input_vocab_size=mparams["input_vocab_size"],
-        pad_token=PAD_TOKEN,
-        output_vocab_size=mparams["output_vocab_size"],
-        num_continuous_actions=mparams["num_continuous_actions"],
-        num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-        num_data_loaders=8,
-        num_kafka_partitions=1024,
-        multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
-        use_post_sid=use_post_sid,
-        sid_num_levels=sid_num_levels,
-        ads_head_masking=mparams.get("ads_head_masking", False),
-        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 
@@ -288,8 +259,7 @@ RANKING_DATASET_FACTORIES = {
     "rust_kafka": _ranking_rust_kafka,
     "kafka_dispatcher": _ranking_kafka_dispatcher,
     "offline_kafka_dump": _ranking_offline_kafka_dump,
-    "rust_parquet": _ranking_rust_parquet,
-    "grpc_recsys": _ranking_grpc_recsys,
+    "rust_parquet": _ranking_offline_kafka_dump,
 }
 
 RANKING_EXTRA_DATASET_TYPES = [
@@ -297,7 +267,6 @@ RANKING_EXTRA_DATASET_TYPES = [
     "rust_parquet",
     "rust_kafka",
     "kafka_dispatcher",
-    "grpc_recsys",
 ]
 
 
@@ -329,6 +298,7 @@ def _retrieval_aggregated_kafka(
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 
@@ -364,6 +334,7 @@ def _retrieval_rust_kafka(
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 
@@ -375,7 +346,7 @@ def _retrieval_offline_kafka_dump(
     extra_kwargs: dict = {}
     if global_ids_file_path is not None:
         extra_kwargs["global_ids_file_path"] = global_ids_file_path
-    return PhoenixDataset(
+    return RustParquetDataset(
         hash_table=hash_table,
         path=_RETRIEVAL_DUMP_PATH,
         history_seq_len=mparams["history_seq_len"],
@@ -388,8 +359,10 @@ def _retrieval_offline_kafka_dump(
         num_kafka_partitions=1024,
         include_candidate_post_ids=True,
         date_range=mparams.get("date_range", None),
+        output_vocab_size=mparams["output_vocab_size"],
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
+        ld_label_exclude_clicks=mparams.get("ld_label_exclude_clicks", False),
         **extra_kwargs,
     )
 
@@ -406,69 +379,8 @@ RETRIEVAL_EXTRA_DATASET_TYPES = [
 ]
 
 
-_SID_TOPIC = settings.SID_TOPIC
-_SID_KAFKA_CLUSTER = settings.SID_KAFKA_CLUSTER
-
-
-def _sid_aggregated_kafka(hash_table, dataset_params: dict, config_name: str):
-    return PhoenixKafkaDataset(
-        **kafka_kwargs(_SID_KAFKA_CLUSTER),
-        topic_name=_SID_TOPIC,
-        group_id=_group_id(config_name) + "-direct-numpy",
-        max_queue_size=100,
-        hash_table=hash_table,
-        path=None,
-        history_seq_len=dataset_params["history_seq_len"],
-        candidate_seq_len=dataset_params["candidate_seq_len"],
-        input_vocab_size=dataset_params["input_vocab_size"],
-        hash_vocab_size=dataset_params["hash_vocab_size"],
-        num_continuous_actions=dataset_params["num_continuous_actions"],
-        pad_token=dataset_params["pad_token"],
-        multimodal_embedding_type=None,
-        num_kafka_partitions=2048,
-        num_negatives_per_example=0,
-        include_candidate_post_ids=True,
-        use_post_sid=True,
-        sid_num_levels=dataset_params["sid_num_levels"],
-    )
-
-
-_GEN_RECS_TOPIC = settings.GEN_RECS_TOPIC
-_GEN_RECS_GLOBAL_IDS = Path(settings.GEN_RECS_GLOBAL_IDS)
-
-
-def _gen_recs_aggregated_kafka(mparams, hash_table, dataset_params: dict):
-    extra_kwargs: dict = {}
-    if dataset_params["num_global_negatives"] > 0:
-        extra_kwargs["global_ids_file_path"] = _GEN_RECS_GLOBAL_IDS
-    return PhoenixKafkaDataset(
-        **phoenix_kafka_kwargs(),
-        topic_name=_GEN_RECS_TOPIC,
-        group_id=f"{mparams['group_id']}_{job_suffix()}-direct-numpy",
-        max_queue_size=100,
-        hash_table=hash_table,
-        path=None,
-        history_seq_len=mparams["history_seq_len"],
-        candidate_seq_len=mparams["candidate_seq_len"],
-        input_vocab_size=mparams["input_vocab_size"],
-        num_continuous_actions=mparams["num_continuous_actions"],
-        pad_token=dataset_params["pad_token"],
-        multimodal_embedding_type="v5",
-        num_kafka_partitions=2048,
-        num_negatives_per_example=0,
-        include_candidate_post_ids=True,
-        num_global_negatives_per_example=dataset_params["num_global_negatives"],
-        candidate_negative_filter=dataset_params["candidate_negative_filter"],
-        candidate_negative_mode=dataset_params["candidate_negative_mode"],
-        global_ids_reload_interval_seconds=600,
-        **extra_kwargs,
-    )
-
-
 config_registry.RANKING_DATASET_FACTORIES.update(RANKING_DATASET_FACTORIES)
 config_registry.RANKING_EXTRA_DATASET_TYPES.extend(RANKING_EXTRA_DATASET_TYPES)
 config_registry.RETRIEVAL_DATASET_FACTORIES.update(RETRIEVAL_DATASET_FACTORIES)
 config_registry.RETRIEVAL_EXTRA_DATASET_TYPES.extend(RETRIEVAL_EXTRA_DATASET_TYPES)
 config_registry.GLOBAL_IDS_RESOLVERS.append(resolve_global_ids_file_path)
-config_registry.SID_DATASET_FACTORIES["aggregated_kafka"] = _sid_aggregated_kafka
-config_registry.GEN_RECS_DATASET_FACTORIES["aggregated_kafka"] = _gen_recs_aggregated_kafka

@@ -1,13 +1,12 @@
-use crate::clients::read_fields;
+use crate::clients::strato::{self, decode_only};
 use crate::models::CommunityModeration;
+use crate::thrift_read::read_fields;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TStructIdentifier, TType,
 };
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
-use xai_twittercontext_proto::TwitterContextViewer;
 
 const TWEET_MODERATION: &str = "communities/moderationState.TweetCommunityRelationship";
 const AUTHOR_MODERATION: &str = "communities/moderationState.UserCommunityRelationship";
@@ -35,20 +34,19 @@ impl CommunitySource {
         &self,
         posts: &[CommunityPost],
     ) -> HashMap<u64, Result<Option<CommunityModeration>>> {
-        let calls = posts
-            .iter()
-            .flat_map(|post| {
-                let relationship = UserCommunityRelationshipId {
-                    user_id: post.author_id,
-                    community_id: post.community_id,
-                };
-                [
-                    fetch(TWEET_MODERATION, encode(&(post.tweet_id, ()))),
-                    fetch(AUTHOR_MODERATION, encode(&(relationship, ()))),
-                ]
-            })
-            .collect();
-        let mut replies = self.grpc_client.batch_call(calls, None).await.into_iter();
+        let keys = posts.iter().flat_map(|post| {
+            let relationship = UserCommunityRelationshipId {
+                user_id: post.author_id,
+                community_id: post.community_id,
+            };
+            [
+                (TWEET_MODERATION, encode(&(post.tweet_id, ()))),
+                (AUTHOR_MODERATION, encode(&(relationship, ()))),
+            ]
+        });
+        let mut replies = strato::fetch_each(&self.grpc_client, keys, None)
+            .await
+            .into_iter();
         posts
             .iter()
             .map(|post| {
@@ -101,17 +99,10 @@ impl CommunitySource {
         community_ids: &[u64],
         holds: impl Fn(T) -> bool,
     ) -> HashMap<u64, Result<Option<bool>>> {
-        let calls = community_ids
+        let keys = community_ids
             .iter()
-            .map(|&community_id| fetch(column, encode(&(community_id, ()))))
-            .collect();
-        let viewer = TwitterContextViewer {
-            user_id: viewer_id.cast_signed(),
-            ..Default::default()
-        };
-        let mut replies = self
-            .grpc_client
-            .batch_call(calls, Some(&viewer))
+            .map(|&community_id| (column, encode(&(community_id, ()))));
+        let mut replies = strato::fetch_each(&self.grpc_client, keys, Some(viewer_id))
             .await
             .into_iter();
         community_ids
@@ -121,19 +112,12 @@ impl CommunitySource {
     }
 }
 
-fn fetch(column: &str, key: Vec<u8>) -> (String, String, Vec<Vec<u8>>) {
-    (column.to_string(), "fetch".to_string(), vec![key])
-}
-
 fn read<T: TSerializable>(
     reply: Option<Result<Bytes>>,
     holds: impl FnOnce(T) -> bool,
 ) -> Result<bool> {
     let bytes = reply.ok_or_else(|| anyhow!("Strato answered fewer calls than it was sent"))??;
-    match strato_decode::<T>(&bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value.is_some_and(holds)),
-        StratoResult::Err { code, message } => Err(anyhow!("Strato error code {code}: {message}")),
-    }
+    Ok(strato::decode::<T>(&bytes)?.is_some_and(holds))
 }
 
 #[derive(Default)]
@@ -248,18 +232,11 @@ fn is(field: &TFieldIdentifier, id: i16, field_type: TType) -> bool {
     field.id == Some(id) && field.field_type == field_type
 }
 
-fn decode_only(name: &str) -> thrift::Error {
-    thrift::new_protocol_error(
-        thrift::ProtocolErrorKind::NotImplemented,
-        format!("{name} is decode-only"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift::{Bool, Struct, I32};
-    use crate::clients::strato_answer::{found, no_row, strato_error};
+    use crate::clients::strato::answer::Thrift::{Bool, Struct, I32};
+    use crate::clients::strato::answer::{found, no_row, strato_error};
     use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 
     fn answered(bytes: Vec<u8>) -> Option<Result<Bytes>> {

@@ -15,35 +15,36 @@ TREE_DEK_CLAIM_NAME = "_DEK.claim"
 PUBLISH_TIMEOUT_SECS = 120.0
 
 _TRANSIENT_KMS_MARKERS = ("429", "502", "503", "504", "KMS transport")
-_UNWRAP_ATTEMPTS = 4
-_UNWRAP_BACKOFF_CAP_SECS = 2.0
+_KMS_RETRY_BUDGET_SECS = 300.0
 
 
-def _unwrap_with_backoff(kms_client, dek_path) -> bytes:
+def _retry_delay(error: BaseException, attempt: int, deadline: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not any(m in str(error) for m in _TRANSIENT_KMS_MARKERS):
+        return None
+    return min(min(2.0**attempt, 30.0) * (0.5 + random.random()), remaining)
+
+
+def _unwrap_with_backoff(kms_client, dek_path, deadline: float) -> bytes:
     import xai_kms
 
-    slept = 0.0
-    for attempt in range(_UNWRAP_ATTEMPTS):
+    attempt = 0
+    while True:
         try:
             return bytes(xai_kms.nfs.unwrap_shared_dek(kms_client, dek_path))
         except Exception as error:
-            transient = any(m in str(error) for m in _TRANSIENT_KMS_MARKERS)
-            remaining = _UNWRAP_BACKOFF_CAP_SECS - slept
-            if not transient or attempt == _UNWRAP_ATTEMPTS - 1 or remaining <= 0:
+            delay = _retry_delay(error, attempt, deadline)
+            if delay is None:
                 raise
-            delay = min(0.2 * 2**attempt, 1.0, remaining) * (0.5 + random.random())
-            delay = min(delay, remaining)
             rank_logger.warning(
-                "KMS unwrap of %s failed transiently (%s); retrying in %.1fs (attempt %d/%d)",
+                "KMS unwrap of %s failed transiently (%s); retrying in %.1fs (attempt %d)",
                 dek_path,
                 error,
                 delay,
                 attempt + 1,
-                _UNWRAP_ATTEMPTS,
             )
             time.sleep(delay)
-            slept += delay
-    raise AssertionError("unreachable")
+            attempt += 1
 
 
 def _read_wrapped_dek(dek_path: pathlib.Path) -> dict | None:
@@ -60,7 +61,8 @@ def publish_tree_dek(path: pathlib.Path, kms_client) -> tuple[bytes, str, dict, 
     dek_path = path / TREE_DEK_NAME
     claim = path / TREE_DEK_CLAIM_NAME
 
-    deadline = time.monotonic() + PUBLISH_TIMEOUT_SECS
+    deadline = time.monotonic() + _KMS_RETRY_BUDGET_SECS
+    mint_failures = 0
     if _read_wrapped_dek(dek_path) is not None:
         rank_logger.info("adopted existing _DEK at %s", path)
     while (entry := _read_wrapped_dek(dek_path)) is None:
@@ -80,10 +82,21 @@ def publish_tree_dek(path: pathlib.Path, kms_client) -> tuple[bytes, str, dict, 
                     )
                 else:
                     rank_logger.info("adopted existing _DEK at %s", path)
-            except BaseException:
+            except BaseException as error:
                 if _read_wrapped_dek(dek_path) is None:
                     claim.unlink(missing_ok=True)
-                raise
+                delay = _retry_delay(error, mint_failures, deadline)
+                if delay is None:
+                    raise
+                rank_logger.warning(
+                    "KMS mint at %s failed transiently (%s); re-racing in %.1fs (attempt %d)",
+                    path,
+                    error,
+                    delay,
+                    mint_failures + 1,
+                )
+                time.sleep(delay)
+                mint_failures += 1
             continue
         if time.monotonic() >= deadline:
             raise RuntimeError(
@@ -92,7 +105,7 @@ def publish_tree_dek(path: pathlib.Path, kms_client) -> tuple[bytes, str, dict, 
             )
         rank_logger.debug("waiting for wrapped DEK at %s", dek_path)
         time.sleep(0.1)
-    raw = _unwrap_with_backoff(kms_client, dek_path)
+    raw = _unwrap_with_backoff(kms_client, dek_path, deadline)
     return raw, entry["wrapped"], entry.get("context") or {}, entry
 
 
@@ -105,7 +118,7 @@ def adopt_tree_dek(path: pathlib.Path, kms_client) -> bytes:
     dek_path = path / TREE_DEK_NAME
     if dek_path.exists():
         entry = _read_wrapped_dek(dek_path) or {}
-        raw = _unwrap_with_backoff(kms_client, dek_path)
+        raw = _unwrap_with_backoff(kms_client, dek_path, time.monotonic() + _KMS_RETRY_BUDGET_SECS)
         key_id = entry.get("key_id")
     else:
         raw = _unwrap_header_master(kms_client, path)
@@ -121,7 +134,7 @@ def _unwrap_header_master(kms_client, path: pathlib.Path) -> bytes:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(entry, f)
-        return _unwrap_with_backoff(kms_client, tmp)
+        return _unwrap_with_backoff(kms_client, tmp, time.monotonic() + _KMS_RETRY_BUDGET_SECS)
     finally:
         os.unlink(tmp)
 

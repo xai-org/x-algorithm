@@ -101,6 +101,7 @@ mod tests {
                 .collect(),
             seen: vec![],
             seen_error: None,
+            seen_rows: vec![],
             safety_checks: SafetyChecksByEntity {
                 user: ok.clone(),
                 post: ok,
@@ -114,12 +115,13 @@ mod tests {
                 labels: vec![],
             },
             confidence: None,
+            follower_skip: None,
         }
     }
 
     fn view(head: &str, c: Option<&str>, b: Option<&str>, mode: ControlMode) -> ActionControlView {
         let actions = if mode == ControlMode::Live {
-            vec![PageAction::Suspend {}]
+            vec![PageAction::SUSPEND]
         } else {
             vec![]
         };
@@ -183,14 +185,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_switches_off_heads_with_level_records_or_the_defaults() {
+    fn plan_switches_off_heads_with_rows() {
         let mut level = view("Level", None, None, ControlMode::Live);
-        level.record.confidence = Some(crate::confidence::ConfidenceLevel::High);
+        level.record.confidence = Some(crate::confidence::LevelRow::High);
         let l = list(
-            vec![
-                level,
-                view("Defaults", None, None, ControlMode::ConfidenceDefaults),
-            ],
+            vec![level, view("Defaults", None, None, ControlMode::Rows)],
             vec!["user/l/BrokenLevel/high", "post/cl/BrokenClf/c3/mid"],
         );
         let keys: Vec<String> = plan(&l, "operator@example.com")

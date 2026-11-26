@@ -20,6 +20,30 @@ from score_layout import HEAD_ORDER, to_score_row
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gpu_scorer")
 
+
+def kafka_cert_config(bootstrap: str) -> dict:
+    if not bootstrap or ":9094" in bootstrap or "scram" in bootstrap:
+        raise SystemExit(
+            f"Kafka bootstrap {bootstrap!r} is the password listener or empty; "
+            "use the certificate listener (port 9095)"
+        )
+    cert = os.environ.get("KAFKA_SSL_CERTIFICATE_LOCATION", "/etc/ssl/s2s/client/tls.crt")
+    key = os.environ.get("KAFKA_SSL_KEY_LOCATION", "/etc/ssl/s2s/client/tls.key")
+    missing = [p for p in (cert, key) if not os.path.isfile(p)]
+    if missing:
+        raise SystemExit(
+            f"Kafka certificate login: {', '.join(missing)} not found (mount the client "
+            "certificate, or set KAFKA_SSL_CERTIFICATE_LOCATION and KAFKA_SSL_KEY_LOCATION)"
+        )
+    return {
+        "bootstrap.servers": bootstrap,
+        "security.protocol": "SSL",
+        "ssl.certificate.location": cert,
+        "ssl.key.location": key,
+        **kafka_ssl_config(),
+    }
+
+
 PINNED_BACKBONE_SHA256 = "8ccf35dcdc7b6e67ab899b911ae32b991725ffa0ac1497eef2405994a37ebcab"
 PINNED_HEAD_REGISTRY_HASH = "1bb89df6b629a615"
 PINNED_RUN_NAME = "bdsm_v9_h8_mlp512x256"
@@ -37,8 +61,6 @@ def _file_sha256(path: str) -> str:
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kafka-bootstrap", default=DEFAULT_BOOTSTRAP)
-    p.add_argument("--kafka-username", default="kafka-user")
-    p.add_argument("--kafka-password", required=True)
     p.add_argument("--input-topic", default="abuse_ready_batches")
     p.add_argument("--output-topic", default="abuse_scored_results")
     p.add_argument("--kafka-group", default="bdsm-gpu-scorer")
@@ -140,12 +162,7 @@ def main() -> int:
         return jax.nn.sigmoid(head_logits(hp, cls_raw))
 
     kafka_common = {
-        "security.protocol": "SASL_SSL",
-        "sasl.mechanism": "SCRAM-SHA-512",
-        **kafka_ssl_config(),
-        "bootstrap.servers": args.kafka_bootstrap,
-        "sasl.username": args.kafka_username,
-        "sasl.password": args.kafka_password,
+        **kafka_cert_config(args.kafka_bootstrap),
     }
     consumer = Consumer(
         {

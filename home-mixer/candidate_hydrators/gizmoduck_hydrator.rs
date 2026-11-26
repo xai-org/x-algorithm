@@ -4,8 +4,9 @@ use crate::models::query::ScoredPostsQuery;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::utils::{default_quick_cache, QuickCache};
-use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 use xai_x_thrift::user_labels::LabelValue;
 
 pub struct GizmoduckCandidateHydrator {
@@ -24,59 +25,87 @@ impl GizmoduckCandidateHydrator {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydrator {
-    type CacheKey = GizmoduckCacheKey;
-    type CacheValue = GizmoduckCacheValue;
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydrator {
+    type Fetched = Vec<Option<GizmoduckCacheValue>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
     }
 
-    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
+    async fn fetch(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Result<Vec<Option<GizmoduckCacheValue>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
+
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<GizmoduckCacheValue>>, String> {
+        self.fetch_cached(query, candidates, stage).await
+    }
+
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        values: Vec<Option<GizmoduckCacheValue>>,
+    ) {
+        for (candidate, value) in candidates.iter_mut().zip(values) {
+            if let Some(value) = value {
+                candidate.author_followers_count = value.author_followers_count;
+                candidate.author_screen_name = value.author_screen_name;
+                candidate.retweeted_screen_name = value.retweeted_screen_name;
+                candidate.nsfw_author = value.nsfw_author;
+                candidate.nsfw_author_ads = value.nsfw_author_ads;
+                candidate.nsfw_author_phoenix = value.nsfw_author_phoenix;
+            }
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+        candidate.author_followers_count = hydrated.author_followers_count;
+        candidate.author_screen_name = hydrated.author_screen_name;
+        candidate.retweeted_screen_name = hydrated.retweeted_screen_name;
+        candidate.nsfw_author = hydrated.nsfw_author;
+        candidate.nsfw_author_ads = hydrated.nsfw_author_ads;
+        candidate.nsfw_author_phoenix = hydrated.nsfw_author_phoenix;
+    }
+}
+
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydrator {
+    type CacheKey = GizmoduckCacheKey;
+    type Value = GizmoduckCacheValue;
+
+    fn cache_store(&self) -> &dyn CacheStore<GizmoduckCacheKey, GizmoduckCacheValue> {
         &self.cache
     }
-    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
+
+    fn cache_key(&self, _query: &ScoredPostsQuery, candidate: &PostCandidate) -> GizmoduckCacheKey {
         GizmoduckCacheKey {
             author_id: candidate.author_id,
             retweeted_user_id: candidate.retweeted_user_id,
         }
     }
 
-    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        GizmoduckCacheValue {
-            author_followers_count: hydrated.author_followers_count,
-            author_screen_name: hydrated.author_screen_name.clone(),
-            retweeted_screen_name: hydrated.retweeted_screen_name.clone(),
-            nsfw_author: hydrated.nsfw_author,
-            nsfw_author_ads: hydrated.nsfw_author_ads,
-            nsfw_author_phoenix: hydrated.nsfw_author_phoenix,
-        }
-    }
-
-    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        PostCandidate {
-            author_followers_count: value.author_followers_count,
-            author_screen_name: value.author_screen_name,
-            retweeted_screen_name: value.retweeted_screen_name,
-            nsfw_author: value.nsfw_author,
-            nsfw_author_ads: value.nsfw_author_ads,
-            nsfw_author_phoenix: value.nsfw_author_phoenix,
-            ..Default::default()
-        }
-    }
-
-    async fn hydrate_from_client(
+    async fn fetch_values(
         &self,
         _query: &ScoredPostsQuery,
-        candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<GizmoduckCacheValue>> {
         let client = &self.gizmoduck_client;
 
-        let user_ids_to_fetch: Vec<i64> = candidates
+        let user_ids_to_fetch: Vec<i64> = misses
             .iter()
             .map(|c| c.author_id as i64)
             .chain(
-                candidates
+                misses
                     .iter()
                     .filter_map(|c| c.retweeted_user_id)
                     .map(|id| id as i64),
@@ -87,9 +116,9 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
 
         let users = client.get_users(user_ids_to_fetch).await;
 
-        let mut hydrated_candidates = Vec::with_capacity(candidates.len());
+        let mut values = Vec::with_capacity(misses.len());
 
-        for candidate in candidates {
+        for candidate in misses {
             let user = users.get(&(candidate.author_id as i64));
             let user = match user {
                 Some(Ok(Some(user))) => Ok(Some(user)),
@@ -148,31 +177,21 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for GizmoduckCandidateHydra
                             })
                     });
 
-                    Ok(PostCandidate {
+                    Some(GizmoduckCacheValue {
                         author_followers_count,
                         author_screen_name,
                         retweeted_screen_name,
                         nsfw_author,
                         nsfw_author_ads,
                         nsfw_author_phoenix,
-                        ..Default::default()
                     })
                 }
-                (Err(err), _) | (_, Err(err)) => Err(err),
+                (Err(_), _) | (_, Err(_)) => None,
             };
-            hydrated_candidates.push(hydrated);
+            values.push(hydrated);
         }
 
-        hydrated_candidates
-    }
-
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        candidate.author_followers_count = hydrated.author_followers_count;
-        candidate.author_screen_name = hydrated.author_screen_name;
-        candidate.retweeted_screen_name = hydrated.retweeted_screen_name;
-        candidate.nsfw_author = hydrated.nsfw_author;
-        candidate.nsfw_author_ads = hydrated.nsfw_author_ads;
-        candidate.nsfw_author_phoenix = hydrated.nsfw_author_phoenix;
+        values
     }
 }
 

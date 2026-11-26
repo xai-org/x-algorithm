@@ -370,6 +370,19 @@ __global__ void owner_reduce_rows_kernel(
   }
 }
 
+__device__ __forceinline__ uint32_t hash_u32(uint32_t x) {
+  x = (x ^ (x >> 16)) * 0x7feb352du;
+  x = (x ^ (x >> 15)) * 0x846ca68bu;
+  return x ^ (x >> 16);
+}
+
+__device__ __forceinline__ float
+stochastic_round_bf16(float value, uint32_t step, uint32_t row, uint32_t col) {
+  const uint32_t base = hash_u32(hash_u32(step) ^ hash_u32(row));
+  const uint32_t rand = (col * 0x9e3779b1u + base) >> 16;
+  return __uint_as_float((__float_as_uint(value) + rand) & 0xffff0000u);
+}
+
 __global__ void rowwise_adagrad_apply_kernel(
     const bf16* grads,
     const int32_t* order,
@@ -410,7 +423,9 @@ __global__ void rowwise_adagrad_apply_kernel(
     if (lazy) {
       const float delta = fmaxf(0.f, float(clock - last_step[r]));
       accum_factor = expf(-adagrad.accum_decay_rate * delta);
-      wd = ss > 0.f ? expf(-adagrad.weight_decay_rate * delta) : 1.f;
+      wd = (ss > 0.f && delta > adagrad.weight_decay_exempt_window)
+               ? expf(-adagrad.weight_decay_rate * delta)
+               : 1.f;
     }
     const float accum = row_state[r] * accum_factor + ss * adagrad.inv_emb_width;
     const float step = (-adagrad.lr) * (1.f / (sqrtf(accum) + adagrad.eps));
@@ -422,9 +437,16 @@ __global__ void rowwise_adagrad_apply_kernel(
       unpack8(load8(x_row + v * 8), cell);
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        const float delta = round_bf16(step * grad[j]);
-        const float decayed = round_bf16(cell[j] * wd);
-        cell[j] = decayed + delta;
+        if (adagrad.stochastic_rounding) {
+          const float candidate = __fadd_rn(__fmul_rn(cell[j], wd), __fmul_rn(step, grad[j]));
+          cell[j] = stochastic_round_bf16(
+              candidate, uint32_t(clock), uint32_t(g), uint32_t(v * 8 + j)
+          );
+        } else {
+          const float delta = round_bf16(step * grad[j]);
+          const float decayed = round_bf16(cell[j] * wd);
+          cell[j] = decayed + delta;
+        }
       }
       store8(x_row + v * 8, pack8(cell));
     }

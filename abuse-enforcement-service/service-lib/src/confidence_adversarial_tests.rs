@@ -3,7 +3,7 @@ use xai_abuse_proto::enforcement::{self as proto, ScoreResult};
 use super::*;
 use crate::action_control::test_support::record;
 use crate::action_control::{
-    ActionControlRecord, ConfidenceEvidence, ControlEntity, ControlMode, EvidenceOverride,
+    ActionControlRecord, ConfidenceEvidence, ControlMode, EvidenceOverride, LevelRow, PageAction,
 };
 use crate::confidence::ConfidenceLevel;
 use crate::replay_tests::{
@@ -46,100 +46,108 @@ fn high() -> ScoreResult {
     score
 }
 
-fn defaults() -> ActionControlRecord {
+fn moved() -> ActionControlRecord {
+    record(BB1.0, None, None, ControlMode::Rows, vec![])
+}
+
+fn high_row() -> ActionControlRecord {
     ActionControlRecord {
-        entity_type: ControlEntity::User,
-        ..record(BB1.0, None, None, ControlMode::ConfidenceDefaults, vec![])
+        confidence: Some(LevelRow::High),
+        ..record(
+            BB1.0,
+            None,
+            None,
+            ControlMode::Live,
+            vec![PageAction::SUSPEND],
+        )
     }
 }
 
-#[tokio::test]
-async fn malformed_confidence_config_forces_level_decisions_to_record_only() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let mut config = on_config(false, None);
-    config["action_control"]["confidence"] = serde_json::json!({
-        "label_map": {LABEL: "not_a_level"}
-    });
-    let bed = TestBed::new(BedConfig {
+async fn bed(config: serde_json::Value, row: ActionControlRecord) -> TestBed {
+    TestBed::new(BedConfig {
         user_rules: BAKED_USER_RULES,
         post_rules: BAKED_POST_RULES,
         config,
         off_switches: vec![],
-        control_records: vec![defaults()],
+        control_records: vec![moved(), row],
     })
-    .await;
-
-    let trace = bed.run_fresh(&high()).await;
-    assert_eq!(trace.status, "dry_run", "{trace:?}");
-    assert!(trace.ais.is_empty(), "{trace:?}");
-    assert_eq!(trace.tickets, 0, "{trace:?}");
-    assert!(
-        trace
-            .dedup_calls
-            .iter()
-            .all(|call| call.starts_with("peek")),
-        "{trace:?}"
-    );
+    .await
 }
 
 #[tokio::test]
-async fn a_future_record_timestamp_cannot_extend_an_override_past_seven_days() {
+async fn malformed_confidence_config_makes_no_evidence_current_and_the_row_still_acts() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let want = bed(on_config(false, None), high_row())
+        .await
+        .run_fresh(&high())
+        .await;
+    assert_eq!(want.status, "success", "{want:?}");
+    let mut config = on_config(false, None);
+    config["action_control"]["confidence"] = serde_json::json!({
+        "label_map": {LABEL: "high"}
+    });
+    let trace = bed(config, high_row()).await.run_fresh(&high()).await;
+    assert_eq!(trace.status, want.status, "{trace:?}");
+    assert_eq!(trace.ais.len(), want.ais.len(), "{trace:?}");
+    assert_eq!(trace.tickets, want.tickets, "{trace:?}");
+    let info = &trace.outcomes[0].info;
+    assert!(!info.contains_key("logged_because"), "{info:?}");
+    assert!(
+        !info.contains_key(action_control::FORCED_RECORDING_KEY),
+        "{info:?}"
+    );
+    assert_eq!(info["confidence_evidence_supports"], "none");
+}
+
+#[tokio::test]
+async fn a_record_written_in_the_future_with_an_override_is_unreadable() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let now = now_millis();
-    let mut opt_in = defaults();
-    opt_in.updated_at_ms = now + 30 * DAY_MS;
-    opt_in.evidence_override = Some(Box::new(EvidenceOverride {
+    let mut row = high_row();
+    row.updated_at_ms = now + 30 * DAY_MS;
+    row.evidence_override = Some(Box::new(EvidenceOverride {
         by: "operator@example.com".into(),
         reason: "temporary exception".into(),
         expires_at_ms: now + 30 * DAY_MS,
     }));
-    let bed = TestBed::new(BedConfig {
-        user_rules: BAKED_USER_RULES,
-        post_rules: BAKED_POST_RULES,
-        config: on_config(false, None),
-        off_switches: vec![],
-        control_records: vec![opt_in],
-    })
-    .await;
     let mut score = high();
     score.confidence_evidence = None;
 
-    let trace = bed.run_fresh(&score).await;
+    let trace = bed(on_config(false, None), row)
+        .await
+        .run_fresh(&score)
+        .await;
     assert_eq!(trace.status, action_control::STATUS_NO_ACTIONS, "{trace:?}");
     assert!(trace.ais.is_empty(), "{trace:?}");
     assert_eq!(trace.tickets, 0, "{trace:?}");
+    assert_eq!(trace.outcomes[0].info["logged_because"], "unreadable");
 }
 
 #[tokio::test]
-async fn an_override_expiring_before_its_future_write_cannot_act() {
+async fn a_stored_override_expiring_before_its_write_leaves_the_record_unreadable() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let now = now_millis();
-    let mut opt_in = defaults();
-    opt_in.updated_at_ms = now + crate::confidence::CLOCK_SKEW_MS;
-    opt_in.evidence_override = Some(Box::new(EvidenceOverride {
+    let mut row = high_row();
+    row.updated_at_ms = now + crate::confidence::CLOCK_SKEW_MS;
+    row.evidence_override = Some(Box::new(EvidenceOverride {
         by: "operator@example.com".into(),
         reason: "temporary exception".into(),
         expires_at_ms: now + 60_000,
     }));
-    let bed = TestBed::new(BedConfig {
-        user_rules: BAKED_USER_RULES,
-        post_rules: BAKED_POST_RULES,
-        config: on_config(false, None),
-        off_switches: vec![],
-        control_records: vec![opt_in],
-    })
-    .await;
     let mut score = high();
     score.confidence_evidence = None;
 
-    let trace = bed.run_fresh(&score).await;
+    let trace = bed(on_config(false, None), row)
+        .await
+        .run_fresh(&score)
+        .await;
     assert_eq!(trace.status, action_control::STATUS_NO_ACTIONS, "{trace:?}");
     assert!(trace.ais.is_empty(), "{trace:?}");
     assert_eq!(trace.tickets, 0, "{trace:?}");
 }
 
 #[test]
-fn five_minute_and_seven_day_boundaries_are_exact() {
+fn the_five_minute_clock_skew_boundary_is_exact() {
     let now = 1_791_000_000_000;
     let mut ev = evidence(ConfidenceLevel::High);
     ev.read_at_ms = now + crate::confidence::CLOCK_SKEW_MS;
@@ -159,21 +167,5 @@ fn five_minute_and_seven_day_boundaries_are_exact() {
             crate::confidence::DEFAULT_EVIDENCE_MAX_AGE_DAYS * DAY_MS,
         ),
         None
-    );
-
-    let future_write = now + crate::confidence::CLOCK_SKEW_MS;
-    let mut ov = EvidenceOverride {
-        by: "operator@example.com".into(),
-        reason: "temporary exception".into(),
-        expires_at_ms: now + 7 * DAY_MS,
-    };
-    assert!(crate::confidence::override_active(&ov, future_write, now));
-    ov.expires_at_ms += 1;
-    assert!(!crate::confidence::override_active(&ov, future_write, now));
-
-    ov.expires_at_ms = now + 60_000;
-    assert!(
-        !crate::confidence::override_active(&ov, future_write, now),
-        "an override expiring before its stored write time must not act"
     );
 }

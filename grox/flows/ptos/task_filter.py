@@ -48,9 +48,23 @@ class TaskSafetyPtosRealtimeWithSignalsFilter(TaskFilterWithPost):
                 1, attributes={"filter": "ptos_realtime", "reason": "no_user"}
             )
             return False
-        text = post.full_text or ""
-        mention_count = sum(1 for w in text.split() if w.startswith("@"))
-        if mention_count < cls.MIN_MENTION_COUNT:
+        text_handles, tag_handles = post.text_mention_handles, post.media_tag_handles
+        handle_count = len(text_handles | tag_handles)
+        for kind, count in (
+            ("text", len(text_handles)),
+            ("media_tags", len(tag_handles)),
+            ("total", handle_count),
+        ):
+            Metrics.counter(
+                "task.safety_ptos_realtime_with_signals_filter.mentions.count"
+            ).add(
+                1,
+                attributes={
+                    "kind": kind,
+                    "handles": "3+" if count >= 3 else str(count),
+                },
+            )
+        if handle_count < cls.MIN_MENTION_COUNT:
             Metrics.counter("task.filter.skipped.count").add(
                 1,
                 attributes={"filter": "ptos_realtime", "reason": "not_enough_mention"},

@@ -33,14 +33,14 @@
 # Copyright 2026 X.AI Corp.
 import math
 from functools import partial
-from typing import Callable, Optional, Type
+from typing import Callable, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 
@@ -67,6 +67,12 @@ from xrex.cutedsl.ranker_fa4.tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
+
+
+def _load_lse_and_softmax_stats(m_block, producer_state, load_lse, load_row_max, load_inv_sum):
+    load_lse(m_block, producer_state=producer_state)
+    load_row_max(m_block, producer_state=producer_state)
+    load_inv_sum(m_block, producer_state=producer_state)
 
 
 class FlashAttentionBackwardSm90:
@@ -100,6 +106,7 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        qhead_loop: bool = False,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -138,6 +145,9 @@ class FlashAttentionBackwardSm90:
         if qhead_per_kvhead > 1:
             assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
             assert self.num_wg_mma == 2, "GQA backward assumes 2 warp groups"
+        self.qhead_loop = qhead_loop
+        self.q_heads_per_cta = qhead_per_kvhead if qhead_loop else 1
+        self.dKV_postprocess = qhead_per_kvhead > 1 and not qhead_loop
         self.shuffle_LSE = self.SdP_swapAB and self.tile_hdim <= 64
         self.shuffle_dPsum = self.SdP_swapAB and self.tile_hdim <= 64
 
@@ -204,7 +214,7 @@ class FlashAttentionBackwardSm90:
             raise TypeError("dPsum tensor must be Float32")
         if const_expr(mdQaccum_type not in [Float32]):
             raise TypeError("dQaccum tensor must be Float32")
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(not self.dKV_postprocess):
             if const_expr(not (mdK_type == mdV_type == mQ_type)):
                 raise TypeError("mdK and mdV tensors must have the same data type as mQ")
         else:
@@ -257,8 +267,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_SdP, self.SdP_swapAB),
             tiler_mn=(64, tiler_mn_SdP[1] if not self.SdP_swapAB else tiler_mn_SdP[0]),
@@ -270,10 +280,10 @@ class FlashAttentionBackwardSm90:
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.MN
+                cute.nvgpu.OperandMajorMode.MN
                 if not self.mma_dkv_is_rs
-                else warpgroup.OperandMajorMode.K,
-                warpgroup.OperandMajorMode.MN,
+                else cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
                 tiler_mn=(64, tiler_mn_d[1] if not self.dKV_swapAB else tiler_mn_d[0]),
@@ -289,8 +299,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
-            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
             tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),
@@ -317,6 +327,8 @@ class FlashAttentionBackwardSm90:
         sdPsum_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.dO_stage], 128
         ]
+        stat_elems = cute.round_up(self.tile_m, 64) * self.Q_stage if self.has_softmax_stats else 0
+        sStat_struct = cute.struct.Align[cute.struct.MemRange[Float32, stat_elems], 128]
 
         @cute.struct
         class SharedStorageQKV:
@@ -324,6 +336,8 @@ class FlashAttentionBackwardSm90:
             mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
+            sRowMax: sStat_struct
+            sInvSum: sStat_struct
             sQ: sQ_struct
             sV: sV_struct
             sK: sK_struct
@@ -358,8 +372,10 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]] = None,
         stream: cuda.CUstream = None,
     ):
+        self.has_softmax_stats = mSoftmaxStats is not None
         self.varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
 
         self._check_type(
@@ -370,6 +386,11 @@ class FlashAttentionBackwardSm90:
         )
 
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+        if const_expr(self.qhead_loop):
+            assert blocksparse_tensors is not None, "qhead_loop needs block sparsity"
+            assert not (self.is_varlen_q or self.varlen_k), (
+                "qhead_loop does not support cu_seqlens or seqused"
+            )
 
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [
             assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)
@@ -379,7 +400,7 @@ class FlashAttentionBackwardSm90:
             return layout_utils.select(t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1])
 
         mQ, mK, mV, mdO = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO)]
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(not self.dKV_postprocess):
             mdK, mdV = [_qkv_transpose(t) for t in (mdK, mdV)]
         else:
             accum_transpose = [2, 1, 0] if cute.rank(mdK.shape) == 3 else [1, 0]
@@ -388,6 +409,10 @@ class FlashAttentionBackwardSm90:
         mLSE, mdPsum, mdQaccum = [
             layout_utils.select(t, LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
         ]
+        if const_expr(mSoftmaxStats is not None):
+            mSoftmaxStats = tuple(
+                layout_utils.select(t, LSE_dPsum_dQaccum_transpose) for t in mSoftmaxStats
+            )
 
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
         if const_expr(self.deterministic):
@@ -473,7 +498,7 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sdO_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdimv),
         )
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(not self.dKV_postprocess):
             mdK_tma = (
                 copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True)
                 if self.varlen_k
@@ -508,7 +533,7 @@ class FlashAttentionBackwardSm90:
         self.spt = (self.is_causal or self.is_local) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
-            cute.size(mQ.shape[2]),
+            cute.size(mK.shape[2]) if const_expr(self.qhead_loop) else cute.size(mQ.shape[2]),
             cute.size(mK.shape[3])
             if const_expr(mCuSeqlensK is None)
             else cute.size(mCuSeqlensK.shape[0] - 1),
@@ -542,13 +567,13 @@ class FlashAttentionBackwardSm90:
         if const_expr(aux_tensors is not None):
             seqlen_q = cute.size(mQ.shape[0])
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         qhead_per_kvhead_divmod = None
         if const_expr(self.qhead_per_kvhead > 1):
-            qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+            qhead_per_kvhead_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
@@ -562,8 +587,8 @@ class FlashAttentionBackwardSm90:
             tma_tensor_K,
             tma_tensor_V,
             tma_tensor_dO,
-            tma_tensor_dK if const_expr(self.qhead_per_kvhead == 1) else mdK,
-            tma_tensor_dV if const_expr(self.qhead_per_kvhead == 1) else mdV,
+            tma_tensor_dK if const_expr(not self.dKV_postprocess) else mdK,
+            tma_tensor_dV if const_expr(not self.dKV_postprocess) else mdV,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -571,6 +596,7 @@ class FlashAttentionBackwardSm90:
             tma_atom_dK,
             tma_atom_dV,
             mLSE,
+            mSoftmaxStats,
             mdPsum,
             mdQaccum,
             mCuSeqlensQ,
@@ -626,6 +652,7 @@ class FlashAttentionBackwardSm90:
         tma_atom_dK: cute.CopyAtom,
         tma_atom_dV: cute.CopyAtom,
         mLSE: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         mdPsum: cute.Tensor,
         mdQaccum: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -651,7 +678,7 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -677,7 +704,8 @@ class FlashAttentionBackwardSm90:
             num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
+            tx_count=self.tma_copy_bytes["Q"]
+            + self.tma_copy_bytes["LSE"] * (3 if const_expr(mSoftmaxStats is not None) else 1),
             defer_sync=True,
         )
         pipeline_dO = pipeline.PipelineTmaAsync.create(
@@ -709,6 +737,16 @@ class FlashAttentionBackwardSm90:
                 stride=(1, cute.round_up(self.tile_m, 64)),
             )
         )
+        sStats = None
+        if const_expr(mSoftmaxStats is not None):
+            sStats = tuple(
+                st.get_tensor(
+                    cute.make_layout(
+                        (self.tile_m, self.Q_stage), stride=(1, cute.round_up(self.tile_m, 64))
+                    )
+                )
+                for st in (storage.sRowMax, storage.sInvSum)
+            )
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         block_info = BlockInfo(
@@ -758,6 +796,8 @@ class FlashAttentionBackwardSm90:
                     sdO,
                     sLSE,
                     sdPsum,
+                    mSoftmaxStats,
+                    sStats,
                     tma_atom_Q,
                     tma_atom_K,
                     tma_atom_V,
@@ -801,6 +841,7 @@ class FlashAttentionBackwardSm90:
                 sdS,
                 sLSE,
                 sdPsum,
+                sStats,
                 sdQaccum,
                 pipeline_Q,
                 pipeline_dO,
@@ -846,6 +887,8 @@ class FlashAttentionBackwardSm90:
         sdO: cute.Tensor,
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
+        sStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -856,9 +899,27 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+
+        q_head_loads = partial(
+            self.get_q_head_loads,
+            mQ=mQ,
+            mdO=mdO,
+            mLSE=mLSE,
+            mdPsum=mdPsum,
+            sQ=sQ,
+            sdO=sdO,
+            sLSE=sLSE,
+            sdPsum=sdPsum,
+            mSoftmaxStats=mSoftmaxStats,
+            sStats=sStats,
+            tma_atom_Q=tma_atom_Q,
+            tma_atom_dO=tma_atom_dO,
+            pipeline_Q=pipeline_Q,
+            pipeline_dO=pipeline_dO,
+        )
 
         if warp_idx_in_wg == 0:
             producer_state_Q = cutlass.pipeline.make_pipeline_state(
@@ -874,45 +935,20 @@ class FlashAttentionBackwardSm90:
                 seqlen = SeqlenInfoCls(batch_idx)
                 head_idx_kv = (
                     head_idx
-                    if const_expr(self.qhead_per_kvhead == 1)
+                    if const_expr(self.qhead_per_kvhead == 1 or self.qhead_loop)
                     else head_idx // qhead_per_kvhead_divmod
                 )
+                first_q_head = head_idx * self.q_heads_per_cta
                 mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
-
-                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[
-                    None, head_idx
-                ]
-                mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
-                mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
-                    None, head_idx
-                ]
-                gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (None, 0))
-                gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
-                gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
-                gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m,), (None,))
-
                 load_K, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_K, 0, cute.make_layout(1), gK, sK, single_stage=True
                 )
                 load_V, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_V, 0, cute.make_layout(1), gV, sV, single_stage=True
                 )
-                load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q, 0, cute.make_layout(1), gQ, sQ
-                )
-                load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
-                load_dO, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
-                )
-                load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
-                load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
-                load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_Q)
-                load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
-                load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
 
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
@@ -923,18 +959,16 @@ class FlashAttentionBackwardSm90:
                         or m_block_min < m_block_max
                     )
                 else:
-                    total_m_block_cnt = get_total_q_block_count_bwd(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
+                    total_m_block_cnt = self.total_q_block_count(
+                        blocksparse_tensors, batch_idx, first_q_head, n_block, m_block_max
                     )
                     process_tile = total_m_block_cnt > Int32(0)
 
                 if process_tile:
                     if const_expr(not self.use_block_sparsity):
+                        load_Q, load_dO, load_LSE, load_dPsum = q_head_loads(
+                            seqlen, batch_idx, head_idx
+                        )
                         first_m_block = m_block_min
                         pipeline_Q.producer_acquire(
                             producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"]
@@ -972,37 +1006,120 @@ class FlashAttentionBackwardSm90:
                             producer_state_Q.advance()
                             producer_state_dO.advance()
                     else:
-                        producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
-                            blocksparse_tensors,
-                            batch_idx,
-                            head_idx,
-                            n_block,
-                            producer_state_Q,
-                            producer_state_dO,
-                            pipeline_Q,
-                            pipeline_dO,
-                            load_K,
-                            load_V,
-                            load_Q,
-                            load_dO,
-                            load_LSE,
-                            load_dPsum,
-                            self.tma_copy_bytes["K"],
-                            self.tma_copy_bytes["V"],
-                            Q_stage_eq_dO_stage=(self.Q_stage == self.dO_stage),
-                            subtile_factor=self.subtile_factor,
-                            m_block_max=m_block_max,
-                        )
+                        kv_loaded = False
+                        for q_head in cutlass.range(
+                            first_q_head, first_q_head + self.q_heads_per_cta, unroll=1
+                        ):
+                            producer_state_Q, producer_state_dO, kv_loaded = (
+                                produce_block_sparse_q_loads_bwd_sm90(
+                                    blocksparse_tensors,
+                                    batch_idx,
+                                    q_head,
+                                    n_block,
+                                    producer_state_Q,
+                                    producer_state_dO,
+                                    pipeline_Q,
+                                    pipeline_dO,
+                                    load_K,
+                                    load_V,
+                                    *q_head_loads(seqlen, batch_idx, q_head),
+                                    self.tma_copy_bytes["K"],
+                                    self.tma_copy_bytes["V"],
+                                    Q_stage_eq_dO_stage=(self.Q_stage == self.dO_stage),
+                                    subtile_factor=self.subtile_factor,
+                                    m_block_max=m_block_max,
+                                    kv_loaded=kv_loaded,
+                                )
+                            )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
+    def get_q_head_loads(
+        self,
+        seqlen: SeqlenInfoQK,
+        batch_idx: Int32,
+        q_head: Int32,
+        mQ: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        sQ: cute.Tensor,
+        sdO: cute.Tensor,
+        sLSE: cute.Tensor,
+        sdPsum: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
+        sStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_dO: cute.CopyAtom,
+        pipeline_Q: cutlass.pipeline.PipelineAsync,
+        pipeline_dO: cutlass.pipeline.PipelineAsync,
+    ) -> tuple[Callable, Callable, Callable, Callable]:
+        mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, q_head]
+        mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, q_head]
+        mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, q_head]
+        mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[None, q_head]
+        gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (None, 0))
+        gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
+        gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
+        gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m,), (None,))
+        load_Q, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ)
+        load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
+        load_dO, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)
+        load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
+        load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
+        load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_Q)
+        if const_expr(mSoftmaxStats is not None):
+            mRowMax_cur = seqlen.offset_batch_Q(mSoftmaxStats[0], batch_idx, dim=2, padded=True)[
+                None, q_head
+            ]
+            mInvSum_cur = seqlen.offset_batch_Q(mSoftmaxStats[1], batch_idx, dim=2, padded=True)[
+                None, q_head
+            ]
+            gRowMax = cute.local_tile(mRowMax_cur, (self.tile_m,), (None,))
+            gInvSum = cute.local_tile(mInvSum_cur, (self.tile_m,), (None,))
+            load_LSE = partial(
+                _load_lse_and_softmax_stats,
+                load_lse=load_LSE,
+                load_row_max=copy_utils.tma_producer_copy_fn(
+                    copy_utils.cpasync_bulk_get_copy_fn(gRowMax, sStats[0]), pipeline_Q
+                ),
+                load_inv_sum=copy_utils.tma_producer_copy_fn(
+                    copy_utils.cpasync_bulk_get_copy_fn(gInvSum, sStats[1]), pipeline_Q
+                ),
+            )
+        load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
+        load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
+        return load_Q, load_dO, load_LSE, load_dPsum
+
+    @cute.jit
+    def total_q_block_count(
+        self,
+        blocksparse_tensors: BlockSparseTensors,
+        batch_idx: Int32,
+        first_q_head: Int32,
+        n_block: Int32,
+        m_block_max: Int32,
+    ) -> Int32:
+        total = Int32(0)
+        for q_head_in_cta in cutlass.range_constexpr(self.q_heads_per_cta):
+            total += get_total_q_block_count_bwd(
+                blocksparse_tensors,
+                batch_idx,
+                first_q_head + q_head_in_cta,
+                n_block,
+                subtile_factor=self.subtile_factor,
+                m_block_max=m_block_max,
+            )
+        return total
+
+    @cute.jit
     def apply_score_mod(
         self,
         acc_S: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
@@ -1045,7 +1162,7 @@ class FlashAttentionBackwardSm90:
         self,
         grad_tensor: cute.Tensor,
         score_tensor: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
@@ -1104,6 +1221,7 @@ class FlashAttentionBackwardSm90:
         sdS: cute.Tensor,
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
+        sStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         sdQaccum: cute.Tensor,
         pipeline_Q: cutlass.pipeline.PipelineAsync,
         pipeline_dO: cutlass.pipeline.PipelineAsync,
@@ -1120,7 +1238,7 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1224,6 +1342,18 @@ class FlashAttentionBackwardSm90:
         if const_expr(self.shuffle_dPsum):
             tLSEsdPsum = shfl_copy.get_slice(cute.arch.lane_idx() // 4).partition_S(tLSEsdPsum)
             tLSEsdPsum = cute.group_modes(tLSEsdPsum, 0, 2)
+        tLSEsStats = None
+        if const_expr(sStats is not None):
+            tLSEsStats = []
+            for sStat in sStats:
+                tStat = layout_utils.mma_partition_C_vec(
+                    sStat, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not self.SdP_swapAB
+                )
+                if const_expr(self.shuffle_LSE):
+                    tStat = shfl_copy.get_slice(cute.arch.lane_idx() // 4).partition_S(tStat)
+                    tStat = cute.group_modes(tStat, 0, 2)
+                tLSEsStats.append(tStat)
+            tLSEsStats = tuple(tLSEsStats)
 
         tdQsdQaccum = None
         if const_expr(is_dQ_wg):
@@ -1262,6 +1392,7 @@ class FlashAttentionBackwardSm90:
             pipeline_dO=pipeline_dO,
             tLSEsLSE=tLSEsLSE,
             tLSEsdPsum=tLSEsdPsum,
+            tLSEsStats=tLSEsStats,
             tdQsdQaccum=tdQsdQaccum,
             softmax_scale_log2=softmax_scale_log2,
             PdS_barrier=PdS_barrier,
@@ -1283,18 +1414,17 @@ class FlashAttentionBackwardSm90:
             score_mod_fn_cur = partial(
                 score_mod_fn,
                 batch_idx=batch_idx,
-                head_idx=head_idx,
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
             score_mod_bwd_fn_cur = partial(
                 score_mod_bwd_fn,
                 batch_idx=batch_idx,
-                head_idx=head_idx,
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            first_q_head = head_idx * self.q_heads_per_cta
 
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
@@ -1302,13 +1432,8 @@ class FlashAttentionBackwardSm90:
                     or m_block_min < m_block_max
                 )
             else:
-                total_m_block_cnt = get_total_q_block_count_bwd(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    subtile_factor=self.subtile_factor,
-                    m_block_max=m_block_max,
+                total_m_block_cnt = self.total_q_block_count(
+                    blocksparse_tensors, batch_idx, first_q_head, n_block, m_block_max
                 )
                 process_tile = total_m_block_cnt > Int32(0)
 
@@ -1334,34 +1459,41 @@ class FlashAttentionBackwardSm90:
                             consumer_state_Q,
                             consumer_state_dO,
                             mask_fn=mask_fn,
-                            score_mod_fn=score_mod_fn_cur,
-                            score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                            score_mod_fn=partial(score_mod_fn_cur, head_idx=head_idx),
+                            score_mod_bwd_fn=partial(score_mod_bwd_fn_cur, head_idx=head_idx),
                             dKV_accumulate=dKV_accumulate,
                         )
                         dKV_accumulate = True
                 else:
-                    consumer_state_Q, consumer_state_dO = consume_block_sparse_mma_bwd_sm90(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        consumer_state_Q,
-                        consumer_state_dO,
-                        mma_one_m_block_all,
-                        mask,
-                        self.mask_mod,
-                        is_causal=self.is_causal,
-                        is_local=self.is_local,
-                        thr_mma_SdP=thr_mma_SdP,
-                        score_mod_fn=score_mod_fn_cur,
-                        score_mod_bwd_fn=score_mod_bwd_fn_cur,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
-                        aux_tensors=aux_tensors,
-                        fastdiv_mods=fastdiv_mods,
-                    )
+                    dKV_accumulate = False
+                    for q_head in cutlass.range(
+                        first_q_head, first_q_head + self.q_heads_per_cta, unroll=1
+                    ):
+                        consumer_state_Q, consumer_state_dO, dKV_accumulate = (
+                            consume_block_sparse_mma_bwd_sm90(
+                                blocksparse_tensors,
+                                batch_idx,
+                                q_head,
+                                n_block,
+                                consumer_state_Q,
+                                consumer_state_dO,
+                                mma_one_m_block_all,
+                                mask,
+                                self.mask_mod,
+                                is_causal=self.is_causal,
+                                is_local=self.is_local,
+                                thr_mma_SdP=thr_mma_SdP,
+                                score_mod_fn=partial(score_mod_fn_cur, head_idx=q_head),
+                                score_mod_bwd_fn=partial(score_mod_bwd_fn_cur, head_idx=q_head),
+                                subtile_factor=self.subtile_factor,
+                                m_block_max=m_block_max,
+                                aux_tensors=aux_tensors,
+                                fastdiv_mods=fastdiv_mods,
+                                dKV_accumulate=dKV_accumulate,
+                            )
+                        )
 
-                if const_expr(self.qhead_per_kvhead == 1):
+                if const_expr(not self.dKV_postprocess):
                     acc_dK.store(acc_dK.load() * softmax_scale)
                 self.epilogue_dKV(
                     acc_dV,
@@ -1442,6 +1574,7 @@ class FlashAttentionBackwardSm90:
         pipeline_dO: cutlass.pipeline.PipelineAsync,
         tLSEsLSE: cute.Tensor,
         tLSEsdPsum: cute.Tensor,
+        tLSEsStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         tdQsdQaccum: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
@@ -1460,6 +1593,9 @@ class FlashAttentionBackwardSm90:
         pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
+        if const_expr(tLSEsStats is not None):
+            tLSErRowMax = copy_utils.load_s2r(tLSEsStats[0][None, smem_idx_Q])
+            tLSErInvSum = copy_utils.load_s2r(tLSEsStats[1][None, smem_idx_Q])
         pipeline_dO.consumer_wait(
             consumer_state_dO_cur, pipeline_dO.consumer_try_wait(consumer_state_dO_cur)
         )
@@ -1477,16 +1613,27 @@ class FlashAttentionBackwardSm90:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
         lane_idx = cute.arch.lane_idx()
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
-            lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
-            row_masked = lse_val == -Float32.inf
-            for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
-                acc_S_mn[r, c] = (
-                    Float32(0.0)
-                    if row_masked
-                    else cute.math.exp2(
-                        acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
+            if const_expr(tLSEsStats is not None):
+                row_max = self._get_stat(tLSErRowMax, r, lane_idx, shuffle=self.shuffle_LSE)
+                inv_sum = self._get_stat(tLSErInvSum, r, lane_idx, shuffle=self.shuffle_LSE)
+                for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
+                    acc_S_mn[r, c] = (
+                        cute.math.exp2(
+                            (acc_S_mn[r, c] - row_max) * softmax_scale_log2, fastmath=True
+                        )
+                        * inv_sum
                     )
-                )
+            else:
+                lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
+                row_masked = lse_val == -Float32.inf
+                for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
+                    acc_S_mn[r, c] = (
+                        Float32(0.0)
+                        if row_masked
+                        else cute.math.exp2(
+                            acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
+                        )
+                    )
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
 
         tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
@@ -1583,7 +1730,7 @@ class FlashAttentionBackwardSm90:
         n_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
     ):
@@ -1592,7 +1739,7 @@ class FlashAttentionBackwardSm90:
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(not self.dKV_postprocess):
             mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3, ragged=self.varlen_k)[
                 None, None, head_idx
             ]
@@ -1735,21 +1882,7 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
-            else:
-                mdQaccum_cur = cute.domain_offset(
-                    (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
-                )
-            gdQaccum = cute.local_tile(
-                mdQaccum_cur,
-                (
-                    cute.make_layout(
-                        (self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)
-                    ),
-                ),
-                (None,),
-            )
+            first_q_head = head_idx * self.q_heads_per_cta
 
             if const_expr(mdQ_semaphore is not None):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
@@ -1762,18 +1895,14 @@ class FlashAttentionBackwardSm90:
                 )
                 loop_count = m_block_max - m_block_min
             else:
-                total_block_cnt = get_total_q_block_count_bwd(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    subtile_factor=self.subtile_factor,
-                    m_block_max=m_block_max,
+                total_block_cnt = self.total_q_block_count(
+                    blocksparse_tensors, batch_idx, first_q_head, n_block, m_block_max
                 )
                 process_tile = total_block_cnt > Int32(0)
 
             if process_tile:
                 if const_expr(not self.use_block_sparsity):
+                    gdQaccum = self.get_q_head_dQaccum(mdQaccum, seqlen, batch_idx, head_idx)
                     for iter_idx in cutlass.range(loop_count, unroll=1):
                         m_block = m_block_min + iter_idx
                         m_block_safe = m_block
@@ -1831,19 +1960,22 @@ class FlashAttentionBackwardSm90:
                     assert not self.deterministic, (
                         "Deterministic not implemented for block-sparse backward"
                     )
-                    dQaccum_store_block_sparse_bwd_sm90(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        sdQaccum,
-                        gdQaccum,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
-                        num_dQ_warp_groups=self.num_wg_dQ,
-                        num_threads_per_warp_group=self.num_threads_per_warp_group,
-                        tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
-                    )
+                    for q_head in cutlass.range(
+                        first_q_head, first_q_head + self.q_heads_per_cta, unroll=1
+                    ):
+                        dQaccum_store_block_sparse_bwd_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            q_head,
+                            n_block,
+                            sdQaccum,
+                            self.get_q_head_dQaccum(mdQaccum, seqlen, batch_idx, q_head),
+                            subtile_factor=self.subtile_factor,
+                            m_block_max=m_block_max,
+                            num_dQ_warp_groups=self.num_wg_dQ,
+                            num_threads_per_warp_group=self.num_threads_per_warp_group,
+                            tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        )
 
             if const_expr(
                 self.deterministic and not self.spt and block_info.window_size_left is not None
@@ -1862,3 +1994,19 @@ class FlashAttentionBackwardSm90:
 
         if const_expr(not self.deterministic):
             cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    @cute.jit
+    def get_q_head_dQaccum(
+        self, mdQaccum: cute.Tensor, seqlen: SeqlenInfoQK, batch_idx: Int32, q_head: Int32
+    ) -> cute.Tensor:
+        if const_expr(not seqlen.has_cu_seqlens_q):
+            mdQaccum_cur = mdQaccum[None, q_head, batch_idx]
+        else:
+            mdQaccum_cur = cute.domain_offset(
+                (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, q_head]
+            )
+        return cute.local_tile(
+            mdQaccum_cur,
+            (cute.make_layout((self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)),),
+            (None,),
+        )

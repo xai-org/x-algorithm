@@ -11,6 +11,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
     PhoenixToyDataset,
 )
+from xrex.data.recsys.ad_side_ids import AD_SIDE_DEFAULT_FIELDS
 from xrex.data.recsys.constants import continuous_action_type_map
 from xrex.data.recsys.feature_config import (
     WEB_CONV_TRACKING_INTEGRATION_CARDINALITY,
@@ -18,6 +19,8 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
+from xrex.models.fp8 import Fp8Gemms
+from xrex.models.page_critic_only import PAGE_CRITIC_ONLY_PARAM_REGEX, PageCriticOnlyConfig
 from xrex.models.page_rl import PAGE_PARAM_REGEX, PageRlConfig
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
@@ -93,6 +96,9 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_cross_attn=mparams.get("sid_cross_attn", False),
         sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
         sid_decoder_path=mparams.get("sid_decoder_path", ""),
+        sid_recon_rows_per_decoder_pass=mparams.get("sid_recon_rows_per_decoder_pass", 16384),
+        sid_recon_decoder_params=mparams.get("sid_recon_decoder_params", False),
+        sid_recon_remat=mparams.get("sid_recon_remat", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -205,6 +211,7 @@ def _make_dataset(
     _enable_stale_post = mparams.get("enable_stale_post", False)
     _ads_head_masking = mparams.get("ads_head_masking", False)
     _ads_pixel_head_masking = mparams.get("ads_pixel_head_masking", False)
+    _ads_late_window_heads = mparams.get("ads_late_window_heads", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -224,6 +231,7 @@ def _make_dataset(
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
                 ads_pixel_head_masking=_ads_pixel_head_masking,
+                ads_late_window_heads=_ads_late_window_heads,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -232,6 +240,7 @@ def _make_dataset(
                 history_seq_len=mparams["history_seq_len"],
                 candidate_seq_len=mparams["candidate_seq_len"],
                 input_vocab_size=mparams["input_vocab_size"],
+                output_vocab_size=mparams["output_vocab_size"],
                 num_continuous_actions=mparams["num_continuous_actions"],
                 num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
@@ -240,6 +249,7 @@ def _make_dataset(
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
                 ads_pixel_head_masking=_ads_pixel_head_masking,
+                ads_late_window_heads=_ads_late_window_heads,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -252,6 +262,59 @@ def _sequence_len(mparams, dataset, num_user_prefix_tokens: int) -> int:
         + dataset.candidate_seq_len * (1 + getattr(dataset, "num_negatives_per_example", 0))
         + getattr(dataset, "num_global_negatives_per_example", 0)
     )
+
+
+_HOME_SURFACES = (
+    recsys_pb2.ProductSurface.PRODUCT_SURFACE_HOME_TIMELINE_RANKING,
+    recsys_pb2.ProductSurface.PRODUCT_SURFACE_HOME_TIMELINE_RANKED_FOLLOWING,
+)
+HOME_VIDEO_CONTINUATION_ACTION_INDEX = 3
+HOME_PROFILE_VISIT_SECS_ACTION_INDEX = 0
+
+
+def _home_excursion_loss(
+    action_index: int, metric_name: str, loss_weight: float, condition_action_index: int
+) -> ContinuousActionLossConfig:
+    return ContinuousActionLossConfig(
+        action_index=action_index,
+        metric_name=metric_name,
+        loss_weight=loss_weight,
+        condition_action_index=condition_action_index,
+        loss_type="cread",
+        cread_log_min_threshold=2.0,
+        cread_log_num_thresholds=30,
+        cread_restoration_weight=0.5,
+        cread_restoration_loss="huber",
+        cread_huber_delta_sec=5.0,
+        cread_mask_sentinel_labels=False,
+        product_surfaces=_HOME_SURFACES,
+        norm_config=NormConfig(norm_scale=300.0, use_log=False),
+    )
+
+
+def _home_excursion_losses(mparams) -> list[ContinuousActionLossConfig]:
+    losses = []
+    continuation_weight = mparams.get("home_video_continuation_loss_weight", 0.0)
+    if continuation_weight > 0:
+        losses.append(
+            _home_excursion_loss(
+                HOME_VIDEO_CONTINUATION_ACTION_INDEX,
+                "home-video-continuation-cread",
+                continuation_weight,
+                recsys_pb2.ActionName.CLIENT_TWEET_VIDEO_OPEN,
+            )
+        )
+    profile_weight = mparams.get("home_profile_visit_secs_loss_weight", 0.0)
+    if profile_weight > 0:
+        losses.append(
+            _home_excursion_loss(
+                HOME_PROFILE_VISIT_SECS_ACTION_INDEX,
+                "home-profile-visit-secs-cread",
+                profile_weight,
+                recsys_pb2.ActionName.CLIENT_TWEET_CLICK_PROFILE,
+            )
+        )
+    return losses
 
 
 def _home_direct_packed_base() -> dict:
@@ -326,13 +389,12 @@ def _home_direct_packed_base() -> dict:
 
 
 _H100_OVERRIDES = {
-    "bs_per_device": 512,
-    "num_microbatch": 2,
-    "ep": 128,
+    "bs_per_device": 1024,
+    "num_microbatch": 8,
+    "ep": 64,
     "use_async_emb": True,
-    "seqpack_drop_empty_candidates": True,
     "overlap_step_host_work": True,
-    "remat_policy": RematType.SAVE_H100_QKV_ATTN_FFN,
+    "remat_policy": RematType.SAVE_H100_RECSYS,
     "unroll_layer_stack": True,
     "attn_impl": "cutedsl_ranker_varlen_attn",
     "learning_rate": 7.1e-4,
@@ -391,7 +453,6 @@ def _immersive_page_rl() -> dict:
         **base,
         "bs_per_device": 256,
         "num_microbatch": 1,
-        "seqpack_drop_empty_candidates": False,
         "overlap_step_host_work": False,
         "remat_policy": RematType.WHOLE,
         "unroll_layer_stack": False,
@@ -414,6 +475,29 @@ def _immersive_page_rl() -> dict:
             rowwise_adagrad=replace(base["emb_optim_config"].rowwise_adagrad, learning_rate=0.198),
         ),
         "page_rl": PageRlConfig(enabled=True),
+    }
+
+
+def _immersive_page_rl_cread() -> dict:
+    base = _immersive_page_rl()
+    return {
+        **base,
+        "dwell_tweedie_loss_weight": 0.0,
+        "dwell_mae_loss_weight": 0.0,
+        "dwell_cread_loss_weight": 0.1,
+        "dwell_cread_immersive_loss_weight": 0.1,
+        "feature_prep": replace(base["feature_prep"], enable_dwell_bucket_table=True),
+    }
+
+
+def _immersive_page_rl_cread_critic_only() -> dict:
+    base = _immersive_page_rl_cread()
+    return {
+        **base,
+        "page_rl": replace(base["page_rl"], critic_only=PageCriticOnlyConfig()),
+        "optim_config": replace(
+            base["optim_config"], clip_partitions=[PAGE_CRITIC_ONLY_PARAM_REGEX, PAGE_PARAM_REGEX]
+        ),
     }
 
 
@@ -461,7 +545,48 @@ MODEL_CFGS = {
         ip_vocab_size=10_000_000,
     ),
     "home_direct_packed": _make_cfg(
-        {**_home_direct_packed_base(), **_H100_OVERRIDES},
+        {
+            **_home_direct_packed_base(),
+            **_H100_OVERRIDES,
+            "seqpack_candidate_packing": True,
+            "seqpack_candidate_count": [128],
+            "seqpack_distribution": replace(
+                _home_direct_packed_base()["seqpack_distribution"], mean_len=414
+            ),
+            "num_candidate_only_layers": 2,
+            "candidate_only_attn_impl": "cutedsl_ranker_candidate_only_attn",
+            "fp8_gemms": Fp8Gemms.ALL,
+            "metrics_ndcg_shared_sorts": True,
+            "enable_broadcast_metrics": True,
+            "metric_mask_keys": [
+                "non_negative_home",
+                "non_negative_no_history",
+                "negative",
+                "non_negative_ranked_following",
+                "non_negative_home_broadcast",
+            ],
+            "view_loss_weight": 0.5,
+            "home_video_continuation_loss_weight": 0.013,
+            "home_profile_visit_secs_loss_weight": 0.0035,
+            "feature_prep": replace(
+                _home_direct_packed_base()["feature_prep"],
+                enable_time_gap=True,
+                time_gap_lr_scale=4.0,
+                enable_home_excursion_history=True,
+            ),
+            "optim_config": replace(_H100_OVERRIDES["optim_config"], clip_by_global_norm=1.4),
+            "emb_optim_config": RecsysEmbeddingOptimConfig(
+                rowwise_adagrad=replace(
+                    _H100_OVERRIDES["emb_optim_config"].rowwise_adagrad,
+                    weight_decay=5.6e-4,
+                    weight_decay_exempt_window=37,
+                    stochastic_rounding=True,
+                ),
+            ),
+            "scale_config": ScaleConfig(
+                transformer_matrix_lr_scale=0.25, head_lr_scale=0.25, hidden_proj_lr_scale=0.25
+            ),
+        },
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -476,6 +601,20 @@ MODEL_CFGS = {
     ),
     "immersive_page_rl": _make_cfg(
         _immersive_page_rl(),
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl_cread": _make_cfg(
+        _immersive_page_rl_cread(),
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl_cread_critic_only": _make_cfg(
+        _immersive_page_rl_cread_critic_only(),
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -598,9 +737,6 @@ CONFIGS: dict[str, RecsysTrainer] = _ConfigRegistry()
 def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTrainer:
     config_name_gen = f"{config_name}_{dataset_type}"
 
-    if dataset_type == "grpc_recsys" and mparams.get("enable_stale_post", False):
-        mparams = {**mparams, "enable_stale_post": False}
-
     hash_table = HashTable(
         hash_keys=HashKeys(
             user_id_table_size=mparams["user_vocab_size"],
@@ -657,7 +793,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
         user_features_mlp=mparams.get("user_features_mlp", False),
     )
 
-    scale_config = _default_recsys_scaling()
+    scale_config = mparams.get("scale_config", _default_recsys_scaling())
     feature_prep = _make_feature_prep_config(mparams, scale_config)
     use_user_embedding = mparams.get("use_user_embedding", True)
     use_post_embedding = mparams.get("use_post_embedding", True)
@@ -709,18 +845,39 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             ),
             ads_head_masking=mparams.get("ads_head_masking", False),
             ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+            ads_late_window_heads=mparams.get("ads_late_window_heads", False),
+            serve_late_window_composed=mparams.get("serve_late_window_composed", False),
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
+            enable_dpa_sid_feat=mparams.get("enable_dpa_sid_feat", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
+            pad_candidates_to_128=mparams.get("pad_candidates_to_128", True),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
+            concat_history_web_conv_time_on_site=mparams.get(
+                "concat_history_web_conv_time_on_site", False
+            ),
+            add_history_web_conv_value=mparams.get("add_history_web_conv_value", False),
+            wallclock_recency=mparams.get("wallclock_recency", False),
+            ads_counts_emb_dim=mparams.get("ads_counts_emb_dim", 0),
+            ads_ctr_emb_dim=mparams.get("ads_ctr_emb_dim", 0),
+            ad_side_ids_emb_dim=mparams.get("ad_side_ids_emb_dim", 0),
+            ad_side_fields=mparams.get("ad_side_fields", ",".join(AD_SIDE_DEFAULT_FIELDS)),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
+            view_loss_weight=mparams.get("view_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
+            value_loss_normalization=mparams.get("value_loss_normalization", "valid_rows"),
+            aux_value_head_weights=mparams.get("aux_value_head_weights", ""),
+            aux_value_head_type=mparams.get("aux_value_head_type", "binned"),
+            aux_value_include_view_through=mparams.get("aux_value_include_view_through", False),
             condition_search_relevance_on_prompt=mparams.get(
                 "condition_search_relevance_on_prompt", False
             ),
             metric_group=mparams.get("metric_group", "default"),
             enable_platform_metrics=mparams.get("enable_platform_metrics", False),
+            enable_broadcast_metrics=mparams.get("enable_broadcast_metrics", False),
             metric_mask_keys=mparams.get("metric_mask_keys"),
+            metric_own_slice=mparams.get("metric_own_slice", False),
+            metrics_ndcg_shared_sorts=mparams.get("metrics_ndcg_shared_sorts", False),
             conversion_delay_slice_thresholds_s=tuple(
                 mparams.get("conversion_delay_slice_thresholds_s", ())
             ),
@@ -789,6 +946,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                     product_surfaces=(recsys_pb2.ProductSurface.PRODUCT_SURFACE_GALLERY_PAGE,),
                     norm_config=NormConfig(norm_scale=240.0, use_log=False),
                 ),
+                *_home_excursion_losses(mparams),
             ],
             context_features=ContextFeaturesConfig(
                 enabled=mparams.get("enable_context_features", True),
@@ -902,6 +1060,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                     qk_norm=mparams.get("qk_norm", False),
                     max_num_segments_per_batch=1,
                     attn_impl=mparams["attn_impl"],
+                    candidate_only_attn_impl=mparams.get("candidate_only_attn_impl"),
                     fa_version="3",
                     qkv_merge=True,
                     rotary=True,
@@ -921,8 +1080,13 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 primer_norm=mparams.get("primer_norm", True),
                 use_remat=True,
                 remat_policy=mparams.get("remat_policy", RematType.WHOLE),
+                fp8_gemms=mparams.get("fp8_gemms", Fp8Gemms.OFF),
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
+                num_candidate_only_layers=mparams.get("num_candidate_only_layers", 0),
+                candidate_only_layers_update_user_token=mparams.get(
+                    "candidate_only_layers_update_user_token", False
+                ),
                 output_vocab_size=mparams["output_vocab_size"],
             ),
             hash_table=hash_table,
@@ -930,8 +1094,11 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
         bs_per_device=mparams["bs_per_device"],
         num_microbatch=mparams.get("num_microbatch", 1),
         use_async_emb=mparams.get("use_async_emb", False),
+        use_row_emb=mparams.get("use_row_emb", False),
+        row_emb_recv_factor=mparams.get("row_emb_recv_factor", 2.0),
         overlap_step_host_work=mparams.get("overlap_step_host_work", False),
-        seqpack_drop_empty_candidates=mparams.get("seqpack_drop_empty_candidates", False),
+        seqpack_candidate_packing=mparams.get("seqpack_candidate_packing", False),
+        seqpack_candidate_count=mparams.get("seqpack_candidate_count", []),
         seqpack_distribution=seqpack_distribution,
         dataset=dataset,
         parallel_config=ParallelConfig(

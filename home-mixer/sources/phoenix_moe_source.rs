@@ -1,14 +1,17 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixMOESource, EnablePhoenixRetrievalFallback, PhoenixMOEMaxResults,
+    EnablePhoenixMOESource, EnableVideoCarouselMoeSource, PhoenixMOEMaxResults,
     PhoenixMoeColdStartMaxResults, PhoenixRetrievalMOEInferenceClusterId,
     PhoenixXdsRetrievalMaxRetries,
 };
 use crate::sources::sid_source::sid_source_enabled;
-use crate::util::egress::RetrievalDispatch;
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
+use crate::util::video_carousel;
+use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
@@ -17,13 +20,15 @@ use xai_home_mixer_proto as pb;
 pub const PHOENIX_MOE_SOURCE_KILL_SWITCH_DECIDER: &str = "disable_home_mixer_phoenix_moe_source";
 
 pub struct PhoenixMOESource {
-    pub dispatch: RetrievalDispatch,
+    pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
 }
 
 #[async_trait]
 impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.params.get(EnablePhoenixMOESource)
+        (query.params.get(EnablePhoenixMOESource)
+            || (query.params.get(EnableVideoCarouselMoeSource)
+                && video_carousel::is_enabled(query)))
             && !sid_source_enabled(query)
             && (!query.is_topic_request() || query.is_bulk_topic_request())
             && !query.in_network_only
@@ -46,10 +51,8 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
             &query.params.get(PhoenixRetrievalMOEInferenceClusterId),
         );
 
-        let response = self
-            .dispatch
-            .retrieve_with_fallback(
-                query,
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
+            .retrieve(
                 cluster,
                 user_id,
                 sequence.clone(),
@@ -61,7 +64,6 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
                 None,
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
-                query.params.get(EnablePhoenixRetrievalFallback),
                 vec![],
             )
             .await
@@ -89,10 +91,7 @@ mod tests {
 
     fn source() -> PhoenixMOESource {
         PhoenixMOESource {
-            dispatch: RetrievalDispatch {
-                prod: Arc::new(MockRetrievalClient),
-                paths: vec![],
-            },
+            phoenix_retrieval_client: Arc::new(MockRetrievalClient),
         }
     }
 

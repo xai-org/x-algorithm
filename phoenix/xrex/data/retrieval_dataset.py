@@ -8,8 +8,11 @@ import os
 import time
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from xrex import settings
@@ -18,6 +21,7 @@ from xrex.data.cold_pool_filter import (
     default_cold_pool_metadata_path,
     fresh_post_mask,
 )
+from xrex.data.recsys.constants import VIDEO_CREATIVE_BIT
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,8 @@ _bridge_o2_env()
 
 
 _SID_SNAPSHOTS = "post_sid_v8_256x6_snapshots"
+
+_AI_VIDEO_MODEL_DIR = Path(settings.AI_VIDEO_MODEL_DIR)
 
 
 def _sid_window(filename: str) -> tuple[str, str]:
@@ -181,18 +187,49 @@ def _gcs_available() -> bool:
     return sa_path is not None and Path(sa_path).is_file()
 
 
-def _parse_parquet_ids(body: bytes) -> tuple[np.ndarray, np.ndarray]:
-    table = pq.read_table(io.BytesIO(body), columns=["post_id", "author_id"])
+OBJECTIVE_COLUMN = "objective"
+CARD_TYPE_COLUMN = "unified_card_type"
+MEDIA_ARMS_COLUMN = "tweet_media_info_arms"
+VIDEO_CARD_TYPES = frozenset({2, 4, 6, 9, 10, 11, 13, 15, 19, 21, 22, 23, 24, 25, 27})
+VIDEO_MEDIA_ARM = 3
+
+
+def _row_bits_from_table(table: pa.Table) -> np.ndarray:
+    objectives = table.column(OBJECTIVE_COLUMN).combine_chunks().fill_null(0)
+    bits = np.left_shift(1, objectives.to_numpy(zero_copy_only=False).astype(np.int32))
+    is_video = np.zeros(table.num_rows, dtype=bool)
+    if CARD_TYPE_COLUMN in table.column_names:
+        cards = table.column(CARD_TYPE_COLUMN).combine_chunks().fill_null(0)
+        is_video |= np.isin(cards.to_numpy(zero_copy_only=False), list(VIDEO_CARD_TYPES))
+    if MEDIA_ARMS_COLUMN in table.column_names:
+        arms = table.column(MEDIA_ARMS_COLUMN).combine_chunks()
+        values = pc.list_flatten(arms).to_numpy(zero_copy_only=False)
+        parents = pc.list_parent_indices(arms).to_numpy(zero_copy_only=False)
+        is_video[parents[values == VIDEO_MEDIA_ARM]] = True
+    return (bits | np.where(is_video, VIDEO_CREATIVE_BIT, 0)).astype(np.int32)
+
+
+def _parse_parquet_ids(
+    body: bytes, *, read_objective: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    columns = ["post_id", "author_id"]
+    if read_objective:
+        names = pq.ParquetFile(io.BytesIO(body)).schema_arrow.names
+        columns += [
+            c for c in (OBJECTIVE_COLUMN, CARD_TYPE_COLUMN, MEDIA_ARMS_COLUMN) if c in names
+        ]
+    table = pq.read_table(io.BytesIO(body), columns=columns)
     pids = table.column("post_id").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64)
     aids = (
         table.column("author_id").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64)
     )
-    return pids, aids
+    row_bits = _row_bits_from_table(table) if read_objective else None
+    return pids, aids, row_bits
 
 
 def _load_from_o2(
-    name: str, uri: str, *, gcs_mirror: bool = False
-) -> tuple[np.ndarray, np.ndarray]:
+    name: str, uri: str, *, gcs_mirror: bool = False, read_objective: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     bucket, prefix = uri[len(_O2_SCHEME) :].split("/", 1)
     has_gcs = gcs_mirror and _gcs_available()
 
@@ -205,9 +242,9 @@ def _load_from_o2(
                 logger.warning(
                     "%s: O2 snapshot is stale (%.0fs) but no GCS fallback configured", name, age
                 )
-            pids, aids = _parse_parquet_ids(body)
+            pids, aids, row_bits = _parse_parquet_ids(body, read_objective=read_objective)
             logger.info("%s: loaded %s rows from %s", name, f"{len(pids):,}", source)
-            return pids, aids
+            return pids, aids, row_bits
 
         logger.info(
             "%s: O2 snapshot stale (%.0fs > %ds), trying GCS fallback",
@@ -218,30 +255,38 @@ def _load_from_o2(
         try:
             gcs_body, gcs_ts, gcs_source = _download_from_gcs(name, prefix)
             if gcs_ts > ts:
-                pids, aids = _parse_parquet_ids(gcs_body)
+                pids, aids, row_bits = _parse_parquet_ids(gcs_body, read_objective=read_objective)
                 logger.info(
                     "%s: loaded %s rows from %s (newer than O2)", name, f"{len(pids):,}", gcs_source
                 )
-                return pids, aids
+                return pids, aids, row_bits
             else:
                 logger.info("%s: GCS snapshot not newer than O2, using O2", name)
-                pids, aids = _parse_parquet_ids(body)
+                pids, aids, row_bits = _parse_parquet_ids(body, read_objective=read_objective)
                 logger.info("%s: loaded %s rows from %s", name, f"{len(pids):,}", source)
-                return pids, aids
+                return pids, aids, row_bits
         except Exception as gcs_err:
             logger.warning("%s: GCS fallback failed (%s), using stale O2 snapshot", name, gcs_err)
-            pids, aids = _parse_parquet_ids(body)
+            pids, aids, row_bits = _parse_parquet_ids(body, read_objective=read_objective)
             logger.info("%s: loaded %s rows from %s", name, f"{len(pids):,}", source)
-            return pids, aids
+            return pids, aids, row_bits
 
     except Exception as o2_err:
         if not has_gcs:
             raise
         logger.warning("%s: O2 download failed (%s), trying GCS fallback", name, o2_err)
         gcs_body, _, gcs_source = _download_from_gcs(name, prefix)
-        pids, aids = _parse_parquet_ids(gcs_body)
+        pids, aids, row_bits = _parse_parquet_ids(gcs_body, read_objective=read_objective)
         logger.info("%s: loaded %s rows from %s (O2 fallback)", name, f"{len(pids):,}", gcs_source)
-        return pids, aids
+        return pids, aids, row_bits
+
+
+class RetrievalCorpus(NamedTuple):
+    post_ids: np.ndarray
+    author_ids: np.ndarray
+    dataset_types: np.ndarray
+    post_sids: np.ndarray | None
+    objective_bits: np.ndarray | None
 
 
 class RetrievalDataset(Enum):
@@ -279,6 +324,22 @@ class RetrievalDataset(Enum):
     )
     HOME_COLD = (13, *_sid_window("1fav_1day.parquet"))
     HOME_HOT = (14, *_sid_window("1fav_1day.parquet"))
+    IMMERSIVE32FavVideo14To30Day = (19, *_sid_window("32fav_video_14to30day.parquet"))
+    AI_VIDEO_SELF_1DAY = (20, *_sid_window("ai_video_self_1day.parquet"))
+    AI_VIDEO_SELF_2DAY = (21, *_sid_window("ai_video_self_2day.parquet"))
+    AI_VIDEO_SELF_7DAY = (22, *_sid_window("ai_video_self_7day.parquet"))
+    AI_VIDEO_DETECTED_1DAY = (23, *_sid_window("ai_video_detected_1day.parquet"))
+    AI_VIDEO_DETECTED_2DAY = (24, *_sid_window("ai_video_detected_2day.parquet"))
+    AI_VIDEO_DETECTED_7DAY = (25, *_sid_window("ai_video_detected_7day.parquet"))
+    AI_VIDEO_MODEL_1DAY = (26, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_1day.parquet"), None)
+    AI_VIDEO_MODEL_2DAY = (27, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_2day.parquet"), None)
+    AI_VIDEO_MODEL_7DAY = (28, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_7day.parquet"), None)
+    AI_VIDEO_MODEL_14DAY = (29, str(_AI_VIDEO_MODEL_DIR / "ai_video_model_14day.parquet"), None)
+    POPULAR_VIDEO_2DAY = (
+        30,
+        _idx("post_sid_v8_256x6_popular_video_snapshots/popular_video_2day.parquet"),
+        None,
+    )
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)
@@ -324,24 +385,46 @@ class RetrievalDataset(Enum):
         return None
 
     def load(
-        self, *, read_post_sid: bool = False, sid_num_levels: int = 6
+        self,
+        *,
+        read_post_sid: bool = False,
+        sid_num_levels: int = 6,
+        path: str | Path | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
-        load_path = self._get_valid_path()
+        rows = self.load_rows(read_post_sid=read_post_sid, sid_num_levels=sid_num_levels, path=path)
+        return None if rows is None else rows[:3]
+
+    def load_rows(
+        self,
+        *,
+        read_post_sid: bool = False,
+        sid_num_levels: int = 6,
+        path: str | Path | None = None,
+        read_objective_bits: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None] | None:
+        load_path = str(path) if path is not None else self._get_valid_path()
         if load_path is None:
             logger.warning(f"Skipping {self.name}: path not found")
             return None
+        if self is RetrievalDataset.ACTIVE_ADS and not load_path.startswith(_O2_SCHEME):
+            raise ValueError(f"ACTIVE_ADS must load the O2 ads snapshot, got {load_path}")
 
         if load_path.startswith(_O2_SCHEME):
-            pids, aids = _load_from_o2(
+            pids, aids, row_bits = _load_from_o2(
                 self.name,
                 load_path,
                 gcs_mirror=self.name in _GCS_MIRRORED,
+                read_objective=read_objective_bits,
             )
             if self == RetrievalDataset.ACTIVE_ADS:
-                pids, unique_idx = np.unique(pids, return_index=True)
+                pids, unique_idx, inverse = np.unique(pids, return_index=True, return_inverse=True)
                 logger.info("%s: deduped to %d unique post_ids", self.name, len(pids))
                 aids = aids[unique_idx]
-            return pids, aids, None
+                if row_bits is not None:
+                    bits = np.zeros(len(pids), dtype=np.int32)
+                    np.bitwise_or.at(bits, inverse, row_bits)
+                    row_bits = bits
+            return pids, aids, None, row_bits
 
         columns = ["post_id", "author_id"]
         if read_post_sid:
@@ -381,7 +464,7 @@ class RetrievalDataset(Enum):
                 n,
                 sid_num_levels,
             )
-        return pids, aids, post_sids
+        return pids, aids, post_sids, None
 
     @classmethod
     def loadable(cls) -> list[RetrievalDataset]:
@@ -397,22 +480,58 @@ class RetrievalDataset(Enum):
         sid_num_levels: int = 6,
         cold_pool_metadata_path: str | Path | None = None,
         cold_start_max_age_seconds: float = 0.0,
+        paths: dict[RetrievalDataset, str | Path] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        corpus = cls.load_corpus(
+            datasets,
+            max_posts,
+            read_post_sid=read_post_sid,
+            sid_num_levels=sid_num_levels,
+            cold_pool_metadata_path=cold_pool_metadata_path,
+            cold_start_max_age_seconds=cold_start_max_age_seconds,
+            paths=paths,
+        )
+        return corpus.post_ids, corpus.author_ids, corpus.dataset_types, corpus.post_sids
+
+    @classmethod
+    def load_corpus(
+        cls,
+        datasets: list[RetrievalDataset],
+        max_posts: int | None = None,
+        *,
+        read_post_sid: bool = False,
+        sid_num_levels: int = 6,
+        cold_pool_metadata_path: str | Path | None = None,
+        cold_start_max_age_seconds: float = 0.0,
+        paths: dict[RetrievalDataset, str | Path] | None = None,
+        read_objective_bits: bool = False,
+    ) -> RetrievalCorpus:
         start = time.time()
         post_ids_list, author_ids_list, types_list, sids_list = [], [], [], []
+        bits_list: list[np.ndarray] = []
         any_sid_loaded = False
         home_source: tuple[np.ndarray, np.ndarray, np.ndarray | None] | None | bool = False
+        home_paths = {
+            str(path)
+            for dataset, path in (paths or {}).items()
+            if dataset in (cls.HOME, *cls.home_slices())
+        }
+        if len(home_paths) > 1:
+            raise ValueError("HOME, HOME_COLD and HOME_HOT must pin the same source file")
+        home_path = next(iter(home_paths), None)
 
         def _append(
             pids: np.ndarray,
             aids: np.ndarray,
             sids: np.ndarray | None,
             ds_value: int,
+            bits: np.ndarray | None = None,
         ) -> None:
             nonlocal any_sid_loaded
             post_ids_list.append(pids)
             author_ids_list.append(aids)
             types_list.append(np.full(len(pids), ds_value, dtype=np.int32))
+            bits_list.append(np.zeros(len(pids), dtype=np.int32) if bits is None else bits)
             if read_post_sid:
                 if sids is None:
                     sids_list.append(np.full((len(pids), sid_num_levels), -1, dtype=np.int32))
@@ -424,9 +543,24 @@ class RetrievalDataset(Enum):
             nonlocal home_source
             if home_source is False:
                 home_source = cls.HOME.load(
-                    read_post_sid=read_post_sid, sid_num_levels=sid_num_levels
+                    read_post_sid=read_post_sid,
+                    sid_num_levels=sid_num_levels,
+                    **({"path": home_path} if home_path is not None else {}),
                 )
             return None if home_source is False else home_source
+
+        home_cold_keep: list[np.ndarray | None] = []
+
+        def _home_cold_keep(pids: np.ndarray) -> np.ndarray | None:
+            if not home_cold_keep:
+                meta_path = cold_pool_metadata_path or default_cold_pool_metadata_path()
+                mask = cold_pool_mask(pids, meta_path)
+                home_cold_keep.append(
+                    None
+                    if mask is None
+                    else mask & fresh_post_mask(pids, cold_start_max_age_seconds)
+                )
+            return home_cold_keep[0]
 
         for ds in datasets:
             if ds in cls.home_slices():
@@ -434,9 +568,8 @@ class RetrievalDataset(Enum):
                 if result is None:
                     continue
                 pids, aids, sids = result
-                meta_path = cold_pool_metadata_path or default_cold_pool_metadata_path()
-                mask = cold_pool_mask(pids, meta_path)
-                if mask is None:
+                cold_keep = _home_cold_keep(pids)
+                if cold_keep is None:
                     keep = (
                         np.ones(len(pids), dtype=bool)
                         if ds is cls.HOME_HOT
@@ -448,7 +581,6 @@ class RetrievalDataset(Enum):
                         "keeping all HOME rows" if ds is cls.HOME_HOT else "emitting 0 rows",
                     )
                 else:
-                    cold_keep = mask & fresh_post_mask(pids, cold_start_max_age_seconds)
                     keep = cold_keep if ds is cls.HOME_COLD else ~cold_keep
                 n_keep = int(np.count_nonzero(keep))
                 logger.info(
@@ -467,8 +599,24 @@ class RetrievalDataset(Enum):
                 )
                 continue
 
+            path_kwargs = {"path": paths[ds]} if paths and ds in paths else {}
+            if read_objective_bits and ds is cls.ACTIVE_ADS:
+                rows = ds.load_rows(
+                    read_post_sid=read_post_sid,
+                    sid_num_levels=sid_num_levels,
+                    read_objective_bits=True,
+                    **path_kwargs,
+                )
+                if rows is None:
+                    continue
+                pids, aids, sids, bits = rows
+                _append(pids, aids, sids, ds.value, bits)
+                continue
+
             if (
-                result := ds.load(read_post_sid=read_post_sid, sid_num_levels=sid_num_levels)
+                result := ds.load(
+                    read_post_sid=read_post_sid, sid_num_levels=sid_num_levels, **path_kwargs
+                )
             ) is None:
                 continue
             pids, aids, sids = result
@@ -483,6 +631,7 @@ class RetrievalDataset(Enum):
         post_sids: np.ndarray | None = (
             np.concatenate(sids_list) if (read_post_sid and any_sid_loaded) else None
         )
+        objective_bits = np.concatenate(bits_list) if read_objective_bits else None
         logger.info(f"Loaded {len(post_ids):,} pairs in {time.time() - start:.1f}s")
 
         if max_posts is not None and max_posts != len(post_ids):
@@ -493,14 +642,18 @@ class RetrievalDataset(Enum):
                 types = np.pad(types, (0, pad), constant_values=cls.PAD.value).astype(np.int32)
                 if post_sids is not None:
                     post_sids = np.pad(post_sids, ((0, pad), (0, 0)), constant_values=-1)
+                if objective_bits is not None:
+                    objective_bits = np.pad(objective_bits, (0, pad), constant_values=0)
             else:
                 post_ids = post_ids[-max_posts:]
                 author_ids = author_ids[-max_posts:]
                 types = types[-max_posts:]
                 if post_sids is not None:
                     post_sids = post_sids[-max_posts:]
+                if objective_bits is not None:
+                    objective_bits = objective_bits[-max_posts:]
 
-        return post_ids, author_ids, types, post_sids
+        return RetrievalCorpus(post_ids, author_ids, types, post_sids, objective_bits)
 
 
 def _bind_deployment_corpus_paths() -> None:

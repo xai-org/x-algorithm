@@ -1,23 +1,58 @@
 use crate::models::candidate::{PhoenixScores, PostCandidate};
 use crate::models::fs_recipient::FsRecipientInputs;
-use crate::models::query::ScoredPostsQuery;
+use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::*;
 use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
+use crate::scorers::vm_ranker_engagement_labels::EngagementIneligible;
+use crate::side_effects::update_served_history_side_effect::request_type as served_request_type;
+use rustc_hash::FxHashSet;
+use std::cmp::Reverse;
 use xai_vm_ranker_proto as pb;
+use xai_vm_ranker_proto::experiment::PostTopics;
+use xai_x_thrift::served_history::{EntityIdType, RequestType as ServedRequestType, ServedHistory};
 
 const DPP_VALUE_MODEL_ID: &str = "dpp";
 
 pub(crate) struct RequestShape {
     debias: bool,
     pacing: bool,
+    history_topics: bool,
+    post_topics: bool,
+    dpp_history: bool,
+    omit_cached_weighted_score: bool,
+    engagement_ineligible: bool,
 }
 
 impl RequestShape {
     pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
+        let omit_cached_weighted_score = query.params.get(ValueModelMode) == "multiplicative";
+        let ranker_reads_heads = !query.has_cached_posts
+            || query.is_under_the_hood_request
+            || omit_cached_weighted_score;
         Self {
-            debias: !query.has_cached_posts && query.params.get(VMRankerSendDebiasInputs),
+            debias: ranker_reads_heads && query.params.get(VMRankerSendDebiasInputs),
             pacing: query.params.get(VMRankerSendPacingInputs),
+            history_topics: query.params.get(VMRankerSendHistoryTopics)
+                && query.history_topics.is_some(),
+            post_topics: query.params.get(VMRankerSendPostTopics) && !query.recent_views.is_empty(),
+            dpp_history: query.request_type == RequestType::ForYou
+                && query.params.get(VMRankerSendDppHistory),
+            omit_cached_weighted_score,
+            engagement_ineligible: ranker_reads_heads
+                && query.params.get(VMRankerSendEngagementIneligible),
         }
+    }
+
+    pub(crate) fn sends_post_topics(&self) -> bool {
+        self.post_topics
+    }
+
+    pub(crate) fn sends_dpp_history(&self) -> bool {
+        self.dpp_history
+    }
+
+    pub(crate) fn sends_engagement_ineligible(&self) -> bool {
+        self.engagement_ineligible
     }
 
     pub(crate) fn build(
@@ -25,28 +60,59 @@ impl RequestShape {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
         local: &[PostCandidate],
+        topics: &[Option<PostTopics>],
+        ineligible: &[EngagementIneligible],
     ) -> pb::RankRequest {
         let proto_candidates = candidates
             .iter()
             .zip(local)
-            .map(|(c, local)| self.candidate(c, local))
+            .enumerate()
+            .map(|(i, (c, local))| {
+                self.candidate(
+                    c,
+                    local,
+                    topics.get(i).and_then(Option::as_ref),
+                    ineligible.get(i).copied().unwrap_or_default(),
+                )
+            })
             .collect();
         let mut request = pb::RankRequest {
             viewer_id: query.user_id,
+            request_timestamp_ms: u64::try_from(query.request_time_ms).unwrap_or(0),
             candidates: proto_candidates,
             value_model_id: DPP_VALUE_MODEL_ID.to_string(),
             compute_value_model: true,
             viewer: query.fs_recipient_inputs.as_ref().map(viewer_context_proto),
             topic_request: query.is_topic_request(),
+            include_top_heads: query.is_under_the_hood_request,
+            dpp_history: if self.dpp_history {
+                dpp_history(query)
+            } else {
+                Vec::new()
+            },
+            request_type: proto_request_type(served_request_type(query)),
             ..Default::default()
         };
-        if self.debias {
-            request.experiment_payload = request_payload(query, candidates).into();
+        if self.debias || self.history_topics || self.post_topics {
+            request.experiment_payload = request_payload(
+                query,
+                candidates,
+                self.debias,
+                self.history_topics,
+                self.post_topics,
+            )
+            .into();
         }
         request
     }
 
-    fn candidate(&self, c: &PostCandidate, local: &PostCandidate) -> pb::RankCandidate {
+    fn candidate(
+        &self,
+        c: &PostCandidate,
+        local: &PostCandidate,
+        topics: Option<&PostTopics>,
+        ineligible: EngagementIneligible,
+    ) -> pb::RankCandidate {
         let mut out = pb::RankCandidate {
             tweet_id: c.tweet_id,
             author_id: c.author_id,
@@ -59,15 +125,69 @@ impl RequestShape {
             cold_start_lift_to_rank: local.cold_start_lift_to_rank,
             min_video_duration_ms: c.min_video_duration_ms,
             phoenix_scores: Some(phoenix_scores_proto(&c.phoenix_scores)),
-            weighted_score: c.weighted_score,
+            weighted_score: if self.omit_cached_weighted_score {
+                None
+            } else {
+                c.weighted_score
+            },
             semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()
         };
-        if self.debias || self.pacing {
-            out.experiment_payload = candidate_payload(c, self.debias, self.pacing).into();
+        if self.debias || self.pacing || topics.is_some() || ineligible.any() {
+            out.experiment_payload =
+                candidate_payload(c, self.debias, self.pacing, topics, ineligible).into();
         }
         out
     }
+}
+
+fn dpp_history(query: &ScoredPostsQuery) -> Vec<pb::DppHistoryItem> {
+    let mut responses: Vec<(i64, &ServedHistory)> = query
+        .served_history
+        .iter()
+        .filter_map(|r| Some((r.served_time_ms?, r)))
+        .collect();
+    responses.sort_by_key(|&(served_time_ms, _)| Reverse(served_time_ms));
+
+    let max_items = query.params.get(VMRankerDppHistoryMaxItems);
+    let mut seen = FxHashSet::default();
+    let mut history = Vec::new();
+    for (served_time_ms, response) in responses {
+        for entry in &response.entries {
+            let carousel = match entry.entity_type {
+                EntityIdType::TWEET => false,
+                EntityIdType::VIDEO_CAROUSEL_MODULE => true,
+                _ => continue,
+            };
+            for ids in entry.item_ids.iter().flatten() {
+                if history.len() >= max_items {
+                    return history;
+                }
+                let Some(tweet_id) = ids
+                    .source_tweet_id
+                    .or(ids.tweet_id)
+                    .and_then(|id| u64::try_from(id).ok())
+                else {
+                    continue;
+                };
+                if seen.insert(tweet_id) {
+                    history.push(pb::DppHistoryItem {
+                        tweet_id,
+                        served_time_ms,
+                        carousel,
+                        request_type: proto_request_type(response.request_type),
+                    });
+                }
+            }
+        }
+    }
+    history
+}
+
+fn proto_request_type(request_type: ServedRequestType) -> i32 {
+    pb::ServedRequestType::try_from(request_type.0)
+        .unwrap_or_default()
+        .into()
 }
 
 fn viewer_context_proto(inputs: &FsRecipientInputs) -> pb::ViewerContext {
@@ -114,8 +234,309 @@ fn phoenix_scores_proto(s: &PhoenixScores) -> pb::PhoenixScores {
         open_link_score: s.open_link_score,
         quoted_vqv_score: s.quoted_vqv_score,
         post_unexplored_score: s.post_unexplored_score,
-        react_with_video_score: s.react_with_video_score,
+        post_video_score: s.post_video_score,
+        grok_analyze_score: s.grok_analyze_score,
         home_video_continuation_secs: s.home_video_continuation_secs,
         home_profile_visit_secs: s.home_profile_visit_secs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
+    use xai_vm_ranker_proto::experiment::CandidatePayload;
+    use xai_x_thrift::served_history::{
+        EntryWithItemIds, ItemIds, RequestType as ServedRequestType,
+    };
+
+    const NOW_MS: i64 = 1_800_000_000_000;
+
+    fn query(
+        send_dpp_history: &str,
+        max_items: &str,
+        served_history: Vec<ServedHistory>,
+    ) -> ScoredPostsQuery {
+        let fs = FeatureSwitches::new(vec![]).unwrap();
+        let mut results = fs.match_recipient(&RecipientBuilder::new().build());
+        results.override_fs(
+            "rust_home_mixer_vm_ranker_send_dpp_history".to_string(),
+            send_dpp_history,
+        );
+        results.override_fs(
+            "rust_home_mixer_vm_ranker_dpp_history_max_items".to_string(),
+            max_items,
+        );
+        ScoredPostsQuery {
+            request_type: RequestType::ForYou,
+            request_time_ms: NOW_MS,
+            served_history,
+            params: results.into(),
+            ..Default::default()
+        }
+    }
+
+    fn build(query: &ScoredPostsQuery) -> pb::RankRequest {
+        RequestShape::from_query(query).build(query, &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn only_flagged_candidates_carry_ineligible_heads() {
+        let query = query("false", "200", Vec::new());
+        let candidates = [PostCandidate::default(), PostCandidate::default()];
+        let ineligible = [
+            EngagementIneligible {
+                reply: true,
+                click: true,
+                ..Default::default()
+            },
+            EngagementIneligible::default(),
+        ];
+
+        let request = RequestShape::from_query(&query).build(
+            &query,
+            &candidates,
+            &candidates,
+            &[],
+            &ineligible,
+        );
+
+        let payload = |i: usize| {
+            CandidatePayload::decode(request.candidates[i].experiment_payload.as_ref()).unwrap()
+        };
+        let flags = |i| {
+            let p = payload(i);
+            (p.reply_ineligible, p.share_ineligible, p.click_ineligible)
+        };
+        assert_eq!(flags(0), (true, false, true));
+        assert_eq!(flags(1), (false, false, false));
+    }
+
+    fn ids(tweet_id: i64, source_tweet_id: Option<i64>) -> ItemIds {
+        ItemIds {
+            tweet_id: Some(tweet_id),
+            source_tweet_id,
+            ..Default::default()
+        }
+    }
+
+    fn entry(
+        entity_type: EntityIdType,
+        sort_index: i64,
+        item_ids: Vec<ItemIds>,
+    ) -> EntryWithItemIds {
+        EntryWithItemIds {
+            entity_type,
+            sort_index: Some(sort_index),
+            size: None,
+            item_ids: Some(item_ids),
+        }
+    }
+
+    fn tweet(sort_index: i64, tweet_id: i64) -> EntryWithItemIds {
+        entry(EntityIdType::TWEET, sort_index, vec![ids(tweet_id, None)])
+    }
+
+    fn response(
+        age_secs: i64,
+        request_type: ServedRequestType,
+        entries: Vec<EntryWithItemIds>,
+    ) -> ServedHistory {
+        ServedHistory {
+            request_type,
+            entries,
+            served_id: None,
+            served_time_ms: Some(NOW_MS - age_secs * 1_000),
+        }
+    }
+
+    fn pin(
+        tweet_id: u64,
+        age_secs: i64,
+        carousel: bool,
+        request_type: ServedRequestType,
+    ) -> pb::DppHistoryItem {
+        pb::DppHistoryItem {
+            tweet_id,
+            served_time_ms: NOW_MS - age_secs * 1_000,
+            carousel,
+            request_type: proto_request_type(request_type),
+        }
+    }
+
+    #[test]
+    fn history_is_sent_only_for_for_you_with_the_switch_on() {
+        let history = vec![response(30, ServedRequestType::INITIAL, vec![tweet(0, 10)])];
+
+        let for_you = build(&query("true", "200", history.clone()));
+        assert_eq!(
+            for_you.dpp_history,
+            vec![pin(10, 30, false, ServedRequestType::INITIAL)]
+        );
+        assert_eq!(for_you.request_timestamp_ms, NOW_MS as u64);
+        assert_eq!(for_you.request_type(), pb::ServedRequestType::Initial);
+
+        let polling = ScoredPostsQuery {
+            is_polling: true,
+            ..query("true", "200", history.clone())
+        };
+        assert_eq!(
+            build(&polling).request_type(),
+            pb::ServedRequestType::Polling
+        );
+
+        let ranked_following = ScoredPostsQuery {
+            request_type: RequestType::RankedFollowing,
+            ..query("true", "200", history.clone())
+        };
+        assert!(build(&ranked_following).dpp_history.is_empty());
+        assert!(build(&query("false", "200", history))
+            .dpp_history
+            .is_empty());
+    }
+
+    #[test]
+    fn every_served_post_is_sent_and_ads_and_modules_are_not() {
+        let history = vec![response(
+            30,
+            ServedRequestType::INITIAL,
+            vec![
+                entry(EntityIdType::PROMOTED_TWEET, 0, vec![ids(900, None)]),
+                tweet(1, 100),
+                tweet(1, 101),
+                tweet(1, 102),
+                entry(
+                    EntityIdType::WHO_TO_FOLLOW,
+                    2,
+                    vec![ItemIds {
+                        user_id: Some(7),
+                        ..Default::default()
+                    }],
+                ),
+                entry(EntityIdType::TWEET, 3, vec![ids(11, Some(77))]),
+                entry(
+                    EntityIdType::VIDEO_CAROUSEL_MODULE,
+                    4,
+                    vec![ids(21, None), ids(22, None)],
+                ),
+            ],
+        )];
+
+        assert_eq!(
+            build(&query("true", "200", history)).dpp_history,
+            [
+                (100, false),
+                (101, false),
+                (102, false),
+                (77, false),
+                (21, true),
+                (22, true),
+            ]
+            .map(|(id, carousel)| pin(id, 30, carousel, ServedRequestType::INITIAL))
+        );
+    }
+
+    #[test]
+    fn polling_is_included_duplicates_keep_the_newest_serve_and_only_the_newest_are_sent() {
+        let history = vec![
+            response(3_600, ServedRequestType::OLDER, vec![tweet(0, 30)]),
+            response(
+                10,
+                ServedRequestType::POLLING,
+                vec![tweet(0, 500), tweet(1, 10)],
+            ),
+            response(
+                60,
+                ServedRequestType::INITIAL,
+                vec![tweet(0, 10), tweet(1, 20)],
+            ),
+        ];
+
+        assert_eq!(
+            build(&query("true", "200", history)).dpp_history,
+            vec![
+                pin(500, 10, false, ServedRequestType::POLLING),
+                pin(10, 10, false, ServedRequestType::POLLING),
+                pin(20, 60, false, ServedRequestType::INITIAL),
+                pin(30, 3_600, false, ServedRequestType::OLDER),
+            ]
+        );
+
+        let pages: Vec<ServedHistory> = (0..10i64)
+            .rev()
+            .map(|page| {
+                let posts = (0..25).map(|i| tweet(i, page * 100 + i)).collect();
+                response((page + 1) * 10, ServedRequestType::OLDER, posts)
+            })
+            .collect();
+        let newest_first: Vec<pb::DppHistoryItem> = (0..10i64)
+            .flat_map(|page| {
+                (0..25).map(move |i| {
+                    pin(
+                        (page * 100 + i) as u64,
+                        (page + 1) * 10,
+                        false,
+                        ServedRequestType::OLDER,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(newest_first.len(), 250);
+        assert_eq!(
+            build(&query("true", "200", pages)).dpp_history,
+            &newest_first[..200]
+        );
+    }
+
+    #[test]
+    fn multiplicative_mode_omits_cached_weighted_score() {
+        let candidate = PostCandidate {
+            tweet_id: 1,
+            weighted_score: Some(99.0),
+            ..Default::default()
+        };
+        let local = PostCandidate {
+            tweet_id: 1,
+            ..Default::default()
+        };
+
+        let fs = FeatureSwitches::new(vec![]).unwrap();
+        let mut results = fs.match_recipient(&RecipientBuilder::new().build());
+        results.override_fs(
+            "rust_home_mixer_value_model_mode".to_string(),
+            "multiplicative",
+        );
+        let query = ScoredPostsQuery {
+            params: results.into(),
+            has_cached_posts: true,
+            columnar_scoring_sequence: Some(bytes::Bytes::from_static(b"seq")),
+            ..Default::default()
+        };
+        let req = RequestShape::from_query(&query).build(
+            &query,
+            std::slice::from_ref(&candidate),
+            std::slice::from_ref(&local),
+            &[],
+            &[],
+        );
+        assert_eq!(req.candidates[0].weighted_score, None);
+        let payload = pb::experiment::RequestPayload::decode(req.experiment_payload.as_ref())
+            .expect("debias payload");
+        assert_eq!(payload.user_sequence_arrow_ipc.as_ref(), b"seq");
+
+        let control = ScoredPostsQuery {
+            params: FeatureSwitches::new(vec![])
+                .unwrap()
+                .match_recipient(&RecipientBuilder::new().build())
+                .into(),
+            has_cached_posts: true,
+            columnar_scoring_sequence: Some(bytes::Bytes::from_static(b"seq")),
+            ..Default::default()
+        };
+        let control_req =
+            RequestShape::from_query(&control).build(&control, &[candidate], &[local], &[], &[]);
+        assert_eq!(control_req.candidates[0].weighted_score, Some(99.0));
+        assert!(control_req.experiment_payload.is_empty());
     }
 }

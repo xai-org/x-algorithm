@@ -5,13 +5,15 @@ use xai_abuse_proto::enforcement::ScoreResult;
 
 use super::*;
 use crate::action_control::test_support::record;
-use crate::action_control::{ActionControlRecord, ControlMode, Lifetime, PageAction};
+use crate::action_control::{
+    ActionControlRecord, ControlEntity, ControlMode, LevelRow, Lifetime, PageAction,
+};
 use crate::replay_tests::{
     Account, BAKED_POST_RULES, BAKED_USER_RULES, BedConfig, HEADS, TestBed, Trace, base_config,
-    message, on_config, scenarios, switched_off,
+    factory_message, message, on_config, scenarios, switched_off,
 };
 
-const SUSPEND: PageAction = PageAction::Suspend {};
+const SUSPEND: PageAction = PageAction::SUSPEND;
 const LIVENESS: PageAction = PageAction::LivenessCheck {};
 const SHR7: PageAction = PageAction::SpamHighRecall {
     lifetime: Lifetime::Days7,
@@ -70,13 +72,307 @@ fn live(head: &str, band: Option<&str>, actions: Vec<PageAction>) -> ActionContr
     record(head, None, band, ControlMode::Live, actions)
 }
 
+const FACTORY_HEAD: &str = "IsDelayedSuspendSpam";
+
+fn factory_row(row: LevelRow, mode: ControlMode, actions: Vec<PageAction>) -> ActionControlRecord {
+    ActionControlRecord {
+        confidence: Some(row),
+        ..record(FACTORY_HEAD, None, None, mode, actions)
+    }
+}
+
+#[tokio::test]
+async fn a_factory_row_without_actions_records_before_any_fetch() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    for (records, logged) in [
+        (vec![], "no_selection"),
+        (
+            vec![live(FACTORY_HEAD, None, vec![SUSPEND])],
+            "no_selection",
+        ),
+        (
+            vec![factory_row(LevelRow::Missing, ControlMode::Rules, vec![])],
+            "factory_rules_row",
+        ),
+    ] {
+        let b = bed(records, false).await;
+        for account in Account::ALL {
+            let t = b.run_fresh(&factory_message(account)).await;
+            assert_eq!(t.status, action_control::STATUS_NO_ACTIONS, "{account:?}");
+            assert!(t.ais.is_empty() && t.tickets == 0);
+            assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"], "{account:?}");
+            assert!(t.outcomes[0].dry_run);
+            let i = info(&t);
+            assert_eq!(i["level_row"], "missing");
+            assert_eq!(i["logged_because"], logged);
+            assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+            assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+        }
+        assert_eq!(b.fetches().await, 0, "{logged}");
+        b.run_fresh(&bb1(&[], Account::Clean)).await;
+        assert!(b.fetches().await > 0, "a rules decision fetches");
+    }
+    let mut ignore = on_config(false, None);
+    ignore["action_control"] = serde_json::json!({"enabled": true, "ignore_store": true});
+    let b = bed_with(vec![], ignore, BAKED_USER_RULES).await;
+    let t = b.run_fresh(&factory_message(Account::Clean)).await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"]);
+    assert_eq!(info(&t)["logged_because"], "ignore_store");
+    assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn a_factory_row_acts_whatever_its_evidence_without_the_rules() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    const DAY: i64 = 86_400_000;
+    let b = bed(
+        vec![factory_row(
+            LevelRow::High,
+            ControlMode::Live,
+            vec![SUSPEND],
+        )],
+        false,
+    )
+    .await;
+    let with_evidence = |days: i64| {
+        let mut s = factory_message(Account::Clean);
+        s.confidence = abuse_proto::Confidence::High as i32;
+        s.confidence_evidence = Some(abuse_proto::ConfidenceEvidence {
+            precision_lower_bound: 0.96,
+            reads: 59,
+            humans: 0,
+            read_at_ms: now_millis() - days * DAY,
+            link: "read:rd_1".into(),
+        });
+        s
+    };
+    let mut no_read = with_evidence(0);
+    no_read.confidence_evidence = None;
+    for (s, supports) in [
+        (with_evidence(364), "high"),
+        (with_evidence(366), "none"),
+        (no_read, "none"),
+    ] {
+        let t = b.run_fresh(&s).await;
+        assert_eq!(t.status, "success", "{:?}", info(&t));
+        assert_eq!((t.ais.len(), t.tickets), (1, 1));
+        let i = info(&t);
+        assert_eq!(i["action_control_lkey"], "user/l/IsDelayedSuspendSpam/high");
+        assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+        assert_eq!(i["confidence_evidence_supports"], supports);
+        assert!(!i.contains_key("logged_because"), "{i:?}");
+        assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_factory_row_that_acts_takes_dedup_the_off_switch_and_the_cap() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let row = || factory_row(LevelRow::Missing, ControlMode::Live, vec![SUSPEND]);
+    let score = factory_message(Account::Clean);
+    let b = bed(vec![row()], false).await;
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(
+        t.dedup_calls[0], "try_insert(class=3)=new",
+        "claims at its suspend"
+    );
+    assert_eq!((t.ais.len(), t.tickets), (1, 1));
+    let again = b.run(&score).await;
+    assert_eq!(again.status, "dedup_skipped");
+    assert!(again.ais.is_empty() && again.tickets == 0);
+
+    let mut off = off_switch::test_support::record(FACTORY_HEAD, None, true, None);
+    off.updated_at_ms = 1;
+    let switched = TestBed::new(BedConfig {
+        user_rules: BAKED_USER_RULES,
+        post_rules: BAKED_POST_RULES,
+        config: on_config(false, None),
+        off_switches: vec![off],
+        control_records: vec![row()],
+    })
+    .await;
+    let t = switched.run_fresh(&score).await;
+    assert_eq!(t.status, off_switch::STATUS_SWITCHED_OFF);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+
+    let capped = bed_with(vec![row()], on_config(false, Some(0)), BAKED_USER_RULES).await;
+    let t = capped.run_fresh(&score).await;
+    assert_eq!(t.status, "max_enforcement_reached");
+    assert!(t.ais.is_empty());
+}
+
+#[tokio::test]
+async fn a_factory_decision_for_a_test_user_is_skipped_first() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![], false).await;
+    let mut score = factory_message(Account::Clean);
+    score.user_id = 2_050_000_001;
+    assert!(test_user::is_test_user_id(score.user_id));
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "test_user_skipped");
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn factory_decisions_and_runs_mark_their_head_factory_in_the_seen_list() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut acting = message(
+        EntityType::User,
+        "FactoryActing",
+        "factory_acting@1",
+        &["model_factory"],
+        Account::Clean,
+    );
+    acting.policy_version = "1".into();
+    let acting_row = ActionControlRecord {
+        confidence: Some(LevelRow::Missing),
+        ..record(
+            "FactoryActing",
+            None,
+            None,
+            ControlMode::Live,
+            vec![SUSPEND],
+        )
+    };
+    let mut config = on_config(false, None);
+    config["backfill_runs"] =
+        serde_json::json!({"page_keys": ["page"], "max_user_decisions_per_day": 10});
+    let b = bed_with(vec![acting_row], config, BAKED_USER_RULES).await;
+    let (run_head, run_model) = HEADS[3];
+    let mut run = crate::backfill::test_support::put_running(
+        &b.backfill_store,
+        "run-00000001",
+        run_head,
+        vec![SUSPEND],
+        vec![LevelRow::Missing],
+    );
+    run.factory = true;
+    b.backfill_store.rows.lock().unwrap().insert(
+        (crate::backfill::RUN_PKEY.into(), run.run_id.clone()),
+        serde_json::to_vec(&run).unwrap(),
+    );
+    let mut run_score = message(EntityType::User, run_head, run_model, &[], Account::Clean);
+    run_score.backfill_run_id = run.run_id.clone();
+    run_score.score_ts_ms = now_millis() - 60_000;
+
+    assert_eq!(
+        b.run_fresh(&factory_message(Account::Clean)).await.status,
+        action_control::STATUS_NO_ACTIONS
+    );
+    assert_eq!(b.run_fresh(&acting).await.status, "success");
+    b.run_fresh(&bb1(&[&suspend_label()], Account::Clean)).await;
+    b.dedup.slots.lock().unwrap().clear();
+    b.run_on(&b.backfill_processor(), &run_score).await;
+
+    b.ctx.action_control.spawn_seen_writer().unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let seen = b.ctx.action_control.scan_seen().await.unwrap();
+            if seen.len() >= 4 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("four seen rows");
+    let of = |head: &str| {
+        seen.iter()
+            .find(|s| s.head == head)
+            .unwrap_or_else(|| panic!("{head} not seen: {seen:?}"))
+    };
+    for head in [FACTORY_HEAD, "FactoryActing", run_head] {
+        let s = of(head);
+        assert!(s.factory, "{head}");
+        assert_eq!(s.rule_id, "", "{head}");
+        assert_eq!(s.action_specs, serde_json::json!([]), "{head}");
+    }
+    let rules = of(BB1.0);
+    assert!(!rules.factory);
+    assert_eq!(rules.rule_id, suspend_label());
+}
+
+#[test]
+fn only_a_policy_version_marks_a_factory_message() {
+    let mut s = factory_message(Account::Clean);
+    assert!(is_factory_message(&s));
+    s.policy_version.clear();
+    assert!(
+        !is_factory_message(&s),
+        "the routing label alone is not one"
+    );
+    assert!(!is_factory_message(&bb1(&[], Account::Clean)));
+}
+
+#[tokio::test]
+async fn a_grox_impersonation_scam_message_is_suspended_by_its_rule() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let grox = |account| {
+        message(
+            EntityType::User,
+            "ImpersonationScam",
+            "impersonation_scam_classifier_v1",
+            &[
+                "impersonation_scam_classifier_v1_threshold_reached",
+                "impersonation_scam_classifier_v1_suspend",
+            ],
+            account,
+        )
+    };
+    let score = grox(Account::Clean);
+    assert!(!is_factory_message(&score));
+    let unset = bed(vec![], false).await;
+    let t = unset.run_fresh(&score).await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.outcomes[0].dry_run);
+    let b = bed(
+        vec![record(
+            "ImpersonationScam",
+            None,
+            None,
+            ControlMode::Rules,
+            vec![],
+        )],
+        false,
+    )
+    .await;
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(ais_names(&t), vec!["suspendUser"]);
+    let i = info(&t);
+    assert_eq!(i["matched_rule_id"], "act_impersonation_scam_suspend");
+    assert_eq!(i["action_control_mode"], "rules");
+    assert_eq!(
+        i["action_specs"],
+        r#"[{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}]"#
+    );
+    for (account, want) in [
+        (Account::Suspended, ALREADY_SUSPENDED),
+        (Account::Deactivated, "already_deactivated"),
+        (Account::BetweenLimits, "high_follower_count"),
+        (Account::HighCred, "pagerank_skipped"),
+    ] {
+        let t = b.run_fresh(&grox(account)).await;
+        assert_eq!(t.status, want, "{account:?}");
+        assert!(t.ais.is_empty(), "{account:?}");
+        assert_eq!(t.tickets, 0, "{account:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_user_record_on_a_shared_head_never_touches_its_post_decisions() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let head = "SharedSpamBot";
     let model = "shared_spam_v1";
-    let none = bed(vec![], false).await;
-    let user_live = bed(vec![live(head, None, vec![SUSPEND])], false).await;
+    let post_rules = ActionControlRecord {
+        entity_type: ControlEntity::Post,
+        ..record(head, None, None, ControlMode::Rules, vec![])
+    };
+    let none = bed(vec![post_rules.clone()], false).await;
+    let user_live = bed(vec![post_rules, live(head, None, vec![SUSPEND])], false).await;
     let mut acted = 0;
     for label in crate::replay_tests::rule_labels(BAKED_POST_RULES) {
         let post = message(EntityType::Post, head, model, &[&label], Account::Clean);
@@ -94,7 +390,11 @@ async fn a_user_record_on_a_shared_head_never_touches_its_post_decisions() {
                 o.info.get("action_control_mode").map(String::as_str),
                 Some("rules")
             );
-            assert!(!o.info.contains_key("action_control_lkey"), "{label}");
+            assert_eq!(
+                o.info.get("action_control_lkey").map(String::as_str),
+                Some("post/h/SharedSpamBot"),
+                "{label}"
+            );
         }
         acted += usize::from(!now.ais.is_empty());
     }
@@ -247,8 +547,8 @@ async fn live_page_actions_replace_the_rules_and_pass_every_gate() {
     assert!(!i.contains_key("dry_run_source"));
 
     for (account, reason) in [
-        (Account::Followers5k, "high_follower_count"),
-        (Account::Followers200k, "very_high_follower_count"),
+        (Account::BetweenLimits, "high_follower_count"),
+        (Account::AboveTopLimit, "very_high_follower_count"),
         (Account::HighCred, "pagerank_skipped"),
         (Account::NotFound, "user_not_found"),
     ] {
@@ -306,6 +606,31 @@ async fn repeat_label_skip_is_label_only() {
         vec!["addLabelsV2", "bounceViaTemplate"],
         "a composite is never split"
     );
+}
+
+#[tokio::test]
+async fn phoenix_skip_page_label_writes_label_118_once() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    let phoenix = PageAction::PhoenixSkip {
+        lifetime: Lifetime::Days30,
+    };
+    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;
+    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["addLabelsV2"]);
+    let label_id = t.ais[0].1.pointer(
+        "/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels",
+    );
+    assert_eq!(label_id, Some(&serde_json::json!("ClientEventPhoenixSkip")));
+
+    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;
+    assert_eq!(t.status, "already_phoenix_skip_labeled");
+    assert!(t.ais.is_empty());
+    let t = b
+        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))
+        .await;
+    assert_eq!(t.status, "success", "another label does not count");
 }
 
 #[tokio::test]
@@ -369,70 +694,58 @@ async fn global_dry_run_records_only_like_the_other_two_sources() {
     }
 }
 
-const RULES_WITH_UNLISTED_CSE: &str = r#"
-for_entity: user
-rules:
-  - id: user_in_allowlist
-    when: user_allowlist.is_allowlisted
-    then: { kind: skip, reason: user_in_allowlist }
-  - id: user_not_found
-    when: "!user.present"
-    then: { kind: skip, reason: user_not_found }
-  - id: very_high_follower_count
-    when: cred.follower_count >= 12345.67
-    then: { kind: skip, reason: very_high_follower_count }
-  - id: high_follower_count
-    when: cred.follower_count >= 12.34
-    then: { kind: skip, reason: high_follower_count }
-  - id: pagerank_skipped
-    when: cred.is_high || cred.score >= 50.0
-    then: { kind: skip, reason: pagerank_skipped }
-  - id: act_unlisted_cse
-    when: '"unlisted_cse_label" in score.labels'
+fn rules_with_a_cse_suspend() -> String {
+    let mut yaml = String::from("for_entity: user\nrules:\n");
+    for c in safety_checks::USER_CHECKS {
+        yaml.push_str(&format!(
+            "  - id: {}\n    when: {:?}\n    then: {{ kind: skip, reason: {} }}\n",
+            c.id, c.when, c.reason
+        ));
+    }
+    yaml.push_str(
+        r#"  - id: act_cse_label
+    when: '"cse_label" in score.labels'
     then: { kind: act_suspend_user, perm: true, policy: "Cse" }
   - id: terminal
     when: "true"
     then: { kind: skip, reason: no_match }
-"#;
-
-#[tokio::test]
-async fn a_cse_action_found_by_the_rules_locks_a_live_record() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed_with(
-        vec![live("UnlistedHead", None, vec![SUSPEND])],
-        on_config(false, None),
-        RULES_WITH_UNLISTED_CSE,
-    )
-    .await;
-    let t = b
-        .run(&message(
-            EntityType::User,
-            "UnlistedHead",
-            "clf",
-            &["unlisted_cse_label"],
-            Account::Clean,
-        ))
-        .await;
-    assert_eq!(t.status, "dry_run");
-    assert!(t.ais.is_empty());
-    assert_eq!(t.tickets, 0);
-    let i = info(&t);
-    assert_eq!(i["action_control_forced_recording"], "cse_lock");
-    assert_eq!(i["dry_run_source"], "page");
-    assert_eq!(t.dedup_calls.len(), 2, "{:?}", t.dedup_calls);
-    assert!(
-        t.dedup_calls[1].starts_with("invalidate"),
-        "the claim taken before the lock is released, not written: {:?}",
-        t.dedup_calls
+"#,
     );
-    assert!(b.dedup.slots.lock().unwrap().is_empty(), "nothing held");
+    yaml
 }
 
 #[tokio::test]
-async fn a_rules_eval_error_locks_a_live_record_to_recording() {
+async fn a_cse_action_chosen_by_the_rules_leaves_a_live_page_setting_acting() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let rules = RULES_WITH_UNLISTED_CSE.replace(
-        r#"'"unlisted_cse_label" in score.labels'"#,
+    let b = bed_with(
+        vec![live("SomeHead", None, vec![SUSPEND])],
+        on_config(false, None),
+        &rules_with_a_cse_suspend(),
+    )
+    .await;
+    let t = b
+        .run_fresh(&message(
+            EntityType::User,
+            "SomeHead",
+            "clf",
+            &["cse_label"],
+            Account::Clean,
+        ))
+        .await;
+    assert_eq!(t.status, "success");
+    assert!(!t.ais.is_empty());
+    let i = info(&t);
+    assert_eq!(i["matched_rule_id"], "page");
+    assert_eq!(i["rules_would_rule_id"], "act_cse_label");
+    assert_eq!(i["action_control_mode"], "live");
+    assert!(!i.contains_key("action_control_forced_recording"), "{i:?}");
+}
+
+#[tokio::test]
+async fn a_rules_eval_error_leaves_a_live_page_setting_acting() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rules = rules_with_a_cse_suspend().replace(
+        r#"'"cse_label" in score.labels'"#,
         r#"'int("not a number") == 1'"#,
     );
     let seen_calls = || {
@@ -446,18 +759,18 @@ async fn a_rules_eval_error_locks_a_live_record_to_recording() {
             .sum::<u64>()
     };
     let b = bed_with(
-        vec![live("UnlistedHead", None, vec![SUSPEND])],
+        vec![live("SomeHead", None, vec![SUSPEND])],
         on_config(false, None),
         &rules,
     )
     .await;
     let before = seen_calls();
     let t = b
-        .run(&message(
+        .run_fresh(&message(
             EntityType::User,
-            "UnlistedHead",
+            "SomeHead",
             "clf",
-            &["unlisted_cse_label"],
+            &["cse_label"],
             Account::Clean,
         ))
         .await;
@@ -466,19 +779,12 @@ async fn a_rules_eval_error_locks_a_live_record_to_recording() {
         before,
         "no seen row when the rules couldn't be evaluated"
     );
-    assert_eq!(t.status, "dry_run");
-    assert!(t.ais.is_empty());
-    assert_eq!(t.tickets, 0);
+    assert_eq!(t.status, "success");
+    assert!(!t.ais.is_empty());
     let i = info(&t);
-    assert_eq!(i["action_control_forced_recording"], "rules_eval_error");
-    assert_eq!(i["dry_run_source"], "page");
-    assert!(
-        t.dedup_calls
-            .last()
-            .is_some_and(|c| c.starts_with("invalidate")),
-        "{:?}",
-        t.dedup_calls
-    );
+    assert_eq!(i["matched_rule_id"], "page");
+    assert!(!i.contains_key("rules_would_rule_id"));
+    assert!(!i.contains_key("action_control_forced_recording"), "{i:?}");
 }
 
 #[tokio::test]
@@ -497,7 +803,7 @@ async fn a_post_page_decision_skips_a_suspended_or_deactivated_author() {
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Days30,
                 },
-                PageAction::SuspendAuthor {},
+                PageAction::SUSPEND_AUTHOR,
             ],
         )],
         false,
@@ -606,7 +912,7 @@ async fn assert_no_ais_anywhere(
     let mut n = 0;
     for sc in scenarios(user_rules, BAKED_POST_RULES)
         .into_iter()
-        .filter(|s| s.id.starts_with("user|") && !s.id.contains("|factory|") && !s.dry_run)
+        .filter(|s| s.id.starts_with("user|") && !s.dry_run)
     {
         let t = b.run_fresh(&sc.score).await;
         assert!(t.ais.is_empty(), "{}: {:?}", sc.id, t.ais);
@@ -689,7 +995,7 @@ async fn damaged_rules_still_stop_page_decisions_with_the_built_in_checks() {
     )
     .await;
     let t = b
-        .run(&bb1(&[&suspend_label()], Account::Followers200k))
+        .run(&bb1(&[&suspend_label()], Account::AboveTopLimit))
         .await;
     assert_eq!(t.status, "very_high_follower_count");
 }
@@ -715,12 +1021,12 @@ fn as_page_actions(specs: &serde_json::Value, entity: EntityType) -> Option<Vec<
             ("suspend", EntityType::User)
                 if !permanent && s.get("policy")?.as_str()? == "PlatformManipulation" =>
             {
-                PageAction::Suspend {}
+                PageAction::SUSPEND
             }
             ("suspend", EntityType::Post)
                 if !permanent && s.get("policy")?.as_str()? == "PlatformManipulation" =>
             {
-                PageAction::SuspendAuthor {}
+                PageAction::SUSPEND_AUTHOR
             }
             ("liveness_check", EntityType::User) => PageAction::LivenessCheck {},
             ("label", EntityType::User) if label_ok => PageAction::SpamHighRecall {
@@ -819,11 +1125,6 @@ async fn move_to_page(
             );
             continue;
         };
-        let head = if head == "factory" {
-            "IsDelayedSuspendSpam"
-        } else {
-            head
-        };
         let band = (!label.is_empty() && !label.starts_with("cap_full")).then_some(label);
         let rec = record(head, None, band, ControlMode::Live, actions);
         let b = &beds[&(sc.dry_run, sc.cap)];
@@ -869,13 +1170,6 @@ async fn move_to_page(
                 .into()
         } else if was.status == "dedup_skipped" && moved.status != "dedup_skipped" {
             "dedup class from the page's actions outranks the held entry (auto)".into()
-        } else if head == "NearDupEmbeddingCseMatch"
-            && moved.status == "dry_run"
-            && moved.ais.is_empty()
-        {
-            "CSE head: live record runs as recording only".into()
-        } else if head == "IsDelayedSuspendSpam" && moved.ais.is_empty() {
-            "factory head: live record runs as recording only".into()
         } else if was.status == "already_deactivated" {
             "deactivated account: `already_deactivated` is a routing rule, not a safety check"
                 .into()
@@ -1029,7 +1323,10 @@ fn held(b: &TestBed, account: Account) -> Option<(u8, bool, Option<u64>)> {
         .slots
         .lock()
         .unwrap()
-        .get(&(EntityType::User.as_str().to_owned(), account.user_id()))
+        .get(&dedup_cache::DedupKey::entity(
+            EntityType::User,
+            account.user_id(),
+        ))
         .copied()
 }
 
@@ -1097,4 +1394,1591 @@ async fn a_fact_gated_suspend_that_fires_acts_over_a_held_liveness_check() {
     assert_eq!(t.status, "success");
     assert_eq!(ais_names(&t), vec!["bounceViaTemplate"]);
     assert_eq!(t.tickets, 1);
+}
+
+
+const REPLY_HEAD: &str = "ReplyHead";
+const REPLY_MODEL: &str = "reply_model_v1";
+const REPLY_LABEL: &str = "reply_head_label";
+
+fn listing(b: &TestBed, topic: &str, labels: &[&str], negative: &[&str]) -> ScoreResultProcessor {
+    ScoreResultProcessor {
+        topic: topic.into(),
+        labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+        negative_labels: negative.iter().map(|l| (*l).to_owned()).collect(),
+        ..b.processor()
+    }
+}
+
+fn user_topic(b: &TestBed) -> ScoreResultProcessor {
+    listing(
+        b,
+        "abuse.embeddings.user_decisions",
+        &["anchor_campaign_suspend"],
+        &[],
+    )
+}
+
+fn post_topic(b: &TestBed) -> ScoreResultProcessor {
+    listing(
+        b,
+        "abuse.embeddings.post_decisions",
+        &["gibberish_post"],
+        &[],
+    )
+}
+
+fn reply_bot(entity: EntityType) -> ScoreResult {
+    message(
+        entity,
+        REPLY_HEAD,
+        REPLY_MODEL,
+        &[REPLY_LABEL],
+        Account::Clean,
+    )
+}
+
+fn of_entity(entity: ControlEntity, r: ActionControlRecord) -> ActionControlRecord {
+    ActionControlRecord {
+        entity_type: entity,
+        ..r
+    }
+}
+
+fn on_rows(entity: ControlEntity) -> ActionControlRecord {
+    admitting(of_entity(
+        entity,
+        record(REPLY_HEAD, None, None, ControlMode::Rows, vec![]),
+    ))
+}
+
+fn admitting(r: ActionControlRecord) -> ActionControlRecord {
+    ActionControlRecord {
+        admit_unlisted_labels: true,
+        ..r
+    }
+}
+
+fn assert_dropped(t: &Trace, status: &str) {
+    assert_eq!(t.status, status);
+    assert!(t.outcomes.is_empty() && t.ais.is_empty() && t.dedup_calls.is_empty());
+}
+
+fn assert_logged_before_any_fetch(t: &Trace) {
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"]);
+    assert_eq!(t.outcomes.len(), 1);
+    assert!(t.outcomes[0].dry_run);
+    let i = info(t);
+    assert_eq!(i["logged_because"], "no_selection");
+    assert_eq!(i["level_row"], "missing");
+    assert_eq!(i["dry_run_source"], "page");
+    assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+    assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+}
+
+#[tokio::test]
+async fn an_unlisted_head_without_a_deciding_record_is_dropped() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rules = || admitting(record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]));
+    let rows_without_opt_in =
+        |e| of_entity(e, record(REPLY_HEAD, None, None, ControlMode::Rows, vec![]));
+    for records in [
+        vec![
+            of_entity(ControlEntity::User, rules()),
+            of_entity(ControlEntity::Post, rules()),
+        ],
+        vec![
+            rows_without_opt_in(ControlEntity::User),
+            rows_without_opt_in(ControlEntity::Post),
+        ],
+    ] {
+        let b = bed(records, false).await;
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        assert_dropped(&t, "no_match");
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+            .await;
+        assert_dropped(&t, "no_match");
+        assert_eq!(b.fetches().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_head_no_record_names_logs_only_on_both_levels() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![], false).await;
+    let listed = listing(&b, "abuse.embeddings.user_decisions", &[REPLY_LABEL], &[]);
+    for (processor, entity) in [
+        (post_topic(&b), EntityType::Post),
+        (user_topic(&b), EntityType::User),
+        (listed, EntityType::User),
+    ] {
+        let t = b.run_admitted(&processor, &reply_bot(entity)).await;
+        assert_logged_before_any_fetch(&t);
+        assert_eq!(t.outcomes[0].head, REPLY_HEAD);
+        assert_eq!(info(&t)["action_control_mode"], "recording");
+    }
+    let negative = listing(&b, "abuse.embeddings.post_decisions", &[], &[REPLY_LABEL]);
+    let t = b
+        .run_admitted(&negative, &reply_bot(EntityType::Post))
+        .await;
+    assert_dropped(&t, "negative_label");
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn a_first_page_save_keeps_an_unknown_heads_decisions_admitted() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rules = crate::rules::RulesCache::new();
+    let safety = action_control::SafetyChecksByEntity {
+        user: safety_checks::status(EntityType::User, &rules.resolve(EntityType::User, None)),
+        post: safety_checks::status(EntityType::Post, &rules.resolve(EntityType::Post, None)),
+    };
+    for (admit, admitted) in [(None, true), (Some(false), false)] {
+        let b = bed(vec![], false).await;
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        assert_logged_before_any_fetch(&t);
+        let control = b.ctx.dynamic_config.action_control_config();
+        let out = b
+            .ctx
+            .action_control
+            .set(
+                action_control::ActionControlPutRequest {
+                    entity_type: ControlEntity::User,
+                    head: REPLY_HEAD.into(),
+                    classifier: None,
+                    band: None,
+                    mode: ControlMode::Rows,
+                    actions: vec![],
+                    reason: "log only from the page".into(),
+                    expected_version: None,
+                    confirm: None,
+                    confirm_follower_limit: None,
+                    updated_by: None,
+                    confidence: None,
+                    evidence: None,
+                    evidence_override: None,
+                    rows: Some(action_control::RowsRequest::default()),
+                    admit_unlisted_labels: admit,
+                    rollout_bp: None,
+                    follower_threshold: None,
+                    skip_high_credibility: None,
+                },
+                "operator@example.com",
+                "page",
+                now_millis(),
+                &control,
+                &safety,
+            )
+            .await
+            .unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        assert_eq!(out.view.record.admit_unlisted_labels, admitted);
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        if admitted {
+            assert_logged_before_any_fetch(&t);
+            assert!(
+                info(&t).contains_key("action_control_lkey"),
+                "decided by the saved record"
+            );
+        } else {
+            assert_dropped(&t, "no_match");
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_head_on_both_levels_logs_only_where_its_record_is_saved() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let user_rules = of_entity(
+        ControlEntity::User,
+        record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]),
+    );
+    let b = bed(vec![on_rows(ControlEntity::Post), user_rules], false).await;
+    let negative = listing(&b, "abuse.embeddings.post_decisions", &[], &[REPLY_LABEL]);
+    for processor in [post_topic(&b), negative] {
+        let t = b
+            .run_admitted(&processor, &reply_bot(EntityType::Post))
+            .await;
+        assert_logged_before_any_fetch(&t);
+        assert_eq!(t.outcomes[0].head, REPLY_HEAD);
+    }
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_dropped(&t, "no_match");
+    assert_eq!(b.fetches().await, 0);
+
+    b.set_records(&[on_rows(ControlEntity::Post), on_rows(ControlEntity::User)])
+        .await;
+    for (processor, entity) in [
+        (post_topic(&b), EntityType::Post),
+        (user_topic(&b), EntityType::User),
+    ] {
+        let t = b.run_admitted(&processor, &reply_bot(entity)).await;
+        assert_logged_before_any_fetch(&t);
+    }
+    assert_eq!(b.fetches().await, 0);
+
+    b.ctx.action_control.spawn_seen_writer().unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let seen = b.ctx.action_control.scan_seen().await.unwrap();
+            if seen.iter().filter(|s| s.head == REPLY_HEAD).count() >= 2 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the head seen on both levels");
+    let mut levels: Vec<ControlEntity> = seen
+        .iter()
+        .filter(|s| s.head == REPLY_HEAD)
+        .inspect(|s| assert!(!s.factory && s.rule_id.is_empty() && s.band == REPLY_LABEL))
+        .map(|s| s.entity_type)
+        .collect();
+    levels.dedup();
+    assert!(levels.contains(&ControlEntity::Post) && levels.contains(&ControlEntity::User));
+}
+
+#[tokio::test]
+async fn the_saved_page_record_logs_only() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut records = vec![on_rows(ControlEntity::Post)];
+    for row in [
+        LevelRow::Low,
+        LevelRow::Mid,
+        LevelRow::High,
+        LevelRow::Missing,
+    ] {
+        records.push(ActionControlRecord {
+            confidence: Some(row),
+            ..of_entity(
+                ControlEntity::Post,
+                record(REPLY_HEAD, None, None, ControlMode::Recording, vec![]),
+            )
+        });
+    }
+    let b = bed(records, false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+        .await;
+    assert_logged_before_any_fetch(&t);
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn an_unlisted_head_follows_its_record_and_factory_heads_are_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(
+        vec![
+            admitting(live(REPLY_HEAD, None, vec![SHR7])),
+            of_entity(
+                ControlEntity::Post,
+                record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]),
+            ),
+            admitting(record(FACTORY_HEAD, None, None, ControlMode::Rows, vec![])),
+        ],
+        false,
+    )
+    .await;
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["addLabelsV2"]);
+    assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+        .await;
+    assert_dropped(&t, "no_match");
+
+    b.set_records(&[admitting(record(
+        REPLY_HEAD,
+        None,
+        None,
+        ControlMode::Recording,
+        vec![],
+    ))])
+    .await;
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.outcomes[0].dry_run);
+
+    let t = b
+        .run_admitted(&user_topic(&b), &factory_message(Account::Clean))
+        .await;
+    assert_dropped(&t, "no_match");
+}
+
+#[tokio::test]
+async fn a_listed_head_with_a_record_is_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    for records in [vec![], vec![live(BB1.0, None, vec![SHR7])]] {
+        let b = bed(records, false).await;
+        let msg = bb1(&[&label], Account::Clean);
+        let via_admission = b.run_admitted(&user_topic(&b), &msg).await;
+        let direct = b.run_fresh(&msg).await;
+        assert_eq!(via_admission.status, direct.status);
+        assert_eq!(ais_names(&via_admission), ais_names(&direct));
+        assert_eq!(info(&via_admission), info(&direct));
+    }
+}
+
+#[tokio::test]
+async fn a_head_on_rows_without_the_opt_in_is_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut records = vec![record(BB1.0, None, None, ControlMode::Rows, vec![])];
+    for (row, mode) in [
+        (LevelRow::Low, ControlMode::Rules),
+        (LevelRow::Mid, ControlMode::Recording),
+        (LevelRow::High, ControlMode::Rules),
+        (LevelRow::Missing, ControlMode::Rules),
+    ] {
+        records.push(ActionControlRecord {
+            confidence: Some(row),
+            ..record(BB1.0, None, None, mode, vec![])
+        });
+    }
+    let b = bed(records, false).await;
+    for level in [
+        abuse_proto::Confidence::High,
+        abuse_proto::Confidence::Mid,
+        abuse_proto::Confidence::Low,
+        abuse_proto::Confidence::Unspecified,
+    ] {
+        let mut msg = bb1(&["not_listed"], Account::Clean);
+        msg.confidence = level as i32;
+        let t = b.run_admitted(&user_topic(&b), &msg).await;
+        assert_dropped(&t, "no_match");
+    }
+    assert_eq!(b.fetches().await, 0);
+}
+
+const HIDE_REPLY: PageAction = PageAction::HideReply {
+    lifetime: Lifetime::Permanent,
+};
+
+fn hiding(rollout_bp: Option<u32>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::Post),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            rollout_bp,
+            ..of_entity(
+                ControlEntity::Post,
+                live(REPLY_HEAD, None, vec![HIDE_REPLY]),
+            )
+        },
+    ]
+}
+
+fn reply_by(account: Account) -> ScoreResult {
+    message(
+        EntityType::Post,
+        REPLY_HEAD,
+        REPLY_MODEL,
+        &[REPLY_LABEL],
+        account,
+    )
+}
+
+fn assert_hidden(t: &Trace) {
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert!(!t.ais.is_empty());
+    assert!(!t.outcomes[0].dry_run);
+}
+
+fn assert_logged_with_hide(t: &Trace, because: &str) {
+    assert_eq!(t.status, "dry_run", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    assert!(t.outcomes[0].dry_run);
+    let i = info(t);
+    assert_eq!(i["logged_because"], because);
+    assert_eq!(i["action_control_forced_recording"], because);
+    assert_eq!(i["action_control_mode"], "recording");
+    assert_eq!(i["dry_run_source"], "page");
+    assert_eq!(i["level_row"], "missing");
+    assert!(
+        i["action_specs"].contains("RiskyHighVizReply"),
+        "the row's action is recorded: {i:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_rollout_hides_replies_inside_it_and_logs_the_rest() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let place = |a: Account| action_control::rollout_bucket("", REPLY_HEAD, a.user_id());
+    let (mut low, mut high) = (Account::Clean, Account::HasPhoenixSkip);
+    assert_ne!(place(low), place(high));
+    if place(low) > place(high) {
+        std::mem::swap(&mut low, &mut high);
+    }
+    let b = bed(hiding(Some(place(high))), false).await;
+    let t = b.run_admitted(&post_topic(&b), &reply_by(low)).await;
+    assert_hidden(&t);
+    assert_eq!(info(&t)["rollout_bp"], place(high).to_string());
+    assert_eq!(info(&t)["rollout_bucket"], place(low).to_string());
+    let t = b.run_admitted(&post_topic(&b), &reply_by(high)).await;
+    assert_logged_with_hide(&t, "outside_rollout");
+    assert_eq!(info(&t)["rollout_bucket"], place(high).to_string());
+    assert_eq!(t.dedup_calls.len(), 1, "{:?}", t.dedup_calls);
+    assert!(t.dedup_calls[0].starts_with("peek"), "{:?}", t.dedup_calls);
+
+    b.set_records(&hiding(Some(0))).await;
+    for account in [low, high] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_logged_with_hide(&t, "outside_rollout");
+    }
+    b.set_records(&hiding(None)).await;
+    for account in [low, high] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_hidden(&t);
+        assert!(!info(&t).contains_key("rollout_bp"));
+    }
+}
+
+#[tokio::test]
+async fn a_row_this_image_cannot_read_logs_only() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![on_rows(ControlEntity::Post)], false).await;
+    let mut newer = serde_json::to_value(&hiding(Some(10_000))[1]).unwrap();
+    newer["v"] = (action_control::ACTION_CONTROL_RECORD_VERSION + 1).into();
+    newer["rollout_next"] = 1.into();
+    b.control_store.rows.lock().unwrap().insert(
+        (
+            action_control::MH_PKEY.into(),
+            format!("post/l/{REPLY_HEAD}/missing"),
+        ),
+        serde_json::to_vec(&newer).unwrap(),
+    );
+    b.ctx.action_control.refresh().await.unwrap();
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.tickets == 0 && t.outcomes[0].dry_run);
+    assert_eq!(info(&t)["logged_because"], "unreadable");
+}
+
+fn post_label(name: &str, lifetime: Lifetime) -> PageAction {
+    PageAction::PostLabel {
+        label: action_control::PostLabelName::parse(name).unwrap(),
+        lifetime,
+    }
+}
+
+fn nsfw_label(lifetime: Lifetime) -> PageAction {
+    post_label("NsfwHighPrecision", lifetime)
+}
+
+fn labelling(actions: Vec<PageAction>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::Post),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            ..of_entity(ControlEntity::Post, live(REPLY_HEAD, None, actions))
+        },
+    ]
+}
+
+fn post_id(account: Account) -> i64 {
+    reply_by(account).entity_id
+}
+
+fn nsfw_key(account: Account) -> dedup_cache::DedupKey {
+    dedup_cache::DedupKey::entity(EntityType::Post, post_id(account))
+        .with_post_labels(Some(&["NsfwHighPrecision"]))
+}
+
+fn sends_label(t: &Trace, label: &str) -> bool {
+    t.ais.iter().any(|(_, r)| {
+        r.to_string()
+            .contains(&format!(r#""safetyTweetLabels":"{label}""#))
+    })
+}
+
+#[tokio::test]
+async fn a_page_post_label_is_sent_to_ais() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"), "{:?}", t.ais);
+    assert_eq!(
+        *b.post_labels.reads.lock().unwrap(),
+        [post_id(Account::Clean)]
+    );
+    let i = info(&t);
+    assert!(i["action_specs"].contains("NsfwHighPrecision"), "{i:?}");
+    assert!(!i.contains_key("post_labels_carried"));
+    assert!(!i.contains_key("post_labels_read"));
+}
+
+#[tokio::test]
+async fn a_post_already_carrying_the_label_is_skipped() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let id = post_id(Account::Clean);
+    b.post_labels
+        .carry(id, &[("NsfwHighPrecision", None), ("NsfwHighRecall", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "already_post_labeled", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    let i = info(&t);
+    assert_eq!(i["post_labels_carried"], r#"["NsfwHighPrecision"]"#);
+    assert_eq!(i["post_present"], "true");
+    assert_eq!(
+        i["post_labels"],
+        r#"["NsfwHighPrecision","NsfwHighRecall"]"#
+    );
+
+    let week = crate::now_millis() + 7 * 86_400_000;
+    b.post_labels
+        .carry(id, &[("NsfwHighPrecision", Some(week))]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"));
+    assert!(!info(&t).contains_key("post_labels_carried"));
+}
+
+#[tokio::test]
+async fn a_carried_label_leaves_the_rest_of_the_row() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(
+        labelling(vec![nsfw_label(Lifetime::Permanent), HIDE_REPLY]),
+        false,
+    )
+    .await;
+    b.post_labels
+        .carry(post_id(Account::Clean), &[("NsfwHighPrecision", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "RiskyHighVizReply"));
+    assert!(!sends_label(&t, "NsfwHighPrecision"));
+    assert_eq!(info(&t)["post_labels_carried"], r#"["NsfwHighPrecision"]"#);
+}
+
+#[tokio::test]
+async fn a_failed_label_read_sends_the_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Days30)]), false).await;
+    b.post_labels.fail(post_id(Account::Clean));
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "NsfwHighPrecision"));
+    assert_eq!(info(&t)["post_labels_read"], "failed");
+}
+
+#[tokio::test]
+async fn a_page_label_is_not_blocked_by_another_heads_hold_on_the_post() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![nsfw_label(Lifetime::Permanent)]), false).await;
+    let entity = dedup_cache::DedupKey::entity(EntityType::Post, post_id(Account::Clean));
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup.hold_key(entity.clone(), dedup_cache::CLASS_LABEL);
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert_eq!(
+        t.dedup_calls[0],
+        format!("try_insert(class={})=new", dedup_cache::CLASS_LABEL)
+    );
+    {
+        let slots = b.dedup.slots.lock().unwrap();
+        assert_eq!(slots[&entity].0, dedup_cache::CLASS_LABEL, "untouched");
+        assert_eq!(slots[&nsfw_key(Account::Clean)].0, dedup_cache::CLASS_LABEL);
+    }
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "dedup_skipped");
+    assert!(t.ais.is_empty());
+
+    b.set_records(&labelling(vec![
+        nsfw_label(Lifetime::Permanent),
+        PageAction::SUSPEND_AUTHOR,
+    ]))
+    .await;
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert!(
+        t.dedup_calls[0].ends_with("=bypass"),
+        "a row that also suspends dedups on the post itself: {:?}",
+        t.dedup_calls
+    );
+}
+
+#[tokio::test]
+async fn soft_nsfw_is_sent_skipped_and_deduped_like_any_listed_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let soft = post_label("SoftNsfw", Lifetime::Permanent);
+    let b = bed(labelling(vec![soft]), false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"), "{:?}", t.ais);
+
+    let id = post_id(Account::Clean);
+    b.post_labels.carry(id, &[("SoftNsfw", None)]);
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "already_post_labeled", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty());
+
+    b.post_labels.carry(id, &[("NsfwHighPrecision", None)]);
+    b.set_records(&labelling(vec![nsfw_label(Lifetime::Permanent), soft]))
+        .await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"));
+    assert!(!sends_label(&t, "NsfwHighPrecision"));
+
+    b.set_records(&labelling(vec![soft])).await;
+    b.post_labels.carry(id, &[]);
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup
+        .hold_key(nsfw_key(Account::Clean), dedup_cache::CLASS_LABEL);
+    let t = b
+        .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_hidden(&t);
+    assert!(sends_label(&t, "SoftNsfw"));
+    let soft_key =
+        dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&["SoftNsfw"]));
+    assert!(b.dedup.slots.lock().unwrap().contains_key(&soft_key));
+}
+
+#[tokio::test]
+async fn nsfa_labels_are_sent_skipped_and_deduped_like_any_listed_label() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    for (name, other) in [
+        ("NsfaHighPrecision", "NsfaLimitedInventory"),
+        ("NsfaLimitedInventory", "NsfaHighPrecision"),
+    ] {
+        let b = bed(
+            labelling(vec![post_label(name, Lifetime::Permanent)]),
+            false,
+        )
+        .await;
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_hidden(&t);
+        assert!(sends_label(&t, name), "{name}: {:?}", t.ais);
+
+        let id = post_id(Account::Clean);
+        b.post_labels.carry(id, &[(name, None)]);
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, "already_post_labeled", "{name}: {:?}", t.outcomes);
+        assert!(t.ais.is_empty(), "{name}");
+
+        b.post_labels.carry(id, &[(other, None)]);
+        b.dedup.slots.lock().unwrap().clear();
+        let other_key =
+            dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&[other]));
+        b.dedup.hold_key(other_key, dedup_cache::CLASS_LABEL);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_hidden(&t);
+        assert!(sends_label(&t, name), "{name}: {:?}", t.ais);
+        assert!(!sends_label(&t, other), "{name}");
+        let own =
+            dedup_cache::DedupKey::entity(EntityType::Post, id).with_post_labels(Some(&[name]));
+        assert!(b.dedup.slots.lock().unwrap().contains_key(&own), "{name}");
+    }
+}
+
+fn with_skips(
+    r: ActionControlRecord,
+    follower_threshold: Option<u32>,
+    skip_high_credibility: Option<bool>,
+) -> ActionControlRecord {
+    ActionControlRecord {
+        follower_threshold,
+        skip_high_credibility,
+        ..r
+    }
+}
+
+#[tokio::test]
+async fn an_account_head_skips_by_its_own_follower_threshold() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let at = Account::BetweenLimits.followers() as u32;
+    let label = suspend_label();
+    let head =
+        |t: Option<u32>, c: Option<bool>| vec![with_skips(live(BB1.0, None, vec![SUSPEND]), t, c)];
+    let b = bed(head(None, None), false).await;
+    let run = |account: Account| bb1(&[&label], account);
+    let cases: [(Option<u32>, Option<bool>, [&str; 4]); 6] = [
+        (
+            None,
+            None,
+            [
+                "success",
+                "high_follower_count",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            Some(0),
+            None,
+            [
+                "success",
+                "success",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            Some(at),
+            None,
+            [
+                "success",
+                "high_follower_count",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            Some(at + 1),
+            None,
+            [
+                "success",
+                "success",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            None,
+            Some(false),
+            [
+                "success",
+                "high_follower_count",
+                "very_high_follower_count",
+                "success",
+            ],
+        ),
+        (
+            Some(0),
+            Some(false),
+            ["success", "success", "very_high_follower_count", "success"],
+        ),
+    ];
+    for (threshold, cred, want) in cases {
+        b.set_records(&head(threshold, cred)).await;
+        let accounts = [
+            Account::Clean,
+            Account::BetweenLimits,
+            Account::AboveTopLimit,
+            Account::HighCred,
+        ];
+        for (account, want) in accounts.into_iter().zip(want) {
+            let t = b.run_fresh(&run(account)).await;
+            assert_eq!(t.status, want, "{threshold:?} {cred:?} {account:?}");
+            assert_eq!(
+                t.ais.is_empty(),
+                want != "success",
+                "{threshold:?} {account:?}"
+            );
+            let i = info(&t);
+            let read_as = threshold.map(|n| match n {
+                0 => xai_abuse_enforcement_types::action_control::stored_off_follower_threshold(),
+                n => n,
+            });
+            assert_eq!(
+                i.get("action_control_follower_threshold"),
+                read_as.map(|n| n.to_string()).as_ref(),
+            );
+            assert_eq!(
+                i.get("action_control_skip_high_credibility"),
+                cred.map(|c| c.to_string()).as_ref(),
+            );
+        }
+        let t = b.run_fresh(&run(Account::NotFound)).await;
+        assert_eq!(t.status, "user_not_found");
+    }
+
+    b.set_records(&head(Some(at), None)).await;
+    let mut waived = run(Account::BetweenLimits);
+    waived.skip_author_credibility_prechecks = true;
+    assert_eq!(b.run_fresh(&waived).await.status, "high_follower_count");
+}
+
+#[tokio::test]
+async fn a_post_head_skips_authors_by_its_own_threshold_and_keeps_the_waiver() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let at = Account::BetweenLimits.followers() as u32;
+    let head = "SpamEmbeddingPtosDistilled";
+    let label = crate::replay_tests::rule_labels(BAKED_POST_RULES)
+        .into_iter()
+        .next()
+        .expect("a post routing label");
+    let hide = vec![PageAction::PostSpamHighRecall {
+        lifetime: Lifetime::Days30,
+    }];
+    let records = |t: Option<u32>, c: Option<bool>| {
+        vec![with_skips(
+            of_entity(ControlEntity::Post, live(head, None, hide.clone())),
+            t,
+            c,
+        )]
+    };
+    let b = bed(records(None, None), false).await;
+    let post = |account: Account, waived: bool| {
+        let mut s = message(EntityType::Post, head, "clf", &[&label], account);
+        s.skip_author_credibility_prechecks = waived;
+        s
+    };
+    let cases = [
+        (
+            None,
+            None,
+            false,
+            [
+                "high_follower_count",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            None,
+            None,
+            true,
+            ["success", "very_high_follower_count", "success"],
+        ),
+        (
+            Some(0),
+            None,
+            false,
+            ["success", "very_high_follower_count", "pagerank_skipped"],
+        ),
+        (
+            Some(at),
+            None,
+            false,
+            [
+                "high_follower_count",
+                "very_high_follower_count",
+                "pagerank_skipped",
+            ],
+        ),
+        (
+            Some(at),
+            None,
+            true,
+            ["success", "very_high_follower_count", "success"],
+        ),
+        (
+            None,
+            Some(false),
+            false,
+            ["high_follower_count", "very_high_follower_count", "success"],
+        ),
+        (
+            Some(0),
+            Some(true),
+            true,
+            ["success", "very_high_follower_count", "success"],
+        ),
+    ];
+    for (threshold, cred, waived, want) in cases {
+        b.set_records(&records(threshold, cred)).await;
+        let accounts = [
+            Account::BetweenLimits,
+            Account::AboveTopLimit,
+            Account::HighCred,
+        ];
+        for (account, want) in accounts.into_iter().zip(want) {
+            let t = b.run_fresh(&post(account, waived)).await;
+            assert_eq!(
+                t.status, want,
+                "{threshold:?} {cred:?} waived={waived} {account:?}"
+            );
+            assert_eq!(t.ais.is_empty(), want != "success");
+        }
+        assert_eq!(
+            b.run_fresh(&post(Account::Clean, waived)).await.status,
+            "success"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_head_takes_its_own_skips_alike() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    for (head, model) in HEADS.iter().copied().take(3) {
+        let b = bed(
+            vec![with_skips(
+                live(head, None, vec![SUSPEND]),
+                Some(0),
+                Some(false),
+            )],
+            false,
+        )
+        .await;
+        for account in [Account::BetweenLimits, Account::HighCred] {
+            let t = b
+                .run_fresh(&message(EntityType::User, head, model, &[&label], account))
+                .await;
+            assert_eq!(t.status, "success", "{head} {account:?}");
+        }
+        let t = b
+            .run_fresh(&message(
+                EntityType::User,
+                head,
+                model,
+                &[&label],
+                Account::AboveTopLimit,
+            ))
+            .await;
+        assert_eq!(t.status, "very_high_follower_count", "{head}");
+    }
+}
+
+#[tokio::test]
+async fn a_factory_head_ignores_a_head_records_skips() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rows = factory_row(LevelRow::Missing, ControlMode::Live, vec![SUSPEND]);
+    let scope = with_skips(
+        record(FACTORY_HEAD, None, None, ControlMode::Rows, vec![]),
+        Some(0),
+        Some(false),
+    );
+    let b = bed(vec![scope, rows], false).await;
+    for (account, want) in [
+        (Account::Clean, "success"),
+        (Account::BetweenLimits, "high_follower_count"),
+        (Account::HighCred, "pagerank_skipped"),
+    ] {
+        let t = b.run_fresh(&factory_message(account)).await;
+        assert_eq!(t.status, want, "{account:?}");
+        assert!(!info(&t).contains_key("action_control_follower_threshold"));
+    }
+}
+
+fn as_written(mut r: ActionControlRecord) -> ActionControlRecord {
+    r.v = r.schema_version();
+    r
+}
+
+fn allowed_skips() -> Vec<(Option<u32>, Option<bool>)> {
+    let view = safety_checks::follower_skip_view();
+    let (today, ceiling) = (view.today_threshold as u32, view.ceiling as u32);
+    vec![
+        (Some(0), None),
+        (Some(today), None),
+        (Some(today * 5), None),
+        (Some(ceiling - 1), Some(true)),
+        (None, Some(false)),
+        (Some(0), Some(false)),
+    ]
+}
+
+fn assert_skipped_as_today(t: &Trace, today_reason: &str, what: &str) {
+    assert!(
+        t.ais.is_empty() && t.tickets == 0,
+        "{what}: acted ({})",
+        t.status
+    );
+    let recorded = t.outcomes.last().is_some_and(|o| o.dry_run);
+    assert!(t.status == today_reason || recorded, "{what}: {}", t.status);
+}
+
+fn layouts(
+    skips: (Option<u32>, Option<bool>),
+) -> Vec<(
+    &'static str,
+    Vec<ActionControlRecord>,
+    Vec<ActionControlRecord>,
+)> {
+    let (t, c) = skips;
+    let missing_row = ActionControlRecord {
+        confidence: Some(LevelRow::Missing),
+        ..record(BB1.0, None, None, ControlMode::Live, vec![SUSPEND])
+    };
+    let classifier = record(BB1.0, Some(BB1.1), None, ControlMode::Live, vec![SUSPEND]);
+    let head =
+        |mode: ControlMode, actions: Vec<PageAction>| record(BB1.0, None, None, mode, actions);
+    vec![
+        (
+            "live head",
+            vec![as_written(head(ControlMode::Live, vec![SUSPEND]))],
+            vec![as_written(with_skips(
+                head(ControlMode::Live, vec![SUSPEND]),
+                t,
+                c,
+            ))],
+        ),
+        (
+            "live classifier under a rules head",
+            vec![
+                as_written(head(ControlMode::Rules, vec![])),
+                as_written(classifier.clone()),
+            ],
+            vec![
+                as_written(with_skips(head(ControlMode::Rules, vec![]), t, c)),
+                as_written(classifier),
+            ],
+        ),
+        (
+            "confidence rows",
+            vec![
+                as_written(head(ControlMode::Rows, vec![])),
+                as_written(missing_row.clone()),
+            ],
+            vec![
+                as_written(with_skips(head(ControlMode::Rows, vec![]), t, c)),
+                as_written(missing_row),
+            ],
+        ),
+    ]
+}
+
+fn store_only(b: &TestBed, records: &[ActionControlRecord]) {
+    b.control_store.rows.lock().unwrap().clear();
+    for r in records {
+        b.control_store.put_record(r);
+    }
+}
+
+#[tokio::test]
+async fn an_older_image_never_skips_fewer_accounts_than_today() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    let older = crate::action_control::test_support::refresh_as_older_image;
+    for skips in allowed_skips() {
+        for (layout, before, after) in layouts(skips) {
+            for read_before in [false, true] {
+                let b = bed(if read_before { before.clone() } else { vec![] }, false).await;
+                store_only(&b, &after);
+                older(&b.ctx.action_control).await;
+                for (account, today) in [
+                    (Account::BetweenLimits, "high_follower_count"),
+                    (Account::HighCred, "pagerank_skipped"),
+                ] {
+                    let t = b.run_fresh(&bb1(&[&label], account)).await;
+                    let what =
+                        format!("{layout}, {skips:?}, read before {read_before}, {account:?}");
+                    assert_skipped_as_today(&t, today, &what);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn this_image_acts_with_the_head_records_skips_in_every_layout() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    for (layout, _, after) in layouts((Some(0), Some(false))) {
+        let b = bed(after, false).await;
+        for account in [Account::BetweenLimits, Account::HighCred] {
+            let t = b.run_fresh(&bb1(&[&label], account)).await;
+            assert_eq!(t.status, "success", "{layout} {account:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_threshold_below_today_would_skip_fewer_accounts_on_an_older_image() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    let before = vec![as_written(live(BB1.0, None, vec![SUSPEND]))];
+    let below = vec![as_written(with_skips(
+        live(BB1.0, None, vec![SUSPEND]),
+        Some(1),
+        None,
+    ))];
+    let clean = bb1(&[&label], Account::Clean);
+    let b = bed(below.clone(), false).await;
+    assert_eq!(b.run_fresh(&clean).await.status, "high_follower_count");
+    let b = bed(before, false).await;
+    store_only(&b, &below);
+    crate::action_control::test_support::refresh_as_older_image(&b.ctx.action_control).await;
+    let t = b.run_fresh(&clean).await;
+    assert_eq!(t.status, "success");
+    assert!(!t.ais.is_empty());
+}
+
+#[tokio::test]
+async fn the_follower_ceiling_stops_every_decision() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let post_head = "SpamEmbeddingPtosDistilled";
+    let post_label = crate::replay_tests::rule_labels(BAKED_POST_RULES)
+        .into_iter()
+        .next()
+        .expect("a post routing label");
+    let user_label = suspend_label();
+    let waived = |mut s: ScoreResult| {
+        s.skip_author_credibility_prechecks = true;
+        s
+    };
+    let post = |account| {
+        waived(message(
+            EntityType::Post,
+            post_head,
+            "clf",
+            &[&post_label],
+            account,
+        ))
+    };
+    let user = |account| waived(bb1(&[&user_label], account));
+    let hide = vec![PageAction::PostSpamHighRecall {
+        lifetime: Lifetime::Days30,
+    }];
+    let page = vec![
+        with_skips(
+            of_entity(ControlEntity::Post, live(post_head, None, hide)),
+            Some(0),
+            None,
+        ),
+        with_skips(live(BB1.0, None, vec![SUSPEND]), Some(0), None),
+    ];
+    let rules = vec![of_entity(
+        ControlEntity::Post,
+        record(post_head, None, None, ControlMode::Rules, vec![]),
+    )];
+    for (path, records) in [("growthbook rules", rules), ("page", page)] {
+        let b = bed(records, false).await;
+        for (entity, msg) in [
+            ("post", &post as &dyn Fn(Account) -> ScoreResult),
+            ("account", &user),
+        ] {
+            let t = b.run_fresh(&msg(Account::AboveTopLimit)).await;
+            assert_eq!(t.status, "very_high_follower_count", "{path} {entity}");
+            assert!(t.ais.is_empty() && t.tickets == 0, "{path} {entity}");
+            assert_eq!(info(&t)["matched_rule_id"], "very_high_follower_count");
+            let below = b.run_fresh(&msg(Account::JustBelowTopLimit)).await;
+            assert_ne!(below.status, "very_high_follower_count", "{path} {entity}");
+            let acted = entity == "post";
+            assert_eq!(
+                below.status == "success",
+                acted,
+                "{path} {entity}: {}",
+                below.status
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_raised_follower_limit_moves_the_ceiling_for_that_heads_page_decisions() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let post_head = "SpamEmbeddingPtosDistilled";
+    let post_label = crate::replay_tests::rule_labels(BAKED_POST_RULES)
+        .into_iter()
+        .next()
+        .expect("a post routing label");
+    let user_label = suspend_label();
+    let waived = |mut s: ScoreResult| {
+        s.skip_author_credibility_prechecks = true;
+        s
+    };
+    let post = |account| {
+        waived(message(
+            EntityType::Post,
+            post_head,
+            "clf",
+            &[&post_label],
+            account,
+        ))
+    };
+    let user = |account| waived(bb1(&[&user_label], account));
+    let above = Account::AboveTopLimit.followers() as u32;
+    let hide = vec![PageAction::PostSpamHighRecall {
+        lifetime: Lifetime::Days30,
+    }];
+    for (limit, page_acts) in [(above + 1, true), (above, false)] {
+        let page = vec![
+            with_skips(
+                of_entity(ControlEntity::Post, live(post_head, None, hide.clone())),
+                Some(limit),
+                None,
+            ),
+            with_skips(live(BB1.0, None, vec![SUSPEND]), Some(limit), None),
+        ];
+        let rules = vec![with_skips(
+            of_entity(
+                ControlEntity::Post,
+                record(post_head, None, None, ControlMode::Rules, vec![]),
+            ),
+            Some(limit),
+            None,
+        )];
+        for (path, records) in [("growthbook rules", rules), ("page", page)] {
+            let b = bed(records, false).await;
+            for (entity, msg) in [
+                ("post", &post as &dyn Fn(Account) -> ScoreResult),
+                ("account", &user),
+            ] {
+                let t = b.run_fresh(&msg(Account::AboveTopLimit)).await;
+                let what = format!("{limit} {path} {entity}: {}", t.status);
+                if path == "page" && page_acts {
+                    assert_eq!(t.status, "success", "{what}");
+                    assert!(!t.ais.is_empty(), "{what}");
+                } else {
+                    assert_eq!(t.status, "very_high_follower_count", "{what}");
+                    assert!(t.ais.is_empty() && t.tickets == 0, "{what}");
+                }
+            }
+        }
+    }
+}
+
+
+const SUSPEND_PERMANENT_CSE: PageAction = PageAction::Suspend {
+    permanent: true,
+    policy: crate::action_control::SuspensionPolicy::Cse,
+};
+
+fn suspending(actions: Vec<PageAction>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::User),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            ..of_entity(ControlEntity::User, live(REPLY_HEAD, None, actions))
+        },
+    ]
+}
+
+fn suspend_body(t: &Trace) -> serde_json::Value {
+    t.ais
+        .iter()
+        .find_map(|(_, r)| {
+            let actions: Vec<&serde_json::Value> = match r.get("actions") {
+                Some(serde_json::Value::Array(a)) => a.iter().collect(),
+                _ => r.get("action").into_iter().collect(),
+            };
+            actions
+                .into_iter()
+                .find_map(|a| a.get("suspendUser").cloned())
+        })
+        .expect("a suspendUser call")
+}
+
+#[tokio::test]
+async fn a_permanent_policy_suspend_reaches_ais_as_set_and_upgrades_a_suspended_account() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(suspending(vec![SUSPEND_PERMANENT_CSE]), false).await;
+    for account in [Account::Clean, Account::Suspended] {
+        let t = b
+            .run_admitted(
+                &user_topic(&b),
+                &message(
+                    EntityType::User,
+                    REPLY_HEAD,
+                    REPLY_MODEL,
+                    &[REPLY_LABEL],
+                    account,
+                ),
+            )
+            .await;
+        assert_eq!(t.status, "success", "{account:?}: {:?}", t.outcomes);
+        let body = suspend_body(&t);
+        assert_eq!(body["perm"], true, "{account:?}");
+        assert_eq!(body["policy"], "Cse", "{account:?}");
+        assert_eq!(
+            info(&t)["action_specs"],
+            r#"[{"kind":"suspend","permanent":true,"policy":"Cse"}]"#
+        );
+        assert!(
+            t.dedup_calls.iter().any(|c| c.contains("class=5")),
+            "{:?}",
+            t.dedup_calls
+        );
+    }
+    let t = b
+        .run_admitted(
+            &user_topic(&b),
+            &message(
+                EntityType::User,
+                REPLY_HEAD,
+                REPLY_MODEL,
+                &[REPLY_LABEL],
+                Account::Deactivated,
+            ),
+        )
+        .await;
+    assert_eq!(t.status, "already_deactivated");
+    assert!(t.ais.is_empty());
+
+    b.set_records(&suspending(vec![SUSPEND])).await;
+    let t = b
+        .run_admitted(
+            &user_topic(&b),
+            &message(
+                EntityType::User,
+                REPLY_HEAD,
+                REPLY_MODEL,
+                &[REPLY_LABEL],
+                Account::Suspended,
+            ),
+        )
+        .await;
+    assert_eq!(t.status, ALREADY_SUSPENDED);
+    assert!(t.ais.is_empty());
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, "success");
+    let body = suspend_body(&t);
+    assert_eq!(
+        (body["perm"].clone(), body["policy"].clone()),
+        (
+            serde_json::json!(false),
+            serde_json::json!("PlatformManipulation")
+        ),
+        "a plain suspend is the temporary PlatformManipulation one, as before"
+    );
+    assert!(
+        t.dedup_calls.iter().any(|c| c.contains("class=3")),
+        "{:?}",
+        t.dedup_calls
+    );
+}
+
+const POST_SHR_PERMANENT: PageAction = PageAction::PostSpamHighRecall {
+    lifetime: Lifetime::Permanent,
+};
+
+fn author_suspend(permanent: bool, policy: crate::action_control::SuspensionPolicy) -> PageAction {
+    PageAction::SuspendAuthor { permanent, policy }
+}
+
+fn author_permanent_cse() -> PageAction {
+    author_suspend(true, crate::action_control::SuspensionPolicy::Cse)
+}
+
+fn suspend_sent(t: &Trace) -> Option<(bool, String)> {
+    t.ais.iter().find_map(|(_, r)| {
+        let actions: Vec<&serde_json::Value> = match r.get("actions") {
+            Some(serde_json::Value::Array(a)) => a.iter().collect(),
+            _ => r.get("action").into_iter().collect(),
+        };
+        actions.into_iter().find_map(|a| {
+            let s = a.get("suspendUser")?;
+            Some((
+                s.get("perm")?.as_bool()?,
+                s.get("policy")?.as_str()?.to_owned(),
+            ))
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_permanent_cse_author_suspend_is_sent_with_the_post_label_and_upgrades_a_suspended_author()
+ {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let actions = vec![POST_SHR_PERMANENT, author_permanent_cse()];
+    let b = bed(labelling(actions.clone()), false).await;
+    for account in [Account::Clean, Account::Suspended] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_eq!(t.status, "success", "{account:?}: {:?}", t.outcomes);
+        assert_eq!(
+            suspend_sent(&t),
+            Some((true, "Cse".to_owned())),
+            "{account:?}"
+        );
+        assert!(
+            sends_label(&t, "SpamHighRecall"),
+            "{account:?}: {:?}",
+            t.ais
+        );
+        assert_eq!(
+            info(&t)["action_specs"],
+            action_control::action_specs_json(&action_control::page_specs(&actions))
+        );
+        assert_eq!(
+            t.dedup_calls[0],
+            format!("try_insert(class={})=new", dedup_cache::CLASS_SUSPEND_CSE),
+            "{account:?}"
+        );
+        assert_eq!(
+            info(&t)["acted_class"],
+            dedup_cache::CLASS_SUSPEND_CSE.to_string()
+        );
+        assert!(!info(&t).contains_key(ALREADY_SUSPENDED_STRIPPED));
+    }
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Deactivated))
+        .await;
+    assert_eq!(t.status, "already_deactivated");
+    assert!(t.ais.is_empty() && t.tickets == 0);
+}
+
+#[tokio::test]
+async fn each_author_suspend_option_upgrades_a_suspended_author_and_the_plain_one_skips() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![PageAction::SUSPEND_AUTHOR]), false).await;
+    for permanent in [false, true] {
+        for policy in crate::action_control::SuspensionPolicy::ALL {
+            let author = author_suspend(permanent, policy);
+            b.set_records(&labelling(vec![POST_SHR_PERMANENT, author]))
+                .await;
+            let t = b
+                .run_admitted(&post_topic(&b), &reply_by(Account::Suspended))
+                .await;
+            if author == PageAction::SUSPEND_AUTHOR {
+                assert_eq!(t.status, ALREADY_SUSPENDED, "{author:?}");
+                assert!(t.ais.is_empty() && t.tickets == 0, "{author:?}");
+            } else {
+                assert_eq!(t.status, "success", "{author:?}: {:?}", t.outcomes);
+                assert_eq!(
+                    suspend_sent(&t),
+                    Some((permanent, policy.as_str().to_owned())),
+                    "{author:?}"
+                );
+                assert!(sends_label(&t, "SpamHighRecall"), "{author:?}");
+            }
+        }
+    }
+    b.set_records(&labelling(vec![
+        POST_SHR_PERMANENT,
+        PageAction::SUSPEND_AUTHOR,
+    ]))
+    .await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert_eq!(
+        suspend_sent(&t),
+        Some((false, "PlatformManipulation".to_owned()))
+    );
+    assert_eq!(
+        t.dedup_calls[0],
+        format!("try_insert(class={})=new", dedup_cache::CLASS_SUSPEND)
+    );
+}
+
+#[tokio::test]
+async fn an_author_suspend_never_replaces_a_held_cse_or_permanent_suspension_and_the_label_still_goes_on()
+ {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(labelling(vec![PageAction::SUSPEND_AUTHOR]), false).await;
+    let author = Account::Clean.user_id();
+    let pm = crate::action_control::SuspensionPolicy::PlatformManipulation;
+    let cse = crate::action_control::SuspensionPolicy::Cse;
+    for (held, suspend, sent) in [
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(false, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(true, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(false, cse),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_CSE,
+            author_suspend(true, cse),
+            true,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(false, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(true, pm),
+            false,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(false, cse),
+            true,
+        ),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            author_suspend(true, cse),
+            true,
+        ),
+    ] {
+        let what = format!("held {held}, {suspend:?}");
+        b.set_records(&labelling(vec![POST_SHR_PERMANENT, suspend]))
+            .await;
+        b.dedup.slots.lock().unwrap().clear();
+        b.dedup.hold(EntityType::User, author, held);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, "success", "{what}: {:?}", t.outcomes);
+        assert!(sends_label(&t, "SpamHighRecall"), "{what}: {:?}", t.ais);
+        if sent {
+            assert!(suspend_sent(&t).is_some(), "{what}");
+            assert!(!info(&t).contains_key(PERMANENT_SEEN_IN), "{what}");
+        } else {
+            assert_eq!(suspend_sent(&t), None, "{what}");
+            assert_eq!(
+                info(&t)[PERMANENT_SEEN_IN],
+                PERMANENT_SEEN_IN_DEDUP,
+                "{what}"
+            );
+            assert_eq!(
+                info(&t)["acted_class"],
+                dedup_cache::CLASS_LABEL.to_string(),
+                "{what}: only the label was sent"
+            );
+        }
+    }
+
+    for (held, status) in [
+        (dedup_cache::CLASS_SUSPEND_CSE, ALREADY_CSE_SUSPENDED),
+        (
+            dedup_cache::CLASS_SUSPEND_PERMANENT,
+            ALREADY_PERMANENTLY_SUSPENDED,
+        ),
+    ] {
+        b.set_records(&labelling(vec![author_suspend(true, pm)]))
+            .await;
+        b.dedup.slots.lock().unwrap().clear();
+        b.dedup.hold(EntityType::User, author, held);
+        let t = b
+            .run_admitted_on_held(&post_topic(&b), &reply_by(Account::Clean))
+            .await;
+        assert_eq!(t.status, status, "{held}: {:?}", t.outcomes);
+        assert!(t.ais.is_empty() && t.tickets == 0, "{held}");
+    }
 }

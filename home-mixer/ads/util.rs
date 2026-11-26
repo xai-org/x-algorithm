@@ -205,7 +205,7 @@ pub(crate) fn tokenize_ad_keywords(ad: &AdIndexInfo) -> Option<Vec<TokenSequence
     ad_keywords(ad).map(|keywords| keywords.into_iter().map(|(_, tokens)| tokens).collect())
 }
 
-fn ad_keywords(ad: &AdIndexInfo) -> Option<Vec<(&str, TokenSequence)>> {
+pub(crate) fn ad_keywords(ad: &AdIndexInfo) -> Option<Vec<(&str, TokenSequence)>> {
     let keywords: Vec<_> = ad
         .ad_adjacency_control
         .as_ref()?

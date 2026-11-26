@@ -144,6 +144,7 @@ class MediaProcessor:
         post.quoted_post = hydrated.quoted_post
         post.ancestors = hydrated.ancestors
         post.screenshot = hydrated.screenshot
+        post.combined_view = hydrated.combined_view
         post.cardsV2 = hydrated.cardsV2
         post.article_metadata = hydrated.article_metadata
         post.descendants = hydrated.descendants

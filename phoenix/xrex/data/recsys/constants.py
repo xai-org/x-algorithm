@@ -83,8 +83,8 @@ primary_engagement_to_action_types = {
     "IsPostUnexplored": [
         "ServerTweetPostUnexplored",
     ],
-    "IsReactedWithVideo": [
-        "ServerTweetReactWithVideo",
+    "IsPostedVideo": [
+        "ServerTweetPostVideo",
     ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",
@@ -296,6 +296,9 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsSignupConversion": [
         "AdsSignUpConversion",
     ],
+    "IsLeadgenConversion": [
+        "AdsLeadgenConversion",
+    ],
     "IsSiteVisitConversion": [
         "AdsSiteVisitConversion",
     ],
@@ -371,6 +374,24 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsUpperFunnelConversionViewThrough": [
         "AdsUpperFunnelConversionViewThrough",
     ],
+    "IsAttributedKeyViewConversionDelayed": [
+        "AdsAttributedKeyViewConversionDelayed",
+    ],
+    "IsAttributedViewConversionDelayed": [
+        "AdsAttributedViewConversionDelayed",
+    ],
+    "IsPurchaseConversionViewThroughDelayed": [
+        "AdsPurchaseConversionViewThroughDelayed",
+    ],
+    "IsAddToCartConversionViewThroughDelayed": [
+        "AdsAddToCartConversionViewThroughDelayed",
+    ],
+    "IsCheckoutInitiatedConversionViewThroughDelayed": [
+        "AdsCheckoutInitiatedConversionViewThroughDelayed",
+    ],
+    "IsSignUpConversionViewThroughDelayed": [
+        "AdsSignUpConversionViewThroughDelayed",
+    ],
 }
 
 ads_slim_engagement_to_action_types = {
@@ -379,6 +400,9 @@ ads_slim_engagement_to_action_types = {
     ],
     "IsMmpClick": [
         "AdsMmpClick",
+    ],
+    "IsBrandEngagement": [
+        "BrandEngagement",
     ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",
@@ -453,8 +477,21 @@ CLICK_ACTION_INDEX = recsys_pb2.ActionName.CLIENT_TWEET_OPEN_LINK
 MMP_CLICK_ACTION_INDEX = recsys_pb2.ActionName.ADS_MMP_CLICK
 
 
+VIDEO_CREATIVE_BIT = 1 << 30
+
+
 class LineItemObjective(enum.IntEnum):
+    OBJECTIVE_UNSPECIFIED = 0
+    APP_INSTALLS = 1
+    FOLLOWERS = 2
+    BRAND_ENGAGEMENTS = 3
+    VIDEO_VIEWS = 4
     WEBSITE_CLICKS = 5
+    APP_ENGAGEMENTS = 8
+    PREROLL_VIEWS = 9
+    REACH = 11
+    MIDROLL_VIEWS = 12
+    TAKEOVER = 13
 
 
 CLICK_CONDITIONED_ACTION_INDICES = [
@@ -471,6 +508,10 @@ CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_SIGN_UP_CONVERSION,
     recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CLICK_INSTALL,
+]
+
+FRESH_CLICK_CONDITIONED_ACTION_INDICES = [
+    recsys_pb2.ActionName.ADS_LEADGEN_CONVERSION,
 ]
 
 MMP_CLICK_CONDITIONED_ACTION_INDICES = [
@@ -522,6 +563,12 @@ MACT_IN_APP_LOSS_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_CUSTOM,
 ]
 
+VIEW_LOSS_ACTION_INDICES = [
+    recsys_pb2.ActionName.CLIENT_TWEET_RECAP_DWELLED,
+    recsys_pb2.ActionName.CLIENT_TWEET_RECAP_NOT_DWELLED,
+    recsys_pb2.ActionName.CLIENT_TWEET_VIDEO_QUALITY_VIEW,
+]
+
 VIEW_THROUGH_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_KEY_VIEW_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_VIEW_CONVERSION,
@@ -547,4 +594,17 @@ NEGATIVE_FEEDBACK_HEAD_INDICES = [
     recsys_pb2.ActionName.CLIENT_TWEET_MUTE_CONVERSATION,
     recsys_pb2.ActionName.CLIENT_NOTIFICATION_SEE_LESS_OFTEN,
     recsys_pb2.ActionName.CLIENT_TWEET_SEARCH_QUERY_REFORMULATED,
+]
+
+EXPLICIT_NEGATIVE_ACTIONS = [
+    recsys_pb2.ActionName.SERVER_TWEET_REPORT,
+    recsys_pb2.ActionName.CLIENT_TWEET_REPORT,
+    recsys_pb2.ActionName.CLIENT_TWEET_NOT_INTERESTED_IN,
+    recsys_pb2.ActionName.CLIENT_TWEET_SEE_FEWER,
+    recsys_pb2.ActionName.CLIENT_TWEET_UNFOLLOW_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_BLOCK_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_MUTE_AUTHOR,
+    recsys_pb2.ActionName.CLIENT_TWEET_MUTE_CONVERSATION,
+    recsys_pb2.ActionName.CLIENT_TWEET_NOT_RELEVANT,
+    recsys_pb2.ActionName.CLIENT_NOTIFICATION_SEE_LESS_OFTEN,
 ]

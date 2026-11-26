@@ -1,7 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use tonic::async_trait;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
 use xai_recsys_sid_retrieval_proto::RetrieveRequest;
@@ -102,9 +102,10 @@ impl Source<ScoredPostsQuery, PostCandidate> for SidSource {
             })
             .collect();
 
-        let hydrated = self.core_data_hydrator.hydrate(query, &candidates).await;
-        self.core_data_hydrator
-            .update_all(&mut candidates, hydrated);
+        if let Ok(fetched) = self.core_data_hydrator.fetch(query, &candidates).await {
+            self.core_data_hydrator
+                .apply(query, &mut candidates, fetched);
+        }
         candidates.retain(|c| c.author_id != 0);
         record("hydrated", candidates.len());
         Ok(candidates)

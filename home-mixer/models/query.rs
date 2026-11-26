@@ -4,7 +4,9 @@ use crate::models::engagement_signals::EngagementSignalsByType;
 use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::in_network_reply::{serialize_in_network_replies, InNetworkReplies};
 use crate::models::user_features::UserFeatures;
+use crate::params::{AdsOnlyTimelineViewerIds, EnableAdsOnlyTimeline};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_candidate_pipeline::candidate_pipeline::PipelineQuery;
@@ -12,7 +14,7 @@ use xai_core_entities::entities::SubscriptionLevel;
 use xai_decider::Decider;
 use xai_feature_switches::Params;
 use xai_recsys_proto::gender_prediction::InferredGenderLabel;
-use xai_recsys_proto::{DeviceNetworkType, Timezone};
+use xai_recsys_proto::{DeviceNetworkType, RecentSearchQueries, Timezone};
 use xai_twittercontext_proto::{GetTwitterContextViewer, TwitterContextViewer};
 use xai_urt_thrift::cursor::UrtOrderedCursor;
 use xai_x_thrift::non_polling_timestamps::NonPollingTimestamps;
@@ -60,6 +62,15 @@ pub struct ScoredPostsQuery {
     #[serde(skip)]
     pub columnar_scoring_sequence: Option<bytes::Bytes>,
     #[serde(skip)]
+    pub history_topics: Option<xai_vm_ranker_proto::experiment::HistoryTopics>,
+    #[serde(skip)]
+    pub stats_history_topics: Option<xai_vm_ranker_proto::experiment::HistoryTopics>,
+    #[serde(skip)]
+    pub recent_views: Vec<xai_vm_ranker_proto::experiment::RecentView>,
+    #[serde(skip)]
+    pub recent_view_topics:
+        std::collections::HashMap<u64, xai_vm_ranker_proto::experiment::PostTopics>,
+    #[serde(skip)]
     pub immersive_columnar_scoring_sequence: Option<bytes::Bytes>,
     #[serde(skip)]
     pub retrieval_sequence: Option<xai_recsys_proto::UserActionSequence>,
@@ -76,6 +87,7 @@ pub struct ScoredPostsQuery {
     pub cached_posts: Vec<PostCandidate>,
     pub has_cached_posts: bool,
     pub return_backbone_scores: bool,
+    pub is_debug_request: bool,
     pub topic_ids: Vec<i64>,
     pub excluded_topic_ids: Vec<i64>,
     pub exclude_videos: bool,
@@ -109,9 +121,13 @@ pub struct ScoredPostsQuery {
     pub implicit_engagement_signals: Option<EngagementSignalsByType>,
     #[serde(serialize_with = "serialize_debug")]
     pub user_installed_apps: Option<Vec<bool>>,
+    #[serde(skip)]
+    pub recent_search_queries: Option<RecentSearchQueries>,
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
     pub is_under_the_hood_request: bool,
+    pub under_the_hood_setting_enabled: bool,
+    pub under_the_hood_trace_limited: bool,
     pub is_preview: bool,
     pub is_polling: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -119,9 +135,11 @@ pub struct ScoredPostsQuery {
     pub request_context: String,
     #[serde(skip)]
     pub served_history: Vec<ServedHistory>,
+    pub frame_dismissals: Option<HashMap<String, i64>>,
     pub who_to_follow_eligible: bool,
     pub feed_survey_eligible: bool,
     pub video_carousel_eligible: bool,
+    pub seen_carousel_video_ids: HashSet<u64>,
     #[serde(serialize_with = "serialize_debug")]
     pub non_polling_timestamps: Option<NonPollingTimestamps>,
     pub impressed_post_ids: Vec<u64>,
@@ -133,6 +151,11 @@ pub struct ScoredPostsQuery {
     pub ad_drops: Arc<AdDrops>,
     #[serde(serialize_with = "serialize_debug")]
     pub video_carousel: Arc<OnceLock<Vec<PostCandidate>>>,
+    #[serde(skip)]
+    pub video_carousel_ctr_model:
+        Arc<OnceLock<Arc<crate::util::video_carousel_ctr_model::CtrModel>>>,
+    #[serde(skip)]
+    pub served_post_score_infos: Arc<OnceLock<HashMap<u64, xai_recsys_proto::ScoreInfo>>>,
 }
 
 pub use xai_candidate_pipeline::component_library::clients::strato_client::UserDemographics;
@@ -185,6 +208,10 @@ impl ScoredPostsQuery {
             bloom_filter_entries: vec![],
             scoring_sequence: None,
             columnar_scoring_sequence: None,
+            history_topics: None,
+            stats_history_topics: None,
+            recent_views: Vec::new(),
+            recent_view_topics: std::collections::HashMap::new(),
             immersive_columnar_scoring_sequence: None,
             retrieval_sequence: None,
             columnar_retrieval_sequence: None,
@@ -202,6 +229,7 @@ impl ScoredPostsQuery {
             cached_posts: vec![],
             has_cached_posts: false,
             return_backbone_scores: false,
+            is_debug_request: false,
             topic_ids,
             excluded_topic_ids,
             exclude_videos,
@@ -228,17 +256,22 @@ impl ScoredPostsQuery {
             explicit_engagement_signals: None,
             implicit_engagement_signals: None,
             user_installed_apps: None,
+            recent_search_queries: None,
             subscription_level,
             is_shadow_traffic,
             is_under_the_hood_request: false,
+            under_the_hood_setting_enabled: false,
+            under_the_hood_trace_limited: false,
             is_preview,
             is_polling: false,
             cursor: None,
             request_context: String::new(),
             served_history: vec![],
+            frame_dismissals: None,
             who_to_follow_eligible: false,
             feed_survey_eligible: false,
             video_carousel_eligible: false,
+            seen_carousel_video_ids: HashSet::new(),
             non_polling_timestamps: None,
             impressed_post_ids: Vec::new(),
             push_to_home_post_id,
@@ -246,6 +279,8 @@ impl ScoredPostsQuery {
             following_pagination_meta: Arc::new(OnceLock::new()),
             ad_drops: Arc::default(),
             video_carousel: Arc::new(OnceLock::new()),
+            video_carousel_ctr_model: Arc::new(OnceLock::new()),
+            served_post_score_infos: Arc::new(OnceLock::new()),
         }
     }
 
@@ -259,6 +294,14 @@ impl ScoredPostsQuery {
 
     pub fn has_excluded_topics(&self) -> bool {
         !self.excluded_topic_ids.is_empty()
+    }
+
+    pub fn is_ads_only_timeline(&self) -> bool {
+        self.params.get(EnableAdsOnlyTimeline)
+            && self
+                .params
+                .get(AdsOnlyTimelineViewerIds)
+                .contains(&self.user_id)
     }
 }
 

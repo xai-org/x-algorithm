@@ -1,4 +1,10 @@
+use crate::models::Evaluation;
+use crate::params::LimitedActionsPolicies;
+use crate::quote::QuoteRendering;
+use crate::rules::SafetyLevel;
+use crate::treatment;
 use std::fmt::Debug;
+use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::action::Action;
 use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
 use xai_x_thrift::safety_result::FilteredReason;
@@ -30,6 +36,25 @@ pub(crate) enum Failure {
 }
 
 pub(crate) type Label = (String, String);
+
+const SCREENED_DROPS: [&str; 9] = [
+    "tweet_is_bounced",
+    "author_block_viewer",
+    "author_is_protected",
+    "author_is_suspended",
+    "exclusive_tweet",
+    "nsfw_viewer_is_underage",
+    "nsfw_viewer_has_no_stated_age",
+    "nsfw_logged_out",
+    "premium_tweet",
+];
+
+pub(crate) fn renders_alike(vf: &Label, tweetypie: &Label) -> bool {
+    vf == tweetypie
+        || (vf.0 == <&str>::from(Class::BareDrop)
+            && tweetypie.0 == <&str>::from(Class::Drop)
+            && !SCREENED_DROPS.contains(&tweetypie.1.as_str()))
+}
 
 pub(crate) fn label(class: Class, reason: impl Into<String>) -> Label {
     (<&str>::from(class).to_string(), reason.into())
@@ -84,6 +109,37 @@ pub(crate) fn debug_label(value: &impl Debug) -> Label {
     (class, reason)
 }
 
+pub(crate) fn quote_label(rendering: QuoteRendering<'_>, served: Label) -> Label {
+    match rendering {
+        QuoteRendering::Served => served,
+        QuoteRendering::Rerendered(rerendered) => {
+            state_label(&treatment::rerendered_state(rerendered.reason))
+        }
+        QuoteRendering::Omitted => label(Class::Missing, NONE),
+    }
+}
+
+pub(crate) fn filter_label(result: &vf_pb::TweetVisibilityResult) -> Label {
+    let kind = result.action.and_then(|action| action.kind);
+    let reason = result
+        .filtered_reason
+        .as_ref()
+        .and_then(|r| r.reason.as_ref());
+    (
+        kind.map_or_else(|| NONE.to_string(), |kind| debug_label(&kind).0),
+        reason.map_or_else(|| NONE.to_string(), |reason| debug_label(reason).0),
+    )
+}
+
+pub(crate) fn evaluate_tweets_label(
+    evaluation: &Evaluation,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> Label {
+    treatment::evaluate_tweets_state(evaluation, level, policies)
+        .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
+}
+
 pub(crate) fn state_label(state: &TweetFieldsResultState) -> Label {
     #[expect(
         clippy::wildcard_enum_match_arm,
@@ -131,5 +187,30 @@ pub(crate) fn state_label(state: &TweetFieldsResultState) -> Label {
             failed(Failure::OverCapacity)
         }
         TweetFieldsResultState::Failed(_) => failed(Failure::TweetypieFailed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_alike_matches_only_vf_bare_drop_to_an_unscreened_tweetypie_drop() {
+        let bare_drop = label(Class::BareDrop, NONE);
+        let deactivated = label(Class::Drop, "author_is_deactivated");
+        let suspended = label(Class::Drop, "author_is_suspended");
+        for (vf, tweetypie, alike) in [
+            (&bare_drop, &suspended, false),
+            (&bare_drop, &deactivated, true),
+            (&deactivated, &bare_drop, false),
+            (&suspended, &deactivated, false),
+            (&suspended, &suspended, true),
+        ] {
+            assert_eq!(
+                renders_alike(vf, tweetypie),
+                alike,
+                "vf {vf:?}, tweetypie {tweetypie:?}"
+            );
+        }
     }
 }

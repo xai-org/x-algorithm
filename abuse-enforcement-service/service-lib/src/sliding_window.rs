@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use xai_manhattan::{Key, LkeySelector, NativeManhattanClient, Tenant};
 
@@ -14,8 +15,28 @@ pub const USER_SNAP_PKEY: &str = "global_rate_limit";
 pub const POST_SNAP_PKEY: &str = "global_rate_limit:post";
 const WINDOW_SECS: u64 = 86_400;
 const SNAPSHOT_INTERVAL_SECS: u64 = 60;
-const SNAPSHOT_TTL_SECS: u64 = WINDOW_SECS + 3_600;
 const SCAN_LIMIT: u32 = 200_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowSpec {
+    pub windows_secs: &'static [u64],
+    pub snapshot_interval_secs: u64,
+}
+
+impl WindowSpec {
+    fn longest_secs(&self) -> u64 {
+        self.windows_secs.iter().copied().max().unwrap_or(0)
+    }
+
+    fn snapshot_ttl_secs(&self) -> u64 {
+        self.longest_secs() + 3_600
+    }
+}
+
+pub const DAILY_CAP: WindowSpec = WindowSpec {
+    windows_secs: &[WINDOW_SECS],
+    snapshot_interval_secs: SNAPSHOT_INTERVAL_SECS,
+};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -36,6 +57,33 @@ fn window_usage(counts: &[i64]) -> Option<(i64, i64)> {
 
 fn remaining(cap: i64, used: i64) -> i64 {
     (cap - used).max(0)
+}
+
+fn window_cache(
+    rows: &[(String, i64)],
+    now: u64,
+    window: u64,
+    floor: u64,
+    interval: u64,
+    last_count: i64,
+) -> Cached {
+    let start = snapshot_lkey(floor.max(now.saturating_sub(window)), interval);
+    let count = |(_, c): &(String, i64)| *c;
+    let mut counts: Vec<i64> = Vec::new();
+    counts.extend(rows.iter().rfind(|(l, _)| *l <= start).map(count));
+    counts.extend(rows.iter().filter(|(l, _)| *l > start).map(count));
+    match window_usage(&counts) {
+        Some((rolling_tail, baseline)) => Cached {
+            rolling_tail,
+            baseline,
+            present: true,
+        },
+        None => Cached {
+            rolling_tail: 0,
+            baseline: last_count,
+            present: false,
+        },
+    }
 }
 
 #[async_trait]
@@ -132,6 +180,13 @@ impl SnapshotStore for ManhattanSnapshotStore {
 struct Cached {
     rolling_tail: i64,
     baseline: i64,
+    present: bool,
+}
+
+impl Cached {
+    fn rolling(&self, c_now: i64) -> i64 {
+        self.rolling_tail + (c_now - self.baseline).max(0)
+    }
 }
 
 #[derive(Clone)]
@@ -140,11 +195,12 @@ pub struct SlidingWindowLimiter {
     store: Arc<dyn SnapshotStore>,
     snap_pkey: String,
     metric_label: &'static str,
+    spec: WindowSpec,
     last_count: Arc<AtomicI64>,
-    cached: Arc<RwLock<Cached>>,
+    cached: Arc<RwLock<Vec<Cached>>>,
     seeded: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
-    snapshots_present: Arc<AtomicBool>,
+    floor_ms: Arc<AtomicU64>,
     fail_open: bool,
 }
 
@@ -156,6 +212,7 @@ impl SlidingWindowLimiter {
         fail_open: bool,
         snap_pkey: impl Into<String>,
         metric_label: &'static str,
+        spec: WindowSpec,
     ) -> Self {
         Self::from_parts(
             Arc::new(limiter),
@@ -163,6 +220,7 @@ impl SlidingWindowLimiter {
             fail_open,
             snap_pkey,
             metric_label,
+            spec,
         )
     }
 
@@ -172,17 +230,22 @@ impl SlidingWindowLimiter {
         fail_open: bool,
         snap_pkey: impl Into<String>,
         metric_label: &'static str,
+        spec: WindowSpec,
     ) -> Self {
         Self {
             counter,
             store,
             snap_pkey: snap_pkey.into(),
             metric_label,
+            spec,
             last_count: Arc::new(AtomicI64::new(0)),
-            cached: Arc::new(RwLock::new(Cached::default())),
+            cached: Arc::new(RwLock::new(vec![
+                Cached::default();
+                spec.windows_secs.len()
+            ])),
             seeded: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
-            snapshots_present: Arc::new(AtomicBool::new(false)),
+            floor_ms: Arc::new(AtomicU64::new(0)),
             fail_open,
         }
     }
@@ -190,6 +253,7 @@ impl SlidingWindowLimiter {
     pub async fn try_record(&self, cap: i64) -> bool {
         match self.increment_and_rolling().await {
             Some(rolling) => {
+                let rolling = rolling[0];
                 metrics::RATE_LIMIT_REMAINING
                     .with_label_values(&[self.metric_label])
                     .set(remaining(cap, rolling));
@@ -208,7 +272,7 @@ impl SlidingWindowLimiter {
     }
 
     pub fn stats(&self, cap: i64) -> (u32, u32, u32) {
-        let used = self.rolling_cached();
+        let used = self.rolling_cached()[0];
         (
             used.max(0) as u32,
             cap.max(0) as u32,
@@ -217,7 +281,7 @@ impl SlidingWindowLimiter {
     }
 
     pub async fn record_report(&self, cap: i64) -> Option<serde_json::Value> {
-        let rolling = self.increment_and_rolling().await?;
+        let rolling = self.increment_and_rolling().await?[0];
         metrics::RATE_LIMIT_REMAINING
             .with_label_values(&[self.metric_label])
             .set(remaining(cap, rolling));
@@ -255,29 +319,59 @@ impl SlidingWindowLimiter {
         }
 
         let baseline = self.last_count.load(Ordering::Relaxed);
-        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Cached {
-            rolling_tail: 0,
-            baseline,
-        };
+        for c in self
+            .cached
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            c.rolling_tail = 0;
+            c.baseline = baseline;
+        }
         self.seeded.store(true, Ordering::Relaxed);
         warn!(pkey = %self.snap_pkey, deleted, baseline, "sliding-window reset");
         Some(deleted)
     }
 
-    pub fn spawn_background(&self) {
+    pub fn spawn_background(&self) -> JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
             this.refresh().await;
-            let mut tick = tokio::time::interval(Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(this.spec.snapshot_interval_secs));
             loop {
                 tick.tick().await;
                 this.write_snapshot().await;
                 this.refresh().await;
             }
-        });
+        })
     }
 
-    async fn increment_and_rolling(&self) -> Option<i64> {
+    pub fn set_floor(&self, floor_ms: u64) -> bool {
+        if self.floor_ms.fetch_max(floor_ms, Ordering::Relaxed) >= floor_ms {
+            return false;
+        }
+        let last = self.last_count.load(Ordering::Relaxed);
+        for c in self
+            .cached
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            *c = Cached {
+                rolling_tail: 0,
+                baseline: last,
+                present: false,
+            };
+        }
+        true
+    }
+
+    pub fn floor_ms(&self) -> u64 {
+        self.floor_ms.load(Ordering::Relaxed)
+    }
+
+    pub async fn increment_and_rolling(&self) -> Option<Vec<i64>> {
         let c_now = self.counter.increment().await?;
         let prev = self.last_count.swap(c_now, Ordering::Relaxed);
         self.dirty.store(true, Ordering::Relaxed);
@@ -286,30 +380,36 @@ impl SlidingWindowLimiter {
                 .with_label_values(&[self.metric_label])
                 .inc();
         }
-        if !self.snapshots_present.load(Ordering::Relaxed) {
-            self.cached
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .baseline = c_now;
+        {
+            let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());
+            if cached.iter().all(|c| c.present) {
+                return Some(cached.iter().map(|c| c.rolling(c_now)).collect());
+            }
         }
-        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());
-        let head = (c_now - cached.baseline).max(0);
-        Some(cached.rolling_tail + head)
+        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
+        for c in cached.iter_mut().filter(|c| !c.present) {
+            c.baseline = c_now;
+        }
+        Some(cached.iter().map(|c| c.rolling(c_now)).collect())
     }
 
-    fn rolling_cached(&self) -> i64 {
-        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());
-        let head = (self.last_count.load(Ordering::Relaxed) - cached.baseline).max(0);
-        cached.rolling_tail + head
+    pub fn rolling_cached(&self) -> Vec<i64> {
+        let last = self.last_count.load(Ordering::Relaxed);
+        self.cached
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|c| c.rolling(last))
+            .collect()
     }
 
-    async fn write_snapshot(&self) {
-        if !self.dirty.swap(false, Ordering::Relaxed) {
+    pub async fn write_snapshot(&self) {
+        if !self.dirty.load(Ordering::Relaxed) {
             return;
         }
         let c = self.last_count.load(Ordering::Relaxed);
-        let lkey = snapshot_lkey(now_secs(), SNAPSHOT_INTERVAL_SECS);
-        let ttl = ttl_nanos_from_secs(SNAPSHOT_TTL_SECS);
+        let lkey = snapshot_lkey(now_secs(), self.spec.snapshot_interval_secs);
+        let ttl = ttl_nanos_from_secs(self.spec.snapshot_ttl_secs());
         if let Err(e) = self
             .store
             .put_with_ttl(self.snap_pkey.as_str(), lkey.as_str(), c.to_string(), ttl)
@@ -317,14 +417,20 @@ impl SlidingWindowLimiter {
         {
             metrics::MANHATTAN_ERRORS_TOTAL.inc();
             warn!(pkey = %self.snap_pkey, "sliding-window snapshot write failed: {e}");
+            return;
+        }
+        self.dirty.store(false, Ordering::Relaxed);
+        if self.last_count.load(Ordering::Relaxed) != c {
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
-    async fn refresh(&self) {
+    pub async fn refresh(&self) {
         let now = now_secs();
-        let from = snapshot_lkey(now.saturating_sub(WINDOW_SECS), SNAPSHOT_INTERVAL_SECS);
-        let to = snapshot_lkey(now, SNAPSHOT_INTERVAL_SECS);
+        let interval = self.spec.snapshot_interval_secs;
+        let floor_ms = self.floor_ms.load(Ordering::Relaxed);
+        let from = snapshot_lkey(now.saturating_sub(self.spec.longest_secs()), interval);
+        let to = snapshot_lkey(now, interval);
         let items = match self
             .store
             .scan(
@@ -342,37 +448,46 @@ impl SlidingWindowLimiter {
                 return;
             }
         };
-        let counts: Vec<i64> = items
-            .iter()
-            .filter_map(|(_, v)| v.trim().parse().ok())
+        let rows: Vec<(String, i64)> = items
+            .into_iter()
+            .filter_map(|(l, v)| Some((l, v.trim().parse().ok()?)))
             .collect();
-        let (rolling_tail, baseline) = match window_usage(&counts) {
-            Some(usage) => usage,
-            None => {
-                if !self.seeded.load(Ordering::Relaxed) {
-                    info!(
-                        pkey = %self.snap_pkey,
-                        "sliding-window: cold start (no snapshots), baselining at C={}",
-                        self.last_count.load(Ordering::Relaxed)
-                    );
+        let last = self.last_count.load(Ordering::Relaxed);
+        let persisted = !self.dirty.load(Ordering::Relaxed);
+        if rows.is_empty() && !self.seeded.load(Ordering::Relaxed) {
+            info!(
+                pkey = %self.snap_pkey,
+                "sliding-window: cold start (no snapshots), baselining at C={last}"
+            );
+        }
+        let fresh: Vec<Cached> = self
+            .spec
+            .windows_secs
+            .iter()
+            .map(|&w| {
+                let mut c = window_cache(&rows, now, w, floor_ms / 1_000, interval, last);
+                if persisted {
+                    c.baseline = c.baseline.max(last);
                 }
-                (0, self.last_count.load(Ordering::Relaxed))
+                c
+            })
+            .collect();
+        let first = fresh[0];
+        {
+            let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
+            if self.floor_ms.load(Ordering::Relaxed) != floor_ms {
+                return;
             }
-        };
-        self.snapshots_present
-            .store(!counts.is_empty(), Ordering::Relaxed);
-        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Cached {
-            rolling_tail,
-            baseline,
-        };
+            *cached = fresh;
+        }
         self.seeded.store(true, Ordering::Relaxed);
         warn!(
             pkey = %self.snap_pkey,
             from = %from,
             to = %to,
-            snapshots = counts.len(),
-            rolling_tail,
-            baseline,
+            snapshots = rows.len(),
+            rolling_tail = first.rolling_tail,
+            baseline = first.baseline,
             "sliding-window refresh"
         );
     }
@@ -419,16 +534,127 @@ pub(crate) fn counting_limiter_for_test() -> (SlidingWindowLimiter, Arc<AtomicI6
         true,
         USER_SNAP_PKEY,
         "user",
+        DAILY_CAP,
     );
     (limiter, tickets)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct MemCounter {
+        pub count: AtomicI64,
+        pub fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl CounterSource for MemCounter {
+        async fn increment(&self) -> Option<i64> {
+            if self.fail.load(Ordering::Relaxed) {
+                return None;
+            }
+            Some(self.count.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct MemSnapshots {
+        pub rows: Mutex<BTreeMap<(String, String), String>>,
+        pub hang_scan: AtomicBool,
+        pub hang_put: AtomicBool,
+    }
+
+    impl MemSnapshots {
+        pub(crate) fn put_at(&self, pkey: &str, ts_secs: u64, value: i64) {
+            self.rows.lock().unwrap().insert(
+                (
+                    pkey.to_owned(),
+                    snapshot_lkey(ts_secs, SNAPSHOT_INTERVAL_SECS),
+                ),
+                value.to_string(),
+            );
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotStore for MemSnapshots {
+        async fn scan(
+            &self,
+            pkey: &str,
+            from: Option<&str>,
+            to: Option<&str>,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<(String, String)>> {
+            if self.hang_scan.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((p, l), _)| {
+                    p == pkey
+                        && from.is_none_or(|f| l.as_str() >= f)
+                        && to.is_none_or(|t| l.as_str() <= t)
+                })
+                .map(|((_, l), v)| (l.clone(), v.clone()))
+                .collect())
+        }
+
+        async fn put_with_ttl(
+            &self,
+            pkey: &str,
+            lkey: &str,
+            value: String,
+            _ttl_nanos: i64,
+        ) -> anyhow::Result<()> {
+            if self.hang_put.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            self.rows
+                .lock()
+                .unwrap()
+                .insert((pkey.to_owned(), lkey.to_owned()), value);
+            Ok(())
+        }
+
+        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {
+            self.rows
+                .lock()
+                .unwrap()
+                .remove(&(pkey.to_owned(), lkey.to_owned()));
+            Ok(())
+        }
+    }
+
+    pub(crate) fn limiter(
+        counter: Arc<MemCounter>,
+        store: Arc<MemSnapshots>,
+        snap_pkey: &str,
+        metric_label: &'static str,
+        spec: WindowSpec,
+    ) -> SlidingWindowLimiter {
+        SlidingWindowLimiter::from_parts(counter, store, true, snap_pkey, metric_label, spec)
+    }
+
+    pub(crate) fn now() -> u64 {
+        now_secs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    use super::test_support::MemSnapshots as MemStore;
     use super::*;
 
     #[test]
@@ -500,57 +726,6 @@ mod tests {
         assert!(a < b);
     }
 
-    #[derive(Default)]
-    struct MemStore {
-        rows: Mutex<BTreeMap<(String, String), String>>,
-    }
-
-    #[async_trait]
-    impl SnapshotStore for MemStore {
-        async fn scan(
-            &self,
-            pkey: &str,
-            from: Option<&str>,
-            to: Option<&str>,
-            _limit: u32,
-        ) -> anyhow::Result<Vec<(String, String)>> {
-            Ok(self
-                .rows
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((p, l), _)| {
-                    p == pkey
-                        && from.is_none_or(|f| l.as_str() >= f)
-                        && to.is_none_or(|t| l.as_str() <= t)
-                })
-                .map(|((_, l), v)| (l.clone(), v.clone()))
-                .collect())
-        }
-
-        async fn put_with_ttl(
-            &self,
-            pkey: &str,
-            lkey: &str,
-            value: String,
-            _ttl_nanos: i64,
-        ) -> anyhow::Result<()> {
-            self.rows
-                .lock()
-                .unwrap()
-                .insert((pkey.to_string(), lkey.to_string()), value);
-            Ok(())
-        }
-
-        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {
-            self.rows
-                .lock()
-                .unwrap()
-                .remove(&(pkey.to_string(), lkey.to_string()));
-            Ok(())
-        }
-    }
-
     struct ScriptedCounter {
         script: Mutex<VecDeque<i64>>,
     }
@@ -574,7 +749,7 @@ mod tests {
     const PKEY: &str = "global_rate_limit:post";
 
     fn pod(counter: Arc<ScriptedCounter>, store: Arc<MemStore>) -> SlidingWindowLimiter {
-        SlidingWindowLimiter::from_parts(counter, store, true, PKEY, "post")
+        SlidingWindowLimiter::from_parts(counter, store, true, PKEY, "post", DAILY_CAP)
     }
 
     async fn seed(store: &MemStore, age_secs: u64, value: i64) {
@@ -699,6 +874,149 @@ mod tests {
         let (used, _, rem) = pod_a.stats(CAP);
         assert_eq!(used, 28, "post-reset ramp counts once highs age out");
         assert_eq!(rem as i64, CAP - 28);
+    }
+
+    const HOUR_AND_DAY: WindowSpec = WindowSpec {
+        windows_secs: &[3_600, WINDOW_SECS],
+        snapshot_interval_secs: SNAPSHOT_INTERVAL_SECS,
+    };
+
+    fn multi_window_pod(
+        counter: Arc<ScriptedCounter>,
+        store: Arc<MemStore>,
+    ) -> SlidingWindowLimiter {
+        SlidingWindowLimiter::from_parts(counter, store, true, PKEY, "post", HOUR_AND_DAY)
+    }
+
+    #[tokio::test]
+    async fn each_window_counts_its_own_span_of_one_series() {
+        let store = Arc::new(MemStore::default());
+        seed(&store, 7_200, 10).await;
+        seed(&store, 4_000, 15).await;
+        seed(&store, 1_800, 20).await;
+        let pod_a = multi_window_pod(ScriptedCounter::new([21]), store);
+        pod_a.refresh().await;
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![6, 11]));
+        assert_eq!(pod_a.stats(CAP).0, 6, "stats read the first window");
+
+        assert!(pod_a.set_floor((now_secs() - 2 * WINDOW_SECS) * 1_000));
+        pod_a.refresh().await;
+        assert_eq!(
+            pod_a.rolling_cached(),
+            vec![6, 11],
+            "a floor before every window changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_hour_idle_at_its_start_counts_a_burst_at_once() {
+        let store = Arc::new(MemStore::default());
+        seed(&store, 7_200, 10).await;
+        seed(&store, 5_400, 20).await;
+        let pod_a = multi_window_pod(ScriptedCounter::new([21, 22, 23]), store);
+        pod_a.refresh().await;
+        for n in 1..=3 {
+            assert_eq!(
+                pod_a.increment_and_rolling().await,
+                Some(vec![n, 10 + n]),
+                "the day keeps its tail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_hour_after_a_counter_reset_counts_from_the_latest_snapshot() {
+        let store = Arc::new(MemStore::default());
+        seed(&store, 10_800, 100).await;
+        seed(&store, 7_200, 5).await;
+        let pod_a = multi_window_pod(ScriptedCounter::new([6, 7, 8]), store);
+        pod_a.refresh().await;
+        for n in 1..=3 {
+            assert_eq!(pod_a.increment_and_rolling().await.unwrap()[0], n);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_persisted_pre_reset_count_adds_nothing_after_a_counter_reset() {
+        let store = Arc::new(MemStore::default());
+        let pod_a = multi_window_pod(ScriptedCounter::new([1_000, 21]), store.clone());
+        pod_a.refresh().await;
+        pod_a.increment_and_rolling().await.unwrap();
+        pod_a.write_snapshot().await;
+
+        store.rows.lock().unwrap().clear();
+        seed(&store, 10_800, 1_000).await;
+        seed(&store, 7_200, 5).await;
+        seed(&store, 1_800, 20).await;
+        pod_a.refresh().await;
+        assert_eq!(pod_a.rolling_cached(), vec![15, 0]);
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![15, 0]));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_snapshot_write_is_retried() {
+        let store = Arc::new(MemStore::default());
+        seed(&store, 1_800, 20).await;
+        let pod_a = pod(ScriptedCounter::new([25]), store.clone());
+        pod_a.refresh().await;
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![5]));
+
+        store.hang_put.store(true, Ordering::Relaxed);
+        let cut = tokio::time::timeout(Duration::from_millis(20), pod_a.write_snapshot()).await;
+        assert!(cut.is_err(), "the put hangs");
+        pod_a.refresh().await;
+        assert_eq!(pod_a.rolling_cached(), vec![5], "not treated as persisted");
+
+        store.hang_put.store(false, Ordering::Relaxed);
+        pod_a.write_snapshot().await;
+        let rows = store.scan(PKEY, None, None, 100).await.unwrap();
+        assert!(rows.iter().any(|(_, v)| v == "25"), "retried: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn cold_start_counts_fresh_from_the_live_count() {
+        let store = Arc::new(MemStore::default());
+        let pod_a = pod(
+            ScriptedCounter::new([5_000_000, 5_000_001, 5_000_002]),
+            store,
+        );
+        pod_a.refresh().await;
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![0]));
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![0]));
+        pod_a.write_snapshot().await;
+        pod_a.refresh().await;
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![1]));
+        assert_eq!(pod_a.stats(CAP).0, 1);
+    }
+
+    #[tokio::test]
+    async fn a_floor_restarts_every_window_it_cuts() {
+        let store = Arc::new(MemStore::default());
+        seed(&store, 7_200, 10).await;
+        seed(&store, 1_800, 20).await;
+        seed(&store, 600, 25).await;
+        let pod_a = multi_window_pod(ScriptedCounter::new([26]), store);
+        pod_a.refresh().await;
+        assert_eq!(pod_a.increment_and_rolling().await, Some(vec![16, 16]));
+
+        let floor = (now_secs() - 1_200) * 1_000;
+        assert!(pod_a.set_floor(floor));
+        assert_eq!(pod_a.floor_ms(), floor);
+        assert_eq!(
+            pod_a.rolling_cached(),
+            vec![0, 0],
+            "nothing before the floor counts, even before the next refresh"
+        );
+        pod_a.refresh().await;
+        assert_eq!(pod_a.rolling_cached(), vec![6, 6]);
+
+        assert!(
+            !pod_a.set_floor(floor - 600_000),
+            "a lower floor is ignored"
+        );
+        assert!(!pod_a.set_floor(floor), "an equal floor is ignored");
+        assert!(pod_a.set_floor(floor + 1), "a floor 1 ms later restarts");
+        assert_eq!(pod_a.floor_ms(), floor + 1);
     }
 
     #[tokio::test]

@@ -1,52 +1,38 @@
-use anyhow::{bail, Result};
+use crate::clients::strato::{self, EncodeOnlyCodec, ToThrift};
+use anyhow::Result;
+use std::collections::HashMap;
 use std::iter;
 use thrift::protocol::{
-    TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TStructIdentifier, TType,
+    TFieldIdentifier, TInputProtocol, TOutputProtocol, TStructIdentifier, TType,
 };
-use thrift::{new_protocol_error, ProtocolErrorKind};
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
-use xai_strato::{encode, MValCodec, StratoGrpc};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
+use xai_strato::{encode, StratoGrpc};
 
 const IS_MEMBER_COLUMN: &str = "trusted-friends/visibility-filtering/isMember.TrustedFriendsList";
 const IS_OWNER_COLUMN: &str = "trusted-friends/visibility-filtering/isOwner.TrustedFriendsList";
 
-pub struct TrustedFriendsClient {
-    grpc: StratoGrpc,
-}
-
-impl TrustedFriendsClient {
-    pub fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
-
-    pub async fn batch_is_member_or_owner(
-        &self,
-        viewer_id: u64,
-        list_ids: &[u64],
-    ) -> Vec<Result<bool>> {
-        let calls = list_ids
-            .iter()
-            .flat_map(|&list_id| {
-                let key = key(list_id, viewer_id);
-                [IS_MEMBER_COLUMN, IS_OWNER_COLUMN]
-                    .map(|column| (column.to_string(), "fetch".to_string(), vec![key.clone()]))
-            })
-            .collect();
-        let mut answers = self
-            .grpc
-            .batch_call(calls, None)
-            .await
-            .into_iter()
-            .map(|bytes| decode_answer(&bytes?));
-        iter::from_fn(|| Some(member_or_owner(answers.next()?, answers.next()?))).collect()
-    }
+pub async fn batch_is_member_or_owner(
+    grpc: &StratoGrpc,
+    viewer_id: u64,
+    list_ids: &[u64],
+) -> HashMap<u64, Result<bool>> {
+    let keys = list_ids.iter().flat_map(|&list_id| {
+        let key = key(list_id, viewer_id);
+        [(IS_MEMBER_COLUMN, key.clone()), (IS_OWNER_COLUMN, key)]
+    });
+    let mut answers = strato::fetch_each(grpc, keys, None)
+        .await
+        .into_iter()
+        .map(|bytes| decode_answer(&bytes?));
+    let lists = iter::from_fn(|| Some(member_or_owner(answers.next()?, answers.next()?)));
+    list_ids.iter().copied().zip(lists).collect()
 }
 
 pub(crate) fn key(list_id: u64, viewer_id: u64) -> Vec<u8> {
     let view = View {
         user_id: viewer_id.cast_signed(),
     };
-    encode(&(list_id.cast_signed(), &view))
+    encode(&(list_id.cast_signed(), EncodeOnlyCodec(view)))
 }
 
 fn member_or_owner(member: Result<bool>, owner: Result<bool>) -> Result<bool> {
@@ -58,10 +44,7 @@ fn member_or_owner(member: Result<bool>, owner: Result<bool>) -> Result<bool> {
 }
 
 fn decode_answer(bytes: &[u8]) -> Result<bool> {
-    match strato_decode::<Answer>(bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value.is_some_and(|Answer(answer)| answer)),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
-    }
+    Ok(strato::row(strato_decode::<Answer>(bytes)?)?.is_some_and(|Answer(answer)| answer))
 }
 
 struct View {
@@ -70,21 +53,12 @@ struct View {
 
 const USER_ID_FIELD: i16 = 11846;
 
-impl MValCodec for View {
-    fn thrift_type() -> TType {
-        TType::Struct
-    }
-
-    #[expect(clippy::unimplemented, reason = "a view is only encoded")]
-    fn from_thrift(_proto: &mut dyn TInputProtocol) -> Self {
-        unimplemented!("a view is only encoded")
-    }
-
+impl ToThrift for View {
     #[expect(
         clippy::unwrap_used,
         reason = "`xai_strato::encode` writes into a Vec, which cannot fail"
     )]
-    fn to_thrift(&self, proto: &mut dyn TOutputProtocol) {
+    fn write(&self, proto: &mut dyn TOutputProtocol) {
         proto
             .write_struct_begin(&TStructIdentifier::new("View"))
             .unwrap();
@@ -100,23 +74,16 @@ impl MValCodec for View {
 
 struct Answer(bool);
 
-impl TSerializable for Answer {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+impl StratoRead for Answer {
+    fn read(i_prot: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         Ok(Self(i_prot.read_bool()?))
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(new_protocol_error(
-            ProtocolErrorKind::NotImplemented,
-            "Answer is decode-only",
-        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::{found, no_row, Thrift};
+    use crate::clients::strato::answer::{found, no_row, Thrift};
     use anyhow::anyhow;
 
     fn answer(value: Option<bool>) -> bool {

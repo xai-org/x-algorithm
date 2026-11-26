@@ -3,6 +3,9 @@
 pub mod adler32;
 pub mod admission;
 #[cfg(target_os = "linux")]
+pub mod checkpoint_gateway;
+pub mod checkpoint_policy;
+#[cfg(target_os = "linux")]
 pub mod checkpoint_proxy;
 #[cfg(target_os = "linux")]
 pub mod checkpoint_proxy_metrics;

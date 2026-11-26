@@ -9,6 +9,9 @@ from xrex.utils.utils import ffn_size
 @configclass
 class ScaleConfig(Config):
     qk_norm_lr_scale: float = 1.0
+    transformer_matrix_lr_scale: float = 1.0
+    head_lr_scale: float = 1.0
+    hidden_proj_lr_scale: float = 1.0
     ln_weight_decay_mask: float = 0.0
     ffn_init_scale: float = 1.0
     attn_init_scale: float = 1.0
@@ -21,6 +24,9 @@ class ScaleConfig(Config):
 
     def emb_lr_multiplier(self, emb_size):
         return math.sqrt(512 / emb_size) * 0.5
+
+    def head_lr_multiplier(self, emb_size):
+        return self.emb_lr_multiplier(emb_size) * self.head_lr_scale
 
     def hidden_lr_multiplier(self, fan_in):
         return 512 / fan_in

@@ -253,6 +253,8 @@ def rowwise_adagrad_lazy_update_start(
     eps: float,
     accum_decay_rate: float,
     weight_decay_rate: float,
+    weight_decay_exempt_window: float = 0.0,
+    stochastic_rounding: bool = False,
 ):
     assert last_step.shape == row_state.shape and last_step.dtype == jnp.int32
     with jax.named_scope("async_emb.rowwise_adagrad_lazy_update_start"):
@@ -276,6 +278,8 @@ def rowwise_adagrad_lazy_update_start(
             eps=float(eps),
             accum_decay_rate=float(accum_decay_rate),
             weight_decay_rate=float(weight_decay_rate),
+            weight_decay_exempt_window=float(weight_decay_exempt_window),
+            stochastic_rounding=int(stochastic_rounding),
         )
     return tuple(outs)
 

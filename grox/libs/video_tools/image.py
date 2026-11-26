@@ -149,6 +149,20 @@ def _padded_image(image: Image.Image, high_quality_jpeg: bool = False) -> bytes:
     return _img_to_bytes(image, high_quality_jpeg)
 
 
+def side_by_side(images: list[bytes], max_aspect: float) -> bytes | None:
+    opened = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
+    height = max(im.height for im in opened)
+    widths = [max(1, round(im.width * height / im.height)) for im in opened]
+    if sum(widths) > max_aspect * height:
+        return None
+    with Image.new("RGB", (sum(widths), height), (255, 255, 255)) as row:
+        x = 0
+        for im, width in zip(opened, widths):
+            row.paste(im.resize((width, height), Image.Resampling.LANCZOS), (x, 0))
+            x += width
+        return _img_to_bytes(row)
+
+
 def pad_image(image_bytes: bytes) -> bytes:
     with Image.open(io.BytesIO(image_bytes)) as img:
         with img.convert("RGB") as image:
@@ -160,8 +174,9 @@ _MOTION_REVEAL_MAX_INPUT_FRAMES = 48
 _MOTION_REVEAL_WORK_MAX_DIM = 640
 _MOTION_REVEAL_OVERVIEW_FRAMES = 9
 _MOTION_REVEAL_DETAIL_STILLS = 6
+_MOTION_REVEAL_PLAIN_STILLS = 2
+_MOTION_REVEAL_MAX_OPAQUE_MOTION_SHARE = 0.35
 _MOTION_REVEAL_JPEG_QUALITY = 90
-_MOTION_REVEAL_MIN_RESIDUAL_P99 = 3.0
 _MOTION_REVEAL_MAX_RESIDUAL_P99 = 100.0
 _MOTION_REVEAL_DENOISE_ENERGY = (1.0, 3.0, 8.0)
 _MOTION_REVEAL_DENOISE_SIGMA = (2.0, 1.2, 0.0)
@@ -177,7 +192,19 @@ _MOTION_REVEAL_STATIC_MIN_RESPONSE = 0.05
 _MOTION_REVEAL_MIN_COVER_GRADIENT = 5.0
 _MOTION_REVEAL_MAX_WARP_TRANSLATION = 0.15
 _MOTION_REVEAL_MAX_WARP_LINEAR = 0.15
-_MOTION_REVEAL_PREGATE_P99 = (2.0, 130.0)
+_OVERLAY_WORK_MAX_DIM = 320
+_OVERLAY_PATCH = 16
+_OVERLAY_LOCAL_RADIUS = 3
+_OVERLAY_MIN_CHANGE = 2.0
+_OVERLAY_MIN_COVER_TEXTURE = 1.5
+_OVERLAY_SEE_THROUGH_NCC = 0.5
+_OVERLAY_DEPENDENT_NCC = 0.35
+_OVERLAY_OPAQUE_NCC = 0.25
+_OVERLAY_GLOBAL_WEIGHTS = (2.164, 0.581, -8.755, 22.971, -5.714, -9.539, 0.928)
+_OVERLAY_LOCAL_WEIGHTS = (4.049, -0.254, 9.51, 21.771, 0.616, -1.785, 0.232)
+_OVERLAY_BIAS = -4.374
+_OVERLAY_MIN_SCORE = -1.0
+_OVERLAY_LOCAL_OPAQUE_MARGIN = 0.05
 _MOTION_REVEAL_SKIN_LAB_AB = (143.0, 148.0)
 _MOTION_REVEAL_SKIN_AXIS_MAX_DISTANCE = 12.0
 _MOTION_REVEAL_FLOW_MAX_DIM = 320
@@ -228,6 +255,53 @@ def _stretch_to_u8(arr: np.ndarray) -> np.ndarray:
     if hi <= lo + 1e-3:
         return np.zeros(arr.shape, dtype=np.uint8)
     return np.clip((arr - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+
+def _plain_reveal(residual: np.ndarray) -> np.ndarray:
+    smoothed = cv2.GaussianBlur(residual, (0, 0), 2.0)
+    lo, hi = np.percentile(smoothed, (1, 99))
+    stretched = np.clip(
+        (smoothed - lo) * (255.0 / max(float(hi - lo), 1e-3)), 0, 255
+    ).astype(np.uint8)
+    lab = cv2.cvtColor(stretched, cv2.COLOR_BGR2LAB)
+    lab[..., 0] = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(lab[..., 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _opaque_motion_share(frames: np.ndarray, radius: int | None) -> float:
+    def grey(image: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(
+            np.clip(image, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32)
+
+    def local(x: np.ndarray) -> np.ndarray:
+        return cv2.GaussianBlur(x, (0, 0), 3.0)
+
+    shares = []
+    for t, frame in enumerate(frames):
+        if radius is not None or t == 0:
+            cover = _temporal_median(
+                frames
+                if radius is None
+                else frames[max(0, t - radius) : t + radius + 1]
+            )
+            cover_grey = grey(cover)
+            c = _band_pass(cover_grey)
+            textured = np.sqrt(local(c * c)) > _OVERLAY_MIN_COVER_TEXTURE
+        frame_grey = grey(frame)
+        f = _band_pass(frame_grey)
+        see_through = local(f * c) / np.sqrt(local(f * f) * local(c * c) + 1e-3)
+        opaque = (
+            (see_through < _OVERLAY_OPAQUE_NCC)
+            & (local(np.abs(frame_grey - cover_grey)) > 6.0)
+            & textured
+        )
+        opaque = np.clip(
+            cv2.GaussianBlur(opaque.astype(np.float32), (0, 0), 4.0) * 1.5, 0.0, 1.0
+        )
+        change = np.abs(frame.astype(np.float32) - cover).mean(axis=-1)
+        shares.append(float((change * opaque).sum() / (change.sum() + 1e-6)))
+    return float(np.median(shares))
 
 
 def _encode_reveal(bgr: np.ndarray) -> bytes | None:
@@ -405,6 +479,119 @@ def _skin_plausible(overlays: list[np.ndarray]) -> bool:
     )
 
 
+def _band_pass(gray: np.ndarray) -> np.ndarray:
+    return cv2.GaussianBlur(gray, (0, 0), 1.0) - cv2.GaussianBlur(gray, (0, 0), 4.0)
+
+
+def _patches(x: np.ndarray) -> np.ndarray:
+    p = _OVERLAY_PATCH
+    h, w = x.shape[-2:]
+    lead = x.shape[:-2]
+    x = x[..., : h // p * p, : w // p * p]
+    return (
+        x.reshape(*lead, h // p, p, w // p, p)
+        .swapaxes(-3, -2)
+        .reshape(*lead, h // p, w // p, p * p)
+    )
+
+
+def _patch_ncc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a = a - a.mean(-1, keepdims=True)
+    b = b - b.mean(-1, keepdims=True)
+    return (a * b).sum(-1) / np.sqrt((a * a).sum(-1) * (b * b).sum(-1) + 1e-6)
+
+
+def _overlay_measures(gray: np.ndarray, radius: int | None) -> np.ndarray:
+    n = len(gray)
+    if radius is None:
+        covers = np.median(gray, axis=0)[None]
+    else:
+        covers = np.stack(
+            [
+                np.median(gray[max(0, t - radius) : t + radius + 1], axis=0)
+                for t in range(n)
+            ]
+        )
+    residual = np.empty_like(gray)
+    for t in range(n):
+        cover = covers[0 if radius is None else t]
+        cover = cover - cover.mean()
+        frame = gray[t] - gray[t].mean()
+        residual[t] = (
+            frame
+            - float((frame * cover).sum() / ((cover * cover).sum() + 1e-6)) * cover
+        )
+    cover_bp = _patches(np.stack([_band_pass(c) for c in covers]))
+    frame_bp = _patches(np.stack([_band_pass(f) for f in gray]))
+    residual_bp = _patches(np.stack([_band_pass(r) for r in residual]))
+    change = _patches(
+        np.stack([cv2.GaussianBlur(np.abs(r), (0, 0), 2.0) for r in residual])
+    ).mean(-1)
+    noise = _patches(
+        np.stack([r - cv2.GaussianBlur(r, (0, 0), 1.0) for r in residual])
+    ).std(-1)
+    changed = change > max(_OVERLAY_MIN_CHANGE, 3.0 * float(np.median(noise)))
+    candidates = changed & (cover_bp.std(-1) > _OVERLAY_MIN_COVER_TEXTURE)
+    measures = np.zeros(len(_OVERLAY_GLOBAL_WEIGHTS))
+    measures[0] = changed.mean()
+    if not candidates.any():
+        return measures
+    see_through = _patch_ncc(frame_bp, cover_bp)
+    dependent = np.abs(_patch_ncc(residual_bp, cover_bp))
+    structured = residual_bp.std(-1) > 2.0 * noise
+    transparent = (
+        candidates
+        & structured
+        & (see_through > _OVERLAY_SEE_THROUGH_NCC)
+        & (dependent < _OVERLAY_DEPENDENT_NCC)
+    )
+    opaque = candidates & (see_through < _OVERLAY_OPAQUE_NCC)
+    n_changed = float(changed.sum())
+    candidate_see_through = see_through[candidates]
+    measures[1:] = (
+        np.median(candidate_see_through),
+        opaque.sum() / n_changed,
+        transparent.sum() / n_changed,
+        structured[candidates].mean(),
+        (candidate_see_through < _OVERLAY_OPAQUE_NCC).mean(),
+        np.log1p(np.median(change[changed])),
+    )
+    return measures
+
+
+def _overlay_cover_radius(stack_u8: np.ndarray) -> tuple[bool, int | None]:
+    h, w = stack_u8.shape[1:3]
+    scale = min(1.0, _OVERLAY_WORK_MAX_DIM / max(h, w))
+    size = (max(_OVERLAY_PATCH, int(w * scale)), max(_OVERLAY_PATCH, int(h * scale)))
+    gray = np.stack(
+        [
+            cv2.resize(
+                cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), size, interpolation=cv2.INTER_AREA
+            )
+            for f in stack_u8
+        ]
+    )
+    gray = gray.astype(np.float32)
+    whole, local = (
+        _overlay_measures(gray, None),
+        _overlay_measures(gray, _OVERLAY_LOCAL_RADIUS),
+    )
+    score = (
+        float(
+            whole @ np.array(_OVERLAY_GLOBAL_WEIGHTS)
+            + local @ np.array(_OVERLAY_LOCAL_WEIGHTS)
+        )
+        + _OVERLAY_BIAS
+    )
+    if score < _OVERLAY_MIN_SCORE:
+        return False, None
+    return True, (
+        _OVERLAY_LOCAL_RADIUS
+        if whole[2] > local[2] + _OVERLAY_LOCAL_OPAQUE_MARGIN
+        else None
+    )
+
+
 def _to_grey(bgr_u8: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
@@ -437,18 +624,27 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
     originals_u8 = np.stack(decoded, axis=0)
 
     raw_median = _temporal_median(originals_u8)
-    raw_residual = _residual_magnitude(originals_u8, raw_median)
-    raw_p99 = np.percentile(raw_residual.reshape(len(originals_u8), -1), 99, axis=1)
+    raw_p99 = np.percentile(
+        _residual_magnitude(originals_u8, raw_median).reshape(len(originals_u8), -1),
+        99,
+        axis=1,
+    )
+    if float(np.median(raw_p99)) > _MOTION_REVEAL_MAX_RESIDUAL_P99:
+        return []
+    is_overlay, cover_radius = _overlay_cover_radius(originals_u8)
     if (
-        not _MOTION_REVEAL_PREGATE_P99[0]
-        <= float(np.median(raw_p99))
-        <= _MOTION_REVEAL_PREGATE_P99[1]
+        not is_overlay
+        or _opaque_motion_share(originals_u8, cover_radius)
+        > _MOTION_REVEAL_MAX_OPAQUE_MOTION_SHARE
     ):
         return []
 
     reference_gray = _to_gray_u8(raw_median)
     warps: dict[int, np.ndarray] = {}
-    if _cover_gradient(reference_gray) >= _MOTION_REVEAL_MIN_COVER_GRADIENT:
+    if (
+        cover_radius is None
+        and _cover_gradient(reference_gray) >= _MOTION_REVEAL_MIN_COVER_GRADIENT
+    ):
         scale = _ecc_working_scale(*originals_u8.shape[1:3])
         reference_gray_f32 = reference_gray.astype(np.float32)
         reference_small = _ecc_downscale(reference_gray, scale)
@@ -465,7 +661,7 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
 
     if not warps:
         stack: np.ndarray = originals_u8
-        median, residual, per_frame_p99 = raw_median, raw_residual, raw_p99
+        median = raw_median
     else:
         stack = np.empty(originals_u8.shape, dtype=np.float32)
         for index, frame_u8 in enumerate(originals_u8):
@@ -474,17 +670,24 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
                 frame_u8 if warp is None else _warp(frame_u8.astype(np.float32), warp)
             )
         median = np.median(stack, axis=0)
-        residual = _residual_magnitude(stack, median)
-        per_frame_p99 = np.percentile(residual.reshape(len(stack), -1), 99, axis=1)
-    del raw_residual
-    motion_energy = residual.mean(axis=(1, 2))
-    if (
-        not _MOTION_REVEAL_MIN_RESIDUAL_P99
-        <= float(np.median(per_frame_p99))
-        <= _MOTION_REVEAL_MAX_RESIDUAL_P99
-    ):
-        return []
 
+    windows = np.array_split(
+        np.arange(len(stack)), max(1, len(stack) // _MOTION_REVEAL_WINDOW_FRAMES)
+    )
+    covers = [
+        median
+        if cover_radius is None
+        else _temporal_median(
+            stack[max(0, window[0] - cover_radius) : window[-1] + cover_radius + 1]
+        )
+        for window in windows
+    ]
+    motion_energy = np.concatenate(
+        [
+            _residual_magnitude(stack[window], cover).mean(axis=(1, 2))
+            for window, cover in zip(windows, covers)
+        ]
+    )
     sigma = float(
         np.interp(
             float(np.median(motion_energy)),
@@ -493,16 +696,13 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
         )
     )
 
-    windows = np.array_split(
-        np.arange(len(stack)), max(1, len(stack) // _MOTION_REVEAL_WINDOW_FRAMES)
-    )
     overlays: list[np.ndarray] = []
     overlay_energy: list[float] = []
     skin: list[float] = []
     reference_frames: list[int] = []
-    for window in windows:
+    for window, cover in zip(windows, covers):
         ref = int(window[np.argmax(motion_energy[window])])
-        reference = stack[ref] - median
+        reference = stack[ref] - cover
         samples = [reference]
         sample_weights = [np.ones(reference.shape[:2], dtype=np.float32)]
         magnitude = max(1.0, float(np.percentile(np.abs(reference), 85)))
@@ -510,7 +710,7 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
             if i == ref:
                 continue
             aligned_residual, valid = _dense_align_residual(
-                reference, stack[i] - median, min(16.0, 96 / magnitude)
+                reference, stack[i] - cover, min(16.0, 96 / magnitude)
             )
             difference = cv2.GaussianBlur(
                 np.abs(aligned_residual - reference).mean(axis=-1), (0, 0), 1.2
@@ -528,7 +728,8 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
         overlays.append(stretched)
         reference_frames.append(ref)
 
-    if not _skin_plausible(overlays):
+    skin_plausible = _skin_plausible(overlays)
+    if not skin_plausible:
         overlays = [_to_grey(o) for o in overlays]
 
     score = np.array(overlay_energy) * (0.5 + np.array(skin))
@@ -541,6 +742,16 @@ def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
     )
     if encoded:
         out.append(encoded)
+
+    peaks = [int(window[np.argmax(motion_energy[window])]) for window in windows]
+    strongest = sorted(range(len(windows)), key=lambda i: -motion_energy[peaks[i]])[
+        :_MOTION_REVEAL_PLAIN_STILLS
+    ]
+    for i in strongest:
+        plain = _plain_reveal(stack[peaks[i]].astype(np.float32) - covers[i])
+        encoded = _encode_reveal(plain if skin_plausible else _to_grey(plain))
+        if encoded:
+            out.append(encoded)
 
     picks = np.linspace(
         0, len(overlays) - 1, min(_MOTION_REVEAL_OVERVIEW_FRAMES, len(overlays))

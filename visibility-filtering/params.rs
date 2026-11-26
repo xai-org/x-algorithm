@@ -1,34 +1,40 @@
 mod client_switches;
-mod limited_actions_policy;
+pub(crate) mod limited_actions_copy;
+pub(crate) mod limited_actions_policy;
 
-use crate::limited_actions_copy::DriftCheck;
+use crate::metrics::families::FEATURE_SWITCH_LOAD_FAILURES;
+use crate::metrics::Metrics;
 use arc_swap::ArcSwap;
+use limited_actions_copy::DriftCheck;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use strum::VariantArray;
-use xai_feature_switches::{Feature, FeatureSwitches, RecipientBuilder, Value};
-use xai_stats_receiver::StatsReceiverExt;
+use xai_feature_switches::{
+    parse_query, DdgExperimentBucketsChooser, ExperimentBucketImpressor, ExperimentBucketsChooser,
+    Feature, FeatureSwitches, KafkaBucketImpressor, MembershipCheck, NullBucketImpressor,
+    NullExperimentBucketsChooser, QueryNode, RecipientBuilder, ReloadableAbDeciderStore, Value,
+    DEFAULT_ABDECIDER_PATH,
+};
+use xai_safety_label_source::{LabelCacheSwitches, SafetyLabelSource};
 
 pub(crate) use client_switches::ClientSwitches;
-pub use limited_actions_policy::LimitedActionType;
 pub(crate) use limited_actions_policy::LimitedActionsPolicies;
 
-const SCALA_FILES: [&str; 6] = [
+const SCALA_FILES: [&str; 7] = [
     "age_verification.yml",
     "community_tweet.yml",
     "country_specific_nsfw_content_gating.yml",
     "freedom_of_speech_not_reach.yml",
     "media_visibility_treatments.yml",
+    "soft_nsfw.yml",
     "stale_tweet.yml",
 ];
 
 const LIMITED_ACTIONS_POLICY_FILE: &str =
     "../../visibility-limited-actions/main/limited_actions_policy.yml";
-
-const LOAD_FAILURE_COUNTER: &str = "feature_switch_load_failures";
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, strum::VariantArray,
@@ -55,12 +61,17 @@ impl CountryList {
         }
     }
 
+    pub(crate) fn names_by_default(self, code: &str) -> Option<&'static str> {
+        self.default_codes()
+            .iter()
+            .find(|&&listed| listed == code)
+            .copied()
+    }
+
     pub(crate) fn listed_by_default(code: &str) -> Option<&'static str> {
         Self::VARIANTS
             .iter()
-            .flat_map(|list| list.default_codes())
-            .find(|&&listed| listed == code)
-            .copied()
+            .find_map(|list| list.names_by_default(code))
     }
 
     const fn default_codes(self) -> &'static [&'static str] {
@@ -81,14 +92,50 @@ impl CountryList {
 }
 
 pub(crate) struct CountryLists {
-    lists: ArcSwap<Vec<Vec<String>>>,
+    lists: ArcSwap<Vec<CountryCodes>>,
+}
+
+#[derive(Default)]
+struct CountryCodes([u64; 11]);
+
+impl CountryCodes {
+    fn parse<'c>(codes: impl IntoIterator<Item = &'c str>) -> Option<Self> {
+        let mut parsed = Self::default();
+        for code in codes {
+            let [first, second] = *code.as_bytes() else {
+                return None;
+            };
+            let (word, bit) = Self::bit(first.to_ascii_lowercase(), second.to_ascii_lowercase())?;
+            *parsed.0.get_mut(word)? |= bit;
+        }
+        Some(parsed)
+    }
+
+    fn contains(&self, code: &str) -> bool {
+        let [first, second] = *code.as_bytes() else {
+            return false;
+        };
+        Self::bit(first, second)
+            .and_then(|(word, bit)| self.0.get(word).map(|held| held & bit != 0))
+            .unwrap_or(false)
+    }
+
+    fn bit(first: u8, second: u8) -> Option<(usize, u64)> {
+        let letter = |byte: u8| byte.is_ascii_lowercase().then(|| usize::from(byte - b'a'));
+        let index = letter(first)? * 26 + letter(second)?;
+        Some((index / 64, 1 << (index % 64)))
+    }
+
+    fn default_for(list: CountryList) -> Self {
+        Self::parse(list.default_codes().iter().copied()).unwrap_or_default()
+    }
 }
 
 impl CountryLists {
     pub fn starting_at_default() -> Self {
         let lists = CountryList::VARIANTS
             .iter()
-            .map(|list| owned(list.default_codes()))
+            .map(|&list| CountryCodes::default_for(list))
             .collect();
         Self {
             lists: ArcSwap::from_pointee(lists),
@@ -100,32 +147,7 @@ impl CountryLists {
             clippy::indexing_slicing,
             reason = "`lists` maps `CountryList::VARIANTS`, which is in declaration order"
         )]
-        let codes = &self.lists.load()[list as usize];
-        codes.iter().any(|c| c == country_code)
-    }
-
-    pub(crate) fn codes(&self) -> BTreeMap<CountryList, Vec<String>> {
-        CountryList::VARIANTS
-            .iter()
-            .copied()
-            .zip(self.lists.load().iter().cloned())
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_codes(codes: &BTreeMap<CountryList, Vec<String>>) -> anyhow::Result<Self> {
-        let lists = CountryList::VARIANTS
-            .iter()
-            .map(|list| {
-                codes
-                    .get(list)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("country_lists lacks {list:?}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Self {
-            lists: ArcSwap::from_pointee(lists),
-        })
+        self.lists.load()[list as usize].contains(country_code)
     }
 
     pub fn refresh(&self, feature_switches: &FeatureSwitches) {
@@ -138,39 +160,169 @@ impl CountryLists {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct Experiments {
+    store: Option<Arc<ReloadableAbDeciderStore>>,
+    impressor: Arc<dyn ExperimentBucketImpressor>,
+}
+
+impl Experiments {
+    pub fn none() -> Self {
+        Self::without_impressions(None)
+    }
+
+    pub async fn serving(datacenter: &str) -> Self {
+        let store = abdecider_store();
+        if crate::config::logs_ddg_impressions() {
+            Self {
+                store,
+                impressor: kafka_impressor(datacenter).await,
+            }
+        } else {
+            Self::without_impressions(store)
+        }
+    }
+
+    fn without_impressions(store: Option<Arc<ReloadableAbDeciderStore>>) -> Self {
+        Self {
+            store,
+            impressor: Arc::new(NullBucketImpressor::new()),
+        }
+    }
+
+    fn engine(&self, features: Vec<Feature>) -> xai_feature_switches::Result<FeatureSwitches> {
+        let chooser: Arc<dyn ExperimentBucketsChooser> = match &self.store {
+            Some(store) => Arc::new(
+                DdgExperimentBucketsChooser::new(Arc::clone(store) as _)
+                    .with_key_filter(experiment_keys(&features)),
+            ),
+            None => Arc::new(NullExperimentBucketsChooser::new()),
+        };
+        FeatureSwitches::with_options(features, chooser, Arc::clone(&self.impressor), None, false)
+    }
+}
+
+fn abdecider_store() -> Option<Arc<ReloadableAbDeciderStore>> {
+    match ReloadableAbDeciderStore::new(DEFAULT_ABDECIDER_PATH) {
+        Ok(store) => {
+            store.start_reload_task();
+            Some(store)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "feature switches: no abdecider store; bucket rules never match");
+            None
+        }
+    }
+}
+
+async fn kafka_impressor(datacenter: &str) -> Arc<dyn ExperimentBucketImpressor> {
+    let producer = FeatureSwitches::builder()
+        .without_abdecider()
+        .datacenter(datacenter)
+        .kafka_impressor_enabled(true)
+        .build()
+        .await
+        .ok()
+        .and_then(|engine| engine.kafka_producer().cloned());
+    match producer {
+        Some(producer) => Arc::new(KafkaBucketImpressor::new(producer)),
+        None => {
+            tracing::warn!("feature switches: no Kafka producer; DDG impressions are dropped");
+            Arc::new(NullBucketImpressor::new())
+        }
+    }
+}
+
+fn experiment_keys(features: &[Feature]) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for feature in features {
+        for rule in &feature.rules {
+            let query = rule.query.as_deref().unwrap_or_default();
+            if let Ok(node) = parse_query(query, &feature.name) {
+                collect_keys(&node, &mut keys);
+            }
+        }
+    }
+    keys
+}
+
+fn collect_keys(node: &QueryNode, keys: &mut BTreeSet<String>) {
+    match node {
+        QueryNode::Criteria(criteria) => {
+            if let Some(
+                MembershipCheck::Bucket { experiment, .. }
+                | MembershipCheck::Experiment { experiment },
+            ) = criteria.membership()
+            {
+                keys.insert(experiment.to_string());
+            }
+        }
+        QueryNode::And(children) | QueryNode::Or(children) => {
+            children.iter().for_each(|child| collect_keys(child, keys));
+        }
+        QueryNode::Not(child) => collect_keys(child, keys),
+        QueryNode::AlwaysTrue | QueryNode::Never => {}
+    }
+}
+
+pub(crate) struct SwitchEngines {
+    pub(crate) visibility: FeatureSwitches,
+    pub(crate) limited_actions: FeatureSwitches,
+}
+
+type LastGood = (PathBuf, Vec<Feature>);
+
 pub(crate) struct SwitchFiles {
-    files: Vec<(PathBuf, Vec<Feature>)>,
+    visibility: Vec<LastGood>,
+    limited_actions: LastGood,
+    experiments: Experiments,
 }
 
 impl SwitchFiles {
-    pub fn beside(fs_path: &str) -> Self {
+    pub fn beside(fs_path: &str, experiments: Experiments) -> Self {
         let fs_path = Path::new(fs_path);
         let dir = fs_path.parent().unwrap_or_else(|| Path::new(""));
-        let files = std::iter::once(fs_path.to_path_buf())
+        let visibility = std::iter::once(fs_path.to_path_buf())
             .chain(SCALA_FILES.iter().map(|name| dir.join(name)))
-            .chain(std::iter::once(dir.join(LIMITED_ACTIONS_POLICY_FILE)))
             .map(|path| (path, Vec::new()))
             .collect();
-        Self { files }
+        Self {
+            visibility,
+            limited_actions: (dir.join(LIMITED_ACTIONS_POLICY_FILE), Vec::new()),
+            experiments,
+        }
     }
 
-    pub fn load(&mut self, stats: Option<&dyn StatsReceiverExt>) -> Option<FeatureSwitches> {
-        for (path, last_good) in &mut self.files {
+    pub(crate) fn load(&mut self, metrics: &Metrics) -> Option<SwitchEngines> {
+        let files = self
+            .visibility
+            .iter_mut()
+            .chain(std::iter::once(&mut self.limited_actions));
+        for (path, last_good) in files {
             match parse_file(path) {
                 Ok(features) => *last_good = features,
                 Err(error) => {
                     let file = path.file_name().and_then(|name| name.to_str());
-                    load_failed(file.unwrap_or_default(), &error, stats);
+                    load_failed(file.unwrap_or_default(), &error, metrics);
                 }
             }
         }
-        let features = self
-            .files
-            .iter()
-            .flat_map(|(_, features)| features.iter().cloned())
-            .collect();
-        FeatureSwitches::new(features)
-            .map_err(|error| load_failed("all", &error, stats))
+        let engine = |files: &[LastGood]| {
+            self.experiments.engine(
+                files
+                    .iter()
+                    .flat_map(|(_, features)| features.iter().cloned())
+                    .collect(),
+            )
+        };
+        engine(&self.visibility)
+            .and_then(|visibility| {
+                Ok(SwitchEngines {
+                    visibility,
+                    limited_actions: engine(std::slice::from_ref(&self.limited_actions))?,
+                })
+            })
+            .map_err(|error| load_failed("all", &error, metrics))
             .ok()
     }
 }
@@ -181,60 +333,61 @@ fn parse_file(path: &Path) -> xai_feature_switches::Result<Vec<Feature>> {
     Ok(features)
 }
 
-fn load_failed(
-    file: &str,
-    error: &xai_feature_switches::Error,
-    stats: Option<&dyn StatsReceiverExt>,
-) {
+fn load_failed(file: &str, error: &xai_feature_switches::Error, metrics: &Metrics) {
     tracing::warn!(
         file,
         %error,
         "feature switches: file failed to load; keeping its last good values"
     );
-    if let Some(stats) = stats {
-        stats.incr(LOAD_FAILURE_COUNTER, &[("file", file)], 1);
-    }
+    metrics.count(&FEATURE_SWITCH_LOAD_FAILURES, [file], 1);
 }
 
-pub(crate) fn spawn_refresh(
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+pub(crate) fn serve(
     mut files: SwitchFiles,
-    feature_switches: Arc<ArcSwap<FeatureSwitches>>,
-    country_lists: Arc<CountryLists>,
+    safety_label_source: Arc<SafetyLabelSource>,
     copy_drift: DriftCheck,
-    stats: Option<Arc<dyn StatsReceiverExt>>,
-) {
+    metrics: Metrics,
+) -> (Arc<ArcSwap<SwitchEngines>>, Arc<CountryLists>) {
+    let country_lists = Arc::new(CountryLists::starting_at_default());
+    let lists = Arc::clone(&country_lists);
+    let publish = move |engines: SwitchEngines| {
+        lists.refresh(&engines.visibility);
+        safety_label_source.set_label_cache_switches(LabelCacheSwitches::from_feature_switches(
+            &engines.visibility,
+        ));
+        Arc::new(engines)
+    };
+    let feature_switches = Arc::new(ArcSwap::new(publish(
+        files
+            .load(&metrics)
+            .expect("files that each built an engine build them together"),
+    )));
+    let serving = Arc::clone(&feature_switches);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if let Some(engine) = files.load(stats.as_deref()) {
-                feature_switches.store(Arc::new(engine));
+            if let Some(engines) = files.load(&metrics) {
+                serving.store(publish(engines));
             }
-            country_lists.refresh(&feature_switches.load());
-            copy_drift.run(stats.as_deref());
+            copy_drift.run(&metrics);
         }
     });
+    (feature_switches, country_lists)
 }
 
-fn owned(codes: &[&str]) -> Vec<String> {
-    codes.iter().map(|code| code.to_string()).collect()
+fn parse(values: &[Value]) -> Option<CountryCodes> {
+    let codes: Option<Vec<&str>> = values.iter().map(Value::as_str).collect();
+    CountryCodes::parse(codes?)
 }
 
-fn parse(values: &[Value]) -> Option<Vec<String>> {
-    values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|code| code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()))
-                .map(str::to_ascii_lowercase)
-        })
-        .collect()
-}
-
-fn load(list: CountryList, configured: Option<&Vec<Value>>) -> Vec<String> {
+fn load(list: CountryList, configured: Option<&Vec<Value>>) -> CountryCodes {
     let Some(values) = configured else {
-        return owned(list.default_codes());
+        return CountryCodes::default_for(list);
     };
     parse(values).unwrap_or_else(|| {
         tracing::warn!(
@@ -242,42 +395,13 @@ fn load(list: CountryList, configured: Option<&Vec<Value>>) -> Vec<String> {
             configured = ?values,
             "country list: an entry is not a two-letter code; using the default"
         );
-        owned(list.default_codes())
+        CountryCodes::default_for(list)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use xai_stats_receiver::HistogramBuckets;
-
-    #[derive(Default)]
-    pub(super) struct Counted(Mutex<Vec<(String, String, u64)>>);
-
-    impl StatsReceiverExt for Counted {
-        fn incr(&self, name: &str, scopes: &[(&str, &str)], value: u64) {
-            let labels = scopes
-                .iter()
-                .map(|(label, tag)| format!("{label}={tag}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            self.0
-                .lock()
-                .unwrap()
-                .push((name.to_string(), labels, value));
-        }
-        fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-    }
-
-    impl Counted {
-        pub(super) fn take(&self) -> Vec<(String, String, u64)> {
-            std::mem::take(&mut self.0.lock().unwrap())
-        }
-    }
 
     fn engine(yaml: &str) -> FeatureSwitches {
         FeatureSwitches::load_string(yaml).unwrap()
@@ -320,6 +444,23 @@ country_specific_nsfw_content_gating:
     }
 
     #[test]
+    fn each_list_starts_with_exactly_its_default_codes() {
+        let lists = CountryLists::starting_at_default();
+        for &list in CountryList::VARIANTS {
+            for code in list.default_codes() {
+                assert!(lists.contains(list, code), "{list:?} {code}");
+                assert!(
+                    !lists.contains(list, &code.to_uppercase()),
+                    "{list:?} {code}"
+                );
+            }
+            for code in ["us", "jp", "", "u", "usa", "z{", "`a"] {
+                assert!(!lists.contains(list, code), "{list:?} {code}");
+            }
+        }
+    }
+
+    #[test]
     fn one_invalid_entry_falls_back_to_the_default() {
         let lists = CountryLists::starting_at_default();
         lists.refresh(&engine(
@@ -345,6 +486,41 @@ country_specific_nsfw_content_gating:
             assert!(lists.contains(list, default), "{list:?}");
             assert!(!lists.contains(list, "xx"), "{list:?}");
         }
+    }
+
+    #[test]
+    fn a_rule_in_another_file_never_sets_a_policy_value() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("visibility/main");
+        let policy_dir = root.path().join("visibility-limited-actions/main");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            dir.join("rust_vf.yml"),
+            "rust_vf:\n  parameters:\n    rust_vf_flag: {type: boolean, default: false}\n  rules:\n  - values: {rust_vf_flag: true, limited_actions_policy_limited_actions: [like]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            policy_dir.join("limited_actions_policy.yml"),
+            "limited_actions_policy:\n  parameters:\n    limited_actions_policy_limited_actions: {type: array, default: [reply]}\n",
+        )
+        .unwrap();
+        let fs_path = dir.join("rust_vf.yml");
+        let engines = SwitchFiles::beside(fs_path.to_str().unwrap(), Experiments::none())
+            .load(&Metrics::none())
+            .unwrap();
+        let recipient = RecipientBuilder::new().build();
+        let policy = engines.limited_actions.match_recipient(&recipient);
+        assert_eq!(
+            policy.get_array_no_impression("limited_actions_policy_limited_actions"),
+            Some(&vec![Value::String("reply".to_string())])
+        );
+        assert!(!policy.is_set("rust_vf_flag"));
+        let visibility = engines.visibility.match_recipient(&recipient);
+        assert_eq!(
+            visibility.get_bool_no_impression("rust_vf_flag"),
+            Some(true)
+        );
     }
 
     #[test]
@@ -374,27 +550,35 @@ country_specific_nsfw_content_gating:
             "other:\n  parameters:\n    other_flag: {type: boolean, default: true}\n",
         );
         let fs_path = dir.join("rust_vf.yml");
-        let mut files = SwitchFiles::beside(fs_path.to_str().unwrap());
-        let stats = Counted::default();
+        let mut files = SwitchFiles::beside(fs_path.to_str().unwrap(), Experiments::none());
+        let (metrics, recording) = Metrics::recording();
         let ios_tombstone = |engine: &FeatureSwitches| {
             engine
                 .match_recipient(&RecipientBuilder::new().build())
                 .get_bool_no_impression("age_verification_ios_tombstone_rule_enabled")
         };
-        let failed = |file: &str| (LOAD_FAILURE_COUNTER.to_string(), format!("file={file}"), 1);
+        let failed = |file: &str| format!("feature_switch_load_failures{{file={file}}} 1");
+        let failures = || -> Vec<String> {
+            recording
+                .take(&FEATURE_SWITCH_LOAD_FAILURES.family)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
 
-        let engine = files.load(Some(&stats)).unwrap();
+        let engine = files.load(&metrics).unwrap().visibility;
         assert_eq!(ios_tombstone(&engine), Some(true));
         assert!(!engine
             .match_recipient(&RecipientBuilder::new().build())
             .is_set("other_flag"));
         assert_eq!(
-            stats.take(),
+            failures(),
             [
                 failed("rust_vf.yml"),
                 failed("community_tweet.yml"),
                 failed("freedom_of_speech_not_reach.yml"),
                 failed("media_visibility_treatments.yml"),
+                failed("soft_nsfw.yml"),
                 failed("stale_tweet.yml"),
                 failed("limited_actions_policy.yml"),
             ]
@@ -406,6 +590,7 @@ country_specific_nsfw_content_gating:
             "media_visibility_treatments:\n  parameters: {}\n",
         );
         write("stale_tweet.yml", "stale_tweet:\n  parameters: {}\n");
+        write("soft_nsfw.yml", "soft_nsfw:\n  parameters: {}\n");
         write(
             "community_tweet.yml",
             "community_tweet:\n  parameters: {}\n",
@@ -431,7 +616,7 @@ country_specific_nsfw_content_gating:
                 "country_specific_nsfw_content_gating.yml",
                 &COUNTRIES.replace("us", code),
             );
-            let engine = files.load(Some(&stats)).unwrap();
+            let engine = files.load(&metrics).unwrap().visibility;
             assert_eq!(ios_tombstone(&engine), Some(true), "{broken}");
             let lists = CountryLists::starting_at_default();
             lists.refresh(&engine);
@@ -439,7 +624,7 @@ country_specific_nsfw_content_gating:
                 lists.contains(CountryList::LocalRegulations, code),
                 "{broken}"
             );
-            assert_eq!(stats.take(), [failed("age_verification.yml")], "{broken}");
+            assert_eq!(failures(), [failed("age_verification.yml")], "{broken}");
         }
     }
 }

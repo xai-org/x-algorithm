@@ -33,6 +33,13 @@ from grox.flows.ptos.state import (
 logger = logging.getLogger(__name__)
 
 _ENFORCE_CATEGORY = SafetyPolicyCategory.Spam
+_NON_ENFORCE_SPAM_POLICY_TYPES = frozenset(
+    {
+        SafetyPolicyType.NoViolation,
+        SafetyPolicyType.SpamPromotesClicks,
+        SafetyPolicyType.SpamPromotesReplies,
+    }
+)
 
 
 def _is_actionable_spam_policy_violation(vp: SafetyPtosViolatedPolicy) -> bool:
@@ -42,7 +49,7 @@ def _is_actionable_spam_policy_violation(vp: SafetyPtosViolatedPolicy) -> bool:
     return bool(
         policy
         and policy.policyType
-        and policy.policyType != SafetyPolicyType.NoViolation
+        and policy.policyType not in _NON_ENFORCE_SPAM_POLICY_TYPES
     )
 
 

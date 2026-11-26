@@ -94,14 +94,17 @@ fn recently_served_ids(
         .iter()
         .filter(|sh| sh.served_time_ms.is_some_and(|t| t >= min_time_ms))
         .flat_map(|sh| {
-            sh.entries.iter().flat_map(|entry| {
-                entry.item_ids.iter().flatten().flat_map(|ids| {
-                    [ids.tweet_id, ids.source_tweet_id]
-                        .into_iter()
-                        .flatten()
-                        .map(|id| id as u64)
+            sh.entries
+                .iter()
+                .filter(|entry| entry.entity_type != EntityIdType::VIDEO_CAROUSEL_MODULE)
+                .flat_map(|entry| {
+                    entry.item_ids.iter().flatten().flat_map(|ids| {
+                        [ids.tweet_id, ids.source_tweet_id]
+                            .into_iter()
+                            .flatten()
+                            .map(|id| id as u64)
+                    })
                 })
-            })
         })
         .take(max_items)
         .collect()

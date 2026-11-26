@@ -35,6 +35,12 @@ pub struct RateLimitStats {
     pub remaining: u64,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RulesResponse {
+    pub user: crate::rules::RuleStatus,
+    pub post: crate::rules::RuleStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AllowlistDeleteResponse {
     pub user_id: i64,
@@ -70,6 +76,15 @@ pub struct AllowlistDeleteResponse {
         service::handle_allowlist_delete_entity,
         service::handle_off_switches_get,
         service::handle_off_switches_put,
+        service::handle_head_guards_get,
+        service::handle_head_guards_put,
+        service::handle_backfill_runs_list,
+        service::handle_backfill_runs_budget,
+        service::handle_backfill_run_get,
+        service::handle_backfill_run_start,
+        service::handle_backfill_run_change,
+        service::handle_backfill_settings_get,
+        service::handle_backfill_settings_put,
     ),
     components(schemas(
         xai_abuse_enforcement_types::action_control::ActionControlRecord,
@@ -87,8 +102,12 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::action_control::ConfidenceEvidence,
         xai_abuse_enforcement_types::action_control::EvidenceOverride,
         xai_abuse_enforcement_types::action_control::ConfidenceView,
-        xai_abuse_enforcement_types::action_control::ConfidenceLevelView,
-        xai_abuse_enforcement_types::action_control::LabelMapEntry,
+        xai_abuse_enforcement_types::action_control::LevelRow,
+        xai_abuse_enforcement_types::action_control::RowView,
+        xai_abuse_enforcement_types::action_control::RowsRequest,
+        xai_abuse_enforcement_types::action_control::RowSetting,
+        xai_abuse_enforcement_types::action_control::ActionControlSeenRow,
+        xai_abuse_enforcement_types::action_control::FollowerSkipView,
         xai_abuse_enforcement_types::allowlist::AllowlistEntry,
         xai_abuse_enforcement_types::allowlist::AllowlistRecord,
         xai_abuse_enforcement_types::allowlist::AllowlistAddRequest,
@@ -97,21 +116,47 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::allowlist::BulkResponse,
         xai_abuse_enforcement_types::allowlist::BulkRowResult,
         xai_abuse_enforcement_types::config::ConfigPatchRequest,
+        xai_abuse_enforcement_types::config::ConfigPendingReview,
         xai_abuse_enforcement_types::off_switch::OffSwitchRecord,
+        xai_abuse_enforcement_types::off_switch::PreviousOff,
         xai_abuse_enforcement_types::off_switch::OffSwitchPutRequest,
         xai_abuse_enforcement_types::off_switch::OffSwitchView,
         xai_abuse_enforcement_types::off_switch::OffSwitchSeen,
         xai_abuse_enforcement_types::off_switch::OffSwitchListResponse,
+        xai_abuse_enforcement_types::head_guard::HeadGuardRecord,
+        xai_abuse_enforcement_types::head_guard::OverturnGuard,
+        xai_abuse_enforcement_types::head_guard::HeadGuardPutRequest,
+        xai_abuse_enforcement_types::head_guard::HeadGuardPutResponse,
+        xai_abuse_enforcement_types::head_guard::HeadGuardView,
+        xai_abuse_enforcement_types::head_guard::HeadGuardListResponse,
+        xai_abuse_enforcement_types::action_control::UnreadableRecord,
+        xai_abuse_enforcement_types::backfill::BackfillRunRecord,
+        xai_abuse_enforcement_types::backfill::BackfillRunStartRequest,
+        xai_abuse_enforcement_types::backfill::BackfillRunChangeRequest,
+        xai_abuse_enforcement_types::backfill::BackfillRunListResponse,
+        xai_abuse_enforcement_types::backfill::RunState,
+        xai_abuse_enforcement_types::backfill::RunSource,
+        xai_abuse_enforcement_types::backfill::PausedReason,
+        xai_abuse_enforcement_types::backfill::RunTransition,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsRecord,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsChange,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsRequest,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsResponse,
+        crate::rules::RuleStatus,
+        crate::rules::RuleSource,
         ApiError,
         DryRunStatus,
         RateLimitStats,
+        RulesResponse,
         AllowlistDeleteResponse,
     )),
     tags(
-        (name = "config", description = "🔒 PROTECTED (bearer token). GrowthBook config — read + write."),
+        (name = "config", description = "🔒 PROTECTED (bearer token). GrowthBook config — read, plus writes that become GrowthBook draft revisions awaiting review (never published here)."),
         (name = "allowlist", description = "🔒 PROTECTED (bearer token). Allowlist — read + write (single + bulk)."),
         (name = "action_control", description = "🔒 PROTECTED (bearer token). Page-owned action control — per entity (user or post) and head / classifier / band: follow the GrowthBook rules, record only, or act with the page's actions; history."),
         (name = "off_switch", description = "🔒 PROTECTED (bearer token). Enforcement off switches — turn enforcement off or back on for a whole head or one head + classifier."),
+        (name = "head_guard", description = "🔒 PROTECTED (bearer token). Head guards — hourly and daily action ceilings for a whole head or one head + classifier (reaching one turns that scope's off switch on; resume by turning the switch back on), plus the appeal-overturn limit the factory backend evaluates. A PUT with no limits clears the guard."),
+        (name = "backfill_runs", description = "🔒 PROTECTED (bearer token). Runs that act on past decisions: start, pause, resume and stop (page key only), done (the sender), reads and claims."),
         (name = "debug", description = "Open (no auth) ops/debug endpoints — dry-run flag, rate-limit usage, dedup lookup — EXCEPT POST /action and both rate-limit writes (POST /rate_limit and POST /rate_limit/reset), which are 🔒 protected because they mutate the enforcement budget. Look for the lock icon per endpoint."),
     ),
     servers(
@@ -121,7 +166,7 @@ pub struct AllowlistDeleteResponse {
         title = "xai-abuse-enforcement-service",
         description = "HTTP API for the xAI abuse-enforcement system. Used by the slackbot + the embedded admin UI at /admin.\n\n\
         **Auth:** endpoints with a 🔒 lock icon require `Authorization: Bearer <token>` — click **Authorize** and paste a key. \
-        PROTECTED: everything under `config` + `allowlist` + `off_switch` + `action_control`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
+        PROTECTED: everything under `config` + `allowlist` + `off_switch` + `head_guard` + `action_control` + `backfill_runs`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
         OPEN (no auth): `GET /dry_run`, `GET /rate_limit`, `GET /dedup/{user_id}`.",
     ),
 )]
@@ -154,10 +199,19 @@ mod tests {
         ("/allowlist/{entity_type}/{entity_id}", "delete", true),
         ("/off_switches", "get", true),
         ("/off_switches", "put", true),
+        ("/head_guards", "get", true),
+        ("/head_guards", "put", true),
         ("/action_controls", "get", true),
         ("/action_controls", "put", true),
         ("/action_controls/history", "get", true),
         ("/action_controls/pod", "get", true),
+        ("/backfill_runs", "get", true),
+        ("/backfill_runs", "post", true),
+        ("/backfill_runs/budget", "get", true),
+        ("/backfill_runs/{run_id}", "get", true),
+        ("/backfill_runs/{run_id}/{change}", "post", true),
+        ("/backfill_settings", "get", true),
+        ("/backfill_settings", "put", true),
     ];
 
     #[test]

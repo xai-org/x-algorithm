@@ -36,9 +36,9 @@ use xai_candidate_pipeline::selector::Selector;
 use xai_candidate_pipeline::side_effect::SideEffect;
 use xai_candidate_pipeline::source::Source;
 use xai_visibility_filtering::tweet_safety_label::{
-    MockTweetSafetyLabelClient, ProdTweetSafetyLabelClient, TweetSafetyLabelClient,
+    MockTweetSafetyLabelClient, TweetSafetyLabelClient,
 };
-use xai_visibility_filtering::vf_client::{MockVfClient, StratoVfClient, VfClient, XaiVfClient};
+use xai_visibility_filtering::vf_client::{MockVfClient, StratoVfClient, VfClient};
 
 pub struct ReverseChronPostsPipeline {
     sources: Vec<Box<dyn Source<ScoredPostsQuery, PostCandidate>>>,
@@ -51,13 +51,15 @@ pub struct ReverseChronPostsPipeline {
 }
 
 impl ReverseChronPostsPipeline {
-    pub async fn new(datacenter: &str) -> Self {
+    pub async fn new(
+        datacenter: &str,
+        xai_vf_client: Arc<dyn VfClient + Send + Sync>,
+        vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
+    ) -> Self {
         let (
             night_owl_client,
             tes_client,
             strato_vf_client,
-            xai_vf_client,
-            vf_safety_labels_client,
             socialgraph_client,
             author_brand_safety_client,
         ) = tokio::join!(
@@ -87,22 +89,6 @@ impl ReverseChronPostsPipeline {
                     .await
                     .expect("Failed to create VF client"),
                 ) as Arc<dyn VfClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    XaiVfClient::connect(datacenter)
-                        .await
-                        .expect("Failed to create XAI VF client"),
-                ) as Arc<dyn VfClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    ProdTweetSafetyLabelClient::new(datacenter)
-                        .await
-                        .expect("Failed to create VF SafetyLabels client")
-                        .with_timeout_ms(500)
-                        .with_max_batch_size(50),
-                ) as Arc<dyn TweetSafetyLabelClient>
             },
             async {
                 Arc::new(

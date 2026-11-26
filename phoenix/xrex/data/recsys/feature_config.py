@@ -58,6 +58,8 @@ class FloatFeature(enum.IntEnum):
 class Int64Feature(enum.IntEnum):
     clientAppIdSeq = 0
     promotedIdSeq = 1
+    dpaSidLevel0 = 3
+    firstVideoDurationMsSeq = 4
     favCountSeq = 5
     replyCountSeq = 6
     repostCountSeq = 7
@@ -68,9 +70,38 @@ class Int64Feature(enum.IntEnum):
     firstDpaProductKeyHash2 = 12
     webConvTimeOnSiteInferredMsSeq = 13
     webConvTimeOnSiteMeasuredMsSeq = 14
+    requestTimeSecSeq = 15
+    latestHistoryImpressionTimeSecSeq = 16
+    dpaSidLevel1 = 17
+    dpaSidLevel2 = 18
+    dpaSidLevel3 = 19
+    dpaSidLevel4 = 20
+    dpaSidLevel5 = 21
+    notInterestedCountSeq = 22
+    notificationSentCountSeq = 23
+    notificationOpenCountSeq = 24
+    notificationClickCountSeq = 25
+    notificationDismissCountSeq = 26
+    notificationSeeLessOftenCountSeq = 27
 
 
-COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset({"firstDpaProductKeyHash2"})
+DPA_SID_NUM_LEVELS = 6
+DPA_SID_CODEBOOK_SIZE = 256
+DPA_SID_LEVEL_NAMES: tuple[str, ...] = tuple(
+    f"dpaSidLevel{level}" for level in range(DPA_SID_NUM_LEVELS)
+)
+assert {n for n in Int64Feature.__members__ if n.startswith("dpaSidLevel")} == set(
+    DPA_SID_LEVEL_NAMES
+)
+
+COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset(
+    {
+        "firstDpaProductKeyHash2",
+        "requestTimeSecSeq",
+        "latestHistoryImpressionTimeSecSeq",
+        *DPA_SID_LEVEL_NAMES,
+    }
+)
 
 
 ADS_PRODUCT_KEY_TABLE_SIZE = 10_000_000
@@ -82,6 +113,21 @@ ADS_PRODUCT_KEY_HASH_MODULUS = 2_147_483_647
 
 STALE_POST_14D_TTL_SEC = 1_213_200
 STALE_POST_30D_TTL_SEC = 2_595_600
+
+ADS_COUNT_FAMILIES: tuple[str, ...] = (
+    "View",
+    "Click",
+    "LongDwellClick",
+    "VideoOpen",
+    "LongVideoView",
+    "Fav",
+    "NotInterested",
+)
+ADS_COUNT_WINDOWS: tuple[str, ...] = ("1h", "3h", "12h", "24h", "3d", "7d", "14d", "28d")
+NUM_ADS_COUNT_FEATURES = 168
+ADS_COUNT_BUCKETS = 33
+NUM_ADS_CTR_FEATURES = 24
+ADS_CTR_BUCKETS = 16
 
 
 CATEGORICAL_FEATURES: list[str] = [f.name for f in CategoricalFeature]
@@ -144,19 +190,34 @@ BASE_REQUIRED_COLUMNS: list[str] = [
 ]
 
 
+SAMPLE_WEIGHT_SEQ_COLUMN = "sampleWeightSeq"
+
+VIDEO_DURATION_COLUMN = "firstVideoDurationMsSeq"
+
 OPTIONAL_COLUMNS: list[str] = [
     "searchQueryEmbeddingSeq",
     "lineItemObjectiveSeq",
     "safetyLabelMaskSeq",
     "semanticIdSeq",
+    "isBroadcastSeq",
     "sampleWeight",
     "firstDpaProductKey",
+    "dpaSidCodesSeq",
     "authorFollowerCountSeq",
     "inReplyToPostIdSeq",
+    "firstVideoDurationMsSeq",
     "sample_source",
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
+    "lineItemIdSeq",
+    "auxValueContentViewRatioSeq",
+    "auxValueContentViewValidSeq",
+    "auxValueContentViewBaselineMeanUsdSeq",
+    "auxValueAddToCartRatioSeq",
+    "auxValueAddToCartValidSeq",
+    "auxValueAddToCartBaselineMeanUsdSeq",
     "conversionKeepBits",
+    "earlyActionNameMultiHotSeqSeq",
     "conversionEligibleTypesSeq",
     "conversionDelayMsSeq",
     "conversionDelayMsSeq_KEY",
@@ -168,6 +229,12 @@ OPTIONAL_COLUMNS: list[str] = [
     "webConvTimeOnSiteInferredMsSeq",
     "webConvTimeOnSiteMeasuredMsSeq",
     "webConvTrackingIntegrationSeq",
+    "notInterestedCountSeq",
+    "notificationSentCountSeq",
+    "notificationOpenCountSeq",
+    "notificationClickCountSeq",
+    "notificationDismissCountSeq",
+    "notificationSeeLessOftenCountSeq",
     "exactPhraseSeq",
     "matchedWordFractionSeq",
     "lexicalTextSeq",

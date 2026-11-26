@@ -1,18 +1,22 @@
+mod debias;
 pub mod dpp_model;
 pub mod value_model;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::error;
 
 use xai_feature_switches::Params;
+use xai_user_debias::UserDebiasModel;
 use xai_vm_ranker_proto::{DppParams, RankRequest, RankedCandidate};
 
-use crate::dpp::DppConfig;
+use crate::dpp::{DppConfig, SlidingWindow};
 use crate::embedding_store::EmbeddingStore;
 use crate::metrics::PARAMS_RESOLVED;
 use crate::params::*;
 use crate::ranking_config::RankingConfig;
+use crate::sid_client::SidClient;
 use dpp_model::EmbeddingMemo;
 use value_model::ValueModelOutput;
 
@@ -20,11 +24,19 @@ use value_model::ValueModelOutput;
 pub struct DppContext {
     pub store: Arc<EmbeddingStore>,
     pub config: DppConfig,
+    pub sid: Option<SidClient>,
+}
+
+#[derive(Clone, Default)]
+pub struct DebiasModels {
+    pub user: Option<Arc<UserDebiasModel>>,
+    pub user_changed_at_ms: u64,
 }
 
 #[derive(Clone, Default)]
 pub struct RankContext {
     pub dpp: Option<DppContext>,
+    pub debias: DebiasModels,
     pub config: Option<Arc<RankingConfig>>,
 }
 
@@ -47,10 +59,29 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
             (Some(p), _) => {
                 dpp.config.theta = p.get(DppTheta);
                 dpp.config.max_selected_rank = p.get(DppMaxSelectedRank) as usize;
+                dpp.config.greedy_order = p.get(DppGreedyOrder);
+                dpp.config.window = match p.get(DppWindow) {
+                    0 => None,
+                    size => Some(SlidingWindow {
+                        size: size as usize,
+                        half_distance: p.get(DppWindowHalfDistance),
+                        sid_lambda: p.get(DppWindowSidLambda).clamp(0.0, 1.0),
+                    }),
+                };
             }
             (None, Some(overrides)) => apply_dpp_overrides(&mut dpp.config, overrides),
             (None, None) => {}
         }
+
+        let history_l1 = match (&dpp.sid, dpp.config.window) {
+            (Some(sid), Some(window)) if window.sid_lambda > 0.0 => {
+                let ids: Vec<u64> = dpp_model::window_history(&req, window.size)
+                    .map(|item| item.tweet_id)
+                    .collect();
+                sid.l1_codes(&ids).await
+            }
+            _ => HashMap::new(),
+        };
 
         let config = ctx.config.clone();
         return tokio::task::spawn_blocking(move || {
@@ -59,10 +90,12 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
                 params.as_ref(),
                 config.as_deref().map(RankingConfig::author_rules),
                 compute_value_model,
+                &ctx.debias,
             );
             let served_pre_dpp = served_pre_dpp_scores(&req, value_model.as_ref());
             let mut memo = EmbeddingMemo::default();
-            let served = dpp_model::rank_with_memo(&req, &served_pre_dpp, &dpp, &mut memo);
+            let served =
+                dpp_model::rank_with_memo(&req, &served_pre_dpp, &dpp, &history_l1, &mut memo);
             ranked_candidates(&req, served, value_model.as_ref())
         })
         .await
@@ -74,6 +107,7 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
         params.as_ref(),
         ctx.config.as_deref().map(RankingConfig::author_rules),
         compute_value_model,
+        &ctx.debias,
     );
     let served = served_pre_dpp_scores(&req, value_model.as_ref())
         .iter()
@@ -136,6 +170,10 @@ fn ranked_candidates(
             tweet_id: c.tweet_id,
             score,
             weighted_score: weighted.map(|vm| vm.weighted[i]),
+            top_heads: weighted
+                .and_then(|vm| vm.top_heads.as_ref())
+                .map(|heads| heads[i].clone())
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -143,13 +181,21 @@ fn ranked_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{BooleanArray, FixedSizeListArray, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use prost::Message;
     use xai_feature_switches::{
         BucketMembership, ExperimentBucket, ExperimentBucketsChooser, FeatureSwitches,
         NullBucketImpressor, Recipient,
     };
+    use xai_user_debias::{arrow as seq, debiased_probability, FEATURE_DIM};
     use xai_value_model::{
-        compute_value_scores, CandidateScoringInputs, QueryScoringContext, ValueModelWeights,
+        compute_value_scores, CandidateScoringInputs, ClassFactors, QueryScoringContext,
+        ValueModelWeights, NEGATIVE_SCORES_OFFSET,
     };
+    use xai_vm_ranker_proto::experiment::{CandidatePayload, RequestPayload};
     use xai_vm_ranker_proto::{PhoenixScores, RankCandidate, ViewerContext};
 
     const FEATURES_YAML: &str = r#"
@@ -169,8 +215,71 @@ rust_home_mixer:
     rust_home_mixer_oon_weight_factor:
       type: double
       default: 0.75
-  rules: []
+    rust_home_mixer_cont_dwell_time_weight:
+      type: double
+      default: 0.1
+    rust_home_mixer_oon_engagement_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_oon_dwell_time_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_in_network_engagement_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_in_network_dwell_time_weight_factor:
+      type: double
+      default: -1.0
+    rust_home_mixer_vm_ranker_user_debias_enabled:
+      type: boolean
+      default: false
+    rust_home_mixer_vm_ranker_user_debias_alpha:
+      type: double
+      default: 0.0
+    rust_home_mixer_vm_ranker_user_debias_clip_logit:
+      type: double
+      default: 2.0
+  rules:
+    - description: "debias arm"
+      query: "[country eq DE]"
+      values:
+        rust_home_mixer_vm_ranker_user_debias_enabled: true
+        rust_home_mixer_vm_ranker_user_debias_alpha: 1.0
+    - description: "class factor arm"
+      query: "[country eq FR]"
+      values:
+        rust_home_mixer_oon_engagement_weight_factor: 0.6
+        rust_home_mixer_oon_dwell_time_weight_factor: 0.9
+        rust_home_mixer_in_network_engagement_weight_factor: 1.2
+        rust_home_mixer_in_network_dwell_time_weight_factor: 0.7
+    - description: "out-of-network dwell-time factor only"
+      query: "[country eq JP]"
+      values:
+        rust_home_mixer_oon_dwell_time_weight_factor: 0.9
 "#;
+
+    const HEAD_NAMES: [&str; 20] = [
+        "fav",
+        "reply",
+        "quote",
+        "retweet",
+        "dwelled",
+        "not_dwelled",
+        "vqv",
+        "photo_expand",
+        "report",
+        "not_interested",
+        "follow_author",
+        "block",
+        "mute",
+        "click",
+        "profile_click",
+        "bookmark",
+        "share",
+        "open_link",
+        "video_open",
+        "post_unexplored",
+    ];
 
     fn candidate(
         tweet_id: u64,
@@ -202,6 +311,7 @@ rust_home_mixer:
     fn scoring_context() -> QueryScoringContext {
         QueryScoringContext {
             effective_oon_weight: 0.75,
+            ..Default::default()
         }
     }
 
@@ -209,9 +319,10 @@ rust_home_mixer:
         Arc::new(RankingConfig::from_yaml(FEATURES_YAML).unwrap())
     }
 
-    fn context(config: Arc<RankingConfig>) -> RankContext {
+    fn context(config: Arc<RankingConfig>, debias: DebiasModels) -> RankContext {
         RankContext {
             dpp: None,
+            debias,
             config: Some(config),
         }
     }
@@ -263,7 +374,9 @@ rust_home_mixer:
         assert_eq!(weights.favorite, 2.0);
         assert_eq!(weights.retweet, 1.0);
 
-        let ranked = rank(req.clone(), context(config())).await.unwrap();
+        let ranked = rank(req.clone(), context(config(), DebiasModels::default()))
+            .await
+            .unwrap();
 
         let expected = compute_value_scores(&weights, &scoring_context(), &inputs(&candidates));
         assert_eq!(ranked.len(), 3);
@@ -283,7 +396,7 @@ rust_home_mixer:
                 compute_value_model: false,
                 ..req.clone()
             },
-            context(config()),
+            context(config(), DebiasModels::default()),
         )
         .await
         .unwrap();
@@ -350,14 +463,92 @@ rust_home_mixer_author_exploration:
                 "rust_home_mixer_multiplier_pre_offset".to_string(),
                 pre_offset.to_string(),
             );
-            let base = rank(req.clone(), context(config())).await.unwrap();
-            let boosted = rank(req, context(Arc::clone(&author_config)))
+            let base = rank(req.clone(), context(config(), DebiasModels::default()))
                 .await
                 .unwrap();
+            let boosted = rank(
+                req,
+                context(Arc::clone(&author_config), DebiasModels::default()),
+            )
+            .await
+            .unwrap();
 
             assert!((boosted[0].score - (base[0].score + 0.2)).abs() < 1e-12);
             assert_eq!(boosted[1].score, base[1].score);
             assert_eq!(boosted[0].weighted_score, base[0].weighted_score);
+        }
+    }
+
+    #[tokio::test]
+    async fn ineligible_engagement_heads_are_left_out_of_the_score() {
+        let score = |payload: CandidatePayload, exclude: bool| async move {
+            let mut req = request(
+                vec![RankCandidate {
+                    tweet_id: 1,
+                    author_id: 10,
+                    in_network: true,
+                    phoenix_scores: Some(PhoenixScores {
+                        favorite_score: Some(0.5),
+                        reply_score: Some(0.2),
+                        share_score: Some(0.1),
+                        share_via_dm_score: Some(0.05),
+                        share_via_copy_link_score: Some(0.02),
+                        click_score: Some(0.3),
+                        ..Default::default()
+                    }),
+                    experiment_payload: payload.encode_to_vec().into(),
+                    ..Default::default()
+                }],
+                "US",
+            );
+            let overrides = &mut req.viewer.as_mut().unwrap().fs_overrides;
+            for (key, value) in [
+                (
+                    "rust_home_mixer_vm_ranker_exclude_ineligible_engagement_heads",
+                    exclude.to_string(),
+                ),
+                ("rust_home_mixer_share_weight", "1.0".to_string()),
+                ("rust_home_mixer_share_via_dm_weight", "1.0".to_string()),
+                (
+                    "rust_home_mixer_share_via_copy_link_weight",
+                    "1.0".to_string(),
+                ),
+                ("rust_home_mixer_click_weight", "1.0".to_string()),
+            ] {
+                overrides.insert(key.to_string(), value);
+            }
+            rank(req, context(config(), DebiasModels::default()))
+                .await
+                .unwrap()[0]
+                .score
+        };
+        let (reply, share, click) = (4.0 * 0.2, 0.1 + 0.05 + 0.02, 0.3);
+        let all_heads = 2.0 * 0.5 + reply + share + click + NEGATIVE_SCORES_OFFSET;
+        let reply_ineligible = CandidatePayload {
+            reply_ineligible: true,
+            ..Default::default()
+        };
+        let share_ineligible = CandidatePayload {
+            share_ineligible: true,
+            ..Default::default()
+        };
+        let click_ineligible = CandidatePayload {
+            click_ineligible: true,
+            ..Default::default()
+        };
+
+        for (payload, exclude, want) in [
+            (CandidatePayload::default(), true, all_heads),
+            (reply_ineligible.clone(), true, all_heads - reply),
+            (share_ineligible, true, all_heads - share),
+            (click_ineligible, true, all_heads - click),
+            (reply_ineligible, false, all_heads),
+        ] {
+            let got = score(payload.clone(), exclude).await;
+            assert!(
+                (got - want).abs() < 1e-12,
+                "{payload:?} exclude={exclude}: got {got} want {want}"
+            );
         }
     }
 
@@ -377,6 +568,8 @@ rust_home_mixer_author_exploration:
             theta: 0.7,
             max_selected_rank: 150,
             debug_viewer_id: 0,
+            greedy_order: false,
+            window: None,
         };
         apply_dpp_overrides(
             &mut config,
@@ -388,5 +581,239 @@ rust_home_mixer_author_exploration:
         assert_eq!(config.theta, 0.7);
         assert_eq!(config.max_selected_rank, 150);
         assert_eq!(config.top_k, 24);
+    }
+
+    fn toy_model(user_fav_logit: f32, global_fav_logit_home: f32) -> Arc<UserDebiasModel> {
+        let n_heads = HEAD_NAMES.len();
+        let in_dim = FEATURE_DIM + 4;
+        let head_names = HEAD_NAMES
+            .iter()
+            .map(|h| format!("\"{h}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let meta = format!(
+            concat!(
+                r#"{{"feature_version": "serving_v1", "feature_dim": {d}, "head_names": [{heads}], "#,
+                r#""n_layers": 0, "emb_dim": 1, "trained_at_ms": {trained_at_ms}, "train_records": 1, "tensors": {{"#,
+                r#""feat_mean": [{d}], "feat_std": [{d}], "ln_g": [{d}], "ln_b": [{d}], "#,
+                r#""emb_surface": [3, 1], "emb_hour": [24, 1], "emb_dow": [7, 1], "emb_app": [32, 1], "#,
+                r#""w_out": [{in_dim}, {out}], "b_out": [{out}], "global_logit_by_surface": [3, {n}], "#,
+                r#""global_log_dwell_by_surface": [3]}}}}"#
+            ),
+            d = FEATURE_DIM,
+            heads = head_names,
+            trained_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            in_dim = in_dim,
+            out = n_heads + 1,
+            n = n_heads,
+        );
+        let mut b_out = vec![0.0f32; n_heads + 1];
+        b_out[0] = user_fav_logit;
+        let mut global_logits = vec![0.0f32; 3 * n_heads];
+        global_logits[n_heads] = global_fav_logit_home;
+        let tensors: Vec<Vec<f32>> = vec![
+            vec![0.0; FEATURE_DIM],
+            vec![1.0; FEATURE_DIM],
+            vec![1.0; FEATURE_DIM],
+            vec![0.0; FEATURE_DIM],
+            vec![0.0; 3],
+            vec![0.0; 24],
+            vec![0.0; 7],
+            vec![0.0; 32],
+            vec![0.0; in_dim * (n_heads + 1)],
+            b_out,
+            global_logits,
+            vec![0.0; 3],
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"UDB1");
+        bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(meta.as_bytes());
+        for t in tensors {
+            for v in t {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Arc::new(UserDebiasModel::from_bytes(&bytes).unwrap())
+    }
+
+    fn sequence_ipc(rows: usize) -> Vec<u8> {
+        let list_field = Arc::new(Field::new("item", DataType::Boolean, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(seq::COL_IMPRESSED_TIME_MS, DataType::Int64, false),
+            Field::new(seq::COL_DWELL_TIME_MS, DataType::Int64, true),
+            Field::new(seq::COL_FIRST_VIDEO_DURATION_MS, DataType::Int64, true),
+            Field::new(seq::COL_TIMEZONE_ID, DataType::Int32, true),
+            Field::new(seq::COL_PRODUCT_SURFACE, DataType::Int32, true),
+            Field::new(seq::COL_HAS_MEDIA, DataType::Boolean, true),
+            Field::new(
+                seq::COL_IS_AUTHOR_FOLLOWED_BY_VIEWER,
+                DataType::Boolean,
+                true,
+            ),
+            Field::new(seq::COL_TWEET_POSITION, DataType::Int32, true),
+            Field::new(seq::COL_MEDIA_CONTENT_TYPE, DataType::Int32, true),
+            Field::new(
+                seq::COL_ACTION_NAME_MULTI_HOT,
+                DataType::FixedSizeList(list_field.clone(), 64),
+                true,
+            ),
+        ]));
+        let mut hot = vec![false; rows * 64];
+        for r in 0..rows {
+            hot[r * 64 + 1] = r % 2 == 0;
+            hot[r * 64 + 11] = true;
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|r| 1_699_990_000_000 + r as i64 * 60_000),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|r| 500 + r as i64),
+                )),
+                Arc::new(Int64Array::from(vec![0i64; rows])),
+                Arc::new(Int32Array::from(vec![1i32; rows])),
+                Arc::new(Int32Array::from(vec![1i32; rows])),
+                Arc::new(BooleanArray::from(vec![false; rows])),
+                Arc::new(BooleanArray::from(vec![true; rows])),
+                Arc::new(Int32Array::from_iter_values((0..rows).map(|r| r as i32))),
+                Arc::new(Int32Array::from(vec![0i32; rows])),
+                Arc::new(FixedSizeListArray::new(
+                    list_field,
+                    64,
+                    Arc::new(BooleanArray::from(hot)),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn user_debias_recenters_fav_probability_before_fusion() {
+        let (p, user_logit, global_logit, clip) = (0.3, 1.5f32, 0.5f32, 2.0);
+        let mut req = request(vec![candidate(1, 10, p, None, true, 1.0)], "DE");
+        req.experiment_payload = RequestPayload {
+            user_sequence_arrow_ipc: sequence_ipc(5).into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into();
+
+        let debias = DebiasModels {
+            user: Some(toy_model(user_logit, global_logit)),
+            user_changed_at_ms: 0,
+        };
+        let ranked = rank(req, context(config(), debias)).await.unwrap();
+
+        let debiased_p = debiased_probability(p, user_logit, global_logit, clip);
+        assert!((debiased_p - p).abs() > 0.05);
+        let expected = 2.0 * debiased_p + NEGATIVE_SCORES_OFFSET;
+        let raw = 2.0 * p + NEGATIVE_SCORES_OFFSET;
+        let got = ranked[0].score;
+        assert!((got - expected).abs() < 1e-12, "got {got} want {expected}");
+        assert!(got < raw, "debiased {got} should be below raw {raw}");
+    }
+
+    #[test]
+    fn class_factors_come_from_config_and_fall_back_to_the_single_factor() {
+        let context = |country: &str, topic_request: bool| {
+            let req = RankRequest {
+                topic_request,
+                ..request(Vec::new(), country)
+            };
+            value_model::scoring_context(&req, &config().resolve(&viewer(country)))
+        };
+
+        assert_eq!(context("US", false), scoring_context());
+        assert_eq!(
+            context("FR", false),
+            QueryScoringContext {
+                effective_oon_weight: 0.75,
+                oon_factors: ClassFactors::new(0.6, 0.9),
+                in_network_factors: ClassFactors::new(1.2, 0.7),
+            }
+        );
+        assert_eq!(
+            context("JP", false),
+            QueryScoringContext {
+                effective_oon_weight: 0.75,
+                oon_factors: ClassFactors::new(0.75, 0.9),
+                in_network_factors: None,
+            }
+        );
+        let topic = context("FR", true);
+        assert_eq!(topic.oon_factors, None);
+        assert_eq!(topic.in_network_factors, None);
+    }
+
+    #[tokio::test]
+    async fn class_factors_rescale_the_dwell_time_term() {
+        let with_dwell_time = |tweet_id, in_network, weighted_score| RankCandidate {
+            phoenix_scores: Some(PhoenixScores {
+                favorite_score: Some(0.2),
+                dwell_time: Some(4.0),
+                ..Default::default()
+            }),
+            weighted_score,
+            ..candidate(tweet_id, tweet_id, 0.2, None, in_network, 1.0)
+        };
+        let candidates = vec![
+            with_dwell_time(1, false, None),
+            with_dwell_time(2, true, None),
+        ];
+        let engagement = 2.0 * 0.2 + NEGATIVE_SCORES_OFFSET;
+        let dwell_time = 0.1 * 4.0;
+
+        let scores = |candidates: Vec<RankCandidate>, country: &'static str| async move {
+            rank(
+                request(candidates, country),
+                context(config(), DebiasModels::default()),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.score)
+            .collect::<Vec<f64>>()
+        };
+        let assert_close = |got: &[f64], want: &[f64]| {
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want) {
+                assert!((got - want).abs() < 1e-12, "got {got} want {want}");
+            }
+        };
+
+        assert_close(
+            &scores(candidates.clone(), "US").await,
+            &[0.75 * (engagement + dwell_time), engagement + dwell_time],
+        );
+        assert_close(
+            &scores(candidates, "FR").await,
+            &[
+                0.6 * engagement + 0.9 * dwell_time,
+                1.2 * engagement + 0.7 * dwell_time,
+            ],
+        );
+        let cached = vec![
+            with_dwell_time(1, false, Some(1.0)),
+            with_dwell_time(2, true, Some(1.0)),
+        ];
+        assert_close(
+            &scores(cached, "FR").await,
+            &[
+                0.6 * (1.0 - dwell_time) + 0.9 * dwell_time,
+                1.2 * (1.0 - dwell_time) + 0.7 * dwell_time,
+            ],
+        );
     }
 }

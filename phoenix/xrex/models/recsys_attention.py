@@ -264,11 +264,11 @@ class CutedslRankerVarlenAttention(CustomAttention):
         cap = self.config.attn_logit_cap if has_cap else -1.0
         cap_method = self.config.attn_logit_cap_method
 
+        from xrex.cutedsl.ranker_attention_varlen_candidate_packed_fa4 import (
+            ranker_attention_varlen_candidate_packed_fa4,
+        )
         from xrex.cutedsl.ranker_attention_varlen_fa4 import (
             ranker_attention_varlen_fa4,
-        )
-        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
-            ranker_candidate_attention_fa4,
         )
 
         def sharded_mha(
@@ -313,13 +313,12 @@ class CutedslRankerVarlenAttention(CustomAttention):
             )
             if candidate_region_args:
                 assert cap <= 0, (
-                    "attn_logit_cap is not wired into the compact candidate layout "
-                    "(ranker_candidate_attention_fa4); use the regular packed layout"
+                    "attn_logit_cap is not supported with seqpack_candidate_packing=True"
                 )
                 candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
                     candidate_region_args
                 )
-                attn_out = ranker_candidate_attention_fa4(
+                attn_out = ranker_attention_varlen_candidate_packed_fa4(
                     q,
                     k,
                     v,
@@ -376,4 +375,105 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     "candidate_key_counts",
                 )
             )
+        return sharded_mha, extras
+
+
+class CutedslRankerCandidateOnlyAttention(CustomAttention):
+    def sharded_custom_op_with_extra_args(self, **kwargs):
+        assert isinstance(self.config, RecsysAttentionConfig)
+        assert not (
+            self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
+        ), (
+            "The candidate-only kernel has no logit cap. Set candidate_only_attn_impl=None to run "
+            "the candidate-only layers with attn_logit_cap."
+        )
+        sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
+
+        from xrex.cutedsl.ranker_attention_candidate_only_fa4 import (
+            ranker_attention_candidate_only_fa4,
+            ranker_attention_varlen_candidate_only_fa4,
+        )
+
+        has_user_rows = kwargs.get("user_key_starts") is not None
+
+        def sharded_mha(
+            q,
+            k,
+            v,
+            segment_ids,
+            segment_ids_k,
+            temp,
+            candidate_keys,
+            candidate_values,
+            *candidate_region_args,
+        ):
+            del segment_ids_k, temp
+            if candidate_region_args:
+                assert q.shape[0] == 1, "Seqpack varlen attention expects one packed row per shard."
+                if has_user_rows:
+                    (
+                        q,
+                        k,
+                        v,
+                        own_k,
+                        own_v,
+                        cu_seqlens,
+                        key_starts,
+                        key_counts,
+                        user_key_starts,
+                        user_key_counts,
+                    ) = (
+                        x[0]
+                        for x in (q, k, v, candidate_keys, candidate_values, *candidate_region_args)
+                    )
+                    num_users = user_key_counts.shape[0]
+                    region = q.shape[0] - num_users
+                    region_out = ranker_attention_varlen_candidate_only_fa4(
+                        q[:region],
+                        k,
+                        v,
+                        own_k[:region],
+                        own_v[:region],
+                        cu_seqlens,
+                        key_starts,
+                        key_counts,
+                        sm_scale,
+                    )
+                    user_out = ranker_attention_varlen_candidate_only_fa4(
+                        q[region:],
+                        k,
+                        v,
+                        own_k[region:],
+                        own_v[region:],
+                        jnp.arange(num_users + 1, dtype=jnp.int32),
+                        user_key_starts,
+                        user_key_counts,
+                        sm_scale,
+                    )
+                    return jnp.concatenate([region_out, user_out])[None], None
+                row_args = (
+                    x[0]
+                    for x in (q, k, v, candidate_keys, candidate_values, *candidate_region_args)
+                )
+                return ranker_attention_varlen_candidate_only_fa4(*row_args, sm_scale)[None], None
+            history_lengths = jnp.sum(segment_ids[:, : k.shape[1]] == 1, axis=-1, dtype=jnp.int32)
+            output = ranker_attention_candidate_only_fa4(
+                q, k, v, candidate_keys, candidate_values, history_lengths, sm_scale
+            )
+            return output, None
+
+        def _kv_heads(s):
+            return NamedShape(s, ("batch_attn", "replicated", "kv_head", "hidden"))
+
+        def _rep(s):
+            return NamedShape(s, ("batch_attn",) + tuple("replicated" for _ in s[1:]))
+
+        extras = (("candidate_keys", _kv_heads), ("candidate_values", _kv_heads))
+        if kwargs.get("candidate_cu_seqlens") is not None:
+            extras += tuple(
+                (name, _rep)
+                for name in ("candidate_cu_seqlens", "candidate_key_starts", "candidate_key_counts")
+            )
+        if has_user_rows:
+            extras += (("user_key_starts", _rep), ("user_key_counts", _rep))
         return sharded_mha, extras

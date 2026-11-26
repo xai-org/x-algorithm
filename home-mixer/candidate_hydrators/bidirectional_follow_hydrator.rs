@@ -5,23 +5,25 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::SocialGraphClientOps;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 
 pub struct BidirectionalFollowHydrator {
     pub socialgraph_client: Arc<dyn SocialGraphClientOps>,
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for BidirectionalFollowHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for BidirectionalFollowHydrator {
+    type Fetched = Vec<FollowFlags>;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.params.get(EnableBidirectionalFollowHydration) && !query.has_cached_posts
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Vec<FollowFlags>, String> {
         let following: HashSet<i64> = query
             .user_features
             .followed_user_ids
@@ -41,35 +43,46 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for BidirectionalFollowHydrator {
         let followers = if authors.is_empty() {
             HashSet::new()
         } else {
-            match self
-                .socialgraph_client
+            self.socialgraph_client
                 .check_followed_by(query.user_id, &authors)
                 .await
-            {
-                Ok(m) => m,
-                Err(e) => return candidates.iter().map(|_| Err(e.to_string())).collect(),
-            }
+                .map_err(|e| e.to_string())?
         };
 
-        candidates
+        Ok(candidates
             .iter()
             .map(|c| {
                 let author_follows_viewer = followers.contains(&c.author_id);
-                Ok(PostCandidate {
+                FollowFlags {
                     author_follows_viewer: check_all_authors.then_some(author_follows_viewer),
-                    is_mutual_follow_author: Some(
-                        author_follows_viewer && following.contains(&(c.author_id as i64)),
-                    ),
-                    ..Default::default()
-                })
+                    is_mutual_follow_author: author_follows_viewer
+                        && following.contains(&(c.author_id as i64)),
+                }
             })
-            .collect()
+            .collect())
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        flags: Vec<FollowFlags>,
+    ) {
+        for (candidate, flags) in candidates.iter_mut().zip(flags) {
+            candidate.is_mutual_follow_author = Some(flags.is_mutual_follow_author);
+            candidate.author_follows_viewer = flags.author_follows_viewer;
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.is_mutual_follow_author = hydrated.is_mutual_follow_author;
         candidate.author_follows_viewer = hydrated.author_follows_viewer;
     }
+}
+
+pub struct FollowFlags {
+    author_follows_viewer: Option<bool>,
+    is_mutual_follow_author: bool,
 }
 
 #[cfg(test)]
@@ -169,32 +182,30 @@ mod tests {
     async fn tags_only_mutual_follow_authors() {
         let hydrator = hydrator(vec![2, 3, 5]);
         let q = query(vec![1, 2, 3], true);
-        let candidates = vec![candidate(1), candidate(2), candidate(4)];
+        let mut candidates = vec![candidate(1), candidate(2), candidate(4)];
 
-        let out = hydrator.hydrate(&q, &candidates).await;
+        let fetched = hydrator.fetch(&q, &candidates).await.unwrap();
+        hydrator.apply(&q, &mut candidates, fetched);
 
-        assert_eq!(
-            out[0].as_ref().unwrap().is_mutual_follow_author,
-            Some(false)
-        );
-        assert_eq!(out[1].as_ref().unwrap().is_mutual_follow_author, Some(true));
-        assert_eq!(
-            out[2].as_ref().unwrap().is_mutual_follow_author,
-            Some(false)
-        );
+        let mutual: Vec<_> = candidates
+            .iter()
+            .map(|c| c.is_mutual_follow_author)
+            .collect();
+        assert_eq!(mutual, vec![Some(false), Some(true), Some(false)]);
     }
 
     #[tokio::test]
     async fn empty_following_tags_all_false() {
         let hydrator = hydrator(vec![1, 2, 3]);
         let q = query(vec![], true);
-        let candidates = vec![candidate(1), candidate(2)];
+        let mut candidates = vec![candidate(1), candidate(2)];
 
-        let out = hydrator.hydrate(&q, &candidates).await;
+        let fetched = hydrator.fetch(&q, &candidates).await.unwrap();
+        hydrator.apply(&q, &mut candidates, fetched);
 
-        assert!(out
+        assert!(candidates
             .iter()
-            .all(|c| c.as_ref().unwrap().is_mutual_follow_author == Some(false)));
+            .all(|c| c.is_mutual_follow_author == Some(false)));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# mirrored from GrowthBook dynamic config; last sync 2026-08-26T16:31:18Z
+# mirrored from GrowthBook dynamic config; last sync 2026-10-20T01:49:10Z
 
 for_entity: user
 
@@ -15,12 +15,6 @@ rules:
       kind: skip
       reason: user_not_found
 
-  - id: very_high_follower_count
-    # Prod uses a different follower count threshold; this is a mock value to reduce gaming.
-    when: cred.follower_count >= 12345.67
-    then:
-      kind: skip
-      reason: very_high_follower_count
 
   - id: high_follower_count
     # Prod uses a different follower count threshold; this is a mock value to reduce gaming.
@@ -29,10 +23,11 @@ rules:
       kind: skip
       reason: high_follower_count
 
+  # Prod uses a different credibility score threshold; this is a mock value to reduce gaming.
   - id: pagerank_skipped
     when: >
       cred.is_high
-      || cred.score >= 50.0
+      || cred.score >= 12.34
     then:
       kind: skip
       reason: pagerank_skipped
@@ -53,6 +48,65 @@ rules:
     when: '"panda_reports_embedding_v10_rough_spam" in score.labels'
     then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
 
+  - id: act_bb1_post_spam_bot_suspend
+    when: '"bb1_post_spam_bot_suspend" in score.labels'
+    then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+
+  - id: act_bb1_post_spam_bot_bounce
+    when: '"bb1_post_spam_bot_bounce" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - kind: act_add_labels_v2
+          labels: ["SpamHighRecall"]
+          ttl_msec: 2592000000
+        - kind: act_spam_liveness_check
+
+  - id: act_bb1_reply_spam_bot_suspend
+    when: '"bb1_reply_spam_bot_suspend" in score.labels'
+    then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+
+  - id: act_bb1_reply_spam_bot_bounce
+    when: '"bb1_reply_spam_bot_bounce" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - kind: act_add_labels_v2
+          labels: ["SpamHighRecall"]
+          ttl_msec: 2592000000
+        - kind: act_spam_liveness_check
+
+  - id: act_bb1_user_suspend
+    when: '"bb1_user_suspend" in score.labels'
+    then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+
+  - id: act_liveness_check_and_spam_high_recall_7d
+    when: '"liveness_check_and_spam_high_recall_7d" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - kind: act_add_labels_v2
+          labels: ["SpamHighRecall"]
+          ttl_msec: 604800000
+        - kind: act_spam_liveness_check
+
+  - id: act_spam_high_recall_7d
+    when: '"spam_high_recall_7d" in score.labels'
+    then:
+      kind: act_add_labels_v2
+      labels: ["SpamHighRecall"]
+      ttl_msec: 604800000
+
+  - id: act_bb1_user_bounce
+    when: '"bb1_user_bounce" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - kind: act_add_labels_v2
+          labels: ["SpamHighRecall"]
+          ttl_msec: 2592000000
+        - kind: act_spam_liveness_check
+
 
 
   - id: already_spam_high_recall_labeled_llm_slop
@@ -66,7 +120,7 @@ rules:
     then:
       kind: act_add_labels_v2
       labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000
+      ttl_msec: 604800000
 
   - id: already_spam_high_recall_labeled_majority_poster
     when: '"SpamEmbeddingMajorityPoster" in score.labels && "SpamHighRecall" in user.labels'
@@ -120,110 +174,12 @@ rules:
     then:
       kind: act_spam_liveness_check
 
-  - id: act_inauthentic_detection_v45_suspend
-    when: 'score.model_version.startsWith("inauthentic_detection_v45") && "inauthentic_detection_v45_suspend" in score.labels'
+  - id: act_impersonation_scam_suspend
+    when: '"impersonation_scam_classifier_v1_suspend" in score.labels'
     then:
       kind: act_suspend_user
       perm: false
       policy: PlatformManipulation
-
-  - id: act_inauthentic_detection_v45_label_and_captcha
-    when: >
-      score.model_version.startsWith("inauthentic_detection_v45")
-      && "inauthentic_detection_v45_label_shr" in score.labels
-      && "inauthentic_detection_v45_bounce_captcha" in score.labels
-    then:
-      kind: act_all
-      actions:
-        - kind: act_add_labels_v2
-          labels: ["SpamHighRecall"]
-          ttl_msec: 2592000000
-        - kind: act_captcha
-
-  - id: act_inauthentic_detection_v45_label_and_arkose
-    when: >
-      score.model_version.startsWith("inauthentic_detection_v45")
-      && "inauthentic_detection_v45_label_shr" in score.labels
-      && "inauthentic_detection_v45_bounce_arkose" in score.labels
-    then:
-      kind: act_all
-      actions:
-        - kind: act_add_labels_v2
-          labels: ["SpamHighRecall"]
-          ttl_msec: 2592000000
-        - kind: act_arkose
-
-  - id: act_inauthentic_detection_v45_label
-    when: 'score.model_version.startsWith("inauthentic_detection_v45") && "inauthentic_detection_v45_label_shr" in score.labels'
-    then:
-      kind: act_add_labels_v2
-      labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000
-
-  - id: act_inauthentic_detection_v45_bounce_captcha
-    when: 'score.model_version.startsWith("inauthentic_detection_v45") && "inauthentic_detection_v45_bounce_captcha" in score.labels'
-    then:
-      kind: act_captcha
-
-  - id: act_inauthentic_detection_v45_bounce_arkose
-    when: 'score.model_version.startsWith("inauthentic_detection_v45") && "inauthentic_detection_v45_bounce_arkose" in score.labels'
-    then:
-      kind: act_arkose
-
-  - id: act_cluster_spam_extended_suspend
-    when: 'score.model_version.startsWith("cluster_spam_extended") && "cluster_spam_extended_suspend" in score.labels'
-    then:
-      kind: act_suspend_user
-      perm: false
-      policy: PlatformManipulation
-
-  - id: act_cluster_spam_extended_bounce
-    when: 'score.model_version.startsWith("cluster_spam_extended") && "cluster_spam_extended_bounce" in score.labels'
-    then:
-      kind: act_arkose
-
-  - id: act_cluster_spam_extended_label
-    when: 'score.model_version.startsWith("cluster_spam_extended") && "cluster_spam_extended_label_shr" in score.labels'
-    then:
-      kind: act_add_labels_v2
-      labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000
-
-  - id: hold_cluster_spam
-    when: 'score.model_version.startsWith("cluster_spam")'
-    then:
-      kind: skip
-      reason: cluster_spam_held
-
-  - id: act_cluster_spam_suspend
-    when: 'score.model_version.startsWith("cluster_spam") && "cluster_spam_suspend" in score.labels'
-    then:
-      kind: act_suspend_user
-      perm: false
-      policy: PlatformManipulation
-
-  - id: act_cluster_spam_bounce
-    when: 'score.model_version.startsWith("cluster_spam") && "cluster_spam_bounce" in score.labels'
-    then:
-      kind: act_arkose
-
-  - id: act_cluster_spam_label
-    when: 'score.model_version.startsWith("cluster_spam") && "cluster_spam_label_shr" in score.labels'
-    then:
-      kind: act_add_labels_v2
-      labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000
-
-  - id: platform_row_without_requested_actions
-    when: '"abuse_platform_requested_actions" in score.labels && size(score.requested_actions) == 0'
-    then:
-      kind: skip
-      reason: platform_row_without_requested_actions
-
-  - id: act_requested_actions
-    when: "size(score.requested_actions) > 0"
-    then:
-      kind: act_requested_actions
 
   - id: act_suspend
     when: "true"

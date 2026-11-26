@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use tonic::async_trait;
 use tracing::warn;
 use wingman_client::{Exists, Fleet};
@@ -18,7 +19,7 @@ pub trait WingmanClient: Send + Sync {
         &self,
         viewer_id: u64,
         root_author_ids: &[u64],
-    ) -> Option<Vec<Exists>>;
+    ) -> HashMap<u64, Exists>;
 }
 
 pub struct ProdWingmanClient {
@@ -38,7 +39,7 @@ impl WingmanClient for ProdWingmanClient {
         &self,
         viewer_id: u64,
         root_author_ids: &[u64],
-    ) -> Option<Vec<Exists>> {
+    ) -> HashMap<u64, Exists> {
         let pairs = root_author_ids.iter().map(|&root| (root, viewer_id));
         let mode = IntersectMode::FwdXRev;
         wingman_client::exists_intersect(&self.client, FOLLOWS_GRAPH, mode, pairs)
@@ -49,6 +50,7 @@ impl WingmanClient for ProdWingmanClient {
                     "Wingman exists_intersect failed"
                 );
             })
-            .ok()
+            .map(|exists| root_author_ids.iter().copied().zip(exists).collect())
+            .unwrap_or_default()
     }
 }

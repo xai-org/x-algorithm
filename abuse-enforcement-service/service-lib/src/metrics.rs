@@ -55,6 +55,20 @@ lazy_static! {
             "Bypass claims lost to a concurrent claimant at nonce verification.")
             .unwrap();
 
+                            pub static ref SUSPEND_ORDER_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_suspend_order_total",
+            "Suspensions ordered against another suspension of the same account.",
+            &["outcome", "seen_in"])
+            .unwrap();
+
+            pub static ref POST_LABEL_READ_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_post_label_read_total",
+            "Reads of a post's current labels before a page decision labels it.",
+            &["result"])
+            .unwrap();
+
                             pub static ref STRATO_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_strato_latency_seconds",
@@ -95,6 +109,27 @@ lazy_static! {
             "abuse_enforcement_gizmoduck_check_total",
             "Gizmoduck precheck observed user state.",
             &["status"])
+            .unwrap();
+
+            pub static ref GIZMODUCK_LOGIN_EMAIL_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_gizmoduck_login_email_total",
+            "Found gizmoduck users by login e-mail state.",
+            &["state"])
+            .unwrap();
+
+            pub static ref TEST_ACCOUNT_SKIPS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_test_account_skips_total",
+            "Decisions skipped because the account is a test account.",
+            &["kind"])
+            .unwrap();
+
+            pub static ref INVITED_REPLY_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_invited_reply_total",
+            "Post decisions on replies, by whether the parent post invited the reply.",
+            &["answer"])
             .unwrap();
 
                     pub static ref GIZMODUCK_LATENCY: HistogramVec =
@@ -187,14 +222,6 @@ lazy_static! {
             "abuse_enforcement_rules_yaml_compiled_total",
             "GrowthBook rules-YAML compile attempts, by entity_type and result (success keeps/updates last-good; fail keeps last-good).",
             &["entity_type", "result"])
-            .unwrap();
-
-
-                                                                                    pub static ref GENERIC_ACTION_TOTAL: IntCounterVec =
-        register_int_counter_vec!(
-            "abuse_enforcement_generic_action_total",
-            "Requested actions handled by the generic executor, by entity_type, kind, result, and fail-closed skip reason.",
-            &["entity_type", "kind", "result", "reason"])
             .unwrap();
 
 
@@ -347,6 +374,14 @@ lazy_static! {
             &["result"])
             .unwrap();
 
+
+                                                pub static ref HEAD_GUARD_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_head_guard_total",
+            "Head-guard events by head, scope, window and result.",
+            &["head", "scope", "window", "result"])
+            .unwrap();
+
             pub static ref ACTION_CONTROL_LOADED: IntGauge =
         register_int_gauge!(
             "abuse_enforcement_action_control_loaded",
@@ -384,6 +419,13 @@ lazy_static! {
             "abuse_enforcement_action_control_decisions_total",
             "Decisions an action-control record matched, by effective mode.",
             &["head", "mode", "forced"])
+            .unwrap();
+
+                pub static ref ACTION_CONTROL_ROLLOUT_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_action_control_rollout_total",
+            "Decisions a live row's rollout placed, by head, row and side (inside, outside).",
+            &["head", "row", "side"])
             .unwrap();
 
             pub static ref ACTION_CONTROL_SAFETY_CHECKS_OK: IntGaugeVec =
@@ -445,11 +487,16 @@ pub fn init() {
     let _ = &*DEDUP_WRITE_FENCED_TOTAL;
     let _ = &*DEDUP_DISPLACED_RESTORED_TOTAL;
     let _ = &*DEDUP_BYPASS_CLAIM_LOST_TOTAL;
+    let _ = &*SUSPEND_ORDER_TOTAL;
+    let _ = &*POST_LABEL_READ_TOTAL;
     let _ = &*STRATO_LATENCY;
     let _ = &*AIS_LATENCY;
     let _ = &*KAFKA_MESSAGE_LATENCY;
     let _ = &*USER_ACTIVE_SECONDS;
     let _ = &*GIZMODUCK_CHECK_TOTAL;
+    let _ = &*GIZMODUCK_LOGIN_EMAIL_TOTAL;
+    let _ = &*TEST_ACCOUNT_SKIPS_TOTAL;
+    let _ = &*INVITED_REPLY_TOTAL;
     let _ = &*GIZMODUCK_LATENCY;
     let _ = &*STRATO_RETRIES;
     let _ = &*RETRY_ATTEMPTS;
@@ -461,7 +508,6 @@ pub fn init() {
     let _ = &*MANHATTAN_ERRORS_TOTAL;
     let _ = &*KAFKA_SELF_DELETE_TOTAL;
     let _ = &*RULES_YAML_COMPILED;
-    let _ = &*GENERIC_ACTION_TOTAL;
     let _ = &*HTTP_LATENCY;
     let _ = &*HTTP_INFLIGHT;
     let _ = &*KAFKA_PUBLISH_TOTAL;
@@ -481,8 +527,10 @@ pub fn init() {
     let _ = &*ACTION_CONTROL_REFRESH_TOTAL;
     let _ = &*ACTION_CONTROL_UNREADABLE_TOTAL;
     let _ = &*ACTION_CONTROL_DECISIONS_TOTAL;
+    let _ = &*ACTION_CONTROL_ROLLOUT_TOTAL;
     let _ = &*ACTION_CONTROL_SAFETY_CHECKS_OK;
     let _ = &*ACTION_CONTROL_SEEN_TOTAL;
+    let _ = &*HEAD_GUARD_TOTAL;
 }
 
 #[cfg(test)]

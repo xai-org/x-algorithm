@@ -13,9 +13,11 @@ use futures::future::join_all;
 use std::any::type_name_of_val;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::task::JoinSet;
 use tonic::async_trait;
-use tracing::{field::Empty, Span};
+use tracing::{field::Empty, warn, Instrument, Span};
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
+use xai_x_rpc::{current_deadline, CallContext};
 
 const FINAL_RESULT_SIZE_SCOPE: [(&str, &str); 1] = [("requests", "result_size")];
 const FINAL_RESULT_EMPTY_SCOPE: [(&str, &str); 1] = [("requests", "result_empty")];
@@ -78,6 +80,8 @@ pub trait PipelineQuery: Clone + Send + Sync + 'static {
 pub trait PipelineCandidate: Clone + Send + Sync + 'static {}
 impl<T> PipelineCandidate for T where T: Clone + Send + Sync + 'static {}
 
+pub type SharedHydrators<Q, C> = Arc<Vec<Box<dyn Hydrator<Q, C>>>>;
+
 #[async_trait]
 pub trait CandidatePipeline<Q, C>: Send + Sync
 where
@@ -90,6 +94,9 @@ where
     }
     fn sources(&self) -> &[Box<dyn Source<Q, C>>];
     fn hydrators(&self) -> &[Box<dyn Hydrator<Q, C>>];
+    fn spawned_hydrators(&self, _query: &Q) -> Option<SharedHydrators<Q, C>> {
+        None
+    }
     fn filters(&self) -> &[Box<dyn Filter<Q, C>>];
     fn scorers(&self) -> &[Box<dyn Scorer<Q, C>>];
     fn selector(&self) -> &dyn Selector<Q, C>;
@@ -97,7 +104,13 @@ where
     fn post_selection_filters(&self) -> &[Box<dyn Filter<Q, C>>];
     fn side_effects(&self) -> Arc<Vec<Box<dyn SideEffect<Q, C>>>>;
     fn result_size(&self) -> usize;
+    fn result_size_for(&self, _query: &Q) -> usize {
+        self.result_size()
+    }
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
+    fn retain_retrieved_candidates(&self, _query: &Q) -> bool {
+        true
+    }
 
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
         self.execute_traced(query).await.0
@@ -129,9 +142,14 @@ where
         let candidates = self.fetch_candidates(&hydrated_query).await;
 
         let hydrated_candidates = self.hydrate(&hydrated_query, candidates).await;
+        let retrieved_candidates = if self.retain_retrieved_candidates(&hydrated_query) {
+            hydrated_candidates.clone()
+        } else {
+            Vec::new()
+        };
 
         let (kept_candidates, mut filtered_candidates) =
-            self.filter(&hydrated_query, hydrated_candidates.clone());
+            self.filter(&hydrated_query, hydrated_candidates);
 
         let scored_candidates = self.score(&hydrated_query, kept_candidates).await;
 
@@ -148,8 +166,10 @@ where
             self.filter_post_selection(&hydrated_query, post_selection_hydrated_candidates);
         filtered_candidates.extend(post_selection_filtered_candidates);
 
-        let truncated_candidates =
-            final_candidates.split_off(self.result_size().min(final_candidates.len()));
+        let truncated_candidates = final_candidates.split_off(
+            self.result_size_for(&hydrated_query)
+                .min(final_candidates.len()),
+        );
         non_selected_candidates.extend(truncated_candidates);
 
         self.finalize(&hydrated_query, &mut final_candidates);
@@ -166,7 +186,7 @@ where
         self.run_side_effects(input);
 
         PipelineResult {
-            retrieved_candidates: hydrated_candidates,
+            retrieved_candidates,
             filtered_candidates,
             selected_candidates: final_candidates,
             query: arc_hydrated_query,
@@ -291,9 +311,15 @@ where
         let source_futures = sources.iter().map(|s| s.run(query, PipelineStage::Source));
         let results = join_all(source_futures).await;
 
-        let mut collected = Vec::new();
-        for mut candidates in results.into_iter().flatten() {
-            collected.append(&mut candidates);
+        let total = results.iter().flatten().map(Vec::len).sum::<usize>();
+        let mut sources = results
+            .into_iter()
+            .flatten()
+            .filter(|candidates| !candidates.is_empty());
+        let mut collected = sources.next().unwrap_or_default();
+        collected.reserve(total - collected.len());
+        for candidates in sources {
+            collected.extend(candidates);
         }
         Span::current().record("candidate_count", collected.len());
         stats.finish_with_size(collected.len());
@@ -305,8 +331,16 @@ where
         enabled_count = Empty,
     ))]
     async fn hydrate(&self, query: &Q, candidates: Vec<C>) -> Vec<C> {
-        self.run_hydrators(query, candidates, self.hydrators(), PipelineStage::Hydrator)
-            .await
+        match self.spawned_hydrators(query) {
+            Some(hydrators) => {
+                self.run_spawned_hydrators(query, candidates, hydrators, PipelineStage::Hydrator)
+                    .await
+            }
+            None => {
+                self.run_hydrators(query, candidates, self.hydrators(), PipelineStage::Hydrator)
+                    .await
+            }
+        }
     }
 
     #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "post_selection_hydrators", fields(
@@ -333,10 +367,75 @@ where
         let stats = StageStats::begin(stage);
         let enabled: Vec<_> = hydrators.iter().filter(|h| h.enable(query)).collect();
         stats.record_components(hydrators.len(), enabled.len());
-        let hydrate_futures = enabled.iter().map(|h| h.run(query, &candidates, stage));
-        let results = join_all(hydrate_futures).await;
-        for (hydrator, result) in enabled.iter().zip(results) {
-            hydrator.update_all(&mut candidates, result);
+        let fetch_futures = enabled
+            .iter()
+            .map(|h| h.fetch_output(query, &candidates, stage));
+        let outputs = join_all(fetch_futures).await;
+        for (hydrator, output) in enabled.iter().zip(outputs) {
+            hydrator.apply_output(query, &mut candidates, output);
+        }
+        stats.finish_with_size(candidates.len());
+        candidates
+    }
+
+    async fn run_spawned_hydrators(
+        &self,
+        query: &Q,
+        candidates: Vec<C>,
+        hydrators: SharedHydrators<Q, C>,
+        stage: PipelineStage,
+    ) -> Vec<C> {
+        let stats = StageStats::begin(stage);
+        let enabled: Vec<usize> = hydrators
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.enable(query))
+            .map(|(i, _)| i)
+            .collect();
+        stats.record_components(hydrators.len(), enabled.len());
+
+        let query = Arc::new(query.clone());
+        let shared = Arc::new(candidates);
+        let summary = pipeline_summary::fork(stage);
+        let labels = vec![("pipeline".to_string(), self.name().to_string())];
+        let call_context = CallContext {
+            deadline: current_deadline(),
+        };
+        let mut tasks = JoinSet::new();
+        for &i in &enabled {
+            let hydrators = Arc::clone(&hydrators);
+            let query = Arc::clone(&query);
+            let shared = Arc::clone(&shared);
+            let task = async move {
+                let (output, trace) = summary
+                    .capture(hydrators[i].fetch_output(&query, &shared, stage))
+                    .await;
+                (i, output, trace)
+            };
+            tasks.spawn(
+                call_context
+                    .scope(xai_stats_receiver::with_scoped_metric_labels(
+                        labels.clone(),
+                        task,
+                    ))
+                    .instrument(Span::current()),
+            );
+        }
+
+        let mut results = Vec::with_capacity(enabled.len());
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(result) => results.push(result),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => warn!(%error, "hydrator task cancelled"),
+            }
+        }
+        results.sort_unstable_by_key(|(i, _, _)| *i);
+
+        let mut candidates = Arc::unwrap_or_clone(shared);
+        for (i, output, trace) in results {
+            summary.merge(trace);
+            hydrators[i].apply_output(&query, &mut candidates, output);
         }
         stats.finish_with_size(candidates.len());
         candidates

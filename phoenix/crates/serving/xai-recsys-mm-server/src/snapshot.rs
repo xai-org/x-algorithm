@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
-use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -110,11 +109,27 @@ impl EmbeddingStore {
     }
 }
 
+pub const SNAPSHOT_ROWS_PER_GROUP: usize = 4_096;
+
 pub fn write_embeddings_to_parquet(records: &[EmbeddingRecord], version: &str) -> Result<Bytes> {
-    if records.is_empty() {
+    let (bytes, _) = write_embedding_rows_to_parquet(
+        records.iter().map(|r| (r.post_id, r.embedding.as_slice())),
+        version,
+        SNAPSHOT_ROWS_PER_GROUP,
+    )?;
+    Ok(bytes)
+}
+
+pub fn write_embedding_rows_to_parquet<'a>(
+    rows: impl IntoIterator<Item = (u64, &'a [f16])>,
+    version: &str,
+    rows_per_group: usize,
+) -> Result<(Bytes, usize)> {
+    let mut rows = rows.into_iter().peekable();
+    let Some(&(_, first)) = rows.peek() else {
         log::error!("No embeddings to write");
-        return Ok(Bytes::new());
-    }
+        return Ok((Bytes::new(), 0));
+    };
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("postID", DataType::UInt64, false),
@@ -125,42 +140,50 @@ pub fn write_embeddings_to_parquet(records: &[EmbeddingRecord], version: &str) -
             false,
         ),
     ]));
-
-    let post_ids: Vec<u64> = records.iter().map(|r| r.post_id).collect();
-    let post_id_array = Arc::new(UInt64Array::from(post_ids)) as ArrayRef;
-
-    let versions: Vec<&str> = records.iter().map(|_| version).collect();
-    let version_array = Arc::new(StringArray::from(versions)) as ArrayRef;
-
-    let mut embedding_builder = LargeListBuilder::new(Float32Builder::new());
-    for record in records {
-        let values_builder = embedding_builder.values();
-        for &val in &record.embedding {
-            values_builder.append_value(val.to_f32());
-        }
-        embedding_builder.append(true);
-    }
-    let embedding_array = Arc::new(embedding_builder.finish()) as ArrayRef;
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![post_id_array, version_array, embedding_array],
-    )
-    .context("Failed to create record batch")?;
-
-    let mut buffer = Cursor::new(Vec::new());
+    let max_rows = rows.size_hint().1.unwrap_or(rows_per_group);
+    let buffer = Vec::with_capacity(max_rows.saturating_mul(first.len() * 4) + (1 << 20));
     let props = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(rows_per_group.max(1)))
         .build();
-    let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(props))
+    let mut writer = ArrowWriter::try_new(buffer, schema.clone(), Some(props))
         .context("Failed to create parquet writer")?;
 
-    writer
-        .write(&batch)
-        .context("Failed to write record batch")?;
-    writer.close().context("Failed to close parquet writer")?;
+    let mut embedding_builder = LargeListBuilder::new(Float32Builder::new());
+    let mut written = 0usize;
+    loop {
+        let mut post_ids = Vec::with_capacity(rows_per_group);
+        for (post_id, embedding) in rows.by_ref().take(rows_per_group) {
+            post_ids.push(post_id);
+            let values_builder = embedding_builder.values();
+            for &val in embedding {
+                values_builder.append_value(val.to_f32());
+            }
+            embedding_builder.append(true);
+        }
+        if post_ids.is_empty() {
+            break;
+        }
+        let n = post_ids.len();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(post_ids)) as ArrayRef,
+                Arc::new(StringArray::from(vec![version; n])) as ArrayRef,
+                Arc::new(embedding_builder.finish()) as ArrayRef,
+            ],
+        )
+        .context("Failed to create record batch")?;
+        writer
+            .write(&batch)
+            .context("Failed to write record batch")?;
+        written += n;
+    }
 
-    Ok(Bytes::from(buffer.into_inner()))
+    let buffer = writer
+        .into_inner()
+        .context("Failed to close parquet writer")?;
+    Ok((Bytes::from(buffer), written))
 }
 
 pub async fn dump_snapshot(store: &EmbeddingStore, o2_client: &O2Client, dst_dir: &str) {
@@ -655,5 +678,72 @@ mod tests {
             DEFAULT_O2_FETCH_CONCURRENCY
         );
         assert_eq!(parse_o2_fetch_concurrency(""), DEFAULT_O2_FETCH_CONCURRENCY);
+    }
+
+    fn record(post_id: u64, values: &[f32]) -> EmbeddingRecord {
+        EmbeddingRecord {
+            post_id,
+            embedding: values.iter().map(|&v| f16::from_f32(v)).collect(),
+        }
+    }
+
+    #[test]
+    fn chunked_parquet_round_trips_through_the_engine_reader() {
+        let records: Vec<_> = (1..=5u64)
+            .map(|id| record(id, &[id as f32, -0.5, 0.25]))
+            .collect();
+        let (bytes, written) = write_embedding_rows_to_parquet(
+            records.iter().map(|r| (r.post_id, r.embedding.as_slice())),
+            "v8_2",
+            2,
+        )
+        .unwrap();
+        assert_eq!(written, 5);
+
+        let meta = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(meta.num_row_groups(), 3);
+
+        let read = read_embeddings_from_parquet(bytes, "test").unwrap();
+        let got: Vec<(u64, Vec<f16>)> =
+            read.into_iter().map(|r| (r.post_id, r.embedding)).collect();
+        let want: Vec<(u64, Vec<f16>)> = records
+            .into_iter()
+            .map(|r| (r.post_id, r.embedding))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn chunked_parquet_matches_the_single_batch_schema() {
+        let records = vec![record(7, &[1.0, 2.0])];
+        let bytes = write_embeddings_to_parquet(&records, "v5_1").unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let schema = reader.schema().clone();
+        let fields: Vec<(&str, &DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type(), f.is_nullable()))
+            .collect();
+        let list = DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)));
+        assert_eq!(
+            fields,
+            vec![
+                ("postID", &DataType::UInt64, false),
+                ("version", &DataType::Utf8, false),
+                ("embedding", &list, false),
+            ]
+        );
+        let batch = reader.build().unwrap().next().unwrap().unwrap();
+        assert_eq!(batch.column(1).as_string::<i32>().value(0), "v5_1");
+    }
+
+    #[test]
+    fn chunked_parquet_writes_nothing_for_no_rows() {
+        let (bytes, written) =
+            write_embedding_rows_to_parquet(std::iter::empty(), "v8_2", 2).unwrap();
+        assert_eq!((bytes.len(), written), (0, 0));
     }
 }

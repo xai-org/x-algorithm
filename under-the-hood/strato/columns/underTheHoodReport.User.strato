@@ -35,16 +35,36 @@ val englishMonthNames = Seq(
   "December",
 )
 type RichTextEntity = com.twitter.timelines.render.RichTextEntity
-type NoteSpan = {
+type TextSpan = {
   text: String,
   url: Option[String]
 }
-type NoteBuild = {
+type RichTextBuild = {
   text: String,
   entities: Seq[RichTextEntity]
 }
+type AppealSwitches = {
+  enabled: Boolean,
+  sensitiveMediaFromPost: Boolean
+}
+type PostIdPolicy = {
+  enabled: Boolean,
+  listAllWhenPostsAtMost: Int,
+  listNoneWhenSharePctAbove: Int,
+  maxPerLabel: Int
+}
+type PostIdOutcome = {
+  postIds: Option[Seq[String]],
+  postIdsMostRecentNote: Option[String],
+  postIdsNotShownNote: Option[String]
+}
 
-val noteSpans: Seq[NoteSpan] = Seq(
+val postLabelsDescription =
+  "Labels that could limit post visibility and were on your posts at any point in this period."
+val accountLabelsDescription =
+  "Labels that could limit post visibility and were on your account at any point in this period."
+
+val noteSpans: Seq[TextSpan] = Seq(
   {
     text = "You can learn more about instances when a post’s reach may be limited by reading our ",
     url = None : Option[String],
@@ -64,12 +84,13 @@ val noteSpans: Seq[NoteSpan] = Seq(
   { text = "open-source", url = Some("https://github.com/xai-org/x-algorithm/tree/main/under-the-hood") },
 )
 
-val reportNoteString = noteSpans.foldLeft("") { (acc, span) =>
-  span.url match {
-    case Some(url) => acc + span.text + " (" + url + ")"
-    case None => acc + span.text
+def spansText(spans: Seq[TextSpan]): String =
+  spans.foldLeft("") { (acc, span) =>
+    span.url match {
+      case Some(url) => acc + span.text + " (" + url + ")"
+      case None => acc + span.text
+    }
   }
-}
 
 def linkEntity(fromIndex: Int, linkText: String, url: String): RichTextEntity = {
   fromIndex = fromIndex,
@@ -80,8 +101,8 @@ def linkEntity(fromIndex: Int, linkText: String, url: String): RichTextEntity = 
   })),
 }
 
-def reportNote(): RichText = {
-  val built = noteSpans.foldLeft[NoteBuild]({ text = "", entities = Seq.empty[RichTextEntity] }) { (acc, span) =>
+def spansRichText(spans: Seq[TextSpan]): RichText = {
+  val built = spans.foldLeft[RichTextBuild]({ text = "", entities = Seq.empty[RichTextEntity] }) { (acc, span) =>
     span.url match {
       case Some(url) => {
         text = acc.text + span.text,
@@ -98,6 +119,10 @@ def reportNote(): RichText = {
     entities = built.entities,
   }
 }
+
+val reportNoteString = spansText(noteSpans)
+
+def reportNote(): RichText = spansRichText(noteSpans)
 
 val utcYyyyMm = TimeFormat.apply("yyyyMM").withZone("UTC")
 val utcYyyyMmDd = TimeFormat.apply("yyyy-MM-dd").withZone("UTC")
@@ -239,21 +264,134 @@ def formatPercentage(numerator: Long, denominator: Long): String = {
   }
 }
 
+def postAppealSpans(
+    raw: String,
+    countryCodes: Seq[String],
+    includeTakedowns: Boolean,
+    appeals: AppealSwitches
+): Option[Seq[TextSpan]] =
+  if (!appeals.enabled) {
+    None
+  } else if (underTheHoodLabels.isPostLabel(raw)) {
+    underTheHoodLabels.postLabelAppeal(raw, appeals.sensitiveMediaFromPost)
+  } else if (includeTakedowns && underTheHoodLabels.isPostTakedownLabel(raw, countryCodes)) {
+    underTheHoodLabels.takedownAppeal(raw, countryCodes)
+  } else {
+    None
+  }
+
+def postRowLabel(raw: String, countryCodes: Seq[String]): String =
+  if (underTheHoodLabels.isPostLabel(raw)) {
+    underTheHoodLabels.postLabelName(raw)
+  } else {
+    underTheHoodLabels.takedownLabelName(raw, countryCodes)
+  }
+
+def postLabelAppeals(
+    userMonth: UthUserMonthAggregate,
+    includeTakedowns: Boolean,
+    appeals: AppealSwitches
+): Option[Map[String, RichText]] = {
+  val byLabel = userMonth.postLabelAgg
+    .getOrElse(Seq.empty)
+    .flatMap { agg =>
+      agg.label.flatMap { raw =>
+        val codes = agg.countryCodes.getOrElse(Seq.empty)
+        postAppealSpans(raw, codes, includeTakedowns, appeals).map { spans =>
+          (postRowLabel(raw, codes), spansRichText(spans))
+        }
+      }
+    }
+    .toMap
+  if (byLabel.isEmpty) { None } else { Some(byLabel) }
+}
+
+def postIdsNotShownNote(postIdPolicy: PostIdPolicy): String = {
+  val byShare = "You’ll see specific posts listed here only if " +
+    postIdPolicy.listNoneWhenSharePctAbove.toString + "% or fewer of your posts have this label"
+  if (postIdPolicy.listAllWhenPostsAtMost > 0) {
+    byShare + ", or if " + postIdPolicy.listAllWhenPostsAtMost.toString +
+      " or fewer of your posts have it."
+  } else {
+    byShare + "."
+  }
+}
+
+def postIdsMostRecentNote(listed: Int): String =
+  if (listed == 1) {
+    "Listing the most recent post with this label."
+  } else {
+    "Listing the " + listed.toString + " most recent posts with this label."
+  }
+
+def listedPostIds(ids: Seq[String], carried: Long): PostIdOutcome = {
+  val mostRecentNote = if (ids.nonEmpty && ids.size.toLong < carried) {
+    Some(postIdsMostRecentNote(ids.size))
+  } else {
+    None : Option[String]
+  }
+  {
+    postIds = Some(ids),
+    postIdsMostRecentNote = mostRecentNote,
+    postIdsNotShownNote = None : Option[String],
+  }
+}
+
+def shownPostIds(
+    postIdPolicy: PostIdPolicy,
+    allPostIds: Seq[Long],
+    carried: Long,
+    postCount: Long,
+    isTakedown: Boolean
+): PostIdOutcome = {
+  val newest = allPostIds.take(postIdPolicy.maxPerLabel).map { id => id.toString }
+  if (!postIdPolicy.enabled) {
+    {
+      postIds = None : Option[Seq[String]],
+      postIdsMostRecentNote = None : Option[String],
+      postIdsNotShownNote = None : Option[String],
+    }
+  } else if (isTakedown) {
+    listedPostIds(newest, carried)
+  } else if (carried <= postIdPolicy.listAllWhenPostsAtMost.toLong) {
+    listedPostIds(newest, carried)
+  } else if (carried * 100L > postIdPolicy.listNoneWhenSharePctAbove.toLong * postCount) {
+    {
+      postIds = Some(Seq.empty[String]),
+      postIdsMostRecentNote = None : Option[String],
+      postIdsNotShownNote = Some(postIdsNotShownNote(postIdPolicy)),
+    }
+  } else {
+    listedPostIds(newest, carried)
+  }
+}
+
 def postLabelRow(
     raw: String,
     countryCodes: Seq[String],
     carried: Long,
     postCount: Long,
-    includeTakedowns: Boolean
+    includeTakedowns: Boolean,
+    appeals: AppealSwitches,
+    allPostIds: Seq[Long],
+    postIdPolicy: PostIdPolicy
 ): Option[{
   label: String,
   about: String,
   effect: String,
   posts: Long,
   totalPostsInMonth: Long,
-  percentageOfPosts: String
-}] =
+  percentageOfPosts: String,
+  howToAppeal: Option[String],
+  postIds: Option[Seq[String]],
+  postIdsMostRecentNote: Option[String],
+  postIdsNotShownNote: Option[String]
+}] = {
+  val howToAppeal = postAppealSpans(raw, countryCodes, includeTakedowns, appeals).map { spans =>
+    spansText(spans)
+  }
   if (underTheHoodLabels.isPostLabel(raw)) {
+    val ids = shownPostIds(postIdPolicy, allPostIds, carried, postCount, false)
     Some({
       label = underTheHoodLabels.postLabelName(raw),
       about = underTheHoodLabels.postLabelAbout(raw),
@@ -261,8 +399,13 @@ def postLabelRow(
       posts = carried,
       totalPostsInMonth = postCount,
       percentageOfPosts = formatPercentage(carried, postCount),
+      howToAppeal = howToAppeal,
+      postIds = ids.postIds,
+      postIdsMostRecentNote = ids.postIdsMostRecentNote,
+      postIdsNotShownNote = ids.postIdsNotShownNote,
     })
   } else if (includeTakedowns && underTheHoodLabels.isPostTakedownLabel(raw, countryCodes)) {
+    val ids = shownPostIds(postIdPolicy, allPostIds, carried, postCount, true)
     Some({
       label = underTheHoodLabels.takedownLabelName(raw, countryCodes),
       about = underTheHoodLabels.postTakedownAbout(raw, countryCodes),
@@ -270,10 +413,15 @@ def postLabelRow(
       posts = carried,
       totalPostsInMonth = postCount,
       percentageOfPosts = formatPercentage(carried, postCount),
+      howToAppeal = howToAppeal,
+      postIds = ids.postIds,
+      postIdsMostRecentNote = ids.postIdsMostRecentNote,
+      postIdsNotShownNote = ids.postIdsNotShownNote,
     })
   } else {
     None
   }
+}
 
 def accountLabelRow(
     raw: String,
@@ -288,7 +436,7 @@ def accountLabelRow(
   days: Long,
   daysInPeriod: Int,
   percentageOfDays: String
-}] =
+}] = {
   if (underTheHoodLabels.isAccountLabel(raw)) {
     Some({
       label = underTheHoodLabels.accountLabelName(raw),
@@ -310,13 +458,16 @@ def accountLabelRow(
   } else {
     None
   }
+}
 
 def buildReportJson(
     userMonth: UthUserMonthAggregate,
     monthBucket: Int,
     generatedAtMs: Long,
     periodDays: Int,
-    includeTakedowns: Boolean
+    includeTakedowns: Boolean,
+    appeals: AppealSwitches,
+    postIdPolicy: PostIdPolicy
 ): String = {
   val postCount = userMonth.eligiblePostAgg
     .map { days => sumDayCounts(Some(days)) }
@@ -336,7 +487,10 @@ def buildReportJson(
           agg.countryCodes.getOrElse(Seq.empty),
           sumCarried(agg.days),
           postCount,
-          includeTakedowns)
+          includeTakedowns,
+          appeals,
+          agg.postIds.getOrElse(Seq.empty),
+          postIdPolicy)
       }
     }
 
@@ -360,7 +514,9 @@ def buildReportJson(
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
+      postLabelsDescription = postLabelsDescription,
       postLabels = postLabels,
+      accountLabelsDescription = accountLabelsDescription,
       accountLabels = accountLabels,
       totalPostLabels = 0,
       totalAccountLabels = 0,
@@ -371,7 +527,9 @@ def buildReportJson(
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
+      postLabelsDescription = postLabelsDescription,
       postLabels = postLabels,
+      accountLabelsDescription = accountLabelsDescription,
       accountLabels = accountLabels,
       totalPostLabels = 0,
     }.toJson
@@ -381,7 +539,9 @@ def buildReportJson(
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
+      postLabelsDescription = postLabelsDescription,
       postLabels = postLabels,
+      accountLabelsDescription = accountLabelsDescription,
       accountLabels = accountLabels,
       totalAccountLabels = 0,
     }.toJson
@@ -391,7 +551,9 @@ def buildReportJson(
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
+      postLabelsDescription = postLabelsDescription,
       postLabels = postLabels,
+      accountLabelsDescription = accountLabelsDescription,
       accountLabels = accountLabels,
     }.toJson
   }
@@ -444,6 +606,16 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
 
   val primaryMonth = reportMonthBucket(now, params.underTheHoodReportMaxMonthBucket())
   val includeTakedowns = params.underTheHoodReportTakedownsEnabled()
+  val appeals: AppealSwitches = {
+    enabled = params.underTheHoodReportAppealsEnabled(),
+    sensitiveMediaFromPost = params.sensitiveMediaAppealAuthorWarningEnabled(),
+  }
+  val postIdPolicy: PostIdPolicy = {
+    enabled = params.underTheHoodReportPostIdsEnabled(),
+    listAllWhenPostsAtMost = params.underTheHoodReportPostIdsAlwaysShowUpTo(),
+    listNoneWhenSharePctAbove = params.underTheHoodReportPostIdsMaxSharePct(),
+    maxPerLabel = params.underTheHoodReportPostIdsMaxPerLabel(),
+  }
   val primaryUserKey: UthUserMonthKey = {
     userId = ctx.key,
     monthBucket = primaryMonth,
@@ -490,6 +662,9 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
                 ageCheckLabel -> ageOk,
               )),
               note = Some(reportNote()),
+              postLabelAppeals = None : Option[Map[String, RichText]],
+              accountLabelAppeals = None : Option[Map[String, RichText]],
+              maxPostIdsPerLabel = None : Option[Int],
             }
             Ok.value(Some({
               reportJson = None,
@@ -510,16 +685,30 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
           postsCheckLabel -> hasEnoughPosts,
           ageCheckLabel -> ageOk,
         )
+        val showReport = ageOk && hasEnoughPosts
         val reportInfo = {
           reportPeriod = Some(reportPeriodLabel(monthBucket)),
           eligibilityChecks = Some(eligibilityChecks),
           note = Some(reportNote()),
+          postLabelAppeals =
+            if (showReport) { postLabelAppeals(userMonth, includeTakedowns, appeals) } else { None },
+          accountLabelAppeals = None : Option[Map[String, RichText]],
+          maxPostIdsPerLabel =
+            if (postIdPolicy.enabled) { Some(postIdPolicy.maxPerLabel) } else { None : Option[Int] },
         }
         val generatedAtMs = generatedAtMillis(daysIncludedForTs, now.inMillis)
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)
         val reportJson =
-          if (ageOk && hasEnoughPosts) {
-            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns))
+          if (showReport) {
+            Some(
+              buildReportJson(
+                userMonth,
+                monthBucket,
+                generatedAtMs,
+                periodDays,
+                includeTakedowns,
+                appeals,
+                postIdPolicy))
           } else {
             None
           }
@@ -549,6 +738,12 @@ Managed({
       "under_the_hood_report_max_month_bucket when > 0; if that month lacks complete observation " +
       "(finalThroughDay), falls back one month. Takedown rows (label = reason name + countryCodes) in " +
       "postLabelAgg / accountLabelAgg render only when FS under_the_hood_report_takedowns_enabled. " +
+      "When FS under_the_hood_report_appeals_enabled, post labels with a way to appeal carry " +
+      "howToAppeal (urls in parentheses), and reportInfo.postLabelAppeals carries the same sentences " +
+      "as RichText keyed by label; accountLabelAppeals is always absent. When FS under_the_hood_report_post_ids_enabled, post-label " +
+      "rows carry postIds (strings; all when the label is on <= always_show_up_to posts, none with a " +
+      "postIdsNotShownNote when on > max_share_pct of the month's posts, else the newest max_per_label; takedown " +
+      "rows always the newest max_per_label) and reportInfo.maxPostIdsPerLabel. " +
       "Uses the per-user row when present; if missing, userId=-1 month-meta can still return " +
       "reportInfo without reportJson. Missing only when both user and meta are absent/incomplete. " +
       "eligibilityChecks = posts/age only. Called by underTheHoodReport for the authenticated viewer."

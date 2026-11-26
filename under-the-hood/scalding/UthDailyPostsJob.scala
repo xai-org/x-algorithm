@@ -107,7 +107,7 @@ class UthDailyPostsApp {
         observationMs,
         config)
         .map {
-          case (userId, authoredDay, label, carried, removed) =>
+          case (userId, authoredDay, label, carried, removed, postIds) =>
             val age = calendarDaysBetween(authoredDay, asOfDay)
             UthDailyPostLabel(
               userId = Some(userId),
@@ -118,7 +118,8 @@ class UthDailyPostsApp {
               asOfYyyymmdd = Some(asOfDay),
               observationAgeDays = Some(age),
               isFinal = Some(age >= config.postObservationDays),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Option(postIds).filter(_.nonEmpty)
             )
         }
 
@@ -129,9 +130,11 @@ class UthDailyPostsApp {
         config.tweetFlagLabels,
         dayStartMs,
         dayEndMs,
-        config.reducers)
+        config.reducers,
+        config.postIdLabels,
+        config.maxPostIdsPerLabel)
         .map {
-          case (userId, authoredDay, label, carried) =>
+          case (userId, authoredDay, label, carried, postIds) =>
             UthDailyPostLabel(
               userId = Some(userId),
               authoredYyyymmdd = Some(authoredDay),
@@ -141,7 +144,8 @@ class UthDailyPostsApp {
               asOfYyyymmdd = Some(asOfDay),
               observationAgeDays = Some(0),
               isFinal = Some(true),
-              postObservationDays = Some(config.postObservationDays)
+              postObservationDays = Some(config.postObservationDays),
+              postIds = Option(postIds).filter(_.nonEmpty)
             )
         }
 
@@ -191,8 +195,10 @@ object UthDailyPostsApp {
     flagLabels: Set[String],
     dayStartMs: Long,
     dayEndMs: Long,
-    reducers: Int
-  ): TypedPipe[(Long, Int, String, Long)] =
+    reducers: Int,
+    postIdLabels: Set[String] = Set.empty,
+    maxPostIdsPerLabel: Int = DefaultMaxPostIdsPerLabel
+  ): TypedPipe[(Long, Int, String, Long, Seq[Long])] =
     if (flagLabels.isEmpty) TypedPipe.empty
     else {
       val flagged = tweets.flatMap { t =>
@@ -207,11 +213,15 @@ object UthDailyPostsApp {
           } else Nil
         } else Nil
       }
-      val counts = applyReducers(flagged.group, reducers).sum.keys.map {
-        case (userId, day, _, label) => ((userId, day, label), 1L)
-      }.sumByKey
-      (if (reducers > 0) counts.withReducers(reducers) else counts).toTypedPipe
-        .map { case ((userId, day, label), carried) => (userId, day, label, carried) }
+      val perPost = applyReducers(flagged.group, reducers).sum.keys.map {
+        case (userId, day, logicalId, label) =>
+          val ids: Seq[Long] = if (postIdLabels.contains(label)) Seq(logicalId) else Seq.empty
+          ((userId, day, label), (1L, ids))
+      }
+      applyReducers(perPost.group, reducers)
+        .reduce { (a, b) => (a._1 + b._1, newestPostIds(a._2 ++ b._2, maxPostIdsPerLabel)) }
+        .toTypedPipe
+        .map { case ((userId, day, label), (carried, ids)) => (userId, day, label, carried, ids) }
     }
 
   private[under_the_hood] def loadPosts(
@@ -340,7 +350,7 @@ object UthDailyPostsApp {
     dayEndMs: Long,
     observationMs: Long,
     config: UthDailyPostsConfig
-  ): TypedPipe[(Long, Int, String, Long, Long)] = {
+  ): TypedPipe[(Long, Int, String, Long, Long, Seq[Long])] = {
     val postByTweetId = posts.map {
       case (tweetId, userId, day, logicalId, createdMs) =>
         (tweetId, (logicalId, userId, day, createdMs))
@@ -378,20 +388,24 @@ object UthDailyPostsApp {
       (everApply, last._1, last._2, last._3)
     }.toTypedPipe
 
-    applyReducers(
-      reduced.collect {
-        case ((_, userId, day, label, createdMs), (everApply, _, lastApply, lastExpires))
-            if everApply =>
-          val deadline = math.min(createdMs + observationMs, dayEndMs)
-          val removed =
-            if (removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L else 0L
-          ((userId, day, label), (1L, removed))
-      }.group,
-      config.reducers
-    ).sum.toTypedPipe.map {
-      case ((userId, day, label), (carried, removed)) =>
-        (userId, day, label, carried, removed)
+    val perPost = reduced.collect {
+      case ((logicalId, userId, day, label, createdMs), (everApply, _, lastApply, lastExpires))
+          if everApply =>
+        val deadline = math.min(createdMs + observationMs, dayEndMs)
+        val removed =
+          if (removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L else 0L
+        val ids: Seq[Long] = if (config.postIdLabels.contains(label)) Seq(logicalId) else Seq.empty
+        ((userId, day, label), (1L, removed, ids))
     }
+    applyReducers(perPost.group, config.reducers)
+      .reduce { (a, b) =>
+        (a._1 + b._1, a._2 + b._2, newestPostIds(a._3 ++ b._3, config.maxPostIdsPerLabel))
+      }
+      .toTypedPipe
+      .map {
+        case ((userId, day, label), (carried, removed, ids)) =>
+          (userId, day, label, carried, removed, ids)
+      }
   }
 }
 
@@ -404,7 +418,9 @@ case class UthDailyPostsConfig(
   dateRangeFilteredSnapshotPath: Option[String],
   writeShards: Int,
   outputPath: String,
-  tweetFlagLabels: Set[String] = Set.empty)
+  tweetFlagLabels: Set[String] = Set.empty,
+  postIdLabels: Set[String] = Set.empty,
+  maxPostIdsPerLabel: Int = UnderTheHoodCommon.DefaultMaxPostIdsPerLabel)
 
 object UthDailyPostsConfig {
   import UthDailyPostsApp._
@@ -429,7 +445,10 @@ object UthDailyPostsConfig {
         n
       },
       outputPath = args.optional("outputPath").getOrElse("/user/<hadoop-role>/under_the_hood"),
-      tweetFlagLabels = parseTweetFlags(args)
+      tweetFlagLabels = parseTweetFlags(args),
+      postIdLabels = UnderTheHoodCommon.parsePostIdLabels(args, UthPostIdLabels.postLabels),
+      maxPostIdsPerLabel =
+        args.int("maxPostIdsPerLabel", UnderTheHoodCommon.DefaultMaxPostIdsPerLabel)
     )
 
   private[under_the_hood] def parseTweetFlags(args: Args): Set[String] = {

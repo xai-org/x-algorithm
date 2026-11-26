@@ -149,6 +149,24 @@ class RetrievalValidityTest(unittest.TestCase):
                         for old, new in zip(legacy, result[:2]):
                             np.testing.assert_array_equal(old, new)
 
+    def test_shard_local_top_k_marks_padding(self):
+        self.posts = self.posts.astype(jnp.int8)
+        kwargs = dict(
+            target_dataset_types=(1, 2),
+            dataset_ranges=jnp.array([[0, 1], [1, 4]], dtype=jnp.int32),
+            dataset_capacities=(2, 3),
+            post_scales=jnp.ones(4, dtype=jnp.float32),
+            shard_local_top_k=True,
+        )
+        results = self.forward(**kwargs)
+        self.assert_selected(results[0], [[0]] * 4)
+        self.assert_selected(results[1], [[1, 2, 3]] * 4)
+        legacy = self.forward(return_validity=False, **kwargs)
+        for old, new in zip(legacy, results):
+            self.assertEqual(len(old), 2)
+            for a, b in zip(old, new[:2]):
+                np.testing.assert_array_equal(a, b)
+
     def test_legacy_outputs_are_unchanged(self):
         for kwargs in (
             {},

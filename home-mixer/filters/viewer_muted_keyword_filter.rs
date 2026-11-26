@@ -23,7 +23,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for ViewerMutedKeywordFilter {
         query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let muted_keywords = query.user_features.muted_keywords.clone();
+        let muted_keywords = &query.user_features.muted_keywords;
 
         if muted_keywords.is_empty() {
             return FilterResult {
@@ -32,26 +32,23 @@ impl Filter<ScoredPostsQuery, PostCandidate> for ViewerMutedKeywordFilter {
             };
         }
 
-        let tokenizer = self.tokenizer.clone();
+        let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::block_in_place(|| {
-            let tokenized = muted_keywords.iter().map(|k| tokenizer.tokenize(k));
-            let token_sequences: Vec<TokenSequence> = tokenized.collect::<Vec<_>>();
+            let token_sequences: Vec<TokenSequence> = muted_keywords
+                .iter()
+                .map(|k| tokenizer.tokenize(k))
+                .collect();
             let user_mutes = UserMutes::new(token_sequences);
             let matcher = MatchTweetGroup::new(user_mutes);
+            let use_ascii_prefilter = matcher.ascii_prefilter_can_reject();
 
-            let mut kept = Vec::new();
-            let mut removed = Vec::new();
-
-            for candidate in candidates {
-                let tweet_text_token_sequence = tokenizer.tokenize(&candidate.tweet_text);
-                if matcher.matches(&tweet_text_token_sequence) {
-                    removed.push(candidate);
-                } else {
-                    kept.push(candidate);
+            FilterResult::partition(candidates, |candidate| {
+                let text = candidate.tweet_text.as_str();
+                if use_ascii_prefilter && !matcher.may_match_ascii_text(text) {
+                    return true;
                 }
-            }
-
-            FilterResult { kept, removed }
+                !matcher.matches(&tokenizer.tokenize(text))
+            })
         })
     }
 }

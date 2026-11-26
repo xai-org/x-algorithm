@@ -7,6 +7,7 @@ import com.twitter.botmaker.ASTNode
 import com.twitter.botmaker.BotMakerFinatraModule.Migration
 import com.twitter.botmaker.Context
 import com.twitter.botmaker.DownstreamService
+import com.twitter.botmaker.FunctionUnit4
 import com.twitter.botmaker.FunctionUnit5O2
 import com.twitter.botmaker.app.scarecrow.ScarecrowRuntime
 import com.twitter.botmaker.compiler.ActionLevel
@@ -31,13 +32,27 @@ object XReviewIntakeRegistry extends TwitterPrivateModule {
     "CA cert path for XReview intake mTLS"
   )
 
+  flag[String](
+    "xreview.tls.client-fullchain",
+    "",
+    "Client cert chain for XReview intake mTLS"
+  )
+
+  flag[String](
+    "xreview.tls.client-key",
+    "",
+    "Client key for XReview intake mTLS"
+  )
+
   @Provides
   @Singleton
   @Exposed
   def providesXReviewReportSubmitter(
     serviceIdentifier: ServiceIdentifier,
     @Migration statsReceiver: StatsReceiver,
-    @Flag("xreview.tls.ca-cert") caCertPath: String
+    @Flag("xreview.tls.ca-cert") caCertPath: String,
+    @Flag("xreview.tls.client-fullchain") clientFullchain: String,
+    @Flag("xreview.tls.client-key") clientKeyPath: String
   ): XReviewReportSubmitter = {
     if (localMode() || personalAccountMode()) {
       XReviewReportSubmitter.noop(statsReceiver)
@@ -45,12 +60,16 @@ object XReviewIntakeRegistry extends TwitterPrivateModule {
       val prodClient = SharedXReviewIntakeClientModule.provideXReviewIntakeClient(
         serviceIdentifier = serviceIdentifier,
         statsReceiver = statsReceiver.scope("xreview"),
-        caCertPath = caCertPath
+        caCertPath = caCertPath,
+        clientFullchain = clientFullchain,
+        clientKeyPath = clientKeyPath
       )
       val stagingClient = SharedXReviewIntakeClientModule.provideXReviewStagingIntakeClient(
         serviceIdentifier = serviceIdentifier,
         statsReceiver = statsReceiver.scope("xreview_staging"),
-        caCertPath = caCertPath
+        caCertPath = caCertPath,
+        clientFullchain = clientFullchain,
+        clientKeyPath = clientKeyPath
       )
       XReviewReportSubmitter(prodClient, stagingClient, statsReceiver)
     }
@@ -176,4 +195,36 @@ object CreateXReviewReportStaging
       detectionTimestampMs = context.startMillis()
     )
   }
+}
+
+object CreateXReviewSpaceReportProd
+    extends FunctionUnit4[ScarecrowRuntime, String, Long, String, Long, Future[Unit]] {
+
+  override def cacheLevel: ASTNode.CacheLevel = ASTNode.CacheLevel.Event
+  override def actionLevel: ActionLevel = ActionLevel.PROD_AGENT_WORKFLOW_ACTION
+  override def downstreams: Set[DownstreamService] = Set(DownstreamServices.XReviewIntake)
+  override def description: String =
+    "Submits a live Space report to production XReview Intake over gRPC, where it lands in " +
+      "the Reported Spaces queue of the report type's project. reportType must be an " +
+      "XReview-allowlisted value. Each evaluation includes detection_timestamp_ms so intake's " +
+      "content-hash report id is unique."
+  override def arguments: Seq[String] = Seq(
+    "Space id (broadcastId)",
+    "reported user id (usually the Space creator)",
+    "XReview report_type (e.g. hate_abuse_or_harassment)",
+    "bot id (report-bag detection_bot_id; reporter_id is 0)"
+  )
+  override def examples: Seq[String] = Seq(
+    "CreateXReviewSpaceReportProd(broadcastId, :space.creator_twitter_user_id, \"hate_abuse_or_harassment\", RULE_ID)"
+  )
+
+  override def evaluate(
+    context: Context[ScarecrowRuntime],
+    spaceId: String,
+    userId: Long,
+    reportType: String,
+    botId: Long
+  ): Future[Unit] =
+    context.getRuntime.fetcher20.xreviewReportSubmitter
+      .submitSpace(spaceId, userId, reportType, botId, context.startMillis())
 }

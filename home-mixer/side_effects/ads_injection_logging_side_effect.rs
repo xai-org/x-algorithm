@@ -5,7 +5,7 @@ use prost::Message;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_ads_injection_proto::ads_injected_timeline::{
-    AdsInjectedTimeline, Counts, SubscriptionLevel, TimelineEntry,
+    AdsInjectedTimeline, Counts, DroppedAd, SubscriptionLevel, TimelineEntry,
 };
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
     KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient, ADS_INJECTION_TOPIC,
@@ -107,7 +107,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for AdsInjectionLoggingSideEffect {
                 RequestType::Following => "following".to_string(),
                 _ => query.params.get(AdsBlenderType),
             },
-            dropped_ads: query.ad_drops.take(),
+            dropped_ads: query.ad_drops.read(<[DroppedAd]>::to_vec),
         };
 
         let bytes = timeline.encode_to_vec();
@@ -176,4 +176,53 @@ fn count_ads(items: &[FeedItem]) -> usize {
         .iter()
         .filter(|i| matches!(i.item, Some(feed_item::Item::Ad(_))))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_recsys_proto::{AdAdjacencyControl, AdIndexInfo};
+
+    #[test]
+    fn ad_entry_logs_line_item_campaign_and_objective() {
+        let ad = AdIndexInfo {
+            post_id: 10,
+            line_item_id: 57018926,
+            author_id: 20,
+            action_probabilities: vec![0.1, 0.2],
+            account_id: 18000000000,
+            campaign_id: 42769584,
+            line_item_objective: 5,
+            impression_id: 30,
+            insert_position: 4,
+            ad_adjacency_control: Some(AdAdjacencyControl {
+                keywords: vec!["kw".to_string()],
+                brand_safety_risk: 3,
+                handles: vec![7],
+            }),
+            ..Default::default()
+        };
+        let item = FeedItem {
+            position: 0,
+            item: Some(feed_item::Item::Ad(ad)),
+        };
+
+        let entry = build_timeline_entry(&item, 2);
+
+        assert_eq!(
+            entry.ad_info,
+            Some(AdIndexInfo {
+                account_id: 18000000000,
+                line_item_id: 57018926,
+                campaign_id: 42769584,
+                line_item_objective: 5,
+                insert_position: 4,
+                ad_adjacency_control: Some(AdAdjacencyControl {
+                    brand_safety_risk: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        );
+    }
 }

@@ -4,6 +4,7 @@ import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.useng.common.xreview.XReviewIntakeClient
 import com.twitter.util.Future
 import com.twitter.util.logging.Logging
+import intake_service.IntakeService.SubmitReportRequest
 import java.lang.{Long => JLong}
 import scala.util.control.NonFatal
 
@@ -39,34 +40,62 @@ class XReviewReportSubmitter(
           new IllegalArgumentException(
             s"XReview entity type must be post or profile, got '$entityType'"))
       case Some(normalizedType) =>
-        clientFor(staging) match {
-          case None =>
-            skippedCounter.incr()
-            Future.Unit
-          case Some(client) =>
-            val request = XReviewReportBuilder.toSubmitReportRequest(
-              entityType = normalizedType,
-              entityId = entityId,
-              userId = userId,
-              reportType = reportType,
-              botId = botId,
-              note = note,
-              victimId = victimId,
-              detectionTimestampMs = detectionTimestampMs
-            )
-            client
-              .submitReport(request)
-              .onSuccess(_ => submittedCounter.incr())
-              .unit
-              .rescue {
-                case NonFatal(e) =>
-                  rpcFailedCounter.incr()
-                  warn(s"[xreview] botmaker report submit failed: ${e.getMessage}", e)
-                  Future.exception(e)
-              }
-        }
+        send(
+          XReviewReportBuilder.toSubmitReportRequest(
+            entityType = normalizedType,
+            entityId = entityId.toString,
+            userId = userId,
+            reportType = reportType,
+            botId = botId,
+            note = note,
+            victimId = victimId,
+            detectionTimestampMs = detectionTimestampMs
+          ),
+          staging
+        )
     }
   }
+
+  def submitSpace(
+    spaceId: String,
+    userId: Long,
+    reportType: String,
+    botId: Long,
+    detectionTimestampMs: Long
+  ): Future[Unit] = {
+    attemptedCounter.incr()
+    send(
+      XReviewReportBuilder.toSubmitReportRequest(
+        entityType = XReviewReportBuilder.SpaceEntityType,
+        entityId = spaceId,
+        userId = userId,
+        reportType = reportType,
+        botId = botId,
+        note = None,
+        victimId = None,
+        detectionTimestampMs = detectionTimestampMs
+      ),
+      staging = false
+    )
+  }
+
+  private def send(request: SubmitReportRequest, staging: Boolean): Future[Unit] =
+    clientFor(staging) match {
+      case None =>
+        skippedCounter.incr()
+        Future.Unit
+      case Some(client) =>
+        client
+          .submitReport(request)
+          .onSuccess(_ => submittedCounter.incr())
+          .unit
+          .rescue {
+            case NonFatal(e) =>
+              rpcFailedCounter.incr()
+              warn(s"[xreview] botmaker report submit failed: ${e.getMessage}", e)
+              Future.exception(e)
+          }
+    }
 
   def close(): Unit = {
     prodClient.foreach(_.shutdown())

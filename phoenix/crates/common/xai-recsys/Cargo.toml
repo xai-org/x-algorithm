@@ -14,6 +14,7 @@ log = { workspace = true }
 prometheus = { workspace = true }
 serde_json = { workspace = true }
 xai-recsys-proto = { workspace = true }
+xai-user-debias = { workspace = true }
 
 [lints]
 workspace = true

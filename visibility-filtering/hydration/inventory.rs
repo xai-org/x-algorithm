@@ -1,166 +1,102 @@
-use crate::hydration::plan::{MissPolicy, Subject};
-use crate::hydration::sources::{exchange, Exchange, Scope, Visit};
-use strum::VariantArray;
+use crate::hydration::Cause;
 
-pub(super) struct Row {
-    pub(super) miss: MissPolicy,
-    pub(super) batch: Batch,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stake {
+    Exists,
+    MustHave,
+    BestEffort,
+    Absent(Tier),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Batch {
-    Unrecorded,
-    Keys,
-    Requested,
+pub(crate) enum Tier {
+    MustHave,
+    BestEffort,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
-pub(crate) enum Source {
-    TesPureCoreData,
-    TesConversationRoot,
-    TesTweet,
-    TesConversationControl,
-    SafetyLabels,
-    GizmoduckViewer,
-    GizmoduckAuthor,
-    Flock,
-    ViewerCountry,
-    Wingman,
-    CommunityModeration,
-    CommunityModerator,
-    CommunityViewerRemoved,
-    ArticleLifecycle,
-    ArticleMediaEntities,
-    ArticleCoverMedia,
-    TrustedFriends,
-    UserLocation,
+impl Stake {
+    pub(crate) const fn tier(self) -> Tier {
+        match self {
+            Stake::Exists | Stake::MustHave => Tier::MustHave,
+            Stake::BestEffort => Tier::BestEffort,
+            Stake::Absent(tier) => tier,
+        }
+    }
 }
 
-impl Source {
-    pub(super) const fn row(self) -> Row {
-        match self {
-            Source::TesPureCoreData => Row {
-                miss: MissPolicy::Unresolves(Subject::Tweet),
-                batch: Batch::Keys,
-            },
-            Source::TesConversationRoot => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::TesTweet => Row {
-                miss: MissPolicy::Unresolves(Subject::Tweet),
-                batch: Batch::Unrecorded,
-            },
-            Source::TesConversationControl => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::SafetyLabels => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Requested,
-            },
-            Source::GizmoduckViewer => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Unrecorded,
-            },
-            Source::GizmoduckAuthor => Row {
-                miss: MissPolicy::Unresolves(Subject::Author),
-                batch: Batch::Keys,
-            },
-            Source::Flock => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Requested,
-            },
-            Source::ViewerCountry => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Unrecorded,
-            },
-            Source::Wingman => Row {
-                miss: MissPolicy::ReadsNoEdge,
-                batch: Batch::Requested,
-            },
-            Source::CommunityModeration => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::CommunityModerator => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::CommunityViewerRemoved => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::ArticleLifecycle => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Keys,
-            },
-            Source::ArticleMediaEntities => Row {
-                miss: MissPolicy::ReadsNotFound,
-                batch: Batch::Keys,
-            },
-            Source::ArticleCoverMedia => Row {
-                miss: MissPolicy::ReadsNotFound,
-                batch: Batch::Keys,
-            },
-            Source::TrustedFriends => Row {
-                miss: MissPolicy::ReadsNoEdge,
-                batch: Batch::Keys,
-            },
-            Source::UserLocation => Row {
-                miss: MissPolicy::FailsNode,
-                batch: Batch::Unrecorded,
-            },
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Answer {
+    Found,
+    Partial,
+    NotFound,
+    Failed,
+    Unanswered,
+    Unclaimed,
+}
 
-    pub(super) const fn scope(self) -> Scope {
-        match self {
-            Source::TesPureCoreData => <exchange::TesPureCoreData as Exchange>::SCOPE,
-            Source::TesConversationRoot => <exchange::TesConversationRoot as Exchange>::SCOPE,
-            Source::TesTweet => <exchange::TesTweet as Exchange>::SCOPE,
-            Source::TesConversationControl => <exchange::TesConversationControl as Exchange>::SCOPE,
-            Source::SafetyLabels => <exchange::SafetyLabels as Exchange>::SCOPE,
-            Source::GizmoduckViewer => <exchange::GizmoduckViewer as Exchange>::SCOPE,
-            Source::GizmoduckAuthor => <exchange::GizmoduckAuthor as Exchange>::SCOPE,
-            Source::Flock => <exchange::Flock as Exchange>::SCOPE,
-            Source::ViewerCountry => <exchange::ViewerCountry as Exchange>::SCOPE,
-            Source::Wingman => <exchange::Wingman as Exchange>::SCOPE,
-            Source::CommunityModeration => <exchange::CommunityModeration as Exchange>::SCOPE,
-            Source::CommunityModerator => <exchange::CommunityModerator as Exchange>::SCOPE,
-            Source::CommunityViewerRemoved => <exchange::CommunityViewerRemoved as Exchange>::SCOPE,
-            Source::ArticleLifecycle => <exchange::ArticleLifecycle as Exchange>::SCOPE,
-            Source::ArticleMediaEntities => <exchange::ArticleMediaEntities as Exchange>::SCOPE,
-            Source::ArticleCoverMedia => <exchange::ArticleCoverMedia as Exchange>::SCOPE,
-            Source::TrustedFriends => <exchange::TrustedFriends as Exchange>::SCOPE,
-            Source::UserLocation => <exchange::UserLocation as Exchange>::SCOPE,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Effect {
+    Value,
+    Absent,
+    Fails,
+    Unresolves(Cause),
+}
 
-    pub(crate) fn visit(self, visitor: &mut impl Visit) {
-        match self {
-            Source::TesPureCoreData => visitor.exchange::<exchange::TesPureCoreData>(),
-            Source::TesConversationRoot => visitor.exchange::<exchange::TesConversationRoot>(),
-            Source::TesTweet => visitor.exchange::<exchange::TesTweet>(),
-            Source::TesConversationControl => {
-                visitor.exchange::<exchange::TesConversationControl>()
+impl Effect {
+    pub(super) const fn fails_node(self) -> bool {
+        matches!(self, Effect::Fails | Effect::Unresolves(Cause::Failed))
+    }
+}
+
+pub(super) const fn classify(stake: Stake, answer: Answer) -> Effect {
+    match (stake, answer) {
+        (_, Answer::Found) | (Stake::Absent(_), Answer::Partial) => Effect::Value,
+        (Stake::Exists, Answer::NotFound) => Effect::Unresolves(Cause::NotFound),
+        (Stake::Exists, Answer::Failed | Answer::Unanswered | Answer::Unclaimed) => {
+            Effect::Unresolves(Cause::Failed)
+        }
+        (_, Answer::NotFound) | (Stake::Absent(_), Answer::Failed | Answer::Unanswered) => {
+            Effect::Absent
+        }
+        (Stake::Exists | Stake::MustHave | Stake::BestEffort, Answer::Partial)
+        | (Stake::MustHave | Stake::BestEffort, Answer::Failed | Answer::Unanswered)
+        | (_, Answer::Unclaimed) => Effect::Fails,
+    }
+}
+
+pub(super) const fn claimed_answer_fails(stake: Stake, answer: Answer) -> bool {
+    !matches!(answer, Answer::Unclaimed) && classify(stake, answer).fails_node()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_stake_classifies_each_answer() {
+        use Answer::{Failed, Found, NotFound, Partial, Unanswered, Unclaimed};
+        use Effect::{Absent, Fails, Unresolves, Value};
+        let answers = [Found, Partial, NotFound, Failed, Unanswered, Unclaimed];
+        let unresolves = Unresolves(Cause::Failed);
+        let not_found = Unresolves(Cause::NotFound);
+        let absent = [Value, Value, Absent, Absent, Absent, Fails];
+        let table = [
+            (
+                Stake::Exists,
+                [Value, Fails, not_found, unresolves, unresolves, unresolves],
+            ),
+            (Stake::MustHave, [Value, Fails, Absent, Fails, Fails, Fails]),
+            (
+                Stake::BestEffort,
+                [Value, Fails, Absent, Fails, Fails, Fails],
+            ),
+            (Stake::Absent(Tier::MustHave), absent),
+            (Stake::Absent(Tier::BestEffort), absent),
+        ];
+        for (stake, effects) in table {
+            for (answer, effect) in answers.into_iter().zip(effects) {
+                assert_eq!(classify(stake, answer), effect, "{stake:?} {answer:?}");
             }
-            Source::SafetyLabels => visitor.exchange::<exchange::SafetyLabels>(),
-            Source::GizmoduckViewer => visitor.exchange::<exchange::GizmoduckViewer>(),
-            Source::GizmoduckAuthor => visitor.exchange::<exchange::GizmoduckAuthor>(),
-            Source::Flock => visitor.exchange::<exchange::Flock>(),
-            Source::ViewerCountry => visitor.exchange::<exchange::ViewerCountry>(),
-            Source::Wingman => visitor.exchange::<exchange::Wingman>(),
-            Source::CommunityModeration => visitor.exchange::<exchange::CommunityModeration>(),
-            Source::CommunityModerator => visitor.exchange::<exchange::CommunityModerator>(),
-            Source::CommunityViewerRemoved => {
-                visitor.exchange::<exchange::CommunityViewerRemoved>()
-            }
-            Source::ArticleLifecycle => visitor.exchange::<exchange::ArticleLifecycle>(),
-            Source::ArticleMediaEntities => visitor.exchange::<exchange::ArticleMediaEntities>(),
-            Source::ArticleCoverMedia => visitor.exchange::<exchange::ArticleCoverMedia>(),
-            Source::TrustedFriends => visitor.exchange::<exchange::TrustedFriends>(),
-            Source::UserLocation => visitor.exchange::<exchange::UserLocation>(),
         }
     }
 }

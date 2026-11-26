@@ -2,11 +2,11 @@ const REGIONS: &[(&str, &[&str])] = &[
     (
         "AFR",
         &[
-            "AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CM", "CV", "DJ", "DZ", "EG", "EH",
-            "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "IO", "KE", "KM", "LR", "LS", "LY",
-            "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA", "NE", "NG", "RE", "RW", "SC", "SD",
-            "SH", "SL", "SN", "SO", "SS", "ST", "SZ", "TD", "TG", "TN", "TZ", "UG", "YT", "ZA",
-            "ZM", "ZW",
+            "AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ", "DZ", "EG",
+            "EH", "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "IO", "KE", "KM", "LR", "LS",
+            "LY", "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA", "NE", "NG", "RE", "RW", "SC",
+            "SD", "SH", "SL", "SN", "SO", "SS", "ST", "SZ", "TD", "TG", "TN", "TZ", "UG", "YT",
+            "ZA", "ZM", "ZW",
         ],
     ),
     (
@@ -81,6 +81,7 @@ mod tests {
             (codes(&["NAM"]), "US", true),
             (codes(&["nam"]), "us", true),
             (codes(&["EUR"]), "US", false),
+            (codes(&["AFR"]), "CI", true),
             (codes(&["EUR", "SAM"]), "BR", true),
             (codes(&["BR"]), "br", true),
             (codes(&["BR"]), "US", false),

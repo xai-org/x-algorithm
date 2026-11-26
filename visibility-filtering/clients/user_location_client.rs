@@ -1,12 +1,12 @@
-use crate::clients::read_fields;
-use anyhow::bail;
+use crate::clients::strato::{self, EncodeOnlyCodec, ToThrift};
+use crate::thrift_read::read_fields;
 use std::collections::HashSet;
 use thrift::protocol::{
-    TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TSetIdentifier,
+    TFieldIdentifier, TInputProtocol, TListIdentifier, TOutputProtocol, TSetIdentifier,
     TStructIdentifier, TType,
 };
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
-use xai_strato::{encode, MValCodec, StratoGrpc};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
+use xai_strato::{encode, StratoGrpc};
 
 const USER_LOCATION_COLUMN: &str = "geo/service/userLocation";
 
@@ -21,72 +21,51 @@ const GEODUCK_IDL_DEFAULT_FLAGS: [(&str, i16, bool); 3] = [
 const FOUND: i16 = 1;
 const PLACE_MAP: i16 = 5;
 
-pub struct UserLocationClient {
-    grpc: StratoGrpc,
-}
-
-impl UserLocationClient {
-    pub fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
-
-    pub async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>> {
-        let bytes = self
-            .grpc
-            .call(USER_LOCATION_COLUMN, "fetch", vec![key(user_id)], None)
-            .await?;
-        decode_places(&bytes, user_id)
-    }
+pub async fn places(grpc: &StratoGrpc, user_id: u64) -> anyhow::Result<HashSet<u64>> {
+    let bytes = strato::fetch(grpc, USER_LOCATION_COLUMN, key(user_id)).await?;
+    decode_places(&bytes, user_id)
 }
 
 pub(crate) fn key(user_id: u64) -> Vec<u8> {
     let view = UserLocationRequest {
         user_id: user_id.cast_signed(),
     };
-    encode(&((), &view))
+    encode(&((), EncodeOnlyCodec(view)))
 }
 
 fn decode_places(bytes: &[u8], user_id: u64) -> anyhow::Result<HashSet<u64>> {
-    match strato_decode::<UserLocationResponse>(bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value
-            .and_then(|response| {
-                response
-                    .found
-                    .into_iter()
-                    .find(|(user, _)| *user == user_id)
-            })
-            .map(|(_, places)| places)
-            .unwrap_or_default()),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
-    }
+    Ok(strato::row(strato_decode::<UserLocationResponse>(bytes)?)?
+        .and_then(|response| {
+            response
+                .found
+                .into_iter()
+                .find(|(user, _)| *user == user_id)
+        })
+        .map(|(_, places)| places)
+        .unwrap_or_default())
 }
 
 struct UserLocationRequest {
     user_id: i64,
 }
 
-impl MValCodec for UserLocationRequest {
-    fn thrift_type() -> TType {
-        TType::Struct
-    }
-
-    #[expect(clippy::unimplemented, reason = "a view is only encoded")]
-    fn from_thrift(_proto: &mut dyn TInputProtocol) -> Self {
-        unimplemented!("a view is only encoded")
-    }
-
+impl ToThrift for UserLocationRequest {
     #[expect(
         clippy::unwrap_used,
         reason = "`xai_strato::encode` writes into a Vec, which cannot fail, and five place types fit an i32"
     )]
-    fn to_thrift(&self, proto: &mut dyn TOutputProtocol) {
+    fn write(&self, proto: &mut dyn TOutputProtocol) {
         proto
             .write_struct_begin(&TStructIdentifier::new("UserLocationRequest"))
             .unwrap();
         proto
             .write_field_begin(&TFieldIdentifier::new("userIds", TType::List, 1))
             .unwrap();
-        vec![self.user_id].to_thrift(proto);
+        proto
+            .write_list_begin(&TListIdentifier::new(TType::I64, 1))
+            .unwrap();
+        proto.write_i64(self.user_id).unwrap();
+        proto.write_list_end().unwrap();
         proto.write_field_end().unwrap();
         proto
             .write_field_begin(&TFieldIdentifier::new("place_query", TType::Struct, 2))
@@ -125,8 +104,8 @@ struct UserLocationResponse {
     found: Vec<(u64, HashSet<u64>)>,
 }
 
-impl TSerializable for UserLocationResponse {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+impl StratoRead for UserLocationResponse {
+    fn read(i_prot: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let mut found = Vec::new();
         read_fields(i_prot, |i_prot, field| {
             if field.id != Some(FOUND) || field.field_type != TType::Map {
@@ -142,16 +121,9 @@ impl TSerializable for UserLocationResponse {
         })?;
         Ok(Self { found })
     }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "UserLocationResponse is decode-only",
-        ))
-    }
 }
 
-fn read_place_ids(i_prot: &mut dyn TInputProtocol) -> thrift::Result<HashSet<u64>> {
+fn read_place_ids(i_prot: &mut MValProtocol<'_>) -> thrift::Result<HashSet<u64>> {
     let mut places = HashSet::new();
     read_fields(i_prot, |i_prot, field| {
         if field.id != Some(PLACE_MAP) || field.field_type != TType::Map {
@@ -178,8 +150,8 @@ fn read_place_ids(i_prot: &mut dyn TInputProtocol) -> thrift::Result<HashSet<u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift::{Map, Set, Struct, I32, I64};
-    use crate::clients::strato_answer::{found, no_row, strato_error};
+    use crate::clients::strato::answer::Thrift::{Map, Set, Struct, I32, I64};
+    use crate::clients::strato::answer::{found, no_row};
 
     const USER: u64 = 7;
     const OTHER_USER: u64 = 8;
@@ -215,7 +187,7 @@ mod tests {
     #[test]
     fn the_view_asks_the_five_place_types_of_one_user() {
         assert_eq!(
-            encode(&((), &UserLocationRequest { user_id: 7 })),
+            key(7),
             [
                 0x0c, 0x00, 0x04, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x0f, 0x00, 0x01, 0x0a, 0x00,
                 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x0c, 0x00, 0x02,
@@ -259,8 +231,5 @@ mod tests {
                 "{name}"
             );
         }
-
-        let error = decode_places(&strato_error(2, "boom"), USER).unwrap_err();
-        assert_eq!(error.to_string(), "Strato error (code 2): boom");
     }
 }

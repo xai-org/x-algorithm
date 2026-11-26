@@ -27,11 +27,26 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub embedding_dim: usize,
 
+    #[arg(long, env = "VM_RANKER_SID_ENDPOINT")]
+    pub sid_endpoint: Option<String>,
+
     #[arg(long, default_value_t = 0)]
     pub dpp_debug_viewer_id: u64,
 
     #[arg(long, default_value_t = false)]
     pub enable_profiling: bool,
+
+    #[arg(long)]
+    pub user_debias_artifact_path: Option<std::path::PathBuf>,
+
+    #[arg(long, default_value_t = 300)]
+    pub user_debias_reload_secs: u64,
+
+    #[arg(long)]
+    pub carousel_model_dir: Option<std::path::PathBuf>,
+
+    #[arg(long, default_value_t = 60)]
+    pub carousel_model_reload_secs: u64,
 
     #[arg(long, default_value_t = false)]
     pub config_sync_enabled: bool,

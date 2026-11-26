@@ -22,6 +22,21 @@ if TYPE_CHECKING:
     )
 
 _LN2 = math.log(2)
+_LEGACY_MAX_FUSED_SHARD_WIDTH = 32
+
+
+def _hash_u32(x: jax.Array) -> jax.Array:
+    x = (x ^ (x >> 16)) * jnp.uint32(0x7FEB352D)
+    x = (x ^ (x >> 15)) * jnp.uint32(0x846CA68B)
+    return x ^ (x >> 16)
+
+
+def _stochastic_round_bf16(value: jax.Array, step: jax.Array, rows: jax.Array) -> jax.Array:
+    base = _hash_u32(_hash_u32(step.astype(jnp.uint32)) ^ _hash_u32(rows.astype(jnp.uint32)))
+    cols = jax.lax.broadcasted_iota(jnp.uint32, value.shape, 1)
+    rand = (cols * jnp.uint32(0x9E3779B1) + base[:, None]) >> 16
+    bits = jax.lax.bitcast_convert_type(value, jnp.uint32) + rand
+    return jax.lax.bitcast_convert_type((bits >> 16).astype(jnp.uint16), jnp.bfloat16)
 
 
 @configclass
@@ -33,6 +48,8 @@ class RecsysRowwiseAdagradConfig(Config):
     half_life_steps: int | None = 5000
     lazy_decay: bool = False
     weight_decay: float = 0.0
+    weight_decay_exempt_window: int = 0
+    stochastic_rounding: bool = False
 
 
 class RecsysRowwiseAdagradState(NamedTuple):
@@ -50,12 +67,20 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
         half_life_steps: int | None = None,
         lazy_decay: bool = False,
         weight_decay: float = 0.0,
+        weight_decay_exempt_window: int = 0,
+        stochastic_rounding: bool = False,
     ):
+        if weight_decay_exempt_window < 0:
+            raise ValueError(f"{weight_decay_exempt_window=} must be >= 0")
+        if (weight_decay_exempt_window > 0 or stochastic_rounding) and not lazy_decay:
+            raise ValueError("weight_decay_exempt_window and stochastic_rounding need lazy_decay")
         self._learning_rate = learning_rate
         self._eps = eps
         self._initial_accumulator_value = initial_accumulator_value
         self._lazy_decay = lazy_decay
         self._weight_decay = weight_decay
+        self._weight_decay_exempt_window = weight_decay_exempt_window
+        self._stochastic_rounding = stochastic_rounding
         self._decay_rate = _LN2 / half_life_steps if half_life_steps is not None else None
 
     def init(self, params: dict[str, Parameter]) -> RecsysRowwiseAdagradState:
@@ -67,7 +92,9 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
                 (num_rows,), self._initial_accumulator_value, dtype=jnp.float32
             )
             last_step[key] = jnp.zeros((num_rows,), dtype=jnp.int32)
-        lazy_features = self._decay_rate is not None or self._weight_decay > 0.0
+        lazy_features = (
+            self._decay_rate is not None or self._weight_decay > 0.0 or self._stochastic_rounding
+        )
         need_timestamps = lazy_features and self._lazy_decay
         return RecsysRowwiseAdagradState(
             row_sum_sq=row_sum_sq,
@@ -101,13 +128,24 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
 
         async_emb = recsys_async_emb.kernel_bindings(context)
         row_sharded = recsys_async_emb.is_row_sharded(context)
-        if not row_sharded and 32 % context.shard_width != 0:
-            raise ValueError(
-                f"the fused rowwise Adagrad update needs a row shard that divides a warp, "
-                f"got shard_width={context.shard_width} (emb_width={context.emb_width})"
+        if not row_sharded:
+            max_width = getattr(
+                async_emb.async_emb_api, "max_shard_width", _LEGACY_MAX_FUSED_SHARD_WIDTH
             )
+            if max_width % context.shard_width != 0:
+                raise ValueError(
+                    "the fused rowwise Adagrad update needs shard_width to divide "
+                    f"{max_width}, got shard_width={context.shard_width} "
+                    f"(emb_width={context.emb_width})"
+                )
 
         metrics: dict[str, jax.Array] = {}
+        lazy_options: dict[str, Any] = {}
+        if self._weight_decay_exempt_window > 0 or self._stochastic_rounding:
+            lazy_options = {
+                "weight_decay_exempt_window": self._weight_decay_exempt_window,
+                "stochastic_rounding": self._stochastic_rounding,
+            }
 
         table_spec = recsys_async_emb.table_spec(context)
         state_spec = P(context.table_axis) if row_sharded else P()
@@ -137,6 +175,7 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
                     eps=self._eps,
                     accum_decay_rate=self._decay_rate or 0.0,
                     weight_decay_rate=self._weight_decay,
+                    **lazy_options,
                 )
 
             assert state.step is not None and state.last_step is not None
@@ -241,20 +280,32 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
         scale = 1.0 / (jnp.sqrt(new_small_accum) + eps)
         update = -self._learning_rate * scale[:, None] * g
 
-        base_x = small_emb_table.x
+        wd_factor = None
         if self._weight_decay > 0.0:
             if self._lazy_decay:
                 assert delta is not None
                 wd_factor = jnp.exp(-delta.astype(jnp.float32) * self._weight_decay)
+                if self._weight_decay_exempt_window > 0:
+                    wd_factor = jnp.where(delta > self._weight_decay_exempt_window, wd_factor, 1.0)
             else:
                 wd_factor = jnp.full_like(row_mean_sq, math.exp(-self._weight_decay))
             touched = row_mean_sq > 0.0
             wd_factor = jnp.where(touched, wd_factor, 1.0)[:, None]
-            base_x = (base_x.astype(jnp.float32) * wd_factor).astype(small_emb_table.x.dtype)
-        new_params = replace(
-            small_emb_table,
-            x=(base_x + update.astype(small_emb_table.x.dtype)),
-        )
+        if self._stochastic_rounding:
+            candidate = small_emb_table.x.astype(jnp.float32)
+            if wd_factor is not None:
+                candidate = candidate * wd_factor
+            rows = jnp.where(
+                unique_tokens < 0, unique_tokens + full_emb_table.x.shape[0], unique_tokens
+            )
+            assert full_state.step is not None
+            new_x = _stochastic_round_bf16(candidate + update, full_state.step, rows)
+        else:
+            base_x = small_emb_table.x
+            if wd_factor is not None:
+                base_x = (base_x.astype(jnp.float32) * wd_factor).astype(small_emb_table.x.dtype)
+            new_x = base_x + update.astype(small_emb_table.x.dtype)
+        new_params = replace(small_emb_table, x=new_x)
 
         new_emb_table = replace(
             full_emb_table,

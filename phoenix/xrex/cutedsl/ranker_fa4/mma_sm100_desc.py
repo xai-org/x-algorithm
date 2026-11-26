@@ -193,8 +193,8 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.a_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
     )
 
 

@@ -1,4 +1,10 @@
+use crate::models::PostText;
+use crate::rules::RequestExperiments;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, LazyLock};
+use strum::VariantArray;
+use xai_core_entities::entities::{GizmoduckMutedKeyword, MuteOption, MuteSurface};
+use xai_post_text::{TweetTokenizer, UserMutes};
 use xai_twittercontext_proto::TwitterContextViewer;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -21,6 +27,134 @@ impl Viewer {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RequestViewer {
+    id: Option<u64>,
+    country_code: Option<String>,
+    context: Option<Arc<TwitterContextViewer>>,
+}
+
+impl RequestViewer {
+    pub(crate) fn new(raw_id: Option<u64>, country_code: Option<String>) -> Self {
+        Self {
+            id: raw_id.filter(|&id| id.cast_signed() > 0),
+            country_code: country_code.filter(|code| !code.is_empty()),
+            context: None,
+        }
+    }
+
+    pub(crate) fn with_context(raw_id: Option<u64>, context: Option<TwitterContextViewer>) -> Self {
+        let country_code = context
+            .as_ref()
+            .map(|context| context.request_country_code.clone());
+        Self {
+            context: context.map(Arc::new),
+            ..Self::new(raw_id, country_code)
+        }
+    }
+
+    pub(crate) fn id(&self) -> Option<u64> {
+        self.id
+    }
+
+    pub(crate) fn country_code(&self) -> Option<&str> {
+        self.country_code.as_deref()
+    }
+
+    pub(crate) fn context(&self) -> Option<&TwitterContextViewer> {
+        self.context.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestFacts {
+    viewer: RequestViewer,
+    request_country: Option<String>,
+    client_capability: ClientCapability,
+    soft_nsfw_new_user_drop: bool,
+    experiments: RequestExperiments,
+}
+
+impl RequestFacts {
+    pub(crate) fn new(viewer: RequestViewer, client_capability: ClientCapability) -> Self {
+        Self {
+            request_country: viewer.country_code().map(str::to_ascii_lowercase),
+            viewer,
+            client_capability,
+            soft_nsfw_new_user_drop: false,
+            experiments: RequestExperiments::default(),
+        }
+    }
+
+    pub(crate) fn logged_in(id: u64) -> Self {
+        Self::new(
+            RequestViewer::new(Some(id), None),
+            ClientCapability::DEFAULT,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn with_soft_nsfw_new_user_drop(self, soft_nsfw_new_user_drop: bool) -> Self {
+        Self {
+            soft_nsfw_new_user_drop,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_experiments(self, experiments: RequestExperiments) -> Self {
+        Self {
+            experiments,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_country(self, country_code: &str) -> Self {
+        let viewer = RequestViewer {
+            context: self.viewer.context,
+            ..RequestViewer::new(self.viewer.id, Some(country_code.to_owned()))
+        };
+        Self::new(viewer, self.client_capability)
+            .with_soft_nsfw_new_user_drop(self.soft_nsfw_new_user_drop)
+            .with_experiments(self.experiments)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_client(self, client_capability: ClientCapability) -> Self {
+        Self {
+            client_capability,
+            ..self
+        }
+    }
+
+    pub(crate) fn viewer(&self) -> &RequestViewer {
+        &self.viewer
+    }
+
+    pub(crate) fn viewer_id(&self) -> Option<u64> {
+        self.viewer.id()
+    }
+
+    pub(crate) fn request_country(&self) -> Option<&str> {
+        self.request_country.as_deref()
+    }
+
+    pub(crate) fn client_capability(&self) -> ClientCapability {
+        self.client_capability
+    }
+
+    pub(crate) fn soft_nsfw_new_user_drop(&self) -> bool {
+        self.soft_nsfw_new_user_drop
+    }
+
+    pub(crate) fn experiments(&self) -> &RequestExperiments {
+        &self.experiments
+    }
+}
+
 pub const ADULT_AGE_YEARS: i32 = 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,7 +173,89 @@ pub struct ViewerProfile {
     pub has_idv_premium: bool,
     pub is_read_only: bool,
     pub account_country_code: Option<String>,
+    pub is_new_account: bool,
+    pub is_suspended: bool,
+    pub is_deactivated: bool,
+    pub has_uqf_enabled: bool,
+    pub mention_filter_is_following: bool,
+    pub has_blink_label: bool,
+    pub notification_filters: NotificationFilters,
+    pub notification_muted_keywords: NotificationMutedKeywords,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotificationFilters {
+    pub no_confirmed_email: bool,
+    pub no_confirmed_phone: bool,
+    pub default_profile_image: bool,
+    pub new_users: bool,
+    pub not_followed_by: bool,
+}
+
+static TOKENIZER: LazyLock<TweetTokenizer> = LazyLock::new(TweetTokenizer::new);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotificationMutedKeywords(Option<Box<Mutes>>);
+
+#[derive(Clone, Debug)]
+struct Mutes {
+    from_anyone: UserMutes,
+    excluding_followed: UserMutes,
+}
+
+impl NotificationMutedKeywords {
+    pub fn of(keywords: &[GizmoduckMutedKeyword]) -> Self {
+        let (excluding_followed, from_anyone): (Vec<_>, Vec<_>) = keywords
+            .iter()
+            .filter(|keyword| keyword.mute_surfaces.contains(&MuteSurface::Notifications))
+            .partition(|keyword| {
+                keyword
+                    .mute_options
+                    .contains(&MuteOption::ExcludeFollowingAccounts)
+            });
+        if from_anyone.is_empty() && excluding_followed.is_empty() {
+            return Self(None);
+        }
+        Self(Some(Box::new(Mutes {
+            from_anyone: tokenized(&from_anyone),
+            excluding_followed: tokenized(&excluding_followed),
+        })))
+    }
+
+    pub fn mutes_from_anyone(&self, text: &PostText) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|mutes| matches(&mutes.from_anyone, text))
+    }
+
+    pub fn mutes_excluding_followed(&self, text: &PostText) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|mutes| matches(&mutes.excluding_followed, text))
+    }
+}
+
+fn tokenized(keywords: &[&GizmoduckMutedKeyword]) -> UserMutes {
+    UserMutes::new(
+        keywords
+            .iter()
+            .map(|keyword| TOKENIZER.tokenize(&keyword.keyword))
+            .collect(),
+    )
+}
+
+fn matches(mutes: &UserMutes, text: &PostText) -> bool {
+    !mutes.is_empty() && mutes.matches(&TOKENIZER.tokenize(&text.lossy()))
+}
+
+impl PartialEq for Mutes {
+    fn eq(&self, other: &Self) -> bool {
+        self.from_anyone.phrases() == other.from_anyone.phrases()
+            && self.excluding_followed.phrases() == other.excluding_followed.phrases()
+    }
+}
+
+impl Eq for Mutes {}
 
 impl ViewerProfile {
     pub fn is_underage(&self) -> bool {
@@ -51,9 +267,7 @@ impl ViewerProfile {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::VariantArray)]
 pub enum VerifyBlurSupport {
     #[default]
     Unsupported,
@@ -62,35 +276,142 @@ pub enum VerifyBlurSupport {
     Supported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientCapability {
-    pub verify_blur_support: Option<VerifyBlurSupport>,
-    pub modern_blur: bool,
-    pub stale_tweet_limits: bool,
-    pub community_viewer_removed_limits: bool,
-    pub gore_blur_ignores_settings: bool,
-    pub fosnr_rules: bool,
-    pub fosnr_fallback_drops: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::VariantArray, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ClientSwitch {
+    ModernBlur,
+    StaleTweetLimits,
+    CommunityViewerRemovedLimits,
+    GoreBlurIgnoresSettings,
+    FosnrRules,
+    FosnrFallbackDrops,
 }
 
-impl Default for ClientCapability {
-    fn default() -> Self {
+impl ClientSwitch {
+    pub const fn default_on(self) -> bool {
+        match self {
+            Self::StaleTweetLimits | Self::FosnrRules => true,
+            Self::ModernBlur
+            | Self::CommunityViewerRemovedLimits
+            | Self::GoreBlurIgnoresSettings
+            | Self::FosnrFallbackDrops => false,
+        }
+    }
+
+    const fn bit(self) -> u32 {
+        1 << self as u8
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClientSwitchSet(u32);
+
+const _: () = assert!(ClientSwitch::VARIANTS.len() <= u32::BITS as usize);
+
+impl ClientSwitchSet {
+    pub const NONE: Self = Self(0);
+
+    pub const DEFAULT_ON: Self = {
+        let mut set = Self::NONE;
+        let mut rest = ClientSwitch::VARIANTS;
+        while let [switch, tail @ ..] = rest {
+            if switch.default_on() {
+                set = set.with(*switch);
+            }
+            rest = tail;
+        }
+        set
+    };
+
+    #[must_use]
+    pub const fn with(self, switch: ClientSwitch) -> Self {
+        Self(self.0 | switch.bit())
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn without(self, switch: ClientSwitch) -> Self {
+        Self(self.0 & !switch.bit())
+    }
+
+    pub const fn contains(self, switch: ClientSwitch) -> bool {
+        self.0 & switch.bit() != 0
+    }
+}
+
+impl std::fmt::Debug for ClientSwitchSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set()
+            .entries(
+                ClientSwitch::VARIANTS
+                    .iter()
+                    .filter(|&&switch| self.contains(switch)),
+            )
+            .finish()
+    }
+}
+
+impl FromIterator<ClientSwitch> for ClientSwitchSet {
+    fn from_iter<I: IntoIterator<Item = ClientSwitch>>(switches: I) -> Self {
+        switches.into_iter().fold(Self::NONE, Self::with)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientCapability {
+    pub verify_blur_support: Option<VerifyBlurSupport>,
+    pub switches_on: ClientSwitchSet,
+}
+
+impl ClientCapability {
+    pub const DEFAULT: Self = Self {
+        verify_blur_support: Some(VerifyBlurSupport::Unsupported),
+        switches_on: ClientSwitchSet::DEFAULT_ON,
+    };
+
+    pub const fn has(self, switch: ClientSwitch) -> bool {
+        self.switches_on.contains(switch)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with(self, switch: ClientSwitch) -> Self {
         Self {
-            verify_blur_support: Some(VerifyBlurSupport::default()),
-            modern_blur: false,
-            stale_tweet_limits: true,
-            community_viewer_removed_limits: false,
-            gore_blur_ignores_settings: false,
-            fosnr_rules: true,
-            fosnr_fallback_drops: false,
+            switches_on: self.switches_on.with(switch),
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn without(self, switch: ClientSwitch) -> Self {
+        Self {
+            switches_on: self.switches_on.without(switch),
+            ..self
         }
     }
 }
 
+impl Default for ClientCapability {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Client {
     #[default]
     Web,
@@ -161,22 +482,7 @@ impl Client {
 #[derive(Clone, Debug, Default)]
 pub struct ViewerFeatures {
     pub viewer: Viewer,
-    pub country_code: Option<String>,
-    pub client_capability: ClientCapability,
-}
-
-impl ViewerFeatures {
-    pub fn from_request(
-        viewer: Viewer,
-        country_code: Option<String>,
-        client_capability: ClientCapability,
-    ) -> Self {
-        Self {
-            viewer,
-            country_code: country_code.map(|c| c.to_ascii_lowercase()),
-            client_capability,
-        }
-    }
+    pub(crate) facts: RequestFacts,
 }
 
 #[cfg(test)]

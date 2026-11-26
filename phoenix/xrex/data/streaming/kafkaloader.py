@@ -8,10 +8,11 @@ import os
 import queue
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
-from functools import partial
+from functools import cached_property, partial
 from threading import Event
 from typing import Any, Iterator, Mapping, Optional, cast
 
@@ -23,7 +24,9 @@ from xai_configlib import configclass
 _OTEL_AVAILABLE = False
 try:
     from opentelemetry import metrics
-    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+        OTLPMetricExporter,
+    )
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
@@ -34,28 +37,60 @@ except ImportError:
     metrics = None
 
 from xrex import settings
-from xrex.data.parquet_recsys import DataPosition, PhoenixDataset, load_global_ids_from_parquet_file
-from xrex.data.recsys import reply_features
+from xrex.data.parquet_recsys import (
+    DataPosition,
+    PhoenixDataset,
+    load_global_ids_from_parquet_file,
+)
+from xrex.data.recsys import (
+    id_list_features,
+    long_term_author_profile,
+    reply_features,
+    teacher_distill,
+)
+from xrex.data.recsys.ad_side_ids import AD_SIDE_FIELD_COLUMNS
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
+    SAMPLE_WEIGHT_SEQ_COLUMN,
+    VIDEO_DURATION_COLUMN,
 )
 from xrex.data.recsys.recsys_batch import (
+    ADS_COUNT_COLUMNS,
+    ADS_CTR_COUNT_PAIRS,
     EMBEDDING_CONFIG,
+    HISTORY_RANKED_URL_ID_COLUMNS,
+    HISTORY_URL_ID_COLUMN,
+    USER_ADS_COUNT_COLUMNS,
     CandidateNegativeMode,
     EmbeddingType,
     RecsysFeaturesBatch,
     from_record_batch,
+)
+from xrex.data.streaming.history_url_embedding import (
+    DEFAULT_MODEL_VERSION,
+    URL_EMBEDDING_DIM,
+    HistoryUrlEmbeddingLookup,
+    UrlEmbeddingLookupStats,
+    post_embedding_key,
+    url_embedding_key,
 )
 from xrex.data.streaming.kafkaconsumer import (
     DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
     ConsumerMode,
     DropModeController,
     KafkaAuth,
+    KafkaBootstrapOffsets,
+    KafkaQueueItem,
+    KafkaSourceIdentity,
     PartitionLagTracker,
     consume_messages,
     discover_partition_count,
+    set_expected_inner_list_widths,
+    validate_offset_map,
+    validate_seek_options,
 )
+from xrex.data.user_debias_feed import HISTORY_STATS_COLUMNS
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.utils import cluster
 
@@ -139,10 +174,15 @@ def _rearm_catchup_request(generation: int) -> None:
 _meter = None
 _kafka_batches_processed = None
 _kafka_messages_processed = None
+_kafka_embedding_zero_filled = None
 _kafka_batch_processing_time = None
 _kafka_queue_size = None
 _kafka_empty_polls = None
 _kafka_partition_delivered_offset = None
+_kafka_history_url_embedding = None
+_kafka_history_url_embedding_mget_seconds = None
+_kafka_candidate_mm_embedding = None
+_kafka_candidate_mm_embedding_mget_seconds = None
 
 _training_metrics_initialized = False
 _training_histograms: dict[str, Any] = {}
@@ -269,8 +309,11 @@ def _init_otel_metrics(
     training_name: str = "recsys-kafka-loader",
 ) -> bool:
     global _meter, _kafka_batches_processed, _kafka_messages_processed
+    global _kafka_embedding_zero_filled
     global _kafka_batch_processing_time, _kafka_queue_size, _kafka_empty_polls
     global _kafka_partition_delivered_offset
+    global _kafka_history_url_embedding, _kafka_history_url_embedding_mget_seconds
+    global _kafka_candidate_mm_embedding, _kafka_candidate_mm_embedding_mget_seconds
     global _training_metrics_initialized, _training_histograms, _training_metric_values
     global _training_cluster_name, _TRAINER_KEY_MAP, _KNOWN_OTEL_KEYS
     global metrics_server_started
@@ -498,6 +541,36 @@ def _init_otel_metrics(
         unit="1",
     )
 
+    _kafka_embedding_zero_filled = _meter.create_counter(
+        name="recsys_kafka_embedding_zero_filled_total",
+        description="Records read as zero MM embeddings (no column, or null after unification)",
+        unit="1",
+    )
+
+    _kafka_history_url_embedding = _meter.create_counter(
+        name="recsys_kafka_history_url_embedding_total",
+        description="History URL embedding lookup counts by outcome (UrlEmbeddingLookupStats)",
+        unit="1",
+    )
+
+    _kafka_history_url_embedding_mget_seconds = _meter.create_counter(
+        name="recsys_kafka_history_url_embedding_mget_seconds_total",
+        description="Time spent in history URL embedding Redis MGETs",
+        unit="1",
+    )
+
+    _kafka_candidate_mm_embedding = _meter.create_counter(
+        name="recsys_kafka_candidate_mm_embedding_total",
+        description="Candidate MM embedding lookup counts by outcome (UrlEmbeddingLookupStats)",
+        unit="1",
+    )
+
+    _kafka_candidate_mm_embedding_mget_seconds = _meter.create_counter(
+        name="recsys_kafka_candidate_mm_embedding_mget_seconds_total",
+        description="Time spent in candidate MM embedding Redis MGETs",
+        unit="1",
+    )
+
     _kafka_batch_processing_time = _meter.create_histogram(
         name="recsys_kafka_batch_processing_seconds",
         description="Time spent processing Kafka batches",
@@ -669,6 +742,23 @@ def report_training_metrics(
             _training_metric_values[(training_name, otel_key)] = fval
 
 
+_CANDIDATE_MM_NEGATIVE_TTL_S = 900.0
+
+
+def _record_embedding_lookup_stats(
+    stats: UrlEmbeddingLookupStats,
+    attrs: Mapping[str, str],
+    counts: Any | None,
+    mget_seconds: Any | None,
+) -> None:
+    if counts is not None:
+        for outcome, count in dataclasses.asdict(stats).items():
+            if outcome != "mget_seconds" and count:
+                counts.add(count, {**attrs, "outcome": outcome})
+    if mget_seconds is not None and stats.mget_seconds:
+        mget_seconds.add(stats.mget_seconds, dict(attrs))
+
+
 def _cast_column(arr: pa.Array, target_type: pa.DataType) -> pa.Array:
     if arr.type == target_type:
         return arr
@@ -716,20 +806,34 @@ def _unify_record_batch_schemas(
     if not batches:
         return batches
 
-    all_batch_names: set[str] = set()
+    index_by_names: dict[tuple[str, ...], dict[str, int]] = {}
+    batch_indices: list[dict[str, int]] = []
     for rb in batches:
-        all_batch_names.update(rb.schema.names)
+        names = tuple(rb.schema.names)
+        index = index_by_names.get(names)
+        if index is None:
+            index = {}
+            for i, name in enumerate(names):
+                index[name] = -1 if name in index else i
+            index_by_names[names] = index
+        batch_indices.append(index)
+
+    all_batch_names: set[str] = set()
+    for index in index_by_names.values():
+        all_batch_names.update(index)
 
     col_names: list[str] = list(required_columns)
     for opt_name in optional_columns:
-        if opt_name in all_batch_names:
+        if opt_name in all_batch_names and opt_name not in col_names:
             col_names.append(opt_name)
 
     canonical_types: dict[str, pa.DataType] = {}
     for name in col_names:
-        for rb in batches:
-            if name in rb.schema.names:
-                canonical_types[name] = rb.schema.field(name).type
+        for rb, index in zip(batches, batch_indices):
+            if name in index:
+                if index[name] < 0:
+                    rb.schema.field(name)
+                canonical_types[name] = rb.schema.field(index[name]).type
                 break
 
     missing_everywhere = [name for name in col_names if name not in canonical_types]
@@ -741,16 +845,26 @@ def _unify_record_batch_schemas(
     target_schema = pa.schema([pa.field(name, canonical_types[name]) for name in col_names])
 
     result: list[pa.RecordBatch] = []
-    for rb in batches:
+    for rb, index in zip(batches, batch_indices):
         if rb.schema.equals(target_schema):
             result.append(rb)
             continue
+        if all(name in index for name in col_names):
+            for name in col_names:
+                if index[name] < 0:
+                    rb.column(name)
+            selected = rb.select([index[name] for name in col_names])
+            if selected.schema.equals(target_schema, check_metadata=True):
+                result.append(selected)
+                continue
         num_rows = rb.num_rows
         new_columns: list[pa.Array] = []
         for name in col_names:
             target_type = canonical_types[name]
-            if name in rb.schema.names:
-                col = rb.column(name)
+            if name in index:
+                if index[name] < 0:
+                    rb.schema.field(name)
+                col = rb.column(index[name])
                 if col.type != target_type:
                     try:
                         col = _cast_column(col, target_type)
@@ -950,6 +1064,52 @@ def _resolve_sasl_password(bootstrap_servers: str) -> str:
     )
 
 
+class KafkaConsumerStoppedError(RuntimeError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedBatchCardinality:
+    topic_name: str
+    shard_index: int
+    decoded_rows: int
+    prepared_rows: int
+    expected_rows: int | None
+    leading_dimensions: tuple[tuple[str, int | None], ...]
+
+
+class PreparedRowCountError(ValueError):
+    cardinality: PreparedBatchCardinality
+
+    def __init__(self, cardinality: PreparedBatchCardinality) -> None:
+        self.cardinality = cardinality
+        super().__init__(f"Kafka prepared-row shape mismatch: {cardinality}")
+
+
+def inspect_prepared_batch(
+    example: RecsysFeaturesBatch,
+    *,
+    topic_name: str,
+    shard_index: int,
+    decoded_rows: int,
+    expected_rows: int | None,
+) -> PreparedBatchCardinality:
+    dimensions: list[tuple[str, int | None]] = []
+
+    def visit(value: object, path: str) -> None:
+        if isinstance(value, np.ndarray):
+            dimensions.append((path, value.shape[0] if value.ndim else None))
+        elif isinstance(value, Mapping):
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else str(key))
+
+    visit(example, "")
+    rows = len(example["user_hashes"])
+    return PreparedBatchCardinality(
+        topic_name, shard_index, decoded_rows, rows, expected_rows, tuple(dimensions)
+    )
+
+
 @configclass
 class PhoenixKafkaDataset(PhoenixDataset):
     name: str = ""
@@ -966,10 +1126,15 @@ class PhoenixKafkaDataset(PhoenixDataset):
     sasl_mechanism: str = "SCRAM-SHA-512"
 
     reset_to_latest: bool = False
+    fresh_training_bootstrap: bool = False
+    native_checkpoint_restart: bool = False
     seek_to_timestamp_ms: int | None = None
     auto_offset_reset: str = "latest"
     seek_to_offset: dict[int, int] | None = None
     offset_ptr: dict[int, int] | None = None
+    expected_prepared_rows: int | None = None
+    native_initial_positions: dict[int, int] | None = dataclasses.field(init=False, default=None)
+    _native_expected_partitions: set[int] | None = dataclasses.field(init=False, default=None)
     num_kafka_partitions: int | None = None
     sampling_factor: int = 1
     partition_sampling_factor: int = 1
@@ -977,6 +1142,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     negative_downsample_positive_action_indices: str = (
         DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES
     )
+    drop_width_mismatched_messages: bool = True
     per_partition_poll: bool = True
     consumer_mode: ConsumerMode = ConsumerMode.PER_PARTITION
 
@@ -991,6 +1157,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     global_post_ids: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_author_ids: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_post_sids: np.ndarray | None = dataclasses.field(init=False, default=None)
+    _global_ids_lock = threading.Lock()
 
     global_ids_reload_interval_seconds: float = 0
 
@@ -1008,7 +1175,41 @@ class PhoenixKafkaDataset(PhoenixDataset):
     compute_post_unexplored_label: bool = False
     search_negative_clear_word_match: bool = False
 
+    history_url_embedding_cache: str = ""
+    history_url_embedding_dc: str = "atla"
+    history_url_ranked_pages: bool = False
+    history_url_embedding_cache_entries: int = 200_000
+    history_url_embedding_timeout_s: float = 0.1
+    history_url_embedding_sample_rate: float = 1.0
+    history_url_embedding_negative_ttl_s: float = 3600.0
+    history_url_embedding_model_version: str = DEFAULT_MODEL_VERSION
+    candidate_mm_embedding_model_version: str = ""
+
     exclude_required_columns: str = ""
+
+    def prepare_continuation(
+        self,
+        source: KafkaSourceIdentity,
+        offsets: Mapping[int, int],
+        *,
+        continuation: bool,
+        offset_ranges: Mapping[int, tuple[int, int]] | None = None,
+    ) -> "PhoenixKafkaDataset":
+        if not continuation:
+            raise ValueError("Kafka continuation mode must be explicitly requested")
+        if (self.bootstrap_servers, self.topic_name, self.num_kafka_partitions) != (
+            source.bootstrap_servers,
+            source.topic_name,
+            source.num_partitions,
+        ):
+            raise ValueError("Kafka continuation source identity mismatch")
+        validated = validate_offset_map(
+            offsets,
+            num_partitions=source.num_partitions,
+            required_partitions=set(range(source.num_partitions)),
+            offset_ranges=offset_ranges,
+        )
+        return dataclasses.replace(self, seek_to_timestamp_ms=None, seek_to_offset=validated)
 
     def kafka_to_training_batch(
         self, batch: list[pa.RecordBatch], batch_size: int, shard_index: int = 0
@@ -1017,9 +1218,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
         start_time = time.time()
 
         required_columns: list[str] = list(REQUIRED_COLUMNS)
+        if self.read_video_duration:
+            required_columns.append(VIDEO_DURATION_COLUMN)
         if self.exclude_required_columns:
             excluded = {c.strip() for c in self.exclude_required_columns.split(",") if c.strip()}
             required_columns = [c for c in required_columns if c not in excluded]
+        if self.user_history_stats_dim:
+            required_columns = list(dict.fromkeys(required_columns + HISTORY_STATS_COLUMNS))
 
         if not self._logged_schema and batch:
             first_rb = batch[0]
@@ -1034,16 +1239,40 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.info(f"Schema validated. Available columns: {available_cols}")
             self._logged_schema = True
 
-        if self.multimodal_embedding_type is not None:
-            embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
-            if batch and embedding_col_name in batch[0].schema.names:
-                required_columns.append(embedding_col_name)
-
         optional_columns = OPTIONAL_COLUMNS
         if self.reply_parent_mode:
             optional_columns = list(
                 dict.fromkeys(OPTIONAL_COLUMNS + reply_features.REPLY_OPTIONAL_COLUMNS)
             )
+        if self.id_list_specs:
+            optional_columns = [*optional_columns, id_list_features.COLUMN]
+        if self.long_term_author_profile_size > 0:
+            optional_columns = [*optional_columns, *long_term_author_profile.COLUMNS]
+        if self.read_ads_engagement_counts:
+            optional_columns = [*optional_columns, *ADS_COUNT_COLUMNS, *USER_ADS_COUNT_COLUMNS]
+        if self.read_ads_ctr_features:
+            ctr_columns = [c for pair in ADS_CTR_COUNT_PAIRS for c in pair]
+            optional_columns = list(dict.fromkeys([*optional_columns, *ctr_columns]))
+        if self.per_candidate_sample_weight:
+            optional_columns = [*optional_columns, SAMPLE_WEIGHT_SEQ_COLUMN]
+        if self.read_ad_side_ids:
+            ad_columns = [c for f in self.ad_side_field_names for c in AD_SIDE_FIELD_COLUMNS[f]]
+            optional_columns = list(dict.fromkeys([*optional_columns, *ad_columns]))
+        if self.distill_teacher:
+            optional_columns = [*optional_columns, teacher_distill.COLUMN]
+        candidate_mm_lookup = self._candidate_mm_lookup
+        embedding_col_name: str | None = None
+        if self.multimodal_embedding_type is not None and candidate_mm_lookup is None:
+            embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
+            optional_columns = [*optional_columns, embedding_col_name]
+        history_url_lookup = self._history_url_lookup
+        url_id_columns = (
+            HISTORY_RANKED_URL_ID_COLUMNS
+            if self.history_url_ranked_pages
+            else (HISTORY_URL_ID_COLUMN,)
+        )
+        if history_url_lookup is not None:
+            optional_columns = [*optional_columns, *url_id_columns]
         unified_batches = _unify_record_batch_schemas(batch, required_columns, optional_columns)
 
         t = time.time()
@@ -1060,6 +1289,18 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
         if table.num_rows == 0:
             raise ValueError("Combined table has no rows")
+        embedding_zero_filled = 0
+        if embedding_col_name is not None:
+            embedding_zero_filled = (
+                table.column(embedding_col_name).null_count
+                if embedding_col_name in table.column_names
+                else table.num_rows
+            )
+
+        with self._global_ids_lock:
+            global_post_ids = self.global_post_ids
+            global_author_ids = self.global_author_ids
+            global_post_sids = self.global_post_sids
 
         t = time.time()
         example = from_record_batch(
@@ -1072,28 +1313,63 @@ class PhoenixKafkaDataset(PhoenixDataset):
             self.hash_table,
             self.include_candidate_post_ids,
             self.num_global_negatives_per_example,
-            self.global_post_ids,
-            self.global_author_ids,
+            global_post_ids,
+            global_author_ids,
             self.max_candidates_for_embeddings,
             self.multimodal_embedding_type,
             search_query_embedding_dim=self.search_query_embedding_dim,
+            aux_value_events=self.aux_value_events,
+            distill_teacher=self.distill_teacher,
+            distill_actions=self.distill_actions,
+            distill_bad_spans_ms=self.distill_bad_spans_ms,
             candidate_negative_filter=self.candidate_negative_filter,
             candidate_negative_mode=(
                 self.candidate_negative_mode
                 if self.candidate_negative_mode is not None
                 else CandidateNegativeMode.FILTER
             ),
-            global_post_sids=self.global_post_sids,
+            global_post_sids=global_post_sids,
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
+            ld_label_exclude_clicks=self.ld_label_exclude_clicks,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
             stale_post_30d=self.enable_stale_post_30d,
             search_negative_clear_word_match=self.search_negative_clear_word_match,
             reply_parent_mode=self.reply_parent_mode,
             ads_head_masking=self.ads_head_masking,
             ads_pixel_head_masking=self.ads_pixel_head_masking,
+            ads_late_window_heads=self.ads_late_window_heads,
             page_records=self.page_records,
+            id_list_specs=self.id_list_specs or None,
+            long_term_author_profile_size=self.long_term_author_profile_size,
+            history_url_embedding_dim=self.history_url_embedding_dim,
+            history_url_embedding_fn=history_url_lookup,
+            history_url_id_columns=url_id_columns,
+            candidate_embedding_fn=candidate_mm_lookup,
+            read_ads_engagement_counts=self.read_ads_engagement_counts,
+            read_ads_ctr_features=self.read_ads_ctr_features,
+            per_candidate_sample_weight=self.per_candidate_sample_weight,
+            user_history_stats_dim=self.user_history_stats_dim,
+            alloc=self._alloc,
+            read_ad_side_ids=self.read_ad_side_ids,
+            ad_side_fields=self.ad_side_field_names,
         )
+
+        cardinality = inspect_prepared_batch(
+            example,
+            topic_name=self.topic_name,
+            shard_index=shard_index,
+            decoded_rows=table.num_rows,
+            expected_rows=self.expected_prepared_rows,
+        )
+        if self.expected_prepared_rows is not None and (
+            cardinality.prepared_rows != self.expected_prepared_rows
+            or any(
+                rows != self.expected_prepared_rows for _, rows in cardinality.leading_dimensions
+            )
+        ):
+            rank_logger.error("Kafka prepared-row shape mismatch: %s", cardinality)
+            raise PreparedRowCountError(cardinality)
 
         elapsed = time.time() - t
         logger.debug(
@@ -1111,8 +1387,83 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 _kafka_batch_processing_time.record(total_elapsed, shard_attrs)
             if _kafka_messages_processed:
                 _kafka_messages_processed.add(len(batch), shard_attrs)
+            if _kafka_embedding_zero_filled and embedding_col_name is not None:
+                _kafka_embedding_zero_filled.add(embedding_zero_filled, shard_attrs)
+            if history_url_lookup is not None:
+                _record_embedding_lookup_stats(
+                    history_url_lookup.take_stats(),
+                    shard_attrs,
+                    _kafka_history_url_embedding,
+                    _kafka_history_url_embedding_mget_seconds,
+                )
+            if candidate_mm_lookup is not None:
+                _record_embedding_lookup_stats(
+                    candidate_mm_lookup.take_stats(),
+                    shard_attrs,
+                    _kafka_candidate_mm_embedding,
+                    _kafka_candidate_mm_embedding_mget_seconds,
+                )
 
         return example
+
+    @cached_property
+    def _history_url_lookup(self) -> HistoryUrlEmbeddingLookup | None:
+        if self.history_url_embedding_dim <= 0:
+            return None
+        if not self.history_url_embedding_cache:
+            rank_logger.warning(
+                "history_url_embedding_dim > 0 without history_url_embedding_cache: "
+                "history URL embeddings stay zero"
+            )
+            return None
+        if self.history_url_embedding_dim != URL_EMBEDDING_DIM:
+            raise ValueError(
+                f"history_url_embedding_dim={self.history_url_embedding_dim} must be "
+                f"{URL_EMBEDDING_DIM} to read the URL embedding cache"
+            )
+        return HistoryUrlEmbeddingLookup.from_cache(
+            self.history_url_embedding_cache,
+            self.history_url_embedding_dc,
+            self.history_url_embedding_timeout_s,
+            self.history_url_embedding_cache_entries,
+            self.history_url_embedding_sample_rate,
+            self.history_url_embedding_negative_ttl_s,
+            key_fn=partial(
+                url_embedding_key, model_version=self.history_url_embedding_model_version
+            ),
+        )
+
+    @cached_property
+    def _candidate_mm_lookup(self) -> HistoryUrlEmbeddingLookup | None:
+        if not self.candidate_mm_embedding_model_version:
+            return None
+        if not self.history_url_embedding_cache:
+            raise ValueError(
+                "candidate_mm_embedding_model_version needs history_url_embedding_cache"
+            )
+        if (
+            self.multimodal_embedding_type is None
+            or EMBEDDING_CONFIG[self.multimodal_embedding_type][1] != URL_EMBEDDING_DIM
+        ):
+            raise ValueError(
+                f"candidate_mm_embedding_model_version needs a {URL_EMBEDDING_DIM}-d "
+                f"multimodal_embedding_type, got {self.multimodal_embedding_type}"
+            )
+        return HistoryUrlEmbeddingLookup.from_cache(
+            self.history_url_embedding_cache,
+            self.history_url_embedding_dc,
+            self.history_url_embedding_timeout_s,
+            self.history_url_embedding_cache_entries,
+            1.0,
+            _CANDIDATE_MM_NEGATIVE_TTL_S,
+            key_fn=partial(
+                post_embedding_key, model_version=self.candidate_mm_embedding_model_version
+            ),
+            name="Candidate MM embeddings",
+        )
+
+    def exports_python_otel(self, shard_index: int, num_shards: int) -> bool:
+        return True
 
     def make(
         self,
@@ -1136,14 +1487,101 @@ class PhoenixKafkaDataset(PhoenixDataset):
             prefetch_factor,
             resume_position,
         )
-        global consumer, _kafka_reset_event
+        validate_seek_options(self.seek_to_timestamp_ms, self.seek_to_offset)
+        if self.per_candidate_sample_weight and self.negative_downsample_rate != 1:
+            raise ValueError(
+                "per_candidate_sample_weight requires negative_downsample_rate=1: the reader's "
+                "rate goes to sampleWeight, which sampleWeightSeq replaces on candidate slots"
+            )
+        if type(self.native_checkpoint_restart) is not bool:
+            raise ValueError("Native restart policy must be an exact Boolean")
+        if self.native_checkpoint_restart:
+            if type(self.num_kafka_partitions) is not int or self.num_kafka_partitions <= 0:
+                raise ValueError("Native restart requires a known partition count")
+            if (
+                self.fresh_training_bootstrap
+                or self.is_eval
+                or not self.topic_name
+                or self.seek_to_timestamp_ms is not None
+                or self.reset_to_latest
+                or self.i_know_what_i_am_doing
+                or self.auto_offset_reset != "none"
+                or self.sampling_factor != 1
+                or self.negative_downsample_rate != 1
+                or self.enable_drop_on_high_qps
+                or self.seek_to_offset is None
+            ):
+                raise ValueError(
+                    "Native restart requires restored offsets and unchanged input policy"
+                )
+            validate_offset_map(
+                self.seek_to_offset,
+                num_partitions=self.num_kafka_partitions,
+                required_partitions=set(range(self.num_kafka_partitions)),
+            )
+        if type(self.fresh_training_bootstrap) is not bool:
+            raise ValueError("Fresh bootstrap policy must be an exact Boolean")
+        if self.fresh_training_bootstrap:
+            if (
+                self.is_eval
+                or not self.topic_name
+                or type(self.seek_to_timestamp_ms) is not int
+                or self.seek_to_timestamp_ms <= 0
+                or self.seek_to_offset is not None
+                or self.reset_to_latest
+                or self.i_know_what_i_am_doing
+                or self.auto_offset_reset != "none"
+                or self.sampling_factor != 1
+                or self.negative_downsample_rate != 1
+                or self.enable_drop_on_high_qps
+                or type(self.num_kafka_partitions) is not int
+                or self.num_kafka_partitions <= 0
+            ):
+                raise ValueError(
+                    "Fresh training requires an explicit unsampled timestamp bootstrap"
+                )
+        elif not self.is_eval and not self.i_know_what_i_am_doing:
+            if self.seek_to_timestamp_ms is not None or self.reset_to_latest:
+                raise ValueError(
+                    "Training timestamp or reset requires an explicit bootstrap policy"
+                )
+        if self.expected_prepared_rows is not None and (
+            type(self.expected_prepared_rows) is not int or self.expected_prepared_rows <= 0
+        ):
+            raise ValueError("expected_prepared_rows must be a positive integer")
+        global consumer, stop_event, _kafka_reset_event
         if consumer is not None:
-            raise ValueError("Called make() twice, process is already running.")
+            if consumer.is_alive():
+                raise ValueError("Called make() twice, process is already running.")
+            consumer = None
 
+        native_bootstrap = self.fresh_training_bootstrap or self.native_checkpoint_restart
+        if native_bootstrap:
+            if self.partition_sampling_factor != 1:
+                raise ValueError("Native Kafka requires unsampled partitions")
+            if (
+                type(shard_index) is not int
+                or type(num_shards) is not int
+                or not 0 <= shard_index < num_shards
+            ):
+                raise ValueError("Native Kafka shard index must be within the positive shard count")
+            assert self.num_kafka_partitions is not None
+            if num_shards > self.num_kafka_partitions:
+                raise ValueError("Native Kafka requires at least one partition per shard")
+            self._native_expected_partitions = set(
+                range(
+                    shard_index * self.num_kafka_partitions // num_shards,
+                    (shard_index + 1) * self.num_kafka_partitions // num_shards,
+                )
+            )
+            self.native_initial_positions = None
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self.is_alive = True
         self._reset_event: Event = threading.Event()
         _kafka_reset_event = self._reset_event
 
-        if self.export_metrics:
+        if self.export_metrics and self.exports_python_otel(shard_index, num_shards):
             try:
                 _init_otel_metrics(
                     otel_endpoint=self.otel_endpoint,
@@ -1154,7 +1592,11 @@ class PhoenixKafkaDataset(PhoenixDataset):
             except Exception as e:
                 logger.warning(f"Failed to initialize OTel push metrics: {e}")
 
-        if not self.is_eval:
+        if (
+            not self.is_eval
+            and not self.fresh_training_bootstrap
+            and not self.native_checkpoint_restart
+        ):
             _start_reset_http_server(self.reset_base_port, self.num_local_workers)
 
             if not self.i_know_what_i_am_doing:
@@ -1167,9 +1609,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     "If you are trying to recover from an outage in production, and are tempted to set reset_to_latest=True, then remember: you must harvest one checkpoint and restart training with reset_to_latest=False and i_know_what_i_am_doing=False"
                 )
 
-        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]] | Exception] = (
-            queue.Queue(maxsize=self.max_queue_size)
-        )
+        example_queue: queue.Queue[KafkaQueueItem] = queue.Queue(maxsize=self.max_queue_size)
         consumer = threading.Thread(
             target=self._async_kafka_consumer_arrow,
             args=(
@@ -1178,17 +1618,40 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 shard_index,
                 num_shards,
                 run_server,
-                stop_event,
+                self._stop_event,
                 self._reset_event,
             ),
             daemon=True,
         )
+        self._consumer_thread = consumer
         consumer.start()
 
+        if self.fresh_training_bootstrap or self.native_checkpoint_restart:
+            return self._fresh_training_batches(example_queue, shard_index)
+        return self._iterate_training_batches(example_queue, shard_index)
+
+    def _fresh_training_batches(self, example_queue, shard_index):
+        try:
+            yield from self._iterate_training_batches(example_queue, shard_index)
+        finally:
+            primary = sys.exception()
+            try:
+                self.shutdown()
+            except Exception as cleanup:
+                if primary is None:
+                    raise
+                primary.add_note(f"Fresh input cleanup failed: {cleanup!r}")
+
+    def _iterate_training_batches(
+        self,
+        example_queue: queue.Queue[KafkaQueueItem],
+        shard_index: int,
+    ) -> Iterator[tuple[RecsysFeaturesBatch, dict[int, int] | None]]:
         total_loop_count = 0
         total_empty_count = 0
         consecutive_empty_count = 0
         self.offset_ptr = {}
+        native_bootstrap = self.fresh_training_bootstrap or self.native_checkpoint_restart
         shard_attrs = {
             "training_name": self.name,
             "topic": self.topic_name,
@@ -1197,28 +1660,16 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
         while self.is_alive:
             total_loop_count += 1
+            if self.export_metrics:
+                _queue_size_values[(self.name, self.topic_name, str(shard_index))] = (
+                    example_queue.qsize()
+                )
+
             try:
-                if self.export_metrics:
-                    _queue_size_values[(self.name, self.topic_name, str(shard_index))] = (
-                        example_queue.qsize()
-                    )
-
                 item = example_queue.get(timeout=1.0)
-                if isinstance(item, Exception):
-                    raise item
-                batch, offsets = item
-                self.offset_ptr.update(offsets)
-                consecutive_empty_count = 0
-
-                if self.export_metrics and _kafka_batches_processed:
-                    _kafka_batches_processed.add(1, shard_attrs)
-                    for _part, _off in offsets.items():
-                        _partition_delivered_offsets[
-                            (self.name, self.topic_name, str(shard_index), _part)
-                        ] = _off
-
-                yield batch, self.offset_ptr.copy()
             except queue.Empty:
+                if consumer is not None and not consumer.is_alive() and example_queue.empty():
+                    raise KafkaConsumerStoppedError("Kafka consumer stopped with an empty queue")
                 total_empty_count += 1
                 consecutive_empty_count += 1
 
@@ -1229,6 +1680,56 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     rank_logger.warning(
                         f"No data in the queue. Consecutive empty count: {consecutive_empty_count}, total loop count: {total_loop_count}, total empty count: {total_empty_count}"
                     )
+                continue
+
+            if isinstance(item, Exception):
+                raise item
+            if isinstance(item, KafkaBootstrapOffsets):
+                if not native_bootstrap or item.topic_name != self.topic_name:
+                    raise ValueError("Unexpected Kafka bootstrap topic or mode")
+                if self.native_initial_positions is not None:
+                    raise ValueError("Duplicate Kafka bootstrap frontier")
+                if self._native_expected_partitions is None:
+                    raise ValueError("Native Kafka bootstrap shard assignment is unavailable")
+                offsets = validate_offset_map(
+                    dict(item.offsets),
+                    num_partitions=self.num_kafka_partitions,
+                    required_partitions=self._native_expected_partitions,
+                )
+                if not offsets:
+                    raise ValueError("Native Kafka shard has no partitions")
+                self.native_initial_positions = offsets.copy()
+                self.offset_ptr.update(offsets)
+                continue
+            batch, offsets = item
+            if native_bootstrap:
+                if self.native_initial_positions is None:
+                    raise ValueError("Kafka data arrived before its native bootstrap frontier")
+                offsets = validate_offset_map(offsets, num_partitions=self.num_kafka_partitions)
+                if not offsets or not offsets.keys() <= self.native_initial_positions.keys():
+                    raise ValueError("Unexpected Kafka partition in native batch")
+                if any(
+                    offset < self.offset_ptr[partition] for partition, offset in offsets.items()
+                ):
+                    raise ValueError("Kafka native batch offsets decreased")
+            report_metrics = self.export_metrics and _kafka_batches_processed
+            if report_metrics:
+                advanced = {
+                    _part: _off
+                    for _part, _off in offsets.items()
+                    if _part in self.offset_ptr and self.offset_ptr[_part] != _off
+                }
+            self.offset_ptr.update(offsets)
+            consecutive_empty_count = 0
+
+            if report_metrics:
+                _kafka_batches_processed.add(1, shard_attrs)
+                for _part, _off in advanced.items():
+                    _partition_delivered_offsets[
+                        (self.name, self.topic_name, str(shard_index), _part)
+                    ] = _off
+
+            yield batch, self.offset_ptr.copy()
 
     def _detect_auth(self) -> KafkaAuth:
         return auto_detect_auth(
@@ -1242,6 +1743,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
         return _resolve_bootstrap_servers(self.bootstrap_servers, auth_mode=mode)
 
     def ensure_partition_count(self) -> None:
+        validate_seek_options(self.seek_to_timestamp_ms, self.seek_to_offset)
         if self.num_kafka_partitions is not None:
             return
         if not self.topic_name:
@@ -1294,9 +1796,10 @@ class PhoenixKafkaDataset(PhoenixDataset):
                         sid_num_levels=self.sid_num_levels,
                     )
                     if new_post_ids is not None and new_author_ids is not None:
-                        self.global_post_ids = new_post_ids
-                        self.global_author_ids = new_author_ids
-                        self.global_post_sids = new_post_sids
+                        with self._global_ids_lock:
+                            self.global_post_ids = new_post_ids
+                            self.global_author_ids = new_author_ids
+                            self.global_post_sids = new_post_sids
                         last_reload_time = time.time()
                     else:
                         rank_logger.warning("Failed to reload global ids, keeping existing values")
@@ -1307,9 +1810,49 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.error(f"Error in periodic reload task: {e}")
                 await asyncio.sleep(self.global_ids_reload_interval_seconds / 2)
 
+    def expected_inner_list_widths(self) -> dict[str, int]:
+        if not self.drop_width_mismatched_messages:
+            return {}
+        return {
+            "actionNameMultiHotSeqSeq": self.output_vocab_size,
+            "continuousActionValuesSeqSeq": self.num_continuous_actions,
+        }
+
     def _async_kafka_consumer_arrow(
         self,
-        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]] | Exception],
+        example_queue: queue.Queue[KafkaQueueItem],
+        batch_size: int,
+        shard_index: int,
+        num_shards: int,
+        run_server: bool,
+        stop_event: threading.Event | None = None,
+        reset_event: threading.Event | None = None,
+    ) -> None:
+        set_expected_inner_list_widths(self.expected_inner_list_widths())
+        try:
+            self._run_kafka_consumer_arrow(
+                example_queue,
+                batch_size,
+                shard_index,
+                num_shards,
+                run_server,
+                stop_event,
+                reset_event,
+            )
+        except asyncio.CancelledError:
+            rank_logger.info(f"Consumer [{os.getpid()}] cancelled (shutdown).")
+        except Exception as error:
+            rank_logger.error(f"Consumer [{os.getpid()}] failed: {error}", exc_info=True)
+            while not (stop_event and stop_event.is_set()):
+                try:
+                    example_queue.put(error, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _run_kafka_consumer_arrow(
+        self,
+        example_queue: queue.Queue[KafkaQueueItem],
         batch_size: int,
         shard_index: int,
         num_shards: int,
@@ -1318,21 +1861,25 @@ class PhoenixKafkaDataset(PhoenixDataset):
         reset_event: threading.Event | None = None,
     ):
         del run_server
-        assert self.seek_to_timestamp_ms is None or self.seek_to_offset is None
+        validate_seek_options(self.seek_to_timestamp_ms, self.seek_to_offset)
 
         rank_logger.info(f"[{os.getpid()}] Starting kafka consumer")
 
         if self.num_global_negatives_per_example > 0:
             (
-                self.global_post_ids,
-                self.global_author_ids,
+                global_post_ids,
+                global_author_ids,
                 _,
-                self.global_post_sids,
+                global_post_sids,
             ) = load_global_ids_from_parquet_file(
                 self.global_ids_file_path,
                 read_post_sid=self.use_post_sid,
                 sid_num_levels=self.sid_num_levels,
             )
+            with self._global_ids_lock:
+                self.global_post_ids = global_post_ids
+                self.global_author_ids = global_author_ids
+                self.global_post_sids = global_post_sids
 
         async def consumption_loop(stop_event):
             reload_task = None
@@ -1361,6 +1908,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
                         sasl_plain_username=self.sasl_plain_username,
                         sasl_plain_password=sasl_plain_password,
                         auth=auth,
+                        stop_event=stop_event,
                     )
                 except Exception as e:
                     if self.num_kafka_partitions is not None:
@@ -1421,6 +1969,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     reset_to_latest=self.reset_to_latest,
                     seek_to_timestamp_ms=self.seek_to_timestamp_ms,
                     seek_to_offset=self.seek_to_offset,
+                    fresh_training_bootstrap=self.fresh_training_bootstrap,
+                    native_checkpoint_restart=self.native_checkpoint_restart,
                     stop_event=stop_event,
                     post_process_fn=post_process_fn,
                     sampling_factor=self.sampling_factor,
@@ -1440,24 +1990,29 @@ class PhoenixKafkaDataset(PhoenixDataset):
             finally:
                 if reload_task:
                     reload_task.cancel()
+                    await asyncio.gather(reload_task, return_exceptions=True)
 
-        try:
-            asyncio.run(consumption_loop(stop_event))
-        except asyncio.CancelledError:
-            rank_logger.info(f"Consumer [{os.getpid()}] cancelled (shutdown).")
-        except Exception as e:
-            rank_logger.error(f"Consumer [{os.getpid()}] failed: {e}", exc_info=True)
+        asyncio.run(consumption_loop(stop_event))
 
     def shutdown(self):
         global consumer
         global stop_event
         self.is_alive = False
 
-        if consumer is not None:
-            stop_event.set()
+        owned_consumer = getattr(self, "_consumer_thread", consumer)
+        owned_stop = getattr(self, "_stop_event", stop_event)
+        if owned_consumer is not None:
+            owned_stop.set()
             rank_logger.info("Waiting for kafka consumer to finish...")
-            consumer.join(timeout=10)
-            consumer = None
+            owned_consumer.join(timeout=10)
+            if owned_consumer.is_alive():
+                rank_logger.error(
+                    "Kafka consumer did not stop within ten seconds; retaining its handle until it exits"
+                )
+            else:
+                if consumer is owned_consumer:
+                    consumer = None
+                self._consumer_thread = None
 
         _training_metric_values.clear()
         _partition_delivered_offsets.clear()

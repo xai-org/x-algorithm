@@ -1,20 +1,38 @@
 use super::article::{ArticleCoverMedia, ArticleMediaEntities};
 use super::post::{PostFacts, ReplyControl};
 use super::tweet::Tweet;
-use super::viewer::{ViewerAccount, ViewerCountry, ViewerLabels};
-use super::{EdgeFeature, In};
-use crate::hydration::Hydrator;
+use super::viewer::{ViewerAccount, ViewerCountry, ViewerLabels, ViewerMutedKeywords};
+use super::{EdgeFeature, Feature, In, Reads};
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::region::allows_country;
+use crate::models::PostCandidate;
+use crate::rules::context::At;
 use crate::rules::rule_spec::inputs::Interpreter;
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::Predicate;
 
+type MuteRetweets = EdgeFeature<{ Hydrator::MuteRetweets as u8 }>;
 type SuperFollowsExclusive = EdgeFeature<{ Hydrator::SuperFollowsExclusive as u8 }>;
 type RootFollowsViewer = EdgeFeature<{ Hydrator::RootFollowsViewer as u8 }>;
 type RootFollowsViewerSecondDegree = EdgeFeature<{ Hydrator::RootFollowsViewerSecondDegree as u8 }>;
-type BlockedByReplyRoot = EdgeFeature<{ Hydrator::BlockedByReplyRoot as u8 }>;
-type BlockedByConversationRoot = EdgeFeature<{ Hydrator::BlockedByConversationRoot as u8 }>;
-type BlockedByConversationRootPost = EdgeFeature<{ Hydrator::BlockedByConversationRootPost as u8 }>;
+type ViewerFollowsRoot = EdgeFeature<{ Hydrator::ViewerFollowsRoot as u8 }>;
+type SuperFollowsRoot = EdgeFeature<{ Hydrator::SuperFollowsRoot as u8 }>;
+type TrustedFriends = EdgeFeature<{ Hydrator::TrustedFriends as u8 }>;
+type OutsideNarrowcastPlace = EdgeFeature<{ Hydrator::OutsideNarrowcastPlace as u8 }>;
+
+enum ConversationRootAuthorBlocksViewer {}
+
+impl Feature for ConversationRootAuthorBlocksViewer {
+    const REQUIRED: Hydrators = Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR;
+    type Value<'a> = bool;
+}
+
+impl Reads<PostCandidate> for ConversationRootAuthorBlocksViewer {
+    #[inline]
+    fn read<'a>(at: At<'_, 'a>) -> bool {
+        at.post().conversation_root_author_blocks_viewer
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -25,7 +43,15 @@ pub enum CompoundLeaf {
     ViewerSuperFollowsAuthor,
     ViewerIsInConversationRootAuthorNetwork,
     ViewerIsBlockedByConversationRootAuthor,
+    ViewerHasMatchingMutedKeyword,
+    ViewerHasMatchingMutedKeywordExcludingFollowed,
     ViewerIsInAllowedCountry,
+    ViewerMutesRetweetsFromAuthor,
+    ViewerIsFollowedByConversationRootAuthor,
+    ViewerFollowsConversationRootAuthor,
+    ViewerSuperFollowsConversationRootAuthor,
+    ViewerIsTrustedFriendsListMemberOrOwner,
+    ViewerIsOutsideNarrowcastPlace,
 }
 
 impl CompoundLeaf {
@@ -57,13 +83,18 @@ impl CompoundLeaf {
                     first || second
                 },
             ),
-            Self::ViewerIsBlockedByConversationRootAuthor => i.run(
-                |(
-                    In::<PostFacts>(post),
-                    In::<BlockedByReplyRoot>(direct),
-                    In::<BlockedByConversationRoot>(from_control),
-                    In::<BlockedByConversationRootPost>(fetched),
-                )| { direct || fetched || (from_control && post.is_reply()) },
+            Self::ViewerIsBlockedByConversationRootAuthor => {
+                i.run(|In::<ConversationRootAuthorBlocksViewer>(blocked)| blocked)
+            }
+            Self::ViewerHasMatchingMutedKeyword => i.run(
+                |(In::<Tweet>(tweet), In::<ViewerMutedKeywords>(keywords))| {
+                    keywords.is_some_and(|keywords| keywords.mutes_from_anyone(&tweet.text))
+                },
+            ),
+            Self::ViewerHasMatchingMutedKeywordExcludingFollowed => i.run(
+                |(In::<Tweet>(tweet), In::<ViewerMutedKeywords>(keywords))| {
+                    keywords.is_some_and(|keywords| keywords.mutes_excluding_followed(&tweet.text))
+                },
             ),
             Self::ViewerIsInAllowedCountry => i.run(
                 |(In::<ReplyControl>(control), In::<ViewerCountry>(country))| {
@@ -72,6 +103,22 @@ impl CompoundLeaf {
                     })
                 },
             ),
+            Self::ViewerMutesRetweetsFromAuthor => i.run(|In::<MuteRetweets>(mutes)| mutes),
+            Self::ViewerIsFollowedByConversationRootAuthor => {
+                i.run(|In::<RootFollowsViewer>(follows)| follows)
+            }
+            Self::ViewerFollowsConversationRootAuthor => {
+                i.run(|In::<ViewerFollowsRoot>(follows)| follows)
+            }
+            Self::ViewerSuperFollowsConversationRootAuthor => {
+                i.run(|In::<SuperFollowsRoot>(super_follows)| super_follows)
+            }
+            Self::ViewerIsTrustedFriendsListMemberOrOwner => {
+                i.run(|In::<TrustedFriends>(member)| member)
+            }
+            Self::ViewerIsOutsideNarrowcastPlace => {
+                i.run(|In::<OutsideNarrowcastPlace>(outside)| outside)
+            }
         }
     }
 

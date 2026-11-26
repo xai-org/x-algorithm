@@ -9,6 +9,12 @@ pub struct AuthorFeatures {
     pub is_offboarded: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuthorProfile {
+    pub has_default_profile_image: bool,
+    pub is_new_account: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::VariantArray)]
 #[repr(u8)]
 pub enum AuthorLabel {
@@ -23,6 +29,11 @@ pub enum AuthorLabel {
     ReadOnly,
     ImpersonationHighPrecision,
     DoNotAmplify,
+    NotGraduated,
+    AgathaSpamTopUser,
+    EngagementSpammer,
+    BlinkWorst,
+    DownrankSpamReply,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

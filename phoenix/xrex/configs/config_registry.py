@@ -17,10 +17,5 @@ RETRIEVAL_MODEL_CFG_BUILDERS: list[Callable[[Callable[..., Any]], dict[str, Any]
 RANKING_CONFIG_HOOKS: list[Callable[[dict[str, Any]], None]] = []
 RETRIEVAL_CONFIG_HOOKS: list[Callable[[dict[str, Any]], None]] = []
 
-SID_DATASET_FACTORIES: dict[str, Callable[..., Any]] = {}
-SID_MODEL_CFG_BUILDERS: list[Callable[..., dict[str, Any]]] = []
-
-GEN_RECS_DATASET_FACTORIES: dict[str, Callable[..., Any]] = {}
-
 RETRIEVAL_EVAL_BUILDERS: list[Callable[..., list[Any]]] = []
 EVAL_WANDB_HOOK_FACTORIES: list[Callable[..., Any]] = []

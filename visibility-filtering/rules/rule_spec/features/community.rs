@@ -1,6 +1,6 @@
-use super::{Feature, Leaf, Meaning};
+use super::{Feature, Leaf, Meaning, Reads};
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::CommunityModeration;
+use crate::models::{CommunityModeration, PostCandidate};
 use crate::rules::context::At;
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::Predicate;
@@ -10,7 +10,9 @@ pub(in crate::rules) enum PostModeration {}
 impl Feature for PostModeration {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::CommunityModeration);
     type Value<'a> = CommunityModeration;
+}
 
+impl Reads<PostCandidate> for PostModeration {
     #[inline]
     fn read<'a>(at: At<'_, 'a>) -> CommunityModeration {
         at.post().community_moderation
@@ -49,7 +51,9 @@ pub(in crate::rules) enum CommunityModerator {}
 impl Feature for CommunityModerator {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::CommunityModerator);
     type Value<'a> = Option<bool>;
+}
 
+impl Reads<PostCandidate> for CommunityModerator {
     #[inline]
     fn read<'a>(at: At<'_, 'a>) -> Option<bool> {
         at.post().viewer_is_community_moderator
@@ -86,7 +90,9 @@ pub(in crate::rules) enum CommunityViewerRemoved {}
 impl Feature for CommunityViewerRemoved {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::CommunityViewerRemoved);
     type Value<'a> = bool;
+}
 
+impl Reads<PostCandidate> for CommunityViewerRemoved {
     #[inline]
     fn read<'a>(at: At<'_, 'a>) -> bool {
         at.post().viewer_is_removed_from_community

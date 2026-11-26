@@ -72,14 +72,19 @@ std::chrono::seconds watchdogTimeout() {
 
 std::once_flag warmup_once;
 
+constexpr int64_t kWarmupScalarsOffset = 256;
+
 void warmupKernels(int8_t* scratch, cudaStream_t stream) {
   auto* bf16 = reinterpret_cast<__nv_bfloat16*>(scratch);
   auto* f32 = reinterpret_cast<float*>(scratch);
   auto* i32 = reinterpret_cast<int32_t*>(scratch);
+  auto* scalars = reinterpret_cast<UpdateScalars*>(f32 + kWarmupScalarsOffset);
   const SliceLayout slices{0, 8, 1};
   launch_lookup_dispatch(i32, bf16, bf16, slices, 1, stream);
   launch_grad_dispatch(bf16, bf16, slices, stream);
-  launch_grad_segment_sum(bf16, i32, f32, f32, slices, 0, stream);
+  launch_update_row_bound(i32, i32, scalars, slices, 0, 1, stream);
+  launch_zero_update_rows(f32, scalars, slices.shard_width, stream);
+  launch_grad_segment_sum(bf16, i32, f32, f32, scalars, slices, 0, stream);
   launch_lookup_combine(bf16, bf16, slices, stream);
   XAI_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
@@ -618,12 +623,19 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
       "update gradient all-to-all"
   );
 
-  XAI_CUDA_CHECK(cudaMemsetAsync(arena() + layout.grad_accum, 0, layout.accum_bytes, side_stream_));
+  auto* grad_accum = reinterpret_cast<float*>(arena() + layout.grad_accum);
+  const auto* unique_tokens = reinterpret_cast<const int32_t*>(arena() + layout.unique_tokens);
+  auto* scalars = reinterpret_cast<UpdateScalars*>(arena() + layout.scalars);
+  launch_update_row_bound(
+      unique_tokens, segment_ids_all, scalars, slices, spec.num_unique, job.vocab_rows, side_stream_
+  );
+  launch_zero_update_rows(grad_accum, scalars, spec.shard_width, side_stream_);
   launch_grad_segment_sum(
       reinterpret_cast<const __nv_bfloat16*>(arena() + layout.recv),
       segment_ids_all,
-      reinterpret_cast<float*>(arena() + layout.grad_accum),
+      grad_accum,
       reinterpret_cast<float*>(arena() + layout.row_sq_sums),
+      scalars,
       slices,
       spec.num_unique,
       side_stream_
@@ -643,12 +655,7 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
 
   const float* row_sq_sums = reinterpret_cast<const float*>(arena() + layout.row_sq_sums);
   const ReducedGradients reduced{
-      reinterpret_cast<const float*>(arena() + layout.grad_accum),
-      row_sq_sums,
-      reinterpret_cast<const int32_t*>(arena() + layout.unique_tokens),
-      reinterpret_cast<UpdateScalars*>(arena() + layout.scalars),
-      spec.num_unique,
-      spec.shard_width
+      grad_accum, row_sq_sums, unique_tokens, scalars, spec.num_unique, spec.shard_width
   };
   apply(reduced, job, side_stream_);
   recordDone(update_);
@@ -781,9 +788,11 @@ void AsyncEmbContext::warmupUpdateRule(const ApplyUpdateRule& apply) {
   auto* bf16 = reinterpret_cast<__nv_bfloat16*>(scratch.data());
   auto* f32 = reinterpret_cast<float*>(scratch.data());
   auto* i32 = reinterpret_cast<int32_t*>(scratch.data());
-  const ReducedGradients reduced{f32, f32, i32, reinterpret_cast<UpdateScalars*>(f32 + 256), 0, 8};
+  auto* scalars = reinterpret_cast<UpdateScalars*>(f32 + kWarmupScalarsOffset);
   const UpdateJob job{bf16, 1};
-  apply(reduced, job, side_stream_);
+  for (int64_t width = 1; width <= kMaxShardWidth; width *= 2) {
+    apply(ReducedGradients{f32, f32, i32, scalars, 0, width}, job, side_stream_);
+  }
   XAI_CUDA_CHECK(cudaStreamSynchronize(side_stream_));
 }
 

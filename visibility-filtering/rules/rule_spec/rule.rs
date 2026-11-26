@@ -1,31 +1,32 @@
 #[cfg(test)]
 use super::leaves::TweetHasLabel;
-use super::leaves::{ViewerFollowsAuthor, ViewerIsAuthor};
+use super::leaves::ViewerIsAuthor;
 #[cfg(test)]
 use super::{rule_name, spelled_label};
 use super::{Predicate, RuleAction, RuleId};
 use crate::hydration::Hydrators;
 #[cfg(test)]
 use crate::models::SafetyLabelType;
+use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use std::ptr;
 #[cfg(test)]
 use std::slice;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::rules) struct Rule {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::rules) struct Rule<E: Engine = PostEngine> {
     pub(in crate::rules) id: RuleId,
     pub(in crate::rules) audience: Audience,
-    pub(in crate::rules) when: RuleCond,
-    pub(in crate::rules) action: RuleAction,
+    pub(in crate::rules) when: RuleCond<E>,
+    pub(in crate::rules) action: RuleAction<E>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::rules) enum RuleCond {
-    Leaf(Predicate),
-    All(&'static [RuleCond]),
-    Any(&'static [RuleCond]),
-    Not(&'static RuleCond),
-    Named(&'static NamedCond),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rules) enum RuleCond<E: Engine = PostEngine> {
+    Leaf(Predicate<E>),
+    All(&'static [RuleCond<E>]),
+    Any(&'static [RuleCond<E>]),
+    Not(&'static RuleCond<E>),
+    Named(&'static NamedCond<E>),
 }
 
 macro_rules! all {
@@ -87,13 +88,15 @@ macro_rules! conds {
 
 pub(in crate::rules) use {all, any, conds};
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub(in crate::rules) struct NamedCond {
+pub(in crate::rules) type UserRule = Rule<UserEngine>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::rules) struct NamedCond<E: Engine = PostEngine> {
     pub(in crate::rules) name: &'static str,
-    pub(in crate::rules) condition: RuleCond,
+    pub(in crate::rules) condition: RuleCond<E>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rules) enum Audience {
     Everyone,
     NonAuthors,
@@ -102,41 +105,70 @@ pub(in crate::rules) enum Audience {
 }
 
 impl Audience {
-    pub(in crate::rules) fn condition(self) -> RuleCond {
+    pub(in crate::rules) fn condition<E: Fold>(self) -> RuleCond<E> {
         match self {
             Self::Everyone => all![],
-            Self::NonAuthors => const { RuleCond::Not(&ViewerIsAuthor.leaf()) },
-            Self::NonFollowers => const { all![!ViewerIsAuthor, !ViewerFollowsAuthor] },
+            Self::NonAuthors => E::NON_AUTHORS,
+            Self::NonFollowers => E::NON_FOLLOWERS,
             Self::OnlyAuthor => ViewerIsAuthor.leaf(),
         }
     }
 }
 
-impl Rule {
+impl<E: Fold> Rule<E> {
     pub(in crate::rules) fn requirements(&self) -> Hydrators {
-        self.audience
-            .condition()
-            .requirements()
-            .union(self.when.requirements())
-            .union(self.action.spec().requirements())
+        let mut leaves = Vec::new();
+        self.leaves(&mut leaves);
+        leaves
+            .into_iter()
+            .fold(self.action.spec().requirements(), |hydrators, leaf| {
+                hydrators.union(leaf.requirements())
+            })
+    }
+
+    pub(in crate::rules) fn leaves(&self, leaves: &mut Vec<Predicate>) {
+        self.audience.condition::<E>().leaves(leaves);
+        self.when.leaves(leaves);
     }
 }
 
-impl RuleCond {
+impl<E: Engine> RuleCond<E> {
     pub(in crate::rules) const fn leaf(self) -> Self {
         self
     }
 
-    pub(in crate::rules) fn requirements(self) -> Hydrators {
+    pub(in crate::rules) fn leaves(self, leaves: &mut Vec<Predicate>) {
         match self {
-            Self::Leaf(leaf) => leaf.requirements(),
-            Self::All(children) | Self::Any(children) => children
-                .iter()
-                .fold(Hydrators::empty(), |hydrators, child| {
-                    hydrators.union(child.requirements())
-                }),
-            Self::Not(child) => child.requirements(),
-            Self::Named(named) => named.condition.requirements(),
+            Self::Leaf(leaf) => leaves.push(leaf.lift()),
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.leaves(leaves);
+                }
+            }
+            Self::Not(child) => child.leaves(leaves),
+            Self::Named(named) => named.condition.leaves(leaves),
+        }
+    }
+
+    fn same_as<F: Engine>(self, other: RuleCond<F>) -> bool {
+        let all_same = |children: &[Self], others: &[RuleCond<F>]| {
+            children.len() == others.len()
+                && children
+                    .iter()
+                    .zip(others)
+                    .all(|(child, other)| child.same_as(*other))
+        };
+        match (self, other) {
+            (Self::Leaf(leaf), RuleCond::Leaf(other)) => leaf.lift() == other.lift(),
+            (Self::All(children), RuleCond::All(others))
+            | (Self::Any(children), RuleCond::Any(others)) => all_same(children, others),
+            (Self::Not(child), RuleCond::Not(other)) => child.same_as(*other),
+            (Self::Named(definition), RuleCond::Named(other)) => {
+                definition.name == other.name && definition.condition.same_as(other.condition)
+            }
+            (Self::Leaf(_) | Self::All(_) | Self::Any(_) | Self::Not(_) | Self::Named(_), _) => {
+                false
+            }
         }
     }
 }
@@ -147,16 +179,37 @@ pub(in crate::rules) enum DescriptionError {
     ConflictingName(&'static str),
 }
 
-pub(in crate::rules) fn validate<'a>(
-    rules: impl IntoIterator<Item = &'a Rule>,
+pub(in crate::rules) fn validate<'a, E: Fold>(
+    rules: impl IntoIterator<Item = &'a Rule<E>>,
 ) -> Result<(), DescriptionError> {
-    enum Step {
-        Enter(&'static RuleCond),
+    definitions(rules).map(drop)
+}
+
+pub(in crate::rules) fn validate_across<'a>(
+    user: impl IntoIterator<Item = &'a Rule<UserEngine>>,
+    post: impl IntoIterator<Item = &'a Rule>,
+) -> Result<(), DescriptionError> {
+    let post = definitions(post)?;
+    for definition in definitions(user)? {
+        if post.iter().any(|other| {
+            other.name == definition.name && !definition.condition.same_as(other.condition)
+        }) {
+            return Err(DescriptionError::ConflictingName(definition.name));
+        }
+    }
+    Ok(())
+}
+
+fn definitions<'a, E: Fold>(
+    rules: impl IntoIterator<Item = &'a Rule<E>>,
+) -> Result<Vec<&'static NamedCond<E>>, DescriptionError> {
+    enum Step<E: Engine> {
+        Enter(&'static RuleCond<E>),
         Leave,
     }
-    let mut named: Vec<&'static NamedCond> = Vec::new();
-    let mut steps: Vec<Step> = Vec::new();
-    let mut children = |condition: RuleCond, steps: &mut Vec<Step>| match condition {
+    let mut named: Vec<&'static NamedCond<E>> = Vec::new();
+    let mut steps: Vec<Step<E>> = Vec::new();
+    let mut children = |condition: RuleCond<E>, steps: &mut Vec<Step<E>>| match condition {
         RuleCond::Leaf(_) => {}
         RuleCond::All(children) | RuleCond::Any(children) => {
             steps.extend(children.iter().rev().map(Step::Enter));
@@ -167,17 +220,17 @@ pub(in crate::rules) fn validate<'a>(
             steps.push(Step::Enter(&definition.condition));
         }
     };
-    let mut active: Vec<*const RuleCond> = Vec::new();
-    let mut finished: Vec<*const RuleCond> = Vec::new();
+    let mut active: Vec<*const RuleCond<E>> = Vec::new();
+    let mut finished: Vec<*const RuleCond<E>> = Vec::new();
     for rule in rules {
-        for root in [rule.audience.condition(), rule.when] {
+        for root in [rule.audience.condition::<E>(), rule.when] {
             children(root, &mut steps);
             while let Some(step) = steps.pop() {
                 let Step::Enter(condition) = step else {
                     finished.extend(active.pop());
                     continue;
                 };
-                let at: *const RuleCond = condition;
+                let at: *const RuleCond<E> = condition;
                 if active.contains(&at) {
                     return Err(DescriptionError::Cycle);
                 }
@@ -198,19 +251,19 @@ pub(in crate::rules) fn validate<'a>(
             return Err(DescriptionError::ConflictingName(definition.name));
         }
     }
-    Ok(())
+    Ok(named)
 }
 
 #[cfg(test)]
-impl RuleCond {
-    pub(in crate::rules) fn conjuncts(&self) -> &[RuleCond] {
+impl<E: Engine> RuleCond<E> {
+    pub(in crate::rules) fn conjuncts(&self) -> &[Self] {
         match self {
             Self::All(children) => children,
             Self::Leaf(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => slice::from_ref(self),
         }
     }
 
-    pub(in crate::rules) fn named(self, named: &mut Vec<&'static NamedCond>) {
+    pub(in crate::rules) fn named(self, named: &mut Vec<&'static NamedCond<E>>) {
         match self {
             Self::Leaf(_) => {}
             Self::All(children) | Self::Any(children) => {
@@ -230,8 +283,8 @@ impl RuleCond {
 
     pub(in crate::rules) fn positive_tweet_labels(self) -> Vec<SafetyLabelType> {
         match self {
-            Self::Leaf(Predicate::TweetSafetyLabels(TweetHasLabel(label))) => vec![label],
-            Self::Leaf(_) | Self::Not(_) => Vec::new(),
+            Self::Leaf(leaf) => label_of(leaf.lift()).into_iter().collect(),
+            Self::Not(_) => Vec::new(),
             Self::All(children) | Self::Any(children) => children
                 .iter()
                 .flat_map(|child| child.positive_tweet_labels())
@@ -241,27 +294,11 @@ impl RuleCond {
     }
 
     pub(in crate::rules) fn own_tweet_label(self) -> Option<String> {
+        let label = |leaf: Predicate<E>| label_of(leaf.lift()).map(spelled_label);
         match self {
-            Self::Leaf(Predicate::TweetSafetyLabels(TweetHasLabel(label))) => {
-                Some(spelled_label(label))
-            }
-            Self::Not(Self::Leaf(Predicate::TweetSafetyLabels(TweetHasLabel(label)))) => {
-                Some(format!("not {}", spelled_label(*label)))
-            }
-            Self::Leaf(_) | Self::All(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => None,
-        }
-    }
-
-    pub(in crate::rules) fn leaves(self, leaves: &mut Vec<Predicate>) {
-        match self {
-            Self::Leaf(leaf) => leaves.push(leaf),
-            Self::All(children) | Self::Any(children) => {
-                for child in children {
-                    child.leaves(leaves);
-                }
-            }
-            Self::Not(child) => child.leaves(leaves),
-            Self::Named(named) => named.condition.leaves(leaves),
+            Self::Leaf(leaf) => label(leaf),
+            Self::Not(Self::Leaf(leaf)) => label(*leaf).map(|label| format!("not {label}")),
+            Self::All(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => None,
         }
     }
 
@@ -269,8 +306,8 @@ impl RuleCond {
         self.spelled_with(|named| format!("{}={}", named.name, named.condition.spelled()))
     }
 
-    pub(in crate::rules) fn spelled_with(self, named: fn(&NamedCond) -> String) -> String {
-        let joined = |children: &[RuleCond], separator: &str| {
+    pub(in crate::rules) fn spelled_with(self, named: fn(&NamedCond<E>) -> String) -> String {
+        let joined = |children: &[Self], separator: &str| {
             children
                 .iter()
                 .map(|child| child.spelled_with(named))
@@ -278,7 +315,7 @@ impl RuleCond {
                 .join(separator)
         };
         match self {
-            Self::Leaf(leaf) => leaf.spelled(),
+            Self::Leaf(leaf) => leaf.lift().spelled(),
             Self::All(children) => format!("all[{}]", joined(children, " & ")),
             Self::Any(children) => format!("any[{}]", joined(children, " | ")),
             Self::Not(child) => format!("not({})", child.spelled_with(named)),
@@ -288,7 +325,15 @@ impl RuleCond {
 }
 
 #[cfg(test)]
-impl Rule {
+fn label_of(leaf: Predicate) -> Option<SafetyLabelType> {
+    let Predicate::TweetSafetyLabels(TweetHasLabel(label)) = leaf else {
+        return None;
+    };
+    Some(label)
+}
+
+#[cfg(test)]
+impl<E: Engine> Rule<E> {
     pub(in crate::rules) fn name(&self) -> String {
         rule_name(self.id, &self.action)
     }

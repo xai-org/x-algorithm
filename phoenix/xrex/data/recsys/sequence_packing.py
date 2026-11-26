@@ -8,6 +8,8 @@ import jax
 import numpy as np
 
 from xai_configlib import Config, configclass
+from xrex.data.recsys import long_term_author_profile
+from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 
 
@@ -197,6 +199,7 @@ class SequencePackedLayout:
     token_to_source: np.ndarray | None = None
     source_to_token: np.ndarray | None = None
     dropped_candidate_slots: np.ndarray | None = None
+    value_scale: np.ndarray | None = None
 
 
 PACK_BLOCK_SIZE = 128
@@ -213,7 +216,7 @@ def packed_prefix_positions(layout: SequencePackedLayout) -> np.ndarray:
 def candidate_region_history_schedule(
     layout: SequencePackedLayout, candidate_seq_len: int, num_user_prefix_tokens: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    assert layout.prefix_positions is not None, "not a candidate-region layout"
+    assert layout.prefix_positions is not None, "not a history and candidate packed layout"
     bs_per_device = layout.cu_seqlens.shape[1] - 1
     cu_seqlens = layout.cu_seqlens - np.arange(bs_per_device + 1) * candidate_seq_len
     padding_mask = layout.padding_mask.copy()
@@ -321,6 +324,8 @@ def pack_batch(
     candidate_tokens_per_user: int | None = None,
     min_packed_history_len: int | None = None,
     empty_history_min_slot: bool = False,
+    *,
+    alloc: ArrayAllocator,
 ) -> RecsysFeaturesBatch:
     if empty_history_min_slot and dist is not None:
         if not isinstance(dist, BetaLengthDistribution) or dist.block_size != block_size:
@@ -375,22 +380,22 @@ def pack_batch(
             dst_idx,
             np.arange(total_packed, dtype=np.intp),
         )
-        full_src: np.ndarray | None = None
+        if use_dense_gather:
+            full_src, pad_rows = src_idx, None
+        else:
+            full_src = np.zeros(total_packed, dtype=np.intp)
+            full_src[dst_idx] = src_idx
+            padding = np.ones(total_packed, dtype=np.bool_)
+            padding[dst_idx] = False
+            pad_rows = np.flatnonzero(padding)
         for k, v in seq.items():
             if isinstance(v, np.ndarray) and v.ndim >= 2 and v.shape[1] == seq_len:
                 flat = v.reshape(read_bsz_per_process * seq_len, *v.shape[2:])
-                if use_dense_gather:
-                    out[k] = flat[src_idx].reshape(
-                        num_devices_per_process, packed_len, *v.shape[2:]
-                    )
-                else:
-                    if full_src is None:
-                        full_src = np.full(total_packed, flat.shape[0], dtype=np.intp)
-                        full_src[dst_idx] = src_idx
-                    flatz = np.concatenate([flat, np.zeros((1, *v.shape[2:]), dtype=v.dtype)])
-                    out[k] = flatz[full_src].reshape(
-                        num_devices_per_process, packed_len, *v.shape[2:]
-                    )
+                packed = alloc.empty((total_packed, *v.shape[2:]), v.dtype)
+                np.take(flat, full_src, axis=0, mode="clip", out=packed)
+                if pad_rows is not None:
+                    packed[pad_rows] = 0
+                out[k] = packed.reshape(num_devices_per_process, packed_len, *v.shape[2:])
             else:
                 out[k] = v
         return cast(PostSeq, out)
@@ -399,7 +404,7 @@ def pack_batch(
         packed_history: PostSeq, packed_candidates: PostSeq, layout: SequencePackedLayout
     ) -> RecsysFeaturesBatch:
         D, B = num_devices_per_process, bs_per_device
-        return RecsysFeaturesBatch(
+        out = RecsysFeaturesBatch(
             user_hashes=batch["user_hashes"].reshape(D, B, -1),
             user_ip_hashes=batch["user_ip_hashes"].reshape(D, B, -1),
             history_seq=packed_history,
@@ -438,6 +443,20 @@ def pack_batch(
             ),
             packing_layout=layout,
         )
+        if (il := batch.get("user_id_list_hashes")) is not None and (
+            ilm := batch.get("user_id_list_mask")
+        ) is not None:
+            out["user_id_list_hashes"] = il.reshape(D, B, *il.shape[1:])
+            out["user_id_list_mask"] = ilm.reshape(D, B, *ilm.shape[1:])
+        cast(dict[str, np.ndarray], out).update(
+            {
+                key: arr.reshape(D, B, *arr.shape[1:])
+                for key, arr in long_term_author_profile.present(batch).items()
+            }
+        )
+        if (stats := batch.get("user_history_stats")) is not None:
+            out["user_history_stats"] = stats.reshape(D, B, *stats.shape[1:])
+        return out
 
     history_post_hashes = batch["history_seq"]["post_hashes"]
     real_history_len = np.count_nonzero(history_post_hashes[:, :, 0], axis=1).reshape(
@@ -559,7 +578,7 @@ def pack_batch(
             f"of {block_size=}"
         )
         packed_candidate_seq, dropped_candidate_slots = _drop_candidates_over_budget(
-            packed_candidate_seq, candidate_seq_len, candidate_region_len - 1
+            packed_candidate_seq, candidate_seq_len, candidate_region_len - 1, alloc=alloc
         )
 
     packed_seq_len = (
@@ -654,7 +673,7 @@ def _aligned_candidate_tokens(counts: np.ndarray) -> np.ndarray:
 
 
 def _drop_candidates_over_budget(
-    seq: PostSeq, slots_per_user: int, budget: int
+    seq: PostSeq, slots_per_user: int, budget: int, *, alloc: ArrayAllocator
 ) -> tuple[PostSeq, np.ndarray]:
     post_hashes = seq["post_hashes"]
     assert post_hashes is not None
@@ -696,7 +715,7 @@ def _drop_candidates_over_budget(
     kept_seq = {}
     for key, value in seq.items():
         if isinstance(value, np.ndarray) and value.ndim >= 2 and value.shape[1] == num_slots:
-            value = value.copy()
+            value = alloc.copy(value, value.dtype)
             value[drop] = 0
         kept_seq[key] = value
     return cast(PostSeq, kept_seq), dropped
@@ -713,29 +732,27 @@ def _candidate_region_layout(
     assert num_user_prefix_tokens > 0, (
         "history position 0 marks padding, so a prefix token is needed"
     )
-    num_devices, regular_len = layout.segment_ids.shape
+    num_devices, old_len = layout.segment_ids.shape
     bs_per_device = seq_starts.shape[1]
     device_idx = np.arange(num_devices)[:, None]
-    regular_candidate_tokens = layout.candidate_positions
-    slots_per_user = regular_candidate_tokens.shape[1] // bs_per_device
-    valid = layout.segment_ids[device_idx, regular_candidate_tokens] != 0
+    old_candidate_tokens = layout.candidate_positions
+    slots_per_user = old_candidate_tokens.shape[1] // bs_per_device
+    valid = layout.segment_ids[device_idx, old_candidate_tokens] != 0
     history_region_len = int(span_lens[0].sum())
     assert (span_lens.sum(axis=1) == history_region_len).all()
     packed_seq_len = history_region_len + candidate_region_len
 
-    regular_token = np.full((num_devices, packed_seq_len), regular_len, dtype=np.int64)
-    in_history = np.ones((num_devices, regular_len), dtype=bool)
-    in_history[
-        np.broadcast_to(device_idx, regular_candidate_tokens.shape), regular_candidate_tokens
-    ] = False
-    regular_history_tokens = np.nonzero(in_history)[1].reshape(num_devices, history_region_len)
+    old_token = np.full((num_devices, packed_seq_len), old_len, dtype=np.int64)
+    in_history = np.ones((num_devices, old_len), dtype=bool)
+    in_history[device_idx, old_candidate_tokens] = False
+    old_history_tokens = np.nonzero(in_history)[1].reshape(num_devices, history_region_len)
     span_starts = np.cumsum(span_lens, axis=1) - span_lens
     key_counts = np.zeros((num_devices, bs_per_device), dtype=np.int64)
     for d in range(num_devices):
         token_user = np.repeat(np.arange(bs_per_device), span_lens[d])
         offset = np.arange(history_region_len) - span_starts[d][token_user]
         is_prefix = offset < num_user_prefix_tokens
-        is_key = layout.padding_mask[d, regular_history_tokens[d]] | is_prefix
+        is_key = layout.padding_mask[d, old_history_tokens[d]] | is_prefix
         key_counts[d] = np.bincount(token_user[is_key], minlength=bs_per_device)
         user_pad = (span_lens[d] - key_counts[d])[token_user]
         new_offset = np.where(
@@ -745,7 +762,7 @@ def _candidate_region_layout(
                 offset < num_user_prefix_tokens + user_pad, offset - num_user_prefix_tokens, offset
             ),
         )
-        regular_token[d, span_starts[d][token_user] + new_offset] = regular_history_tokens[d]
+        old_token[d, span_starts[d][token_user] + new_offset] = old_history_tokens[d]
 
     counts = valid.reshape(num_devices, bs_per_device, slots_per_user).sum(axis=2)
     candidate_cu_seqlens = np.zeros((num_devices, bs_per_device + 1), dtype=np.int32)
@@ -754,40 +771,38 @@ def _candidate_region_layout(
     rank_in_user = (np.cumsum(valid.reshape(num_devices, bs_per_device, -1), axis=2) - 1).reshape(
         num_devices, -1
     )
-    slot_user = np.arange(regular_candidate_tokens.shape[1]) // slots_per_user
+    slot_user = np.arange(old_candidate_tokens.shape[1]) // slots_per_user
     slot_token = history_region_len + candidate_cu_seqlens[:, slot_user] + rank_in_user
     d_valid, s_valid = np.nonzero(valid)
-    regular_token[d_valid, slot_token[d_valid, s_valid]] = regular_candidate_tokens[
-        d_valid, s_valid
-    ]
+    old_token[d_valid, slot_token[d_valid, s_valid]] = old_candidate_tokens[d_valid, s_valid]
 
-    is_copy = regular_token < regular_len
-    new_token = np.full((num_devices, regular_len), packed_seq_len - 1, dtype=np.int32)
+    is_copy = old_token < old_len
+    new_token = np.full((num_devices, old_len), packed_seq_len - 1, dtype=np.int32)
     d_copy, t_copy = np.nonzero(is_copy)
-    new_token[d_copy, regular_token[d_copy, t_copy]] = t_copy
+    new_token[d_copy, old_token[d_copy, t_copy]] = t_copy
 
-    clamped_regular_token = np.minimum(regular_token, regular_len - 1)
+    clamped_old_token = np.minimum(old_token, old_len - 1)
     segment_ids = np.where(
-        is_copy, np.take_along_axis(layout.segment_ids, clamped_regular_token, axis=1), 0
+        is_copy, np.take_along_axis(layout.segment_ids, clamped_old_token, axis=1), 0
     )
-    positions = np.take_along_axis(layout.positions, clamped_regular_token[:, :, None], axis=1)
+    positions = np.take_along_axis(layout.positions, clamped_old_token[:, :, None], axis=1)
     positions[~is_copy] = 0.0
     padding_mask = segment_ids != 0
 
     history_positions = np.take_along_axis(new_token, layout.history_positions, axis=1)
     candidate_positions = np.where(
-        valid, np.take_along_axis(new_token, regular_candidate_tokens, axis=1), packed_seq_len - 1
+        valid, np.take_along_axis(new_token, old_candidate_tokens, axis=1), packed_seq_len - 1
     ).astype(np.int32)
     prefix_positions = np.take_along_axis(new_token, seq_starts.astype(np.intp), axis=1)
 
     region_token = slot_token[d_valid, s_valid] - history_region_len
-    num_slots = regular_candidate_tokens.shape[1]
+    num_slots = old_candidate_tokens.shape[1]
     candidate_token_to_slot = np.full(
         (num_devices, candidate_region_len), num_slots, dtype=np.int32
     )
     candidate_token_to_slot[d_valid, region_token] = s_valid
     candidate_slot_to_token = np.full(
-        regular_candidate_tokens.shape, candidate_region_len, dtype=np.int32
+        old_candidate_tokens.shape, candidate_region_len, dtype=np.int32
     )
     candidate_slot_to_token[d_valid, s_valid] = region_token
 

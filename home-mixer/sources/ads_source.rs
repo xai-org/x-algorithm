@@ -1,4 +1,4 @@
-use crate::clients::ad_index_client::AdIndexClient;
+use crate::clients::ad_index_client::{AdIndexClient, SR_ROUTER_DECIDER};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::EnableAdsSource;
 use std::sync::Arc;
@@ -22,10 +22,14 @@ impl Source<ScoredPostsQuery, FeedItem> for AdsSource {
 
     async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {
         let request = build_ad_index_request(query);
+        let sr_router_enabled = query
+            .decider
+            .as_ref()
+            .is_some_and(|d| d.enabled(SR_ROUTER_DECIDER));
 
         let response = self
             .ad_index_client
-            .get_eligible_ads(request)
+            .get_eligible_ads(request, sr_router_enabled)
             .await
             .map_err(|e| format!("AdsSource: {e}"))?;
 

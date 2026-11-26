@@ -136,13 +136,22 @@ class UthDailyPostTakedownLabelsApp {
 
           val labelRows = postRows
             .map {
-              case (userId, authoredDay, _, label, carried, removed, _, _) =>
-                ((userId, authoredDay, label), (carried.toLong, removed.toLong))
+              case (userId, authoredDay, tweetId, label, carried, removed, _, _) =>
+                val keepId = carried > 0 &&
+                  TakedownLabels.parseLabel(label).exists {
+                    case (t, _) => config.postIdLabels.contains(t.name)
+                  }
+                (
+                  (userId, authoredDay, label),
+                  (carried.toLong, removed.toLong, if (keepId) Seq(tweetId) else Seq.empty[Long]))
             }
-            .sumByKey
+            .group
+            .reduce { (a, b) =>
+              (a._1 + b._1, a._2 + b._2, newestPostIds(a._3 ++ b._3, config.maxPostIdsPerLabel))
+            }
             .toTypedPipe
             .map {
-              case ((userId, authoredDay, label), (carried, removed)) =>
+              case ((userId, authoredDay, label), (carried, removed, postIds)) =>
                 val age = calendarDaysBetween(authoredDay, asOfDay)
                 UthDailyPostLabel(
                   userId = Some(userId),
@@ -153,7 +162,8 @@ class UthDailyPostTakedownLabelsApp {
                   asOfYyyymmdd = Some(asOfDay),
                   observationAgeDays = Some(age),
                   isFinal = Some(age >= config.observationDays),
-                  postObservationDays = Some(config.observationDays)
+                  postObservationDays = Some(config.observationDays),
+                  postIds = Option(postIds).filter(_.nonEmpty)
                 )
             }
             .shard(config.writeShards)
@@ -234,7 +244,9 @@ case class UthDailyPostTakedownLabelsConfig(
   reducers: Int,
   writeShards: Int,
   outputPath: String,
-  readTweetEvents: Boolean = true)
+  readTweetEvents: Boolean = true,
+  postIdLabels: Set[String] = Set.empty,
+  maxPostIdsPerLabel: Int = UnderTheHoodCommon.DefaultMaxPostIdsPerLabel)
 
 object UthDailyPostTakedownLabelsConfig {
   def fromArgs(args: Args): UthDailyPostTakedownLabelsConfig =
@@ -252,7 +264,11 @@ object UthDailyPostTakedownLabelsConfig {
         n
       },
       outputPath = args.optional("outputPath").getOrElse("/user/<hadoop-role>/under_the_hood"),
-      readTweetEvents = !args.boolean("noTweetEvents")
+      readTweetEvents = !args.boolean("noTweetEvents"),
+      postIdLabels =
+        UnderTheHoodCommon.parsePostIdLabels(args, UthPostIdLabels.postTakedownReasons),
+      maxPostIdsPerLabel =
+        args.int("maxPostIdsPerLabel", UnderTheHoodCommon.DefaultMaxPostIdsPerLabel)
     )
 }
 

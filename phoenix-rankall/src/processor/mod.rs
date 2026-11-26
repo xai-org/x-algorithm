@@ -4,6 +4,7 @@ pub mod r#gen;
 pub mod main_processor;
 pub mod metadata_processor;
 pub mod record;
+pub mod sid_popular_video_processor;
 pub mod sid_processor;
 pub mod sid_tail_processor;
 pub mod thrift_types;

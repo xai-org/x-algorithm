@@ -42,5 +42,5 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    server::serve::<VFServer>(Args::parse().serve, ()).await
+    server::serve::<VFServer>(Args::parse().serve).await
 }

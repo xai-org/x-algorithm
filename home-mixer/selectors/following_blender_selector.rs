@@ -1,8 +1,9 @@
+use super::{build_non_selected, select_ads_only};
 use crate::ads::{AdsBlender, FollowingAdBlender};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS, PROMPTS_POSITION,
-    WHO_TO_FOLLOW_POSITION,
+    AdsFollowingMinPosts, FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS,
+    PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
 };
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 use xai_home_mixer_proto::{feed_item, FeedItem, Prompt, ScoredPost, WhoToFollowModule};
@@ -19,9 +20,12 @@ impl FollowingBlenderSelector {
 impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
     fn select(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: Vec<FeedItem>,
     ) -> SelectResult<FeedItem> {
+        if query.is_ads_only_timeline() {
+            return select_ads_only(candidates);
+        }
         let PartitionedFeedItems {
             posts,
             ads,
@@ -30,12 +34,15 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
         } = partition_feed_items(candidates);
 
         let input_post_count = posts.len();
-        let input_ad_count = ads.len();
+        let input_ads = ads.clone();
 
         let blender = FollowingAdBlender {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
+            min_posts: query.params.get(AdsFollowingMinPosts) as usize,
         };
-        let mut blended = blender.blend(posts, ads, &mut Vec::new());
+        let mut drops = Vec::new();
+        let mut blended = blender.blend(posts, ads, &mut drops);
+        query.ad_drops.extend(drops);
 
         insert_prompts(&mut blended, prompts);
         if input_post_count > FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS {
@@ -46,14 +53,8 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
             .iter()
             .filter(|i| matches!(i.item, Some(feed_item::Item::Post(_))))
             .count();
-        let output_ad_count = blended
-            .iter()
-            .filter(|i| matches!(i.item, Some(feed_item::Item::Ad(_))))
-            .count();
-
         let dropped_posts = input_post_count.saturating_sub(output_post_count);
-        let dropped_ads = input_ad_count.saturating_sub(output_ad_count);
-        let non_selected = build_non_selected_placeholders(dropped_posts, dropped_ads);
+        let non_selected = build_non_selected(dropped_posts, input_ads, &blended);
 
         SelectResult {
             selected: blended,
@@ -92,23 +93,6 @@ fn insert_who_to_follow(blended: &mut Vec<FeedItem>, wtf_modules: Vec<WhoToFollo
     );
 }
 
-fn build_non_selected_placeholders(dropped_posts: usize, dropped_ads: usize) -> Vec<FeedItem> {
-    let mut non_selected = Vec::with_capacity(dropped_posts + dropped_ads);
-    for _ in 0..dropped_posts {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Post(ScoredPost::default())),
-        });
-    }
-    for _ in 0..dropped_ads {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Ad(AdIndexInfo::default())),
-        });
-    }
-    non_selected
-}
-
 struct PartitionedFeedItems {
     posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
@@ -135,5 +119,59 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
         ads,
         wtf_modules,
         prompts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_home_mixer_proto::BrandSafetyVerdict;
+    use xai_recsys_proto::{AdAdjacencyControl, BrandSafetyRiskLevel};
+
+    fn low_risk_post(tweet_id: u64) -> FeedItem {
+        FeedItem {
+            position: 0,
+            item: Some(feed_item::Item::Post(ScoredPost {
+                tweet_id,
+                brand_safety_verdict: BrandSafetyVerdict::LowRisk.into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn ad(post_id: i64, impression_id: i64, risk: BrandSafetyRiskLevel) -> FeedItem {
+        FeedItem {
+            position: 0,
+            item: Some(feed_item::Item::Ad(AdIndexInfo {
+                post_id,
+                impression_id,
+                ad_adjacency_control: Some(AdAdjacencyControl {
+                    brand_safety_risk: risk.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn ad_ids(items: &[FeedItem]) -> Vec<i64> {
+        items
+            .iter()
+            .filter_map(|item| match &item.item {
+                Some(feed_item::Item::Ad(ad)) => Some(ad.post_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn non_selected_carries_the_earlier_ad_the_blender_skipped() {
+        let mut candidates: Vec<FeedItem> = (1..=12).map(low_risk_post).collect();
+        candidates.push(ad(101, 1, BrandSafetyRiskLevel::BsrLow));
+        candidates.push(ad(102, 2, BrandSafetyRiskLevel::BsrNormal));
+        let result =
+            FollowingBlenderSelector::new().select(&ScoredPostsQuery::default(), candidates);
+        assert_eq!(ad_ids(&result.selected), vec![102]);
+        assert_eq!(ad_ids(&result.non_selected), vec![101]);
     }
 }

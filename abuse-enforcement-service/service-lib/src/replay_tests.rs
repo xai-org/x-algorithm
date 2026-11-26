@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use xai_abuse_proto::enforcement::{
-    self as abuse_proto, EntityType as ProtoEntityType, FiredHead, RequestedAction, ScoreResult,
-    SummaryCounters,
+    self as abuse_proto, EntityType as ProtoEntityType, FiredHead, ScoreResult, SummaryCounters,
 };
 use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, Label, Labels, Safety};
 use xai_core_entities::gizmoduck_client::MockGizmoduckClient;
@@ -27,6 +26,8 @@ pub(crate) const ACTION_CONTROL_INFO_KEYS: &[&str] = &[
     "action_control_version",
     "action_control_lkey",
     "action_control_forced_recording",
+    "action_control_follower_threshold",
+    "action_control_skip_high_credibility",
     "matched_rule_id",
     "rules_would_rule_id",
     "rules_would_action_specs",
@@ -41,10 +42,12 @@ pub(crate) enum Account {
     Suspended,
     Deactivated,
     HasSpamHighRecall,
-    Followers5k,
-    Followers200k,
+    BetweenLimits,
+    AboveTopLimit,
     HighCred,
     NotFound,
+    HasPhoenixSkip,
+    JustBelowTopLimit,
 }
 
 impl Account {
@@ -53,21 +56,25 @@ impl Account {
         Account::Suspended,
         Account::Deactivated,
         Account::HasSpamHighRecall,
-        Account::Followers5k,
-        Account::Followers200k,
+        Account::BetweenLimits,
+        Account::AboveTopLimit,
         Account::HighCred,
         Account::NotFound,
     ];
+
+        pub(crate) const EXTRA: [Account; 2] = [Account::HasPhoenixSkip, Account::JustBelowTopLimit];
 
     pub(crate) fn user_id(self) -> i64 {
         1_700_100_000 + self as i64
     }
 
-    fn followers(self) -> i64 {
+            pub(crate) fn followers(self) -> i64 {
+        let view = crate::safety_checks::follower_skip_view();
         match self {
-            Account::Followers5k => 5_000,
-            Account::Followers200k => 200_000,
-            _ => 10,
+            Account::BetweenLimits => view.today_threshold as i64,
+            Account::AboveTopLimit => view.ceiling as i64 + 1,
+            Account::JustBelowTopLimit => view.ceiling as i64 - 1,
+            _ => 1,
         }
     }
 }
@@ -77,9 +84,13 @@ pub(crate) struct TestBed {
     pub dedup: Arc<RecordingDedup>,
     pub ais: Arc<AisRecorder>,
     pub tickets: Arc<AtomicI64>,
+        pub claims: Arc<backfill_claims::test_support::MemClaimStore>,
     pub outcomes: Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>,
-    control_store: Arc<action_control::test_support::MemControlStore>,
-    _strato: wiremock::MockServer,
+    pub control_store: Arc<action_control::test_support::MemControlStore>,
+    pub backfill_store: Arc<action_control::test_support::MemControlStore>,
+        pub post_labels: Arc<crate::post_labels::test_support::FakePostLabels>,
+    gizmoduck: Arc<MockGizmoduckClient>,
+    strato: wiremock::MockServer,
 }
 
 pub(crate) struct BedConfig<'a> {
@@ -94,13 +105,16 @@ fn gizmoduck_user(account: Account) -> Option<GizmoduckUserResult> {
     if matches!(account, Account::NotFound) {
         return None;
     }
-    let labels = if matches!(account, Account::HasSpamHighRecall) {
-        vec![Label {
+    let labels = match account {
+        Account::HasSpamHighRecall => vec![Label {
             label_value: 23,
             created_at_msec: 0,
-        }]
-    } else {
-        Vec::new()
+        }],
+        Account::HasPhoenixSkip => vec![Label {
+            label_value: 118,
+            created_at_msec: 0,
+        }],
+        _ => Vec::new(),
     };
     Some(GizmoduckUserResult {
         user: Some(GizmoduckUser {
@@ -120,7 +134,7 @@ fn gizmoduck_user(account: Account) -> Option<GizmoduckUserResult> {
 impl TestBed {
     pub(crate) async fn new(cfg: BedConfig<'_>) -> TestBed {
         let server = wiremock::MockServer::start().await;
-        for account in Account::ALL {
+        for account in Account::ALL.into_iter().chain(Account::EXTRA) {
             let body = serde_json::json!({"v": {
                 "isHighPageRankUser": matches!(account, Account::HighCred),
                 "userCredScore": 1.0,
@@ -153,8 +167,9 @@ impl TestBed {
         };
         let gd = Arc::new(MockGizmoduckClient {
             users: Account::ALL
-                .iter()
-                .map(|a| (a.user_id(), gizmoduck_user(*a)))
+                .into_iter()
+                .chain(Account::EXTRA)
+                .map(|a| (a.user_id(), gizmoduck_user(a)))
                 .collect::<HashMap<_, _>>(),
             ..Default::default()
         });
@@ -189,7 +204,7 @@ impl TestBed {
         let ais = Arc::new(AisRecorder::default());
         let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let control_store = Arc::new(action_control::test_support::MemControlStore::default());
-        for r in &cfg.control_records {
+        for r in rules_records().iter().chain(&cfg.control_records) {
             control_store.put_record(r);
         }
         let action_control = Arc::new(action_control::ActionControl::new(
@@ -198,22 +213,41 @@ impl TestBed {
             String::new(),
         ));
         action_control.refresh().await.unwrap();
+        let backfill_store = Arc::new(action_control::test_support::MemControlStore::default());
+        let claims = Arc::new(backfill_claims::test_support::MemClaimStore::listing_all());
+        let post_labels = Arc::new(crate::post_labels::test_support::FakePostLabels::default());
         let ctx = EnforcementCtx {
             ais_client: ais_client::AisClient::recording(ais.clone()),
-            gd: gizmoduck::GizmoduckCoreClient::from_client(gd),
+            gd: gizmoduck::GizmoduckCoreClient::from_client(gd.clone()),
             cred_clients: strato::CredClients {
                 high_page_rank: column("hpr"),
                 grey_badge: column("grey"),
             },
             uas_strato: column("uas"),
+            reply_parents: crate::invited_reply::ReplyParents::new(
+                column("reply_parent"),
+                std::time::Duration::from_secs(1),
+            ),
             dynamic_config,
             rules_cache: Arc::new(rules_cache),
             allowlist: None,
             kafka_producer_decisions: None,
             kafka_producer_decisions_json: None,
-            hold_gate: Arc::new(overturn_hold::HoldGate::new(None)),
+            hold_gate: Arc::new(overturn_hold::HoldGate::new(Some(
+                overturn_hold::FakeHoldStore::new(Vec::new()),
+            ))),
             off_switch,
+            head_guard: Arc::new(head_guard::HeadGuard::new(
+                Arc::new(action_control::test_support::MemControlStore::default()),
+                None,
+            )),
             action_control,
+            backfill: Arc::new(backfill::Backfill::new(
+                backfill_store.clone(),
+                Some(claims.clone()),
+                String::new(),
+            )),
+            post_labels: Some(post_labels.clone()),
             outcome_log: Some(outcomes.clone()),
         };
         TestBed {
@@ -221,10 +255,46 @@ impl TestBed {
             dedup: Arc::new(RecordingDedup::default()),
             ais,
             tickets,
+            claims,
             outcomes,
             control_store,
-            _strato: server,
+            backfill_store,
+            post_labels,
+            gizmoduck: gd,
+            strato: server,
         }
+    }
+
+            pub(crate) async fn answer_reply_parent(
+        &self,
+        parent_id: i64,
+        status: u16,
+        record: serde_json::Value,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex("/reply_parent$"))
+            .and(wiremock::matchers::body_string_contains(
+                parent_id.to_string(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "v": record })),
+            )
+            .with_priority(1)
+            .mount(&self.strato)
+            .await;
+    }
+
+        pub(crate) async fn reply_parent_reads(&self) -> usize {
+        self.strato.received_requests().await.map_or(0, |r| {
+            r.iter()
+                .filter(|q| q.url.path().ends_with("/reply_parent"))
+                .count()
+        })
+    }
+
+        pub(crate) async fn fetches(&self) -> usize {
+        self.gizmoduck.call_count() + self.strato.received_requests().await.map_or(0, |r| r.len())
     }
 
     pub(crate) fn processor(&self) -> ScoreResultProcessor {
@@ -237,12 +307,21 @@ impl TestBed {
             retry_queue: Arc::new(Mutex::new(BinaryHeap::new())),
             last_progress: Arc::new(AtomicI64::new(0)),
             max_in_flight: 1,
+            backfill_topic: false,
         }
     }
 
-        pub(crate) async fn set_records(&self, records: &[action_control::ActionControlRecord]) {
+        pub(crate) fn backfill_processor(&self) -> ScoreResultProcessor {
+        ScoreResultProcessor {
+            topic: backfill::BACKFILL_TOPIC.into(),
+            backfill_topic: true,
+            ..self.processor()
+        }
+    }
+
+            pub(crate) async fn set_records(&self, records: &[action_control::ActionControlRecord]) {
         self.control_store.rows.lock().unwrap().clear();
-        for r in records {
+        for r in rules_records().iter().chain(records) {
             self.control_store.put_record(r);
         }
         self.ctx.action_control.refresh().await.unwrap();
@@ -254,11 +333,48 @@ impl TestBed {
     }
 
         pub(crate) async fn run(&self, score: &ScoreResult) -> Trace {
+        self.run_on(&self.processor(), score).await
+    }
+
+        pub(crate) async fn run_on(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
         self.dedup.take_calls();
         self.ais.take();
         self.outcomes.lock().unwrap().clear();
         let tickets_before = self.tickets.load(Ordering::Relaxed);
-        let result = self.processor().process(score).await;
+        let result = processor.process(score, None).await;
+        self.trace(result, tickets_before)
+    }
+
+            pub(crate) async fn run_admitted(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
+        self.dedup.slots.lock().unwrap().clear();
+        self.run_admitted_on_held(processor, score).await
+    }
+
+        pub(crate) async fn run_admitted_on_held(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
+        self.dedup.take_calls();
+        self.ais.take();
+        self.outcomes.lock().unwrap().clear();
+        let tickets_before = self.tickets.load(Ordering::Relaxed);
+        let result = match processor.admit(score).await {
+            Admission::Admitted(control) => processor.process(score, control.map(|c| *c)).await,
+            Admission::Dropped(status) => Ok(status.to_owned()),
+        };
+        self.trace(result, tickets_before)
+    }
+
+    fn trace(&self, result: Result<String, EnforcementFailed>, tickets_before: i64) -> Trace {
         let status = match &result {
             Ok(s) => s.clone(),
             Err(e) => format!("error:{}", e.source),
@@ -348,12 +464,16 @@ impl Trace {
             .collect()
     }
 
-            pub(crate) fn golden_line(&self, id: &str) -> String {
+                    pub(crate) fn golden_line(&self, id: &str) -> String {
         let dry: Vec<bool> = self.outcomes.iter().map(|o| o.dry_run).collect();
         let mut ais = self.ais.clone();
         ais.iter_mut().for_each(|(_, r)| scrub(r));
+        let mut info = self.old_info();
+        for i in &mut info {
+            i.remove("cred_follower_count");
+        }
         let hashed = serde_json::json!({
-            "info": self.old_info(),
+            "info": info,
             "outcome_status": self.outcomes.iter().map(|o| o.status.clone()).collect::<Vec<_>>(),
             "ais": ais,
         })
@@ -428,30 +548,15 @@ pub(crate) fn factory_message(account: Account) -> ScoreResult {
         EntityType::User,
         "IsDelayedSuspendSpam",
         "is_delayed_suspend_spam@3",
-        &["abuse_platform_requested_actions"],
+        &["model_factory"],
         account,
     );
     s.policy_version = "3".into();
-    s.requested_actions = vec![RequestedAction {
-        kind: "suspend".into(),
-        perm: false,
-        policy: "PlatformManipulation".into(),
-        head: "IsDelayedSuspendSpam".into(),
-        ..Default::default()
-    }];
     s
 }
 
 pub(crate) fn base_config(dry_run: bool, cap: Option<u64>) -> serde_json::Value {
-    let mut c = serde_json::json!({
-        "dry_run": dry_run,
-        "generic_actions": {
-            "user": {"kinds": ["suspend", "label", "spam_liveness_check", "bounce_captcha", "bounce_arkose"],
-                     "suspend_policies": ["PlatformManipulation"], "labels": ["SpamHighRecall"]},
-            "post": {"kinds": ["post_label", "suspend_author"], "suspend_policies": ["Cse"],
-                     "labels": ["SpamHighRecall", "RiskyHighVizReply"]}
-        },
-    });
+    let mut c = serde_json::json!({ "dry_run": dry_run });
     if let Some(cap) = cap {
         c["max_user_enforcements_per_day"] = cap.into();
     }
@@ -478,6 +583,28 @@ pub(crate) const HEADS: &[(&str, &str)] = &[
 ];
 
 pub(crate) const SWITCHED_OFF_HEAD: &str = "SwitchedOffHead";
+
+pub(crate) fn rules_records() -> Vec<action_control::ActionControlRecord> {
+    HEADS
+        .iter()
+        .map(|(h, _)| *h)
+        .chain([SWITCHED_OFF_HEAD])
+        .flat_map(|h| {
+            let user = action_control::test_support::record(
+                h,
+                None,
+                None,
+                action_control::ControlMode::Rules,
+                Vec::new(),
+            );
+            let post = action_control::ActionControlRecord {
+                entity_type: action_control::ControlEntity::Post,
+                ..user.clone()
+            };
+            [user, post]
+        })
+        .collect()
+}
 
 pub(crate) struct Scenario {
     pub id: String,

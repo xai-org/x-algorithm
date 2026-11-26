@@ -23,11 +23,16 @@ NO_THINKING_PROMPT = grox_config.prompt_tokens.no_thinking_prompt
 PREVIEW_IMAGE_LABEL = "[Video Preview Thumbnail]"
 
 MOTION_REVEAL_DESCRIPTION = (
-    "Motion-reveal stills for this video follow. They expose content that may be hidden under the visible video "
-    "as a faint overlay, by subtracting the static layer and amplifying the moving one, so colors and textures are "
-    "distorted. Judge what they show as part of the video's actual content, as if it were shown openly, even when "
-    "it is low-resolution, blurred, or partially obscured. The visible video may be a decoy: when the revealed "
-    "content is more severe than the visible video, classify the post by the revealed content."
+    "Motion-reveal stills for this video follow. They subtract what stays still and amplify what changes, to expose "
+    "content hidden under the visible video as a faint semi-transparent layer, so colors and textures are distorted "
+    "and the hidden layer often looks blurry, ghostly or low-contrast. A hidden layer is a different scene from the "
+    "visible video: different people or bodies, "
+    "in different positions or a different setting, often skin-colored bodies, close-ups of body parts, or sexual "
+    "motion behind an innocent-looking cover such as a selfie, a photo, a cartoon, food or text. Judge the hidden "
+    "layer as part of the video's actual content, as if it were shown openly, even when it is low-resolution, "
+    "blurred, or partially obscured. The visible video is likely a decoy: when the hidden layer is more severe than "
+    "the visible video, classify the post by the hidden layer. Ordinary motion of the visible people appears as "
+    "their own outlines in the same places as in the video frames; that alone is not hidden content."
 )
 
 SHOT_KEY_FRAMES_DESCRIPTION = (
@@ -75,12 +80,14 @@ class Video(BaseModel):
     preview_image: bytes | None = None
     shot_key_frames: list[bytes] = Field(default_factory=lambda: [])
     ranked_key_frames: list[bytes] = Field(default_factory=lambda: [])
+    sharp_frames: list[bytes] = Field(default_factory=lambda: [])
 
     @field_serializer(
         "frames",
         "motion_reveal_frames",
         "shot_key_frames",
         "ranked_key_frames",
+        "sharp_frames",
         when_used="json",
     )
     def serialize_frames(self, value: list[bytes]) -> list[str]:
@@ -100,6 +107,7 @@ class Video(BaseModel):
         "motion_reveal_frames",
         "shot_key_frames",
         "ranked_key_frames",
+        "sharp_frames",
         mode="before",
     )
     @classmethod

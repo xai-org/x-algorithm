@@ -12,9 +12,16 @@ from strato_http.queries.data_types import (
 )
 
 
+MENTION_HANDLE = re.compile(r"(?<!\w)@(\w{1,15})", re.ASCII)
+
+
 class AffiliatedBusiness(BaseModel):
     name: str | None = None
     url: str | None = None
+    badge_image_url: str | None = None
+
+
+BLUE_BADGE_SUBSCRIPTION_LEVELS = frozenset({"Premium", "PremiumPlus"})
 
 
 class User(BaseModel):
@@ -42,6 +49,16 @@ class User(BaseModel):
     profile_image: "Image | None" = None
     profile_banner: "Image | None" = None
     blocked_count: int | None = None
+    is_suspended: bool | None = None
+
+    @property
+    def has_blue_badge(self) -> bool:
+        return self.subscription_level in BLUE_BADGE_SUBSCRIPTION_LEVELS
+
+    @property
+    def signup_country_differs_from_usage_country(self) -> bool:
+        signup, traffic = self.signup_country_code, self.tfe_top_country
+        return bool(signup and traffic and signup.upper() != traffic.upper())
 
     @classmethod
     def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> "User":
@@ -86,6 +103,7 @@ class User(BaseModel):
             affiliated_business=AffiliatedBusiness(
                 name=author_metadata.affiliatedBusinessMetadata.name,
                 url=author_metadata.affiliatedBusinessMetadata.url,
+                badge_image_url=author_metadata.affiliatedBusinessMetadata.badgeImageUrl,
             )
             if author_metadata.affiliatedBusinessMetadata
             else None,
@@ -96,6 +114,7 @@ class User(BaseModel):
             if getattr(author_metadata, "profileBannerImageUrl", None)
             else None,
             blocked_count=getattr(author_metadata, "blockedCount", None),
+            is_suspended=getattr(author_metadata, "isSuspended", None),
         )
 
 
@@ -238,6 +257,7 @@ class Video(BaseModel):
     convo_video: ConvoVideo | None = None
     crop_seconds: float | None = None
     key_frames_ranking: RankingQuery | None = None
+    motion_reveal: bool = False
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":
@@ -701,6 +721,7 @@ class Post(BaseModel):
     created_at: datetime | None = None
     ancestors: list["Post"] | None = None
     screenshot: Image | None = None
+    combined_view: Image | None = None
     reply: Reply | None = None
     cardsV2: list[CardV2] | None = None
     grok_share_metadatas: list[GrokShare] | None = None
@@ -715,6 +736,21 @@ class Post(BaseModel):
     chat_group_metadata: ChatGroupMetadata | None = None
     space_metadata: SpaceMetadata | None = None
     mentioned_users: list[User] | None = None
+    media_tag_mentioned_users: list[User] | None = None
+
+    @property
+    def text_mention_handles(self) -> set[str]:
+        return {h.lower() for h in MENTION_HANDLE.findall(self.full_text or "")}
+
+    @property
+    def media_tag_handles(self) -> set[str]:
+        return {
+            u.handle.lower() for u in self.media_tag_mentioned_users or [] if u.handle
+        }
+
+    @property
+    def notified_handles(self) -> set[str]:
+        return self.text_mention_handles | self.media_tag_handles
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -869,6 +905,12 @@ class Post(BaseModel):
                 User.from_thrift_model(m) for m in post_metadata.mentionedUsersMetadata
             ]
             if post_metadata.mentionedUsersMetadata
+            else None,
+            media_tag_mentioned_users=[
+                User.from_thrift_model(m)
+                for m in post_metadata.mediaTagMentionedUsersMetadata
+            ]
+            if post_metadata.mediaTagMentionedUsersMetadata
             else None,
         )
 

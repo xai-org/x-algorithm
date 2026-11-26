@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -91,6 +92,92 @@ fn upsert_stored(map: &mut WindowData, post_id: PostId, incoming: StoredValue) {
 }
 
 type BufferMap = HashMap<String, WindowData>;
+
+fn posts_in_index_windows(
+    main_data: &BufferMap,
+    pending: &BufferMap,
+    window_name: &str,
+    windows: &[WindowConfig],
+    index_name: &str,
+) -> Vec<PostId> {
+    let Some(target) = main_data.get(window_name) else {
+        return Vec::new();
+    };
+    let index_windows: Vec<String> = windows
+        .iter()
+        .filter(|w| w.name == index_name)
+        .map(WindowConfig::window_name)
+        .collect();
+    target
+        .keys()
+        .filter(|post_id| {
+            index_windows.iter().any(|w| {
+                main_data.get(w).is_some_and(|m| m.contains_key(*post_id))
+                    || pending.get(w).is_some_and(|m| m.contains_key(*post_id))
+            })
+        })
+        .copied()
+        .collect()
+}
+
+fn drop_posts_in_excluded_index(
+    main_data: &mut BufferMap,
+    pending: &BufferMap,
+    wc: &WindowConfig,
+    windows: &[WindowConfig],
+) -> usize {
+    let Some(index_name) = &wc.exclude_posts_in else {
+        return 0;
+    };
+    let window_name = wc.window_name();
+    let excluded = posts_in_index_windows(main_data, pending, &window_name, windows, index_name);
+    if let Some(main) = main_data.get_mut(&window_name) {
+        for post_id in &excluded {
+            main.remove(post_id);
+        }
+    }
+    if !excluded.is_empty() {
+        info!(
+            "dropped {} records from '{window_name}' that are in '{index_name}' windows",
+            excluded.len()
+        );
+    }
+    excluded.len()
+}
+
+fn post_ids_in_file(path: &Path) -> anyhow::Result<HashSet<PostId>> {
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+    let column = builder.schema().index_of("post_id")?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [column]);
+    let mut ids = HashSet::new();
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let post_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("{} post_id is not int64", path.display()))?;
+        ids.extend(post_ids.values().iter().copied());
+    }
+    Ok(ids)
+}
+
+fn drop_posts_by_file(
+    main_data: &mut BufferMap,
+    window_name: &str,
+    listed: &HashSet<PostId>,
+    keep_listed: bool,
+) -> usize {
+    let Some(main) = main_data.get_mut(window_name) else {
+        return 0;
+    };
+    let before = main.len();
+    main.retain(|post_id, _| listed.contains(post_id) == keep_listed);
+    before - main.len()
+}
 
 struct SharedState {
         main_data: BufferMap,
@@ -352,13 +439,33 @@ impl BaseSnapshotStore {
                 }
             }
 
+            let excluded_by_file = wc
+                .exclude_posts_in_file
+                .as_deref()
+                .map(post_ids_in_file)
+                .transpose()?;
+            let required_by_file = wc
+                .require_posts_in_file
+                .as_deref()
+                .map(post_ids_in_file)
+                .transpose()?;
             let cutoff = timestamp_secs_to_snowflake(now - retention_secs);
             let mut state = self.state.lock().await;
+            let dropped = drop_posts_in_excluded_index(
+                &mut state.main_data,
+                &pending_snapshot,
+                wc,
+                &self.config.windows,
+            ) + excluded_by_file.as_ref().map_or(0, |ids| {
+                drop_posts_by_file(&mut state.main_data, &window_name, ids, false)
+            }) + required_by_file.as_ref().map_or(0, |ids| {
+                drop_posts_by_file(&mut state.main_data, &window_name, ids, true)
+            });
             let main = state.main_data.entry(window_name.clone()).or_default();
 
             let before_count = main.len();
             main.retain(|post_id, _| *post_id >= cutoff);
-            let removed = before_count - main.len();
+            let removed = before_count - main.len() + dropped;
             if removed > 0 {
                 self.metrics
                     .store_compaction_removed_total
@@ -517,13 +624,35 @@ impl SnapshotStore for BaseSnapshotStore {
                         }
                     }
 
+                    let load = |path: Option<&Path>| path.map(post_ids_in_file).transpose();
+                    let (excluded_by_file, required_by_file) = match (
+                        load(wc.exclude_posts_in_file.as_deref()),
+                        load(wc.require_posts_in_file.as_deref()),
+                    ) {
+                        (Ok(excluded), Ok(required)) => (excluded, required),
+                        (Err(e), _) | (_, Err(e)) => {
+                            warn!("skipping dump of {window_name}: {e}");
+                            all_ok = false;
+                            continue;
+                        }
+                    };
                     let cutoff = timestamp_secs_to_snowflake(now - retention_secs);
                     let mut st = store_state.lock().await;
+                    let dropped = drop_posts_in_excluded_index(
+                        &mut st.main_data,
+                        &pending_snapshot,
+                        wc,
+                        &config.windows,
+                    ) + excluded_by_file.as_ref().map_or(0, |ids| {
+                        drop_posts_by_file(&mut st.main_data, &window_name, ids, false)
+                    }) + required_by_file.as_ref().map_or(0, |ids| {
+                        drop_posts_by_file(&mut st.main_data, &window_name, ids, true)
+                    });
                     let main = st.main_data.entry(window_name.clone()).or_default();
 
                     let before = main.len();
                     main.retain(|pid, _| *pid >= cutoff);
-                    let removed = before - main.len();
+                    let removed = before - main.len() + dropped;
                     if removed > 0 {
                         metrics
                             .store_compaction_removed_total
@@ -678,7 +807,7 @@ impl SnapshotStore for BaseSnapshotStore {
 
 
 fn is_sid_pipeline(pipeline: &str) -> bool {
-    matches!(pipeline, "sid" | "sid-tail")
+    matches!(pipeline, "sid" | "sid-tail" | "sid-popular-video")
 }
 
 fn stored_to_batch(
@@ -1525,6 +1654,76 @@ mod tests {
             1,
             "old record should be filtered out"
         );
+    }
+
+    #[tokio::test]
+    async fn store_filters_posts_by_exclusion_and_required_files() {
+        let config = |dir: &TempDir, windows: Vec<WindowConfig>| StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows,
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "main".to_string(),
+            sid_num_levels: 6,
+        };
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let kept_id = timestamp_secs_to_snowflake(now_secs - 100.0);
+        let excluded_id = timestamp_secs_to_snowflake(now_secs - 200.0);
+        let unlisted_id = timestamp_secs_to_snowflake(now_secs - 300.0);
+
+        let lists_dir = TempDir::new().unwrap();
+        let lists = BaseSnapshotStore::new(
+            config(
+                &lists_dir,
+                vec![
+                    WindowConfig::new("nsfw", 24),
+                    WindowConfig::new("immersive", 24),
+                ],
+            ),
+            prefix_window_router(),
+            make_metrics(),
+        );
+        lists
+            .add_batch(vec![
+                make_core_record(excluded_id, 20, "nsfw"),
+                make_core_record(kept_id, 10, "immersive"),
+                make_core_record(excluded_id, 20, "immersive"),
+            ])
+            .await
+            .unwrap();
+        lists.dump_all_windows().await.unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let window = WindowConfig::new("1fav", 24)
+            .excluding_posts_in_file(lists_dir.path().join("nsfw_1day.parquet"))
+            .requiring_posts_in_file(lists_dir.path().join("immersive_1day.parquet"));
+        let store = BaseSnapshotStore::new(
+            StoreConfig {
+                pipeline: "sid-popular-video".to_string(),
+                ..config(&dir, vec![window])
+            },
+            sid_window_router(),
+            make_metrics(),
+        );
+        store
+            .add_batch(vec![
+                make_sid_record(kept_id, 10, vec![1, 2, 3, 4, 5, 6]),
+                make_sid_record(excluded_id, 20, vec![1, 2, 3, 4, 5, 6]),
+                make_sid_record(unlisted_id, 30, vec![1, 2, 3, 4, 5, 6]),
+            ])
+            .await
+            .unwrap();
+        store.dump_all_windows().await.unwrap();
+
+        let batches = read_parquet_file(&dir.path().join("1fav_1day.parquet")).unwrap();
+        let ids = batches[0]
+            .column_by_name("post_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values().to_vec(), vec![kept_id]);
+        assert!(batches[0].column_by_name("post_sid").is_some());
     }
 
     #[tokio::test]

@@ -43,23 +43,37 @@ pub struct TextMetrics {
 
 impl TextMetrics {
     pub fn of(text: &str, attachment_urls: u32) -> Self {
-        let whitespace: u32 = text
-            .chars()
-            .filter(|c| c.is_whitespace())
-            .map(char_weight)
-            .sum();
+        let bytes = text.as_bytes();
+        let mut weighted_len = 0u32;
         let mut urls = 0u32;
-        let mut words = 0u32;
-        for token in text.split_whitespace() {
-            if is_url(token) {
-                urls += 1;
+        let mut in_token = false;
+        let mut in_url = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let (weight, is_whitespace, len) = if bytes[i].is_ascii() {
+                (1, matches!(bytes[i], b'\t'..=b'\r' | b' '), 1)
             } else {
-                words += token.chars().map(char_weight).sum::<u32>();
+                let ch = text[i..].chars().next().unwrap_or_default();
+                (char_weight(ch), ch.is_whitespace(), ch.len_utf8())
+            };
+            if is_whitespace {
+                weighted_len += weight;
+                in_token = false;
+            } else {
+                if !in_token {
+                    in_token = true;
+                    in_url = is_url(&text[i..]);
+                    urls += u32::from(in_url);
+                }
+                if !in_url {
+                    weighted_len += weight;
+                }
             }
+            i += len;
         }
         let external_urls = urls.saturating_sub(attachment_urls);
         Self {
-            weighted_len: whitespace + words + URL_WEIGHTED_LEN * external_urls,
+            weighted_len: weighted_len + URL_WEIGHTED_LEN * external_urls,
             external_urls,
         }
     }
@@ -71,6 +85,9 @@ fn is_url(token: &str) -> bool {
 
 fn char_weight(ch: char) -> u32 {
     let cp = ch as u32;
+    if cp <= SINGLE_WEIGHT_CODEPOINT_RANGES[0].1 {
+        return 1;
+    }
     if matches!(cp, 0xFE0E | 0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F) {
         return 0;
     }
@@ -94,6 +111,58 @@ mod tests {
 
     fn weighted(text: &str) -> u32 {
         TextMetrics::of(text, 0).weighted_len
+    }
+
+    fn reference(text: &str, attachment_urls: u32) -> TextMetrics {
+        let whitespace: u32 = text
+            .chars()
+            .filter(|c| c.is_whitespace())
+            .map(char_weight)
+            .sum();
+        let mut urls = 0u32;
+        let mut words = 0u32;
+        for token in text.split_whitespace() {
+            if is_url(token) {
+                urls += 1;
+            } else {
+                words += token.chars().map(char_weight).sum::<u32>();
+            }
+        }
+        let external_urls = urls.saturating_sub(attachment_urls);
+        TextMetrics {
+            weighted_len: whitespace + words + URL_WEIGHTED_LEN * external_urls,
+            external_urls,
+        }
+    }
+
+    #[test]
+    fn matches_the_reference_implementation() {
+        let samples = [
+            "",
+            "   ",
+            "hello world",
+            "  leading and trailing  ",
+            "see https://t.co/abc123 now",
+            "https://t.co/start then http://x.y/z and end https://t.co/end",
+            "not a url: http:// alone, https:/broken, xhttps://inside, HTTPS://upper",
+            "line one\nline two\thttps://t.co/x\r\n",
+            "vertical\u{b}tab\u{c}feed\u{85}next-line",
+            "日本\u{3000}語 and ｆｕｌｌｗｉｄｔｈ",
+            "ok 👍🏽 ❤️ 🏳️‍🌈 \u{e0067}tag",
+            "Ça va très bien, ünïcödé ÀÉÎÕÜ",
+            "\u{2003}em\u{2009}thin\u{a0}nbsp\u{2028}sep",
+            "\u{2010}\u{2015}\u{201c}quotes\u{201d}\u{2032}\u{2037}",
+            "\u{10ff}\u{1100}\u{1101} boundary",
+        ];
+        for text in samples {
+            for attachment_urls in 0..3 {
+                assert_eq!(
+                    TextMetrics::of(text, attachment_urls),
+                    reference(text, attachment_urls),
+                    "{text:?} with {attachment_urls} attachment URLs"
+                );
+            }
+        }
     }
 
     #[test]

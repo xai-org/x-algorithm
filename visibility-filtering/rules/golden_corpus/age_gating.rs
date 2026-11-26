@@ -1,18 +1,15 @@
-use super::builders::{
-    labeled, no_stated_age_viewer, tweet_candidate, viewer_in_country, viewer_with_age,
-};
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::{
-    NsfwViewerDropReason, PostCandidate, SafetyLabelType, Viewer, ViewerAge, ViewerFeatures,
-    ViewerProfile,
+    NsfwViewerDropReason, PostCandidate, RequestFacts, SafetyLabelType, Viewer, ViewerAge,
+    ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
-    allow, blurred, candidate, dropped, legacy_interstitial, nsfw_viewer_dropped,
-    sensitive_opt_in_viewer, viewer_with_profile, AUTHOR_ID,
+    allow, blurred, candidate, dropped, labeled, legacy_interstitial, no_stated_age_viewer,
+    nsfw_viewer_dropped, sensitive_opt_in_viewer, tweet_candidate, viewer_in_country,
+    viewer_with_age, viewer_with_profile, AUTHOR_ID,
 };
 use crate::rules::SafetyLevel::{
-    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeRecommendations,
 };
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::InterstitialReason;
@@ -21,27 +18,22 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "unflagged_media",
-            post: candidate().with_media().build(),
-            expect: vec![
-                (
-                    TimelineHome,
+            subject: Subject::Post(candidate().with_media().build()),
+            expect: vec![(
+                Role::each([
                     Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
-                    allow(),
-                ),
-                (TimelineHome, Role::LoggedOut, allow()),
-                (
-                    TimelineHome,
+                    Role::LoggedOut,
                     Role::As("no_stated_age_in_gb", no_stated_age_viewer("gb")),
-                    allow(),
-                ),
-            ],
+                ]),
+                allow(),
+            )],
+            at: vec![],
         },
         Row {
             name: "nsfw_high_recall_media",
-            post: labeled_media(SafetyLabelType::NSFW_HIGH_RECALL),
+            subject: Subject::Post(labeled_media(SafetyLabelType::NSFW_HIGH_RECALL)),
             expect: vec![
                 (
-                    TimelineHome,
                     Role::LoggedOut,
                     nsfw_viewer_dropped(
                         NsfwViewerDropReason::LoggedOut,
@@ -49,53 +41,23 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHome,
-                    Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
+                    Role::each([
+                        Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
+                        Role::As(
+                            "underage_opted_in",
+                            viewer_with_profile(ViewerProfile {
+                                viewer_age: ViewerAge::Known(17),
+                                allows_sensitive_media: true,
+                                ..ViewerProfile::default()
+                            }),
+                        ),
+                    ]),
                     nsfw_viewer_dropped(
                         NsfwViewerDropReason::IsUnderage,
                         "sensitive_viewer_underage/drop",
                     ),
                 ),
                 (
-                    TimelineHome,
-                    Role::As("no_stated_age_in_us", no_stated_age_viewer("us")),
-                    allow(),
-                ),
-                (
-                    TimelineHome,
-                    Role::As("adult", viewer_with_age(ViewerAge::Known(30))),
-                    allow(),
-                ),
-                (
-                    TimelineHome,
-                    Role::As("no_stated_age_in_gb", no_stated_age_viewer("gb")),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::HasNoStatedAge,
-                        "sensitive_viewer_no_stated_age/drop",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::As("unknown_age_in_gb", viewer_in_country("gb")),
-                    allow(),
-                ),
-                (
-                    TimelineHome,
-                    Role::As(
-                        "underage_opted_in",
-                        viewer_with_profile(ViewerProfile {
-                            viewer_age: ViewerAge::Known(17),
-                            allows_sensitive_media: true,
-                            ..ViewerProfile::default()
-                        }),
-                    ),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::IsUnderage,
-                        "sensitive_viewer_underage/drop",
-                    ),
-                ),
-                (
-                    TimelineHome,
                     Role::As(
                         "underage_author",
                         ViewerFeatures {
@@ -113,6 +75,52 @@ pub(super) fn rows() -> Vec<Row> {
                     allow(),
                 ),
                 (
+                    Role::each([
+                        Role::As("no_stated_age_in_gb", no_stated_age_viewer("gb")),
+                        Role::As(
+                            "no_stated_age_in_de",
+                            ViewerFeatures {
+                                facts: RequestFacts::default().with_country("de"),
+                                ..viewer_with_age(ViewerAge::NotStated)
+                            },
+                        ),
+                        Role::As(
+                            "no_stated_age_kr_account_in_us",
+                            ViewerFeatures {
+                                facts: RequestFacts::default().with_country("us"),
+                                ..no_stated_age_viewer("kr")
+                            },
+                        ),
+                    ]),
+                    nsfw_viewer_dropped(
+                        NsfwViewerDropReason::HasNoStatedAge,
+                        "sensitive_viewer_no_stated_age/drop",
+                    ),
+                ),
+            ],
+            at: vec![
+                (
+                    TimelineHome,
+                    Role::As("adult", viewer_with_age(ViewerAge::Known(30))),
+                    allow(),
+                ),
+                (
+                    TimelineHome,
+                    Role::As("no_stated_age_in_us", no_stated_age_viewer("us")),
+                    allow(),
+                ),
+                (
+                    TimelineHome,
+                    Role::As(
+                        "no_stated_age_us_account_in_de",
+                        ViewerFeatures {
+                            facts: RequestFacts::default().with_country("de"),
+                            ..no_stated_age_viewer("us")
+                        },
+                    ),
+                    allow(),
+                ),
+                (
                     TimelineHome,
                     Role::As(
                         "no_stated_age_without_country",
@@ -122,51 +130,16 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (
                     TimelineHome,
-                    Role::As(
-                        "no_stated_age_in_de",
-                        ViewerFeatures {
-                            country_code: Some("de".to_string()),
-                            ..viewer_with_age(ViewerAge::NotStated)
-                        },
-                    ),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::HasNoStatedAge,
-                        "sensitive_viewer_no_stated_age/drop",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::As(
-                        "no_stated_age_us_account_in_de",
-                        ViewerFeatures {
-                            country_code: Some("de".to_string()),
-                            ..no_stated_age_viewer("us")
-                        },
-                    ),
+                    Role::As("unknown_age_in_gb", viewer_in_country("gb")),
                     allow(),
-                ),
-                (
-                    TimelineHome,
-                    Role::As(
-                        "no_stated_age_kr_account_in_us",
-                        ViewerFeatures {
-                            country_code: Some("us".to_string()),
-                            ..no_stated_age_viewer("kr")
-                        },
-                    ),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::HasNoStatedAge,
-                        "sensitive_viewer_no_stated_age/drop",
-                    ),
                 ),
             ],
         },
         Row {
             name: "nsfw_high_precision_media",
-            post: labeled_media(SafetyLabelType::NSFW_HIGH_PRECISION),
+            subject: Subject::Post(labeled_media(SafetyLabelType::NSFW_HIGH_PRECISION)),
             expect: vec![
                 (
-                    TimelineHome,
                     Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
                     nsfw_viewer_dropped(
                         NsfwViewerDropReason::IsUnderage,
@@ -174,15 +147,22 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHomeHydration,
-                    Role::NonFollower,
+                    Role::each([
+                        Role::NonFollower,
+                        Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    ]),
                     legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
                 ),
                 (
-                    ImmersiveExpandedRecommendations,
-                    Role::As("sensitive_opt_in", sensitive_opt_in_viewer()),
-                    allow(),
+                    Role::LoggedOut,
+                    nsfw_viewer_dropped(
+                        NsfwViewerDropReason::LoggedOut,
+                        "sensitive_viewer_logged_out/drop",
+                    ),
                 ),
+            ],
+            at: vec![
+                (ImmersiveExpandedRecommendations, Role::Author, allow()),
                 (
                     ImmersiveExpandedRecommendations,
                     Role::NonFollower,
@@ -191,42 +171,36 @@ pub(super) fn rows() -> Vec<Row> {
                         "nsfw_sensitive_viewer_tweet/drop/nsfw_media",
                     ),
                 ),
-                (ImmersiveExpandedRecommendations, Role::Author, allow()),
                 (
                     ImmersiveExpandedRecommendations,
-                    Role::LoggedOut,
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::LoggedOut,
-                        "sensitive_viewer_logged_out/drop",
-                    ),
-                ),
-            ],
-        },
-        Row {
-            name: "nsfw_text_label",
-            post: labeled(SafetyLabelType::NSFW_TEXT),
-            expect: vec![
-                (
-                    TimelineHomeRecommendations,
-                    Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
-                    nsfw_viewer_dropped(
-                        NsfwViewerDropReason::IsUnderage,
-                        "sensitive_viewer_underage/drop",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::As("adult", viewer_with_age(ViewerAge::Known(30))),
+                    Role::As("sensitive_opt_in", sensitive_opt_in_viewer()),
                     allow(),
                 ),
             ],
         },
         Row {
+            name: "nsfw_text_label",
+            subject: Subject::Post(labeled(SafetyLabelType::NSFW_TEXT)),
+            expect: vec![(
+                Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
+                nsfw_viewer_dropped(
+                    NsfwViewerDropReason::IsUnderage,
+                    "sensitive_viewer_underage/drop",
+                ),
+            )],
+            at: vec![(
+                TimelineHomeRecommendations,
+                Role::As("adult", viewer_with_age(ViewerAge::Known(30))),
+                allow(),
+            )],
+        },
+        Row {
             name: "gore_and_violence_media",
-            post: labeled_media(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+            subject: Subject::Post(labeled_media(
+                SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+            )),
             expect: vec![
                 (
-                    TimelineHome,
                     Role::As("no_stated_age_in_gb", no_stated_age_viewer("gb")),
                     nsfw_viewer_dropped(
                         NsfwViewerDropReason::HasNoStatedAge,
@@ -234,7 +208,6 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    ImmersiveExpandedRecommendations,
                     Role::NonFollower,
                     dropped(
                         FilteredReason::ContainNsfwMedia,
@@ -242,18 +215,20 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
             ],
+            at: vec![],
         },
         Row {
             name: "nsfw_user_flag_media_retweet",
-            post: {
+            subject: Subject::Post({
                 let mut candidate = tweet_candidate(|t| {
                     t.nsfw.user = true;
                     t.media.has_media = true;
                 });
                 candidate.post.source_tweet_id = Some(2);
                 candidate
-            },
-            expect: vec![(
+            }),
+            expect: vec![],
+            at: vec![(
                 TimelineHome,
                 Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
                 blurred(

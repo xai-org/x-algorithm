@@ -1,29 +1,24 @@
-use crate::clients::about_this_account_client::AboutThisAccountClient;
-use crate::clients::article_client::ArticleClient;
-use crate::clients::gizmoduck_client::GizmoduckLookup;
+use crate::clients::label_warm_client::StratoWarmFetcher;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
-use crate::clients::trusted_friends_client::TrustedFriendsClient;
-use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
-use crate::evaluate_tweets::EvaluateTweetsEndpoint;
-use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
-use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
+use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
+use crate::filter_notifications::FilterNotificationsEndpoint;
+use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
 use crate::hydration::community_source::CommunitySource;
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Backends, ProdSources};
 use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
-use crate::limited_actions_copy::LimitedActionsCopy;
-use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
+use crate::metrics::{Endpoint, Metrics, RequestLevel};
+use crate::models::{
+    Evaluation, PlacedCandidate, RawCandidate, RequestFacts, RetweetMerge, TweetId,
+};
+use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
-use crate::rules::metrics::Rpc;
-use crate::rules::SafetyLevel;
-use crate::safety_label_source::lookup::RemoteSource;
-use crate::safety_label_source::manhattan::ManhattanSource;
-use crate::safety_label_source::twemcache::TwemcacheSource;
-use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher, Warmer};
-use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
+use crate::quote::QuotePassRunner;
+use crate::rules::{NoTrace, SafetyLevel};
 use crate::server::VFServer;
 use anyhow::Context;
 use std::future::Future;
@@ -31,14 +26,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::metadata::MetadataMap;
 use tracing::{error, info, warn};
-use xai_cache::discovery::WilyDiscovery;
-use xai_cache::{
-    CacheClient, ClientBuilder, ClientConfig, HashAlgorithm, Key, Protocol, TlsConfig,
-};
 use xai_core_entities::gizmoduck_client::ProdGizmoduckClient;
 use xai_core_entities::rpc_constants::{GizmoduckRpcConstants, RpcConstants, TESRpcConstants};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CLIENT_ID, S2S_CRT_PATH, S2S_KEY_PATH};
 use xai_core_entities::tweet_entity_service_client::ProdTESClient;
+use xai_safety_label_source::{
+    LabelClients, LabelSourceConfig, S2sPaths, SafetyLabelSource, WarmFetcher,
+};
+use xai_stats_receiver::StatsReceiverExt;
 use xai_strato::StratoGrpc;
 use xai_x_rpc::balanced_channel::LbPolicy;
 use xai_x_rpc::grpc_client::{ChannelBuilder, TlsMode};
@@ -47,19 +42,11 @@ use xai_x_rpc::timed_buffer::DEFAULT_BUFFER_MAX_WAIT;
 use xai_x_rpc::total_timeout::DEFAULT_TOTAL_TIMEOUT;
 use xai_xds_client::StartFrom;
 
-const CACHE_PATH: &str = "/s/cache/safety_label_store:twemcaches";
 const READINESS_PROBE_PORT: u16 = 8081;
 
 pub(crate) const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
 const CLIENT_INIT_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const CLIENT_INIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(crate) fn with_metadata(strato: StratoGrpc, metadata: Option<&MetadataMap>) -> StratoGrpc {
-    match metadata {
-        Some(metadata) => strato.with_default_metadata(metadata.clone()),
-        None => strato,
-    }
-}
 
 pub(crate) async fn init_client_with_retry<T, E, Fut>(
     client: &str,
@@ -78,7 +65,7 @@ where
                 client,
                 attempt, "Client init skipped; init deadline exhausted"
             );
-            return Err("init deadline exhausted before attempt".to_string());
+            return Err(format!("{client}: init deadline exhausted before attempt"));
         }
         let error = match tokio::time::timeout(CLIENT_INIT_ATTEMPT_TIMEOUT, build()).await {
             Ok(Ok(t)) => {
@@ -100,7 +87,7 @@ where
                 error = %error,
                 "Client init failed; retry budget exhausted"
             );
-            return Err(error);
+            return Err(format!("{client}: {error}"));
         }
         warn!(
             client,
@@ -117,10 +104,10 @@ where
 
 pub(crate) struct ServerDeps {
     pub(crate) init_deadline: tokio::time::Instant,
-    pub(crate) filter_tweets: Arc<FilterTweets>,
+    pub(crate) post_evaluator: Arc<PostEvaluator>,
     pub(crate) client_switches: ClientSwitches,
-    limited_actions_copy: LimitedActionsCopy,
     safety_label_source: Arc<SafetyLabelSource>,
+    pub(crate) metrics: Metrics,
 }
 
 #[derive(Clone, Copy)]
@@ -130,9 +117,19 @@ pub(crate) enum CacheWarming {
 }
 
 impl CacheWarming {
-    fn warmer(self, build: impl FnOnce() -> Option<Arc<dyn Warmer>>) -> Option<Arc<dyn Warmer>> {
+    fn warmer(
+        self,
+        build: impl FnOnce() -> Option<Arc<dyn WarmFetcher>>,
+    ) -> Option<Arc<dyn WarmFetcher>> {
         match self {
             Self::AsConfigured => build(),
+            Self::Off => None,
+        }
+    }
+
+    fn label_cache_eds(self) -> Option<String> {
+        match self {
+            Self::AsConfigured => crate::config::label_cache_eds(),
             Self::Off => None,
         }
     }
@@ -145,23 +142,18 @@ pub(crate) struct Serving {
     pub(crate) safety_label_source: Arc<SafetyLabelSource>,
     pub(crate) client_switches: ClientSwitches,
     pub(crate) country_lists: Arc<CountryLists>,
-    pub(crate) limited_actions_copy: LimitedActionsCopy,
-    pub(crate) author_cache_capacity: Option<usize>,
-    pub(crate) tweet_cache_capacity: Option<usize>,
+    pub(crate) metrics: Metrics,
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
 pub(crate) async fn serving(
     datacenter: &str,
     metadata: Option<&MetadataMap>,
     cache_warming: CacheWarming,
+    experiments: crate::params::Experiments,
 ) -> Serving {
     let stats = xai_stats_receiver::global_stats_receiver();
-    let (limited_actions_copy, copy_drift) =
-        LimitedActionsCopy::load_baked(datacenter, stats.as_deref());
+    let metrics = Metrics::new(stats.clone());
+    let (limited_actions_copy, copy_drift) = LimitedActionsCopy::load_baked(datacenter, &metrics);
     let init_deadline = tokio::time::Instant::now() + CLIENT_INIT_RETRY_BUDGET;
     let author_cache_capacity = crate::config::author_cache_capacity();
     let tweet_cache_capacity = crate::config::tweet_cache_capacity();
@@ -171,28 +163,20 @@ pub(crate) async fn serving(
         deterministic_aperture(),
         metadata,
         cache_warming,
+        stats,
     )
     .await;
     let fallback_caches = FallbackCaches {
         tweets: tweet_cache_capacity.map(tweet_fallback_cache),
         authors: author_cache_capacity.map(author_fallback_cache),
     };
-    let mut switch_files = crate::params::SwitchFiles::beside(&crate::config::fs_path());
-    let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
-        switch_files
-            .load(stats.as_deref())
-            .expect("files that each built an engine build one together"),
-    ));
-    let country_lists = Arc::new(CountryLists::starting_at_default());
-    country_lists.refresh(&feature_switches.load());
-    let client_switches = ClientSwitches::new(Arc::clone(&feature_switches));
-    crate::params::spawn_refresh(
-        switch_files,
-        feature_switches,
-        Arc::clone(&country_lists),
+    let (feature_switches, country_lists) = crate::params::serve(
+        crate::params::SwitchFiles::beside(&crate::config::fs_path(), experiments),
+        Arc::clone(&safety_label_source),
         copy_drift,
-        stats,
+        metrics.clone(),
     );
+    let client_switches = ClientSwitches::new(feature_switches, limited_actions_copy);
     Serving {
         init_deadline,
         sources,
@@ -200,9 +184,7 @@ pub(crate) async fn serving(
         safety_label_source,
         client_switches,
         country_lists,
-        limited_actions_copy,
-        author_cache_capacity,
-        tweet_cache_capacity,
+        metrics,
     }
 }
 
@@ -215,142 +197,121 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         safety_label_source,
         client_switches,
         country_lists,
-        limited_actions_copy,
-        author_cache_capacity,
-        tweet_cache_capacity,
-    } = serving(datacenter, metadata, CacheWarming::AsConfigured).await;
+        metrics,
+    } = serving(
+        datacenter,
+        metadata,
+        CacheWarming::AsConfigured,
+        crate::params::Experiments::serving(datacenter).await,
+    )
+    .await;
     let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
-    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
-    let filter_tweets = Arc::new(FilterTweets::new(
+    let post_evaluator = Arc::new(PostEvaluator::new(
         Arc::new(sources),
         rule_engine,
         Arc::new(fallback_caches),
+        metrics.clone(),
     ));
 
-    warm_filter_tweets(&filter_tweets).await;
-
-    info!(
-        hydrator_count = 5,
-        author_cache_capacity = author_cache_capacity.unwrap_or(0),
-        tweet_cache_capacity = tweet_cache_capacity.unwrap_or(0),
-        home_rule_count,
-        recommendations_rule_count,
-        "VFServer initialized with prod clients"
-    );
+    warm_post_evaluator(&post_evaluator).await;
 
     ServerDeps {
         init_deadline,
-        filter_tweets,
+        post_evaluator,
         client_switches,
-        limited_actions_copy,
         safety_label_source,
+        metrics,
     }
 }
 
 fn deterministic_aperture() -> bool {
-    std::env::var("APP_ENV").as_deref() == Ok("prod")
+    std::env::var(crate::config::ENV_APP_ENV).as_deref() == Ok("prod")
 }
 
 impl ServerDeps {
-    pub(crate) fn into_server(self, comparator: Option<Box<dyn Comparator>>) -> VFServer {
-        VFServer::from_endpoints(
-            EvaluateTweetsEndpoint::new(
-                Arc::clone(&self.filter_tweets),
-                self.client_switches,
-                self.limited_actions_copy,
+    pub(crate) fn into_server(self, comparator: Option<Box<dyn EntryComparator>>) -> VFServer {
+        VFServer {
+            evaluate_tweets: EvaluateTweetsEndpoint::new(
+                Arc::clone(&self.post_evaluator),
+                self.client_switches.clone(),
+                comparator,
+                QuotePassRunner::new(crate::config::quote_pass()),
             ),
-            FilterTweetsEndpoint::new(self.filter_tweets, comparator),
-            GetSafetyLabelsEndpoint::new(self.safety_label_source),
-        )
+            filter_notifications: FilterNotificationsEndpoint::new(
+                Arc::clone(&self.post_evaluator),
+                self.client_switches.clone(),
+            ),
+            filter_tweets: FilterTweetsEndpoint::new(self.post_evaluator, self.client_switches),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source, self.metrics),
+        }
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
+#[expect(clippy::panic, reason = "startup fail-fast: init failure is fatal")]
 pub(crate) async fn prod_sources(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
     deterministic_aperture: bool,
     metadata: Option<&MetadataMap>,
     cache_warming: CacheWarming,
+    stats: Option<Arc<dyn StatsReceiverExt>>,
 ) -> (ProdSources, Arc<SafetyLabelSource>) {
-    let tes_client = Arc::new(
-        init_client_with_retry("tes", init_deadline, || async move {
+    let tes = init_client_with_retry("tes", init_deadline, || async move {
+        let strato = build_xds_strato(
+            XdsStratoParams {
+                name: "tes-xds",
+                xds_listener: "tweet-entity-service.prod.tweet-entity-service:fed-grpc",
+                tls_domain: format!(
+                    "tweet-entity-service.tweet-entity-service.prod.{datacenter}.s2s.twttr.net"
+                ),
+                lb_policy: LbPolicy::penalized_peak_ewma(),
+                client_id: S2S_CLIENT_ID.clone(),
+                retry_config: Some(RetryConfig::for_idempotent()),
+                max_batch_size: TESRpcConstants::max_batch_size(),
+                metadata: metadata.cloned(),
+            },
+            deterministic_aperture,
+        )
+        .await?;
+        anyhow::Ok(ProdTESClient {
+            grpc_client: Arc::new(strato),
+        })
+    });
+
+    let gizmoduck_client_id = crate::config::gizmoduck_client_id();
+    let gizmoduck = init_client_with_retry("gizmoduck", init_deadline, || {
+        let client_id = gizmoduck_client_id.clone();
+        async move {
             let strato = build_xds_strato(
                 XdsStratoParams {
-                    name: "tes-xds",
-                    xds_listener: "tweet-entity-service.prod.tweet-entity-service:fed-grpc",
-                    tls_domain: format!(
-                        "tweet-entity-service.tweet-entity-service.prod.{datacenter}.s2s.twttr.net"
-                    ),
-                    lb_policy: LbPolicy::penalized_peak_ewma(),
-                    client_id: S2S_CLIENT_ID.clone(),
-                    retry_config: Some(RetryConfig::for_idempotent()),
-                    max_batch_size: TESRpcConstants::max_batch_size(),
+                    name: "gizmoduck-xds",
+                    xds_listener: "gizmoduck.prod.gizmoduck:fed-grpc",
+                    tls_domain: format!("gizmoduck.gizmoduck.prod.{datacenter}.s2s.twttr.net"),
+                    lb_policy: LbPolicy::least_request(),
+                    client_id,
+                    retry_config: None,
+                    max_batch_size: GizmoduckRpcConstants::max_batch_size(),
                     metadata: metadata.cloned(),
                 },
                 deterministic_aperture,
             )
             .await?;
-            anyhow::Ok(ProdTESClient {
+            anyhow::Ok(ProdGizmoduckClient {
                 grpc_client: Arc::new(strato),
             })
-        })
-        .await
-        .expect("Failed to initialize TES client"),
-    );
+        }
+    });
 
-    let gizmoduck_client_id = crate::config::gizmoduck_client_id();
-    let gizmoduck_client: Arc<
-        dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
-    > = Arc::new(
-        init_client_with_retry("gizmoduck", init_deadline, || {
-            let client_id = gizmoduck_client_id.clone();
-            async move {
-                let strato = build_xds_strato(
-                    XdsStratoParams {
-                        name: "gizmoduck-xds",
-                        xds_listener: "gizmoduck.prod.gizmoduck:fed-grpc",
-                        tls_domain: format!("gizmoduck.gizmoduck.prod.{datacenter}.s2s.twttr.net"),
-                        lb_policy: LbPolicy::least_request(),
-                        client_id,
-                        retry_config: None,
-                        max_batch_size: GizmoduckRpcConstants::max_batch_size(),
-                        metadata: metadata.cloned(),
-                    },
-                    deterministic_aperture,
-                )
-                .await?;
-                anyhow::Ok(ProdGizmoduckClient {
-                    grpc_client: Arc::new(strato),
-                })
-            }
-        })
-        .await
-        .expect("Failed to initialize Gizmoduck client"),
-    );
-    info!(
-        deterministic_aperture,
-        "TES and Gizmoduck clients ready over xDS"
-    );
-
-    let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
-        Arc::new(
-            init_client_with_retry("socialgraph", init_deadline, || {
-                ProdSocialgraphClient::new(
-                    datacenter,
-                    &S2S_CHAIN_PATH,
-                    &S2S_CRT_PATH,
-                    &S2S_KEY_PATH,
-                    deterministic_aperture,
-                    metadata.cloned(),
-                )
-            })
-            .await
-            .expect("Failed to initialize SocialGraph client"),
-        );
+    let socialgraph = init_client_with_retry("socialgraph", init_deadline, || {
+        ProdSocialgraphClient::new(
+            datacenter,
+            &S2S_CHAIN_PATH,
+            &S2S_CRT_PATH,
+            &S2S_KEY_PATH,
+            deterministic_aperture,
+            metadata.cloned(),
+        )
+    });
 
     let stratoserver = init_client_with_retry("stratoserver", init_deadline, || {
         build_xds_strato(
@@ -366,90 +327,68 @@ pub(crate) async fn prod_sources(
             },
             deterministic_aperture,
         )
-    })
-    .await
-    .expect("Failed to initialize the stratoserver client");
+    });
+
+    let wingman = init_client_with_retry("wingman", init_deadline, || {
+        ProdWingmanClient::new(datacenter)
+    });
+
+    let labels = async {
+        LabelClients::connect(LabelSourceConfig {
+            datacenter: datacenter.to_owned(),
+            s2s: S2sPaths {
+                cert: S2S_CRT_PATH.clone(),
+                key: S2S_KEY_PATH.clone(),
+                ca_chain: S2S_CHAIN_PATH.clone(),
+            },
+            deterministic_aperture,
+            twemcache_client_name: Some(crate::config::twemcache_client_name()),
+            label_cache_eds: cache_warming.label_cache_eds(),
+            cache_capacity: crate::config::safety_label_cache_capacity(),
+            stats,
+            init_deadline,
+        })
+        .await
+        .map_err(|e| e.to_string())
+    };
+
+    let connecting = Box::pin(async {
+        tokio::join!(tes, gizmoduck, socialgraph, stratoserver, wingman, labels)
+    });
+    let (tes, gizmoduck, socialgraph, stratoserver, wingman, labels) = match connecting.await {
+        (Ok(tes), Ok(gizmoduck), Ok(socialgraph), Ok(stratoserver), Ok(wingman), Ok(labels)) => {
+            (tes, gizmoduck, socialgraph, stratoserver, wingman, labels)
+        }
+        (tes, gizmoduck, socialgraph, stratoserver, wingman, labels) => {
+            let failures: Vec<String> = [
+                tes.err(),
+                gizmoduck.err(),
+                socialgraph.err(),
+                stratoserver.err(),
+                wingman.err(),
+                labels.err(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            panic!(
+                "Failed to initialize backend clients: {}",
+                failures.join("; ")
+            )
+        }
+    };
+    info!(deterministic_aperture, "Backend clients ready");
+
+    let tes_client = Arc::new(tes);
+    let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
+        Arc::new(socialgraph);
+    let wingman_client = Arc::new(wingman);
+
     let communities = CommunitySource {
         grpc_client: stratoserver.clone(),
     };
-    let about_this_account_client = AboutThisAccountClient::new(stratoserver.clone());
-    let trusted_friends_client = TrustedFriendsClient::new(stratoserver.clone());
-    let user_location_client = UserLocationClient::new(stratoserver.clone());
-    let article_client = ArticleClient::new(stratoserver.clone());
-
-    let wingman_client = Arc::new(
-        init_client_with_retry("wingman", init_deadline, || {
-            ProdWingmanClient::new(datacenter)
-        })
-        .await
-        .expect("Failed to initialize Wingman client"),
-    );
-
-    let mh_label_client: Arc<dyn ManhattanLabelFetcher> = Arc::new(
-        init_client_with_retry("manhattan", init_deadline, || {
-            let s2s = xai_manhattan::s2s::S2sConfig {
-                client_cert_path: S2S_CRT_PATH.clone(),
-                client_key_path: S2S_KEY_PATH.clone(),
-                ca_cert_path: S2S_CHAIN_PATH.clone(),
-            };
-            MhLabelClient::new(datacenter, s2s, deterministic_aperture)
-        })
-        .await
-        .expect("Failed to initialize MhLabelClient"),
-    );
-
-    let twemcache_client_name = crate::config::twemcache_client_name();
-    let twemcache = Arc::new(
-        init_client_with_retry("twemcache", init_deadline, || {
-            let name = twemcache_client_name.clone();
-            let zone = datacenter.to_string();
-            async move {
-                let discovery = Arc::new(WilyDiscovery::new(CACHE_PATH, name, zone).await?);
-                let config = ClientConfig::builder()
-                    .request_timeout(Duration::from_millis(20))
-                    .connect_timeout(Duration::from_secs(5))
-                    .hash_algorithm(HashAlgorithm::FNV1)
-                    .connections_per_endpoint(2)
-                    .depth_cap(100)
-                    .failure_accrual_enabled(false)
-                    .build();
-                ClientBuilder::new(Protocol::Memcached, discovery, config)
-                    .with_tls(TlsConfig {
-                        ca_cert_path: S2S_CHAIN_PATH.clone(),
-                        client_cert_path: S2S_CRT_PATH.clone(),
-                        client_key_path: S2S_KEY_PATH.clone(),
-                    })
-                    .build()
-                    .await
-            }
-        })
-        .await
-        .expect("Failed to create twemcache client"),
-    );
-    let start = Instant::now();
-    let server_count = twemcache.warm_up().await;
-    info!(
-        server_count,
-        latency_ms = elapsed_ms(start),
-        "Cache client connected to {CACHE_PATH}"
-    );
-
-    warm_cache(&twemcache).await;
-    warm_manhattan(mh_label_client.as_ref()).await;
-
-    let cache_warmer = cache_warming.warmer(|| build_cache_warmer(stratoserver));
-
-    let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
-    let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
-    let mut remote = RemoteSource::new(twemcache_source, manhattan_source);
-    if let Some(warmer) = cache_warmer {
-        remote = remote.with_warmer(warmer);
-    }
-    let remote = Arc::new(remote);
-    let safety_label_source = Arc::new(SafetyLabelSource::new(
-        remote,
-        crate::config::safety_label_cache_capacity(),
-    ));
+    let safety_label_source =
+        Arc::new(labels.into_source(cache_warming.warmer(|| warm_fetcher(stratoserver.clone()))));
 
     let tweet_source = TweetSource {
         grpc_client: Arc::clone(&tes_client.grpc_client),
@@ -457,32 +396,24 @@ pub(crate) async fn prod_sources(
     let sources = ProdSources::new(Backends {
         tes: tes_client,
         tweets: tweet_source,
-        gizmoduck: GizmoduckLookup::new(gizmoduck_client),
+        gizmoduck: Arc::new(gizmoduck),
         socialgraph: sg_client,
-        about_this_account: about_this_account_client,
+        strato: stratoserver,
         wingman: wingman_client,
-        articles: article_client,
-        trusted_friends: trusted_friends_client,
-        user_location: user_location_client,
         safety_labels: Arc::clone(&safety_label_source),
         communities,
     });
     (sources, safety_label_source)
 }
 
-fn build_cache_warmer(stratoserver: StratoGrpc) -> Option<Arc<dyn Warmer>> {
-    if !crate::config::cache_warm_enabled() {
-        return None;
-    }
-    info!("L2 cache warmer enabled");
-    Some(CacheWarmer::spawn(Arc::new(StratoWarmFetcher::new(
-        stratoserver,
-    ))))
+fn warm_fetcher(stratoserver: StratoGrpc) -> Option<Arc<dyn WarmFetcher>> {
+    crate::config::cache_warm_enabled()
+        .then(|| Arc::new(StratoWarmFetcher(stratoserver)) as Arc<dyn WarmFetcher>)
 }
 
 const STRATO_REQUEST_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 const STRATO_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
-const STRATO_APERTURE_SIZE: usize = 16;
+const STRATO_APERTURE_SIZE: usize = 32;
 const STRATOSERVER_MAX_BATCH_SIZE: usize = 250;
 const XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -544,76 +475,47 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn warm_cache(twemcache: &CacheClient) {
-    let start = Instant::now();
-    let key = match Key::new(b"slm_warmup".to_vec()) {
-        Ok(key) => key,
-        Err(e) => {
-            warn!(error = %e, "Cache warmup key construction failed (non-fatal)");
-            return;
-        }
-    };
-    match twemcache.multi_get(std::slice::from_ref(&key)).await {
-        Ok(map) => match map.get(&key) {
-            Some(Ok(_)) => info!(latency_ms = elapsed_ms(start), "Cache warmup succeeded"),
-            Some(Err(e)) => warn!(
-                latency_ms = elapsed_ms(start),
-                error = %e,
-                "Cache warmup failed (non-fatal)"
-            ),
-            None => warn!(
-                latency_ms = elapsed_ms(start),
-                "Cache warmup returned no response (non-fatal)"
-            ),
-        },
-        Err(e) => warn!(
-            latency_ms = elapsed_ms(start),
-            error = %e,
-            "Cache warmup failed (non-fatal)"
-        ),
-    }
-}
-
 const WARM_FILTER_TWEETS_TWEET_ID: u64 = 20;
 const WARM_FILTER_TWEETS_CONSECUTIVE: u32 = 3;
 const WARM_FILTER_TWEETS_DEADLINE: Duration = Duration::from_secs(20);
 const WARM_FILTER_TWEETS_SLEEP: Duration = Duration::from_millis(500);
 
-fn warm_filter_tweets_request() -> FilterRequest {
-    FilterRequest {
-        viewer_id: None,
-        country_code: None,
-        client_capability: ClientCapability::default(),
+fn warm_filter_tweets_request() -> PostBatch {
+    PostBatch {
+        facts: RequestFacts::default(),
         safety_level: SafetyLevel::TimelineHomeRecommendations,
-        candidates: vec![RawCandidate {
+        candidates: vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
             request_author_id: None,
-        }],
-        rpc: Rpc::FilterTweets,
+        })],
+        retweet_merge: RetweetMerge::Unmerged,
     }
 }
 
-fn filter_tweets_response_is_warm(response: &FilterResponse) -> bool {
-    response
-        .outcomes
-        .iter()
-        .all(|outcome| match outcome.evaluation {
-            Evaluation::NotFound(lookup) | Evaluation::Failed(lookup) => match lookup {
-                Lookup::Tweet => false,
-                Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
-            },
-            Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
-        })
+fn filter_tweets_response_is_warm(outcomes: &[PostEvaluation]) -> bool {
+    outcomes.iter().all(|outcome| match outcome.evaluation {
+        Evaluation::NotFound(lookup) | Evaluation::Failed(lookup) => match lookup {
+            Lookup::Tweet => false,
+            Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
+        },
+        Evaluation::Deleted(_) => false,
+        Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
+    })
 }
 
-async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
+async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
     let start = Instant::now();
     let mut attempts = 0u32;
     let mut consecutive_warm = 0u32;
     while start.elapsed() < WARM_FILTER_TWEETS_DEADLINE {
         attempts += 1;
-        let response = filter_tweets.run(warm_filter_tweets_request()).await;
-        if filter_tweets_response_is_warm(&response) {
+        let request = warm_filter_tweets_request();
+        let metrics = post_evaluator.metrics().request(
+            Endpoint::FilterTweets,
+            RequestLevel::Named(request.safety_level),
+        );
+        let (_, outcomes) = post_evaluator.run(request, &metrics, &mut NoTrace).await;
+        if filter_tweets_response_is_warm(&outcomes) {
             consecutive_warm += 1;
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {
                 info!(
@@ -637,18 +539,6 @@ async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
         elapsed_ms = elapsed_ms(start),
         "filter_tweets warmup deadline expired (non-fatal)"
     );
-}
-
-async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
-    let start = Instant::now();
-    match manhattan.fetch_labels(&[0]).await {
-        Ok(_) => info!(latency_ms = elapsed_ms(start), "Manhattan warmup succeeded"),
-        Err(e) => warn!(
-            latency_ms = elapsed_ms(start),
-            error = %e,
-            "Manhattan warmup failed (non-fatal)"
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -709,7 +599,7 @@ mod tests {
             })
             .await;
 
-        assert_eq!(result, Err("discovery timed out".to_string()));
+        assert_eq!(result, Err("test: discovery timed out".to_string()));
         assert!(attempts.get() > 1);
         assert!(start.elapsed() < budget);
         assert!(start.elapsed() >= budget - CLIENT_INIT_MAX_BACKOFF);
@@ -729,7 +619,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Err("init deadline exhausted before attempt".to_string())
+            Err("test: init deadline exhausted before attempt".to_string())
         );
         assert_eq!(attempts.get(), 0);
     }
@@ -751,7 +641,7 @@ mod tests {
         assert_eq!(
             result,
             Err(format!(
-                "init attempt timed out after {}s",
+                "test: init attempt timed out after {}s",
                 CLIENT_INIT_ATTEMPT_TIMEOUT.as_secs()
             ))
         );

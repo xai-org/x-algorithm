@@ -46,6 +46,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
+from xrex.data.recsys.ads_late_window import compose_late_engagement_log_probs
 from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
@@ -70,7 +71,11 @@ from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_model import (
+    RecsysAggregatedModelConfig,
+    cread_decode_from_request_enabled,
+    cread_request_decode_avals,
+)
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.models.topic_categories import (
     NUM_TOPIC_INT32S,
@@ -513,6 +518,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     seqpack_packed_len_fractions: list[float] = field(default_factory=list)
 
+    seqpack_packed_len_buckets: list[int] = field(default_factory=list)
+
     history_seq_len: int = 1000
     candidate_seq_len: int = 1400
 
@@ -624,7 +631,14 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     def packed_seq_lens(self, bs: int) -> tuple[int, ...]:
         full = self.full_packed_seq_len(bs)
-        if not self.compact_candidate_slots or bs != max(self.sorted_buckets):
+        if not self.compact_candidate_slots:
+            return (full,)
+        rung_buckets = set(self.seqpack_packed_len_buckets) or {max(self.sorted_buckets)}
+        if unknown := rung_buckets - set(self.sorted_buckets):
+            raise ValueError(
+                f"seqpack_packed_len_buckets {sorted(unknown)} are not buckets {self.sorted_buckets}"
+            )
+        if bs not in rung_buckets:
             return (full,)
         block = self._seqpack_block_size
         lens = {full}
@@ -811,8 +825,12 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         init_params.pop("__class")
         init_params.pop("num_microbatch")
         init_params.pop("use_async_emb")
-        init_params.pop("seqpack_drop_empty_candidates")
+        init_params.pop("seqpack_candidate_packing")
         init_params.pop("overlap_step_host_work")
+        if isinstance(t.model_config, RecsysTwoTowerModelConfig):
+            init_params["model_config"]["user_tower_config"]["model_config"].pop("fp8_gemms")
+        elif isinstance(t.model_config, RecsysAggregatedModelConfig):
+            init_params["model_config"]["model_config"].pop("fp8_gemms")
 
         init_params["inference_batch_size"] = inference_batch_size
         init_params["history_seq_len"] = history_seq_len
@@ -2663,6 +2681,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             dist=None,
             rng=None,
             block_size=self._seqpack_block_size,
+            alloc=self._alloc,
         )
         if packed_seq_len is not None:
             layout = batch.get("packing_layout")
@@ -3094,6 +3113,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                     dist=None,
                     rng=None,
                     block_size=self._seqpack_block_size,
+                    alloc=self._alloc,
                 )
                 if self.using_fa4:
                     batch = self.add_block_sparse_layout(batch)
@@ -3985,6 +4005,9 @@ class RankingModelRunner(
     forward_no_decoder_jit_by_bs: dict[int, JittedOrCompiled] = field(
         default_factory=dict, init=False
     )
+    forward_no_decoder_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
     _zero_page_decode_by_bs: dict[int, PageDecodeInputs] = field(default_factory=dict, init=False)
 
     def _rng_and_init_data(
@@ -4034,6 +4057,9 @@ class RankingModelRunner(
                     (post_hashes.shape[0], post_hashes.shape[1], self.model_config.sid_num_levels),
                     np.uint16,
                 )
+
+        if self.using_seqpack and cread_decode_from_request_enabled(self.model_config):
+            init_data.update(cread_request_decode_avals(init_data, self.model_config))
 
         return rng, init_data
 
@@ -4167,7 +4193,12 @@ class RankingModelRunner(
             batch_id=batch_id,
         ):
             if self.serve_page_decoder:
-                return self.forward_no_decoder_jit_by_bs[bs](
+                no_decoder_jit = (
+                    self.forward_no_decoder_jit_by_bs[bs]
+                    if packed_seq_len is None
+                    else self.forward_no_decoder_jit_by_bs_len[(bs, packed_seq_len)]
+                )
+                return no_decoder_jit(
                     params, rng, batch, merged_embeddings, self.zero_page_decode_inputs(bs)
                 )
             return forward_jit(params, rng, batch, merged_embeddings)
@@ -4279,12 +4310,10 @@ class RankingModelRunner(
 
         self.create_embedding_init_data()
 
-        assert not (self.serve_page_decoder and self.compact_candidate_slots), (
-            "serve_page_decoder does not support compact candidate slots"
-        )
         self.forward_jit_by_bs = {}
         self.forward_jit_by_bs_len = {}
         self.forward_no_decoder_jit_by_bs = {}
+        self.forward_no_decoder_jit_by_bs_len = {}
         for bs in self.sorted_buckets:
             lens: tuple[int | None, ...] = (
                 self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
@@ -4294,11 +4323,17 @@ class RankingModelRunner(
                     bs, compiler_options, packed_seq_len=n
                 )
                 self.forward_jit_by_bs_len[(bs, n)] = jit_fn
+                if self.serve_page_decoder:
+                    self.forward_no_decoder_jit_by_bs_len[(bs, n)] = (
+                        self._build_and_register_forward_jit(
+                            bs, compiler_options, packed_seq_len=n, run_decoder=False
+                        )
+                    )
             self.forward_jit_by_bs[bs] = jit_fn
             if self.serve_page_decoder:
-                self.forward_no_decoder_jit_by_bs[bs] = self._build_and_register_forward_jit(
-                    bs, compiler_options, run_decoder=False
-                )
+                self.forward_no_decoder_jit_by_bs[bs] = self.forward_no_decoder_jit_by_bs_len[
+                    (bs, n)
+                ]
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
         if self.compact_candidate_slots:
             logger.info(
@@ -4437,6 +4472,8 @@ class RankingModelRunner(
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
             outputs = model.forward(batch, recsys_embeddings, page_decode, run_decoder=run_decoder)
             log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.float32)
+            if self.model_config.serve_late_window_composed:
+                log_probs = compose_late_engagement_log_probs(log_probs)
             cont_preds = outputs[1].astype(jnp.float32)
             has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
             return log_probs, cont_preds, *outputs[2:], has_nan
@@ -4525,7 +4562,9 @@ class RetrievalModelRunner(
     enable_async_topk: bool = False
     cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
+    int8_score_pad_rows: int = -1
     enable_int8_post_table: bool = False
+    enable_shard_local_topk: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_fn: Any = field(default=None, init=False)

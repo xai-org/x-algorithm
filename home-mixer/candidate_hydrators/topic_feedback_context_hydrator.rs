@@ -1,19 +1,16 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableTopicFeedbackContext;
+use crate::util::post_annotations::decode_post_annotations;
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
-use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 use xai_recsys_proto::grok_topics::{topic_index, PARENT_TOPIC_IDS};
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
 
-const FID_TOPICS: i16 = -9948;
-const FID_ANNOTATIONS: i16 = 31524;
 const TOP_TOPIC_COUNT: usize = 2;
 
 pub struct TopicFeedbackContextHydrator {
@@ -33,33 +30,27 @@ impl TopicFeedbackContextHydrator {
     }
 
     fn decode_topics(bytes: &[u8]) -> (Vec<TopicAnnotation>, Vec<String>) {
-        match strato_decode::<UnifiedPostAnnotationsValue>(bytes) {
-            Ok(StratoResult::Ok {
-                value: Some(tv), ..
-            }) => {
-                let annotations: Vec<TopicAnnotation> = tv
-                    .annotations
+        match decode_post_annotations(bytes) {
+            Ok(Some(annotations)) => {
+                let topics = annotations
                     .entities
                     .iter()
                     .enumerate()
                     .filter_map(|(i, entity)| {
-                        let topic_id = entity.qualified_id.entity_id;
+                        let topic_id = entity.entity_id;
                         if topic_id == 0 || !Self::is_subtopic(topic_id) {
                             return None;
                         }
-                        let topic_name = tv.topics.get(i)?.clone();
+                        let topic_name = annotations.topics.get(i)?.clone();
                         Some(TopicAnnotation {
                             topic_id,
                             topic_name,
                         })
                     })
                     .collect();
-
-                (annotations, tv.topics)
+                (topics, annotations.topics)
             }
-            Ok(StratoResult::Ok { value: None, .. }) | Ok(StratoResult::Err { .. }) => {
-                (Vec::new(), Vec::new())
-            }
+            Ok(None) => (Vec::new(), Vec::new()),
             Err(e) => {
                 warn!("TopicFeedbackContextHydrator: decode error: {}", e);
                 (Vec::new(), Vec::new())
@@ -112,76 +103,86 @@ impl TopicFeedbackContextHydrator {
     }
 }
 
+#[derive(Default)]
+pub struct TopicFeedbackContext {
+    feedback_topics: HashMap<usize, (String, String)>,
+    grok_topics: HashMap<usize, Vec<String>>,
+}
+
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator {
+    type Fetched = TopicFeedbackContext;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.params.get(EnableTopicFeedbackContext)
             && !query.is_topic_request()
             && !query.in_network_only
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         _query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<TopicFeedbackContext, String> {
         let eligible: Vec<(usize, u64)> = candidates
             .iter()
             .enumerate()
             .filter(|(_, c)| Self::is_eligible_original_post(c))
             .map(|(i, c)| (i, c.tweet_id))
             .collect();
+        if eligible.is_empty() {
+            return Ok(TopicFeedbackContext::default());
+        }
 
-        let mut grok_topics_by_idx: HashMap<usize, Vec<String>> = HashMap::new();
-        let selected = if eligible.is_empty() {
-            HashMap::new()
-        } else {
-            let tweet_ids: Vec<u64> = eligible.iter().map(|(_, id)| *id).collect();
-            let results = self
-                .strato_client
-                .batch_get_unified_post_annotations(&tweet_ids)
-                .await;
+        let tweet_ids: Vec<u64> = eligible.iter().map(|(_, id)| *id).collect();
+        let results = self
+            .strato_client
+            .batch_get_unified_post_annotations(&tweet_ids)
+            .await;
 
-            let mut candidate_topics: Vec<(usize, Vec<TopicAnnotation>)> = Vec::new();
-            for ((idx, _), result) in eligible.into_iter().zip(results) {
-                match result {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        let (annotations, topic_names) = Self::decode_topics(&bytes);
-                        if !topic_names.is_empty() {
-                            grok_topics_by_idx.insert(idx, topic_names);
-                        }
-                        if !annotations.is_empty() {
-                            candidate_topics.push((idx, annotations));
-                        }
+        let mut grok_topics: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut candidate_topics: Vec<(usize, Vec<TopicAnnotation>)> = Vec::new();
+        for ((idx, _), result) in eligible.into_iter().zip(results) {
+            match result {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let (annotations, topic_names) = Self::decode_topics(&bytes);
+                    if !topic_names.is_empty() {
+                        grok_topics.insert(idx, topic_names);
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("TopicFeedbackContextHydrator: strato fetch error: {}", e);
+                    if !annotations.is_empty() {
+                        candidate_topics.push((idx, annotations));
                     }
                 }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("TopicFeedbackContextHydrator: strato fetch error: {}", e);
+                }
             }
-            Self::select_feedback_targets(&candidate_topics)
-        };
-
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let (topic, topic_id) = match selected.get(&i) {
-                    Some((t, id)) => (Some(t.clone()), Some(id.clone())),
-                    None => (None, None),
-                };
-                Ok(PostCandidate {
-                    topic_feedback_topic: topic,
-                    topic_feedback_topic_id: topic_id,
-                    grok_topics: grok_topics_by_idx.get(&i).cloned(),
-                    ..Default::default()
-                })
-            })
-            .collect()
+        }
+        Ok(TopicFeedbackContext {
+            feedback_topics: Self::select_feedback_targets(&candidate_topics),
+            grok_topics,
+        })
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        mut context: TopicFeedbackContext,
+    ) {
+        for (i, candidate) in candidates.iter_mut().enumerate() {
+            let (topic, topic_id) = context
+                .feedback_topics
+                .remove(&i)
+                .map_or((None, None), |(topic, id)| (Some(topic), Some(id)));
+            candidate.topic_feedback_topic = topic;
+            candidate.topic_feedback_topic_id = topic_id;
+            candidate.grok_topics = context.grok_topics.remove(&i);
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.topic_feedback_topic = hydrated.topic_feedback_topic;
         candidate.topic_feedback_topic_id = hydrated.topic_feedback_topic_id;
         candidate.grok_topics = hydrated.grok_topics;
@@ -192,139 +193,4 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for TopicFeedbackContextHydrator 
 struct TopicAnnotation {
     topic_id: i64,
     topic_name: String,
-}
-
-#[derive(Debug, Default, Clone)]
-struct QualifiedId {
-    entity_id: i64,
-}
-
-impl TSerializable for QualifiedId {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut q = QualifiedId::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(2) => q.entity_id = i_prot.read_i64()?,
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(q)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct EntityWithMetadata {
-    qualified_id: QualifiedId,
-}
-
-impl TSerializable for EntityWithMetadata {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut e = EntityWithMetadata::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(1) => e.qualified_id = QualifiedId::read_from_in_protocol(i_prot)?,
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(e)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct UnifiedPostAnnotations {
-    entities: Vec<EntityWithMetadata>,
-}
-
-impl TSerializable for UnifiedPostAnnotations {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut a = UnifiedPostAnnotations::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(2) if field.field_type == TType::List => {
-                    let list = i_prot.read_list_begin()?;
-                    a.entities = Vec::with_capacity(list.size.max(0) as usize);
-                    for _ in 0..list.size {
-                        a.entities
-                            .push(EntityWithMetadata::read_from_in_protocol(i_prot)?);
-                    }
-                    i_prot.read_list_end()?;
-                }
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(a)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct UnifiedPostAnnotationsValue {
-    topics: Vec<String>,
-    annotations: UnifiedPostAnnotations,
-}
-
-impl TSerializable for UnifiedPostAnnotationsValue {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
-        let mut tv = UnifiedPostAnnotationsValue::default();
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
-            match field.id {
-                Some(FID_TOPICS) if field.field_type == TType::List => {
-                    let list = i_prot.read_list_begin()?;
-                    tv.topics = Vec::with_capacity(list.size.max(0) as usize);
-                    for _ in 0..list.size {
-                        tv.topics.push(i_prot.read_string()?);
-                    }
-                    i_prot.read_list_end()?;
-                }
-                Some(FID_ANNOTATIONS) if field.field_type == TType::Struct => {
-                    tv.annotations = UnifiedPostAnnotations::read_from_in_protocol(i_prot)?;
-                }
-                _ => i_prot.skip(field.field_type)?,
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
-        Ok(tv)
-    }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        unimplemented!("decode-only")
-    }
 }

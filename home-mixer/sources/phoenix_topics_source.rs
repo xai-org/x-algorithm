@@ -3,12 +3,14 @@ use crate::models::candidate::PostCandidate;
 use crate::models::candidate_features::TopicFilteringExperiment;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixRetrievalFallback, PhoenixMaxResults, PhoenixRetrievalTopicInferenceClusterId,
-    PhoenixXdsRetrievalMaxRetries, TopicFilteringId, TopicFilteringOverrides,
+    PhoenixMaxResults, PhoenixRetrievalTopicInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
+    TopicFilteringId, TopicFilteringOverrides,
 };
-use crate::util::egress::RetrievalDispatch;
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
+use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
@@ -18,7 +20,7 @@ use xai_stats_receiver::global_stats_receiver;
 const INCLUDED_TOPIC_METRIC: &str = "PhoenixTopicsSource.included_topic_id";
 
 pub struct PhoenixTopicsSource {
-    pub dispatch: RetrievalDispatch,
+    pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
 }
 
 #[async_trait]
@@ -65,10 +67,8 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
             }
         }
 
-        let response = self
-            .dispatch
-            .retrieve_with_fallback(
-                query,
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
+            .retrieve(
                 cluster,
                 user_id,
                 sequence.clone(),
@@ -80,7 +80,6 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
                 None,
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
-                query.params.get(EnablePhoenixRetrievalFallback),
                 vec![],
             )
             .await

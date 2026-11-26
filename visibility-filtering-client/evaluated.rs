@@ -68,9 +68,8 @@ fn decode_result_state(bytes: &[u8]) -> Result<TweetFieldsResultState> {
     let reason = match &state {
         TweetFieldsResultState::Found(found) => found.suppress_reason.as_ref(),
         TweetFieldsResultState::Filtered(filtered) => Some(&filtered.reason),
-        TweetFieldsResultState::NotFound(_) | TweetFieldsResultState::Failed(_) => {
-            bail!("VF sends only found or filtered")
-        }
+        TweetFieldsResultState::NotFound(not_found) => not_found.filtered_reason.as_ref(),
+        TweetFieldsResultState::Failed(_) => bail!("VF sends no Thrift failed state"),
     };
     ensure!(
         !matches!(reason, Some(FilteredReason::SafetyResult(result)) if matches!(result.action, Action::NotEvaluated(_))),
@@ -128,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_result_state_roundtrips_found_and_filtered_and_rejects_the_rest() {
+    fn decode_result_state_roundtrips_found_filtered_and_not_found_and_rejects_the_rest() {
         let drop = safety_result(Action::Drop(action::Drop::new(
             Some(action::DropReason::LegalDemandsWithheld(true)),
             Some(vec!["US".into(), "DE".into()]),
@@ -137,6 +136,7 @@ mod tests {
             TweetFieldsResultState::Found(TweetFieldsResultFound::new(None)),
             filtered(drop),
             filtered(FilteredReason::TweetIsBounced(true)),
+            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(false, false, None)),
         ] {
             let bytes = xai_x_thrift::serialize_compact(&state).unwrap();
             assert_eq!(decode_result_state(&bytes).unwrap(), state);
@@ -152,9 +152,6 @@ mod tests {
             encode(&filtered(safety_result(Action::NotEvaluated(
                 action::NotEvaluated::new(),
             )))),
-            encode(&TweetFieldsResultState::NotFound(
-                TweetFieldsResultNotFound::new(true, true, None),
-            )),
             encode(&TweetFieldsResultState::Failed(
                 TweetFieldsResultFailed::new(false, None),
             )),

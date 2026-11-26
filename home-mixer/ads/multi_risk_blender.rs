@@ -1,23 +1,21 @@
 use super::drops::{adjacency_drop, dropped_ad, truncate_recording_drops};
+use super::health_metrics::{serving_limitation, HealthMetrics, SlotRejections};
 use super::util::*;
 use super::AdsBlender;
 use crate::params::RESULT_SIZE;
 use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
 use xai_home_mixer_proto::{feed_item, FeedItem, ScoredPost};
 use xai_recsys_proto::AdIndexInfo;
-use xai_stats_receiver::global_stats_receiver;
 
-const ENFORCEMENT_METRIC: &str = "MultiRisk.enforcement";
-const SLOT_OUTCOME_METRIC: &str = "MultiRisk.slot_outcome";
-const SERVING_LIMITATION_METRIC: &str = "MultiRisk.serving_limitation";
+const METRICS: HealthMetrics = HealthMetrics {
+    enforcement: "MultiRisk.enforcement",
+    slot_outcome: "MultiRisk.slot_outcome",
+    serving_limitation: "MultiRisk.serving_limitation",
+};
 
 pub struct MultiRiskAdsBlender;
 
 impl AdsBlender for MultiRiskAdsBlender {
-    fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
-        blend_impl(scored_posts, ads, MIN_POSTS_FOR_ADS)
-    }
-
     fn blend_inner_with_drops(
         &self,
         scored_posts: Vec<ScoredPost>,
@@ -28,6 +26,7 @@ impl AdsBlender for MultiRiskAdsBlender {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn blend_impl(
     scored_posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
@@ -45,7 +44,7 @@ pub(crate) fn blend_with_drops(
     let n = scored_posts.len();
 
     if ads.is_empty() || n < min_posts {
-        emit_serving_limitation(if ads.is_empty() {
+        METRICS.emit_serving_limitation(if ads.is_empty() {
             "no_ads"
         } else {
             "too_few_posts"
@@ -72,7 +71,7 @@ pub(crate) fn blend_with_drops(
     let max_medium_slots = medium_count / 2;
     let num_ads = ads.len();
     let safe_budget = num_ads.min(spacing_cap).min(max_safe_slots);
-    emit_serving_limitation(serving_limitation(num_ads, spacing_cap, max_safe_slots));
+    METRICS.emit_serving_limitation(serving_limitation(num_ads, spacing_cap, max_safe_slots));
 
     let any_bsr_high = ads.iter().any(is_bsr_high_ad);
     if safe_budget == 0 && !(any_bsr_high && max_medium_slots > 0 && spacing_cap > 0) {
@@ -182,7 +181,7 @@ pub(crate) fn blend_with_drops(
     }
 
     let placed_ads = triples.len();
-    emit_enforcement_metrics(
+    METRICS.emit_enforcement(
         rejections.bsr_low,
         bsr_ok,
         rejections.handle,
@@ -191,7 +190,7 @@ pub(crate) fn blend_with_drops(
     let offered_slots = num_ads
         .min(spacing_cap)
         .min(max_safe_slots.saturating_add(medium_pair_idx));
-    emit_slot_outcome_metrics(
+    METRICS.emit_slot_outcome(
         placed_ads as u64,
         offered_slots.saturating_sub(placed_ads) as u64,
         &slot_rejections,
@@ -258,105 +257,4 @@ pub(crate) fn blend_with_drops(
     }
 
     items
-}
-
-pub(crate) fn serving_limitation(
-    ads_supply: usize,
-    from_spacing: usize,
-    from_safe: usize,
-) -> &'static str {
-    let budget = ads_supply.min(from_spacing).min(from_safe);
-    if budget == ads_supply {
-        "ads_supply"
-    } else if budget == from_spacing {
-        "spacing"
-    } else {
-        "safe_posts"
-    }
-}
-
-fn emit_serving_limitation(factor: &'static str) {
-    let Some(receiver) = global_stats_receiver() else {
-        return;
-    };
-    receiver.incr(SERVING_LIMITATION_METRIC, &[("factor", factor)], 1);
-}
-
-#[derive(Default)]
-pub(crate) struct SlotRejections {
-    pub(crate) bsr_low: u64,
-    pub(crate) handle: u64,
-    pub(crate) keyword: u64,
-}
-
-impl SlotRejections {
-    fn count(&mut self, reason: &BlockReason) {
-        match reason {
-            BlockReason::LowRiskNeighbour => self.bsr_low += 1,
-            BlockReason::ExcludedHandle(_) => self.handle += 1,
-            BlockReason::ExcludedKeyword(_) => self.keyword += 1,
-        }
-    }
-
-    pub(crate) fn stuck_outcome(&self) -> &'static str {
-        if self.bsr_low == 0 && self.handle == 0 && self.keyword == 0 {
-            "unfilled_no_ads"
-        } else if self.bsr_low >= self.keyword && self.bsr_low >= self.handle {
-            "unfilled_bsr_low"
-        } else if self.keyword >= self.handle {
-            "unfilled_keyword"
-        } else {
-            "unfilled_handle"
-        }
-    }
-}
-
-fn emit_slot_outcome_metrics(filled: u64, unfilled: u64, stuck: &SlotRejections) {
-    let Some(receiver) = global_stats_receiver() else {
-        return;
-    };
-    if filled > 0 {
-        receiver.incr(SLOT_OUTCOME_METRIC, &[("outcome", "filled")], filled);
-    }
-    if unfilled == 0 {
-        return;
-    }
-    receiver.incr(
-        SLOT_OUTCOME_METRIC,
-        &[("outcome", stuck.stuck_outcome())],
-        1,
-    );
-    if unfilled > 1 {
-        receiver.incr(
-            SLOT_OUTCOME_METRIC,
-            &[("outcome", "unfilled_no_ads")],
-            unfilled - 1,
-        );
-    }
-}
-
-fn emit_enforcement_metrics(bsr_drop: u64, bsr_ok: u64, handle_drop: u64, keyword_drop: u64) {
-    let Some(receiver) = global_stats_receiver() else {
-        return;
-    };
-    if bsr_drop > 0 {
-        receiver.incr(ENFORCEMENT_METRIC, &[("action", "drop")], bsr_drop);
-    }
-    if bsr_ok > 0 {
-        receiver.incr(ENFORCEMENT_METRIC, &[("action", "ok")], bsr_ok);
-    }
-    if handle_drop > 0 {
-        receiver.incr(
-            ENFORCEMENT_METRIC,
-            &[("action", "handle_drop")],
-            handle_drop,
-        );
-    }
-    if keyword_drop > 0 {
-        receiver.incr(
-            ENFORCEMENT_METRIC,
-            &[("action", "keyword_drop")],
-            keyword_drop,
-        );
-    }
 }

@@ -11,7 +11,7 @@ use std::{
     cmp,
     collections::BTreeMap,
     fs, io,
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -59,6 +59,7 @@ pub struct CheckpointProxy {
     num_trainers: Option<usize>,
     download_concurrency: usize,
     request_timeout: Duration,
+    evict_guard: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl CheckpointProxy {
@@ -83,7 +84,13 @@ impl CheckpointProxy {
             verify_checksums,
             download_concurrency,
             request_timeout,
+            evict_guard: None,
         }
+    }
+
+    pub fn with_evict_guard(mut self, guard: Arc<parking_lot::Mutex<()>>) -> Self {
+        self.evict_guard = Some(guard);
+        self
     }
 
     async fn resolve_and_connect(
@@ -102,7 +109,24 @@ impl CheckpointProxy {
             )
         })?;
 
-        let addrs: Vec<SocketAddr> = format!("{}:{}", name, port).to_socket_addrs()?.collect();
+        let connect_timeout = std::time::Duration::from_secs(
+            std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        );
+
+        let lookup = format!("{}:{}", name, port);
+        let addrs: Vec<SocketAddr> =
+            tokio::time::timeout(connect_timeout, tokio::net::lookup_host(&lookup))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("DNS lookup for {lookup} timed out after {connect_timeout:?}"),
+                    )
+                })??
+                .collect();
 
         if addrs.is_empty() {
             return Err(io::Error::new(
@@ -112,13 +136,6 @@ impl CheckpointProxy {
         }
 
         let dns_count = addrs.len();
-
-        let connect_timeout = std::time::Duration::from_secs(
-            std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
-        );
 
         let request_timeout = self.request_timeout;
 
@@ -459,6 +476,7 @@ impl CheckpointProxy {
         CHECKPOINTS_AVAILABLE.set(elapsed_dirs.len() as f64);
 
         if elapsed_dirs.len() > self.max_entries {
+            let _evicting = self.evict_guard.as_ref().map(|g| g.lock());
             let to_remove = elapsed_dirs.len() - self.max_entries;
             for name in &elapsed_dirs[..to_remove] {
                 let path = format!("{}{}", ROOT_DIR, name);
@@ -502,6 +520,7 @@ impl CheckpointProxy {
             .collect();
         elapsed_dirs.sort();
 
+        let _evicting = self.evict_guard.as_ref().map(|g| g.lock());
         while free < needed && elapsed_dirs.len() > 1 {
             let name = elapsed_dirs.remove(0);
             let path = format!("{}{}", ROOT_DIR, name);

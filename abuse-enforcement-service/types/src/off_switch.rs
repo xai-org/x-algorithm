@@ -21,6 +21,19 @@ pub struct OffSwitchRecord {
     pub updated_at_ms: i64,
     #[serde(default)]
     pub auto_on_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_off: Option<PreviousOff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PreviousOff {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub updated_by: String,
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 impl OffSwitchRecord {
@@ -99,6 +112,7 @@ mod tests {
             key_id: String::new(),
             updated_at_ms: 0,
             auto_on_at_ms,
+            previous_off: None,
         }
     }
 
@@ -117,7 +131,37 @@ mod tests {
             serde_json::from_str(r#"{"head":"H","off":true,"future_field":1}"#).unwrap();
         assert_eq!(r.classifier, None);
         assert_eq!(r.auto_on_at_ms, None);
+        assert_eq!(r.previous_off, None);
         assert_eq!(r.scope(), "head");
+    }
+
+    #[test]
+    fn previous_off_round_trips_and_is_omitted_when_absent() {
+        let mut r = rec(false, None);
+        assert!(
+            !serde_json::to_string(&r).unwrap().contains("previous_off"),
+            "absent stays absent on the wire"
+        );
+        r.previous_off = Some(PreviousOff {
+            reason: "action ceiling: 5 in 1h (guard v1)".into(),
+            updated_by: "head-guard".into(),
+            updated_at_ms: 7,
+        });
+        let back: OffSwitchRecord =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        let lenient: OffSwitchRecord = serde_json::from_str(
+            r#"{"head":"H","off":false,"previous_off":{"updated_by":"x","future":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lenient.previous_off,
+            Some(PreviousOff {
+                reason: String::new(),
+                updated_by: "x".into(),
+                updated_at_ms: 0,
+            })
+        );
     }
 
     #[test]

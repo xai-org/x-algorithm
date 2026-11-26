@@ -9,6 +9,7 @@ use crate::mem_util::{
 use crate::{
     adler32::adler32_combine,
     r#const::{LIST, SEND},
+    copy_port_client::ProgressAt,
     grpc_util::{
         TRANSFER_FAILED_SENTINEL, block_on, block_on_rate_limited, freeze, get_bytes_mut,
         ready_call_parse,
@@ -701,12 +702,55 @@ fn install_grpc_chunk(dest: &mut [u8], pos: &mut usize, checksum: &mut u32, chun
 }
 
 pub(crate) async fn send_entries(
+    channel: transport::Channel,
+    names: Vec<Vec<u8>>,
+    offsets: Vec<usize>,
+    sizes: Vec<usize>,
+    buf: &mut [u8],
+    label: String,
+    #[cfg(target_os = "linux")] arg: (Vec<usize>, Contexts, MRz),
+) -> (usize, u32) {
+    send_entries_reporting(
+        channel,
+        names,
+        offsets,
+        sizes,
+        buf,
+        label,
+        None,
+        #[cfg(target_os = "linux")]
+        arg,
+    )
+    .await
+}
+
+const PROGRESS_STEP: usize = 64 << 20;
+
+fn report_written(progress: &ProgressAt, from: usize, to: usize) {
+    if to > from {
+        sfence_after_copy();
+        progress
+            .progress
+            .written(progress.offset + from, progress.offset + to);
+    }
+}
+
+fn sfence_after_copy() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        _mm_sfence();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_entries_reporting(
     mut channel: transport::Channel,
     names: Vec<Vec<u8>>,
     offsets: Vec<usize>,
     sizes: Vec<usize>,
     buf: &mut [u8],
     label: String,
+    progress: Option<ProgressAt>,
     #[cfg(target_os = "linux")] arg: (Vec<usize>, Contexts, MRz),
 ) -> (usize, u32) {
     #[cfg(target_os = "linux")]
@@ -731,12 +775,26 @@ pub(crate) async fn send_entries(
     let dest_ptr = buf.as_mut_ptr() as usize;
     let dest_len = buf.len();
     let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+    let copy_progress = progress.clone();
     let copy_join = JoinOnDrop::new(tokio::task::spawn_blocking(move || {
         let dest = unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut u8, dest_len) };
         let mut pos = 0;
         let mut checksum = 1u32;
+        let (mut landed, mut reported) = (0, 0);
         while let Ok(chunk) = rx.recv() {
             install_grpc_chunk(dest, &mut pos, &mut checksum, &chunk);
+            if pos <= dest_len {
+                landed = pos;
+            }
+            if let Some(progress) = &copy_progress
+                && landed - reported >= PROGRESS_STEP
+            {
+                report_written(progress, reported, landed);
+                reported = landed;
+            }
+        }
+        if let Some(progress) = &copy_progress {
+            report_written(progress, reported, landed);
         }
         (pos, checksum)
     }));
@@ -800,6 +858,11 @@ pub(crate) async fn send_entries(
             else {
                 return (TRANSFER_FAILED_SENTINEL, 0);
             };
+            if let Some(progress) = &progress
+                && pos < dest_len
+            {
+                report_written(progress, pos, (pos + size).min(dest_len));
+            }
             (pos + size, checksum)
         }
         Err(e) => {

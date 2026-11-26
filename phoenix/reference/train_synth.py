@@ -110,10 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     pin_visible_devices(1)
 
     from xrex.configs.xrecsys import CONFIGS as _RANKING_CONFIGS
-    from xrex.configs.xrecsys_gen_recs import CONFIGS as _GEN_RECS_CONFIGS
     from xrex.configs.xrecsys_two_tower import CONFIGS as _RETRIEVAL_CONFIGS
 
-    CONFIGS = {**_RANKING_CONFIGS, **_RETRIEVAL_CONFIGS, **_GEN_RECS_CONFIGS}
+    CONFIGS = {**_RANKING_CONFIGS, **_RETRIEVAL_CONFIGS}
 
     if args.config not in CONFIGS:
         available = "\n  ".join(sorted(CONFIGS))

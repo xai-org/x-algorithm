@@ -38,6 +38,7 @@ pub(crate) fn make_urt_timeline(
     entry_id_nonce: Option<u64>,
     request_type: RequestType,
     request_id: u64,
+    video_carousel_header_icon: bool,
 ) -> TimelineResponse {
     let page = urt_page(request_type);
     let initial_sort_index = cursors::initial_sort_index(cursor);
@@ -127,6 +128,7 @@ pub(crate) fn make_urt_timeline(
                     initial_sort_index,
                     language_code,
                     country_code,
+                    video_carousel_header_icon,
                 )
             }
             _ => None,
@@ -240,6 +242,7 @@ mod tests {
             entry_id_nonce,
             RequestType::Following,
             0,
+            false,
         );
         resp.timeline
             .instructions

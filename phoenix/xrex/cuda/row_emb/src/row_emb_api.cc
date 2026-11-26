@@ -299,7 +299,7 @@ ffi::Error initializeRowwiseAdagrad(
   }
   std::call_once(rowwise_adagrad_warmup_once, [&] {
     ctx->warmupUpdateRule(
-        makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
+        makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f, 0.f, 0}, nullptr)
     );
   });
   return ffi::Error::Success();
@@ -382,7 +382,9 @@ ffi::Error RowwiseAdagradUpdateStart(
     }
     XAI_CUDA_CHECK(cudaMemsetAsync(pin->untyped_data(), 0, pin->size_bytes(), stream));
     const auto& spec = ctx->spec();
-    const AdagradParams adagrad{lr_f, eps_f, decay_f, 1.f / float(spec.emb_width), wd_f, 0.f, 0.f};
+    const AdagradParams adagrad{
+        lr_f, eps_f, decay_f, 1.f / float(spec.emb_width), wd_f, 0.f, 0.f, 0.f, 0
+    };
     UpdateJob job{static_cast<bf16*>(table.untyped_data()), table.dimensions()[0]};
     ctx->armUpdate(
         job, makeRowwiseAdagradRule(adagrad, static_cast<float*>(row_state.untyped_data())), stream
@@ -437,17 +439,21 @@ ffi::Error RowwiseAdagradLazyUpdateStart(
     auto eps = attrs.get<double>("eps");
     auto accum_decay_rate = attrs.get<double>("accum_decay_rate");
     auto weight_decay_rate = attrs.get<double>("weight_decay_rate");
+    auto weight_decay_exempt_window = attrs.get<double>("weight_decay_exempt_window");
+    auto stochastic_rounding = attrs.get<int64_t>("stochastic_rounding");
     if (!learning_rate.has_value() || !eps.has_value() || !accum_decay_rate.has_value() ||
-        !weight_decay_rate.has_value()) {
+        !weight_decay_rate.has_value() || !weight_decay_exempt_window.has_value() ||
+        !stochastic_rounding.has_value()) {
       return invalid("rowwise_adagrad_lazy_update_start: missing optimizer attrs");
     }
     const float lr_f = float(*learning_rate);
     const float eps_f = float(*eps);
     const float accum_rate_f = float(*accum_decay_rate);
     const float wd_rate_f = float(*weight_decay_rate);
+    const float wd_window_f = float(*weight_decay_exempt_window);
     if (!std::isfinite(lr_f) || !std::isfinite(eps_f) || eps_f <= 0.f ||
         !std::isfinite(accum_rate_f) || accum_rate_f < 0.f || !std::isfinite(wd_rate_f) ||
-        wd_rate_f < 0.f) {
+        wd_rate_f < 0.f || !std::isfinite(wd_window_f) || wd_window_f < 0.f) {
       return invalid("rowwise_adagrad_lazy_update_start: invalid optimizer parameters");
     }
     ffi::Error buffers_error = validateRowwiseAdagradBuffers(ctx->spec(), table, row_state);
@@ -471,7 +477,15 @@ ffi::Error RowwiseAdagradLazyUpdateStart(
     XAI_CUDA_CHECK(cudaMemsetAsync(pin->untyped_data(), 0, pin->size_bytes(), stream));
     const auto& spec = ctx->spec();
     const AdagradParams adagrad{
-        lr_f, eps_f, 1.f, 1.f / float(spec.emb_width), 1.f, accum_rate_f, wd_rate_f
+        lr_f,
+        eps_f,
+        1.f,
+        1.f / float(spec.emb_width),
+        1.f,
+        accum_rate_f,
+        wd_rate_f,
+        wd_window_f,
+        *stochastic_rounding != 0 ? 1 : 0
     };
     UpdateJob job{static_cast<bf16*>(table.untyped_data()), table.dimensions()[0]};
     ctx->armUpdate(
@@ -715,6 +729,7 @@ nb::bytes testSnapshot(int64_t context_id, const std::string& region) {
 }
 
 NB_MODULE(row_emb_api, m) {
+  m.attr("LAZY_UPDATE_EXEMPT_WINDOW_AND_STOCHASTIC_ROUNDING") = true;
   m.def("lookup_start_init", [] { return encapsulate(kLookupStartInit); });
   m.def("lookup_start", [] { return encapsulate(kLookupStart); });
   m.def("lookup_done", [] { return encapsulate(kLookupDone); });

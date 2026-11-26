@@ -23,6 +23,7 @@ class AttentionConfig(Config):
     attn_logit_cap: float = -1.0
     attn_logit_cap_method: str = "tanh"
     attn_impl: str = "pallas_attn"
+    candidate_only_attn_impl: Optional[str] = None
     attn_sharding_namespace: str = "attention"
     fa_version: str = "3"
     qk_norm: bool = False
@@ -33,6 +34,8 @@ class AttentionConfig(Config):
     qkv_merge: bool = False
     max_num_segments_per_batch: int = 128
     enable_determinism: bool = False
+    attn_output_gate: bool = False
+    attn_output_gate_activation: str = "silu"
 
 
 class Attention(hk.Module):

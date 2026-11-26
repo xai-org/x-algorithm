@@ -1,4 +1,6 @@
 pub const FS_PATH: &str = "/usr/local/config/features/home-mixer/main/rust_home_mixer.yml";
+pub const FS_EXPERIMENT_EXCLUDED_USER_IDS_PARAM: &str =
+    "rust_home_mixer_experiment_excluded_user_ids";
 
 pub const STRINGCENTER_BUNDLE_PATH: &str = "/config/stringcenter/timelinemixer.json";
 
@@ -15,7 +17,6 @@ pub const TRACE_USER_IDS: &[u64] = &[];
 
 pub const MAX_GRPC_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 pub const TOP_K_CANDIDATES_TO_SELECT: usize = 50;
-pub const VIDEO_CAROUSEL_EXTRA_CANDIDATES: usize = 30;
 pub const RESULT_SIZE: usize = 35;
 pub const FEED_MODULE_SLOTS: usize = 5;
 pub const MAX_JETFUEL_FRAMES_PER_RESPONSE: usize = 8;

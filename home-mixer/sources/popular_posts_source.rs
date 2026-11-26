@@ -10,7 +10,7 @@ use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
 
 const METRIC: &str = "PopularPostsSource";
-const SERVED_TYPE: pb::ServedType = pb::ServedType::ForYouPhoenixRetrieval;
+const SERVED_TYPE: pb::ServedType = pb::ServedType::ForYouPopularPosts;
 
 pub struct PopularPostsSource {
     pub popular_posts: Arc<PopularPostsCache>,

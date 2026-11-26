@@ -1,12 +1,10 @@
 use crate::models::candidate::{PostCandidate, RetrievalSource};
 use crate::models::in_network_reply::InNetworkReply;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{ThunderAlgorithm, ThunderClusterId, ThunderMaxResults};
+use crate::params::{ThunderAlgorithm, ThunderMaxResults};
 use std::sync::Arc;
 use tonic::async_trait;
-use xai_candidate_pipeline::component_library::clients::{
-    ThunderCapiClient, ThunderClient, ThunderCluster,
-};
+use xai_candidate_pipeline::component_library::clients::{ThunderCapiClient, ThunderClient};
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
@@ -54,11 +52,9 @@ impl Source<ScoredPostsQuery, PostCandidate> for ThunderSource {
                 .map_err(|e| format!("ThunderSource(capi): {e}"))?
                 .posts
         } else {
-            let configured = ThunderCluster::parse(&query.params.get(ThunderClusterId));
-            let cluster = ThunderCluster::resolve(configured, query.decider.as_ref());
             let channel = self
                 .thunder_client
-                .get_random_channel(cluster)
+                .get_random_channel()
                 .ok_or_else(|| "ThunderSource: no available channel".to_string())?;
 
             let mut client = InNetworkPostsServiceClient::new(channel.clone());

@@ -10,6 +10,19 @@ query UserUnderTheHoodReport {
       note {
         ...TimelineRichText
       }
+      post_label_appeals {
+        key
+        value {
+          ...TimelineRichText
+        }
+      }
+      account_label_appeals {
+        key
+        value {
+          ...TimelineRichText
+        }
+      }
+      max_post_ids_per_label
     }
   }
 }

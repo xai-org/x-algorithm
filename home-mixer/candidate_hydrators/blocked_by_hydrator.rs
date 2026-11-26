@@ -3,7 +3,7 @@ use crate::models::query::ScoredPostsQuery;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::SocialGraphClientOps;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::hydrator::TwoPhaseHydrator;
 
 pub struct BlockedByHydrator {
     pub socialgraph_client: Arc<dyn SocialGraphClientOps>,
@@ -16,42 +16,42 @@ impl BlockedByHydrator {
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for BlockedByHydrator {
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for BlockedByHydrator {
+    type Fetched = Vec<bool>;
+
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         !query.has_cached_posts
     }
 
-    async fn hydrate(
+    async fn fetch(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
+    ) -> Result<Vec<bool>, String> {
         let author_ids: Vec<u64> = candidates.iter().map(|x| x.author_id).collect();
-
-        let blocked_by_user_ids = match self
+        let blocked_by_user_ids = self
             .socialgraph_client
             .check_blocked_by(query.user_id, &author_ids)
             .await
-        {
-            Ok(ids) => ids,
-            Err(e) => {
-                let err_msg = e.to_string();
-                return candidates.iter().map(|_| Err(err_msg.clone())).collect();
-            }
-        };
-        candidates
+            .map_err(|e| e.to_string())?;
+        Ok(candidates
             .iter()
-            .map(|candidate| {
-                let author_blocks_viewer = blocked_by_user_ids.contains(&candidate.author_id);
-                Ok(PostCandidate {
-                    author_blocks_viewer: Some(author_blocks_viewer),
-                    ..Default::default()
-                })
-            })
-            .collect()
+            .map(|candidate| blocked_by_user_ids.contains(&candidate.author_id))
+            .collect())
     }
 
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        author_blocks_viewer: Vec<bool>,
+    ) {
+        for (candidate, blocks) in candidates.iter_mut().zip(author_blocks_viewer) {
+            candidate.author_blocks_viewer = Some(blocks);
+        }
+    }
+
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.author_blocks_viewer = hydrated.author_blocks_viewer;
     }
 }

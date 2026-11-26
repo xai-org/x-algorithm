@@ -309,6 +309,18 @@ impl PeerServeState {
         entries: Vec<ManifestSpec>,
         blobs: Vec<(String, Vec<u8>)>,
     ) -> io::Result<()> {
+        let blobs = blobs
+            .into_iter()
+            .map(|(name, data)| (name, Bytes::from(data)))
+            .collect();
+        self.publish_with_memory(entries, blobs)
+    }
+
+    pub fn publish_with_memory(
+        &self,
+        entries: Vec<ManifestSpec>,
+        memory: Vec<(String, Bytes)>,
+    ) -> io::Result<()> {
         let lease = Arc::new(());
         let mut files: BTreeMap<String, Bytes> = BTreeMap::new();
         let mut manifest_entries = BTreeMap::new();
@@ -336,9 +348,15 @@ impl PeerServeState {
             }
             manifest_entries.insert(spec.name, (bytes.clone(), spec.offset, spec.size));
         }
-        let blobs = blobs
+        let blobs = memory
             .into_iter()
-            .map(|(name, data)| (name, Bytes::from(data)))
+            .map(|(name, bytes)| {
+                let leased = Bytes::from_owner(LeasedSlice {
+                    bytes,
+                    _lease: lease.clone(),
+                });
+                (name, leased)
+            })
             .collect();
         *self.manifest.lock().unwrap() = Some(Arc::new(PeerManifest {
             entries: manifest_entries,
@@ -368,6 +386,10 @@ impl PeerServeState {
             std::thread::sleep(Duration::from_millis(20));
         }
         true
+    }
+
+    pub fn unpublish(&self) {
+        self.manifest.lock().unwrap().take();
     }
 
     pub fn manifest(&self) -> Option<Arc<PeerManifest>> {
@@ -691,6 +713,63 @@ mod tests {
         drop(held);
         publish(&state, &file);
         assert!(state.revoke(Duration::from_secs(5)));
+    }
+
+    struct Owned(Arc<Vec<u8>>);
+
+    impl AsRef<[u8]> for Owned {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn memory_entries_list_resolve_and_release_their_owner() {
+        let buf = Arc::new(backing_data(1024));
+        let state = PeerServeState::new(4, None);
+        state
+            .publish_with_memory(
+                vec![],
+                vec![
+                    (
+                        "elapsed_test/run/w/c/0".into(),
+                        Bytes::from_owner(Owned(buf.clone())),
+                    ),
+                    (
+                        "elapsed_test/run/checksums.0.json".into(),
+                        Bytes::from_static(b"{}"),
+                    ),
+                ],
+            )
+            .unwrap();
+        let manifest = state.manifest().unwrap();
+        assert_eq!(
+            vec![
+                ("elapsed_test/run/checksums.0.json".to_owned(), 2),
+                ("elapsed_test/run/w/c/0".to_owned(), 1024),
+            ],
+            manifest
+                .list()
+                .map(|(n, s)| (String::from_utf8(n).unwrap(), s))
+                .collect::<Vec<_>>()
+        );
+
+        let held = manifest.resolve("elapsed_test/run/w/c/0").unwrap();
+        assert_eq!(&buf[..], &held[..]);
+        drop(manifest);
+        state.unpublish();
+        assert!(state.manifest().is_none());
+        assert_eq!(
+            2,
+            Arc::strong_count(&buf),
+            "the served slice keeps its owner"
+        );
+        drop(held);
+        assert_eq!(
+            1,
+            Arc::strong_count(&buf),
+            "owner released with the last slice"
+        );
     }
 
     #[test]

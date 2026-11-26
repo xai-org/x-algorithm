@@ -1,11 +1,13 @@
 use crate::ads::{
-    multi_risk_blender, partition_organic_blender, safe_gap_blender,
+    least_movement_blender, multi_risk_blender, partition_organic_blender, safe_gap_blender,
+    slot_spread_blender,
     util::{should_drop_handle, should_drop_keyword},
 };
 use crate::params::RESULT_SIZE;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
+use xai_ads_injection_proto::ads_injected_timeline::DroppedAd;
 use xai_home_mixer_proto::{feed_item, BrandSafetyVerdict, FeedItem, ScoredPost};
 use xai_recsys_proto::{AdAdjacencyControl, AdIndexInfo, BrandSafetyRiskLevel};
 
@@ -495,6 +497,12 @@ fn blender_comparison_report() {
         ("safe_gap", safe_gap_blend),
         ("partition_organic", partition_organic_blender::blend_impl),
         ("multi_risk", multi_risk_blender::blend_impl),
+        ("slot_spread", |posts, ads, min_posts| {
+            slot_spread_blender::blend_with_drops(posts, ads, min_posts, &mut Vec::new())
+        }),
+        ("least_movement", |posts, ads, min_posts| {
+            least_movement_blender::blend_with_drops(posts, ads, min_posts, &mut Vec::new())
+        }),
     ];
 
     let mut all_stats: Vec<BlenderStats> = blenders
@@ -679,28 +687,80 @@ fn blender_comparison_report() {
         po_stats.ads_with_medrisk_adj
     );
 
-    let npo_stats = all_stats
-        .iter()
-        .find(|s| s.name == "multi_risk")
-        .expect("multi_risk blender not found in stats");
-    assert_eq!(
-        npo_stats.bsr_low_with_lowrisk_adj, 0,
-        "multi_risk had {} BSR_LOW/IAS ads adjacent to LowRisk posts!",
-        npo_stats.bsr_low_with_lowrisk_adj
-    );
-    assert_eq!(
-        npo_stats.handle_adj, 0,
-        "multi_risk had {} ads adjacent to excluded handles!",
-        npo_stats.handle_adj
-    );
-    assert_eq!(
-        npo_stats.keyword_adj, 0,
-        "multi_risk had {} ads adjacent to excluded keyword matches!",
-        npo_stats.keyword_adj
-    );
-    assert_eq!(
-        npo_stats.non_high_med_risk_adj, 0,
-        "multi_risk had {} non-BSR_HIGH ads adjacent to MediumRisk posts!",
-        npo_stats.non_high_med_risk_adj
-    );
+    for name in ["multi_risk", "slot_spread", "least_movement"] {
+        let npo_stats = all_stats
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} blender not found in stats"));
+        assert_eq!(
+            npo_stats.bsr_low_with_lowrisk_adj, 0,
+            "{name} had {} BSR_LOW/IAS ads adjacent to LowRisk posts!",
+            npo_stats.bsr_low_with_lowrisk_adj
+        );
+        assert_eq!(
+            npo_stats.handle_adj, 0,
+            "{name} had {} ads adjacent to excluded handles!",
+            npo_stats.handle_adj
+        );
+        assert_eq!(
+            npo_stats.keyword_adj, 0,
+            "{name} had {} ads adjacent to excluded keyword matches!",
+            npo_stats.keyword_adj
+        );
+        assert_eq!(
+            npo_stats.non_high_med_risk_adj, 0,
+            "{name} had {} non-BSR_HIGH ads adjacent to MediumRisk posts!",
+            npo_stats.non_high_med_risk_adj
+        );
+    }
+}
+
+type BlendWithDropsFn =
+    fn(Vec<ScoredPost>, Vec<AdIndexInfo>, usize, &mut Vec<DroppedAd>) -> Vec<FeedItem>;
+
+#[test]
+fn new_blenders_account_for_every_ad_and_serve_at_least_multi_risk() {
+    let mut rng = StdRng::seed_from_u64(RNG_SEED);
+    let scenarios = generate_scenarios(&mut rng);
+    let blenders: [(&str, BlendWithDropsFn); 2] = [
+        ("slot_spread", slot_spread_blender::blend_with_drops),
+        ("least_movement", least_movement_blender::blend_with_drops),
+    ];
+    let mut baseline_total = 0;
+    let mut totals = [0; 2];
+    for (scenario_idx, scenario) in scenarios.iter().enumerate() {
+        baseline_total += ad_count(&multi_risk_blender::blend_impl(
+            scenario.posts.clone(),
+            scenario.ads.clone(),
+            5,
+        ));
+        for (b, (name, blend)) in blenders.iter().enumerate() {
+            let mut drops = Vec::new();
+            let result = blend(scenario.posts.clone(), scenario.ads.clone(), 5, &mut drops);
+            totals[b] += ad_count(&result);
+            let mut outcomes: HashMap<i64, usize> = HashMap::new();
+            for item in &result {
+                if let Some(feed_item::Item::Ad(ad)) = &item.item {
+                    *outcomes.entry(ad.post_id).or_default() += 1;
+                }
+            }
+            for drop in &drops {
+                *outcomes.entry(drop.tweet_id as i64).or_default() += 1;
+            }
+            for ad in &scenario.ads {
+                assert_eq!(
+                    outcomes.get(&ad.post_id).copied(),
+                    Some(1),
+                    "[{name}] scenario {scenario_idx}: ad {} served or dropped more or less than once",
+                    ad.post_id
+                );
+            }
+        }
+    }
+    for ((name, _), total) in blenders.iter().zip(totals) {
+        assert!(
+            total >= baseline_total,
+            "{name} served {total} ads vs multi_risk {baseline_total}"
+        );
+    }
 }

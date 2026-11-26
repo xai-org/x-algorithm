@@ -4,7 +4,7 @@ use crate::params::{
     EnablePhoenixRetrievalStatsExperimentBucket, EnablePhoenixScoreStatsExperimentBucket,
     PhoenixRetrievalInferenceClusterId, PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
 };
-use crate::scorers::phoenix_scorer::PhoenixScorer;
+use crate::scorers::value_model;
 use crate::sources::phoenix_source::PhoenixSource;
 
 use rand::random;
@@ -15,6 +15,7 @@ use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_feature_switches::ExperimentBucket;
 use xai_home_mixer_proto::ServedType;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets, StatsReceiverExt};
+use xai_value_model::{unoffset_score, NEGATIVE_SCORES_OFFSET};
 
 const METRIC_PREFIX: &str = "ScoredStats";
 
@@ -89,6 +90,16 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &score_buckets,
                 );
             }
+            if input.query.request_type != RequestType::PhoenixScores
+                && !input.query.in_network_only
+            {
+                record_net_negative_stats(
+                    receiver.as_ref(),
+                    &input.query,
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                );
+            }
             if !experiment_buckets.is_empty() || sampled {
                 record_phoenix_retrieval_stats(
                     receiver.as_ref(),
@@ -118,6 +129,13 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &retrieval_cluster,
                     &experiment_buckets,
                 );
+                record_phoenix_retrieval_ai_video_stats(
+                    receiver.as_ref(),
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                    &retrieval_cluster,
+                    &experiment_buckets,
+                );
                 if input.query.request_type != RequestType::PhoenixScores
                     && !input.query.in_network_only
                 {
@@ -126,7 +144,6 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                         &input.selected_candidates,
                         &input.non_selected_candidates,
                         &format!("{:?}", PhoenixSource::resolve_cluster(&input.query)),
-                        &format!("{:?}", PhoenixScorer::resolve_cluster(&input.query)),
                         &experiment_buckets,
                     );
                 }
@@ -138,6 +155,54 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
         }
 
         Ok(())
+    }
+}
+
+fn record_net_negative_stats(
+    receiver: &dyn StatsReceiverExt,
+    query: &ScoredPostsQuery,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+) {
+    let weights = value_model::weights_for(query);
+    let mut counts: HashMap<(&'static str, &'static str), u64> = HashMap::new();
+    let (mut scored, mut negative) = (0u64, 0u64);
+    for c in selected_candidates.iter().chain(non_selected_candidates) {
+        let sign = match c.weighted_score {
+            None => "missing",
+            Some(s) if s >= NEGATIVE_SCORES_OFFSET => "positive",
+            Some(s) => {
+                let ni_term =
+                    c.phoenix_scores.not_interested_score.unwrap_or(0.0) * weights.not_interested;
+                if unoffset_score(s, &weights) - ni_term >= 0.0 {
+                    "negative_ni"
+                } else {
+                    "negative_other"
+                }
+            }
+        };
+        if sign != "missing" {
+            scored += 1;
+            negative += u64::from(sign.starts_with("negative"));
+        }
+        let served_type = c.served_type.unwrap_or(ServedType::Undefined).as_str_name();
+        *counts.entry((served_type, sign)).or_insert(0) += 1;
+    }
+    let candidates_key = format!("{METRIC_PREFIX}.NetNegative.Candidates");
+    for ((served_type, sign), count) in counts {
+        receiver.incr(
+            &candidates_key,
+            &[("served_type", served_type), ("sign", sign)],
+            count,
+        );
+    }
+    if scored > 0 {
+        receiver.observe(
+            &format!("{METRIC_PREFIX}.NetNegative.RequestShare"),
+            &[],
+            negative as f64 / scored as f64,
+            HistogramBuckets::Bucket0To1,
+        );
     }
 }
 
@@ -166,7 +231,6 @@ fn record_retrieval_source_contribution(
     selected_candidates: &[PostCandidate],
     non_selected_candidates: &[PostCandidate],
     retrieval_cluster: &str,
-    ranker_cluster: &str,
     experiment_buckets: &[&ExperimentBucket],
 ) {
     let empty_bucket = ExperimentBucket::new("", "");
@@ -218,7 +282,6 @@ fn record_retrieval_source_contribution(
     for b in buckets {
         let common = [
             ("retrieval_cluster", retrieval_cluster),
-            ("ranker_cluster", ranker_cluster),
             ("ddg", b.experiment.as_str()),
             ("bucket", b.bucket.as_str()),
         ];
@@ -567,6 +630,24 @@ fn record_phoenix_retrieval_zero_fav_stats(
         experiment_buckets,
         ServedType::ForYouPhoenixRetrievalZeroFav,
         "PhoenixRetrievalZeroFavTweets",
+    );
+}
+
+fn record_phoenix_retrieval_ai_video_stats(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    record_retrieval_source_stats(
+        receiver,
+        selected_candidates,
+        non_selected_candidates,
+        retrieval_cluster,
+        experiment_buckets,
+        ServedType::ForYouPhoenixRetrievalAiVideo,
+        "PhoenixRetrievalAiVideoTweets",
     );
 }
 

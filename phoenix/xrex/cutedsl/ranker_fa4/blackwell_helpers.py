@@ -166,7 +166,7 @@ def gemm_ptx(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
                 else sm100_desc.Major.MN,
             )
         )
@@ -182,7 +182,7 @@ def gemm_ptx(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
             sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
             else sm100_desc.Major.MN,
         )
     )
@@ -279,7 +279,7 @@ def gemm_ptx_loop(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
                 else sm100_desc.Major.MN,
             )
         )
@@ -295,7 +295,7 @@ def gemm_ptx_loop(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
             sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
             else sm100_desc.Major.MN,
         )
     )
@@ -446,7 +446,7 @@ def gemm_ptx_partial(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
                 else sm100_desc.Major.MN,
             )
         )
@@ -462,7 +462,7 @@ def gemm_ptx_partial(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
             sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
             else sm100_desc.Major.MN,
         )
     )
@@ -646,7 +646,7 @@ def gemm_ptx_partial1(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
                 else sm100_desc.Major.MN,
             )
         )
@@ -661,7 +661,7 @@ def gemm_ptx_partial1(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
             sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
             else sm100_desc.Major.MN,
         )
     )

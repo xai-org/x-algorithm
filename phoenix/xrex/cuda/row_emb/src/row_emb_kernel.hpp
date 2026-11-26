@@ -32,6 +32,8 @@ struct AdagradParams {
   float weight_decay_factor;
   float accum_decay_rate;
   float weight_decay_rate;
+  float weight_decay_exempt_window;
+  int32_t stochastic_rounding;
 };
 
 struct UpdateScalars {

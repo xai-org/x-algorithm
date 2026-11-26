@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import logging
+import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import optax
 from jax.sharding import PartitionSpec as P
 
-from xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID
 from xrex.utils.sharding import with_sharding_constraint_unless_manual
 
 logger = logging.getLogger(__name__)
@@ -188,148 +189,130 @@ def cread_loss_compute(
     return loss, gt_clamped, restored, loss_mask, per_element_loss, cls_loss, restoration_loss
 
 
-def purchase_value_valid_mask(
-    label_valid: jax.Array,
-    padding_mask: jax.Array,
-    negative_sample_mask: jax.Array,
-    sample_source: jax.Array,
-    has_click: jax.Array,
-    has_purchase: jax.Array,
-    keeper_mask: jax.Array,
-) -> jax.Array:
+class EgmnMixture(NamedTuple):
+    log_weights: jax.Array
+    rate: jax.Array
+    means: jax.Array
+    sigmas: jax.Array
+
+
+def egmn_initial_bias(
+    num_gaussians: int, norm_scale: float, unit_secs: float, min_sigma_secs: float
+) -> list[float]:
+    def inverse_softplus(x: float) -> float:
+        return math.log(math.expm1(max(x, 1e-4)))
+
+    exp_mean = 4.0 / unit_secs
+    centers = [
+        3.0 * (norm_scale / 3.0) ** (k / max(num_gaussians - 1, 1)) / unit_secs
+        for k in range(num_gaussians)
+    ]
+    gauss_weights = [1.0 / c for c in centers]
+    total = sum(gauss_weights)
+    weights = [0.5] + [0.5 * w / total for w in gauss_weights]
     return (
-        label_valid.astype(jnp.bool_)
-        & padding_mask.astype(jnp.bool_)
-        & ~negative_sample_mask.astype(jnp.bool_)
-        & (sample_source == EARLY_RELABEL_STREAM_ID)
-        & has_click.astype(jnp.bool_)
-        & has_purchase.astype(jnp.bool_)
-        & keeper_mask.astype(jnp.bool_)
+        [math.log(w) for w in weights]
+        + [inverse_softplus(1.0 / exp_mean)]
+        + [inverse_softplus(c - exp_mean) for c in centers]
+        + [inverse_softplus(0.35 * c - min_sigma_secs / unit_secs) for c in centers]
     )
 
 
-def purchase_value_weights(
-    raw_ratio: jax.Array,
-    baseline_mean_usd: jax.Array,
-    valid_mask: jax.Array,
-    raw_weights: jax.Array | None,
-) -> tuple[jax.Array, jax.Array]:
-    ratio = raw_ratio.astype(jnp.float32)
-    baseline = baseline_mean_usd.astype(jnp.float32)
-    valid = (
-        valid_mask.astype(jnp.bool_)
-        & jnp.isfinite(ratio)
-        & (ratio > 0)
-        & jnp.isfinite(baseline)
-        & (baseline > 0)
+def egmn_mixture_from_raw(
+    raw: jax.Array, num_gaussians: int, min_sigma_secs: float, unit_secs: float
+) -> EgmnMixture:
+    raw = raw.astype(jnp.float32)
+    k = num_gaussians
+    log_weights = jax.nn.log_softmax(raw[..., : k + 1], axis=-1)
+    rate = jax.nn.softplus(raw[..., k + 1]) + 1e-3
+    means = 1.0 / rate[..., None] + jax.nn.softplus(raw[..., k + 2 : 2 * k + 2])
+    sigmas = min_sigma_secs / unit_secs + jax.nn.softplus(raw[..., 2 * k + 2 :])
+    return EgmnMixture(log_weights, rate, means, sigmas)
+
+
+def egmn_expected_value(mixture: EgmnMixture, unit_secs: float) -> jax.Array:
+    weights = jnp.exp(mixture.log_weights)
+    return unit_secs * (
+        weights[..., 0] / mixture.rate + jnp.sum(weights[..., 1:] * mixture.means, axis=-1)
     )
-    weights = jnp.ones_like(ratio) if raw_weights is None else raw_weights.astype(jnp.float32)
-    valid = valid & jnp.isfinite(weights) & (weights > 0)
-    return valid, jnp.where(valid, weights, 0.0)
 
 
-def purchase_value_loss_compute(
-    raw_ratio: jax.Array,
-    pred_ratio: jax.Array,
-    baseline_mean_usd: jax.Array,
+def egmn_log_density(mixture: EgmnMixture, value: jax.Array) -> jax.Array:
+    log_exp = mixture.log_weights[..., 0] + jnp.log(mixture.rate) - mixture.rate * value
+    z = (value[..., None] - mixture.means) / mixture.sigmas
+    log_gauss = (
+        mixture.log_weights[..., 1:]
+        - jnp.log(mixture.sigmas)
+        - 0.5 * math.log(2.0 * math.pi)
+        - 0.5 * z * z
+    )
+    return jax.nn.logsumexp(jnp.concatenate([log_exp[..., None], log_gauss], axis=-1), axis=-1)
+
+
+def egmn_loss_compute(
+    gt_raw: jax.Array,
+    mixture: EgmnMixture,
     valid_mask: jax.Array,
-    delta: float = 1.0,
+    negative_sample_mask: jax.Array,
+    norm_scale: float,
+    unit_secs: float,
+    entropy_weight: float,
+    regression_weight: float,
+    regression_loss_type: str,
+    mask_negatives: bool = True,
+    sentinel_values: tuple[float, ...] = (),
     raw_weights: jax.Array | None = None,
     normalizer: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    if not 0 < delta < float("inf"):
-        raise ValueError("purchase value Huber delta must be finite and positive")
-    ratio = raw_ratio.astype(jnp.float32)
-    baseline = baseline_mean_usd.astype(jnp.float32)
-    pred = pred_ratio.astype(jnp.float32)
-    valid, weights = purchase_value_weights(raw_ratio, baseline_mean_usd, valid_mask, raw_weights)
-    target = jnp.where(valid, ratio, 0.0)
-    error = jnp.where(valid, jnp.where(valid, pred, 0.0) - target, 0.0)
-    abs_error = jnp.abs(error)
-    quadratic = jnp.minimum(abs_error, delta)
-    errors = 0.5 * quadratic**2 + delta * (abs_error - quadratic)
-    weight_sum = jnp.sum(weights)
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
+    gt_raw = gt_raw.astype(jnp.float32)
+    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)
+    value = gt_clamped / unit_secs
+    expected = egmn_expected_value(mixture, unit_secs)
+    per_element_nll = -egmn_log_density(mixture, value)
+    weights_k = jnp.exp(mixture.log_weights)
+    per_element_entropy = jnp.sum(weights_k * mixture.log_weights, axis=-1)
+    residual = (expected - gt_clamped) / unit_secs
+    if regression_loss_type == "mae":
+        per_element_regression = jnp.abs(residual)
+    elif regression_loss_type == "mse":
+        per_element_regression = residual * residual
+    elif regression_loss_type == "huber":
+        per_element_regression = optax.huber_loss(residual, delta=0.5)
+    elif regression_loss_type == "none":
+        per_element_regression = jnp.zeros_like(residual)
+    else:
+        raise ValueError(f"Unknown egmn regression loss: {regression_loss_type}")
+    per_element_loss = (
+        per_element_nll
+        + entropy_weight * per_element_entropy
+        + regression_weight * per_element_regression
+    )
+
+    if mask_negatives:
+        loss_mask = valid_mask.astype(jnp.bool_) & (~negative_sample_mask)
+    else:
+        loss_mask = valid_mask.astype(jnp.bool_)
+    for sentinel in sentinel_values:
+        loss_mask = loss_mask & (gt_raw != sentinel)
+
+    weights = loss_mask if raw_weights is None else loss_mask * raw_weights
     if normalizer is None:
-        normalizer = weight_sum
-    loss = jnp.sum(errors * weights) / jnp.where(normalizer > 0, normalizer, 1.0)
-    usd_abs_error = abs_error * jnp.where(valid, baseline, 0.0)
-    sums = jnp.stack(
-        [
-            jnp.sum(errors * weights),
-            jnp.sum(abs_error * weights),
-            jnp.sum(target * weights),
-            jnp.sum(jnp.where(valid, baseline, 0.0) * weights),
-            weight_sum,
-            jnp.sum(valid).astype(jnp.float32),
-            jnp.sum(jnp.abs(1.0 - target) * weights),
-            jnp.sum(usd_abs_error * weights),
-            jnp.sum(jnp.where(valid, pred, 0.0) * weights),
-        ]
-    )
-    return loss, sums
+        normalizer = jnp.sum(weights)
+    num_loss_samples = jnp.maximum(normalizer, 1.0)
 
+    def mean(x: jax.Array) -> jax.Array:
+        return jnp.sum(jnp.where(loss_mask, x, 0.0) * weights) / num_loss_samples
 
-def purchase_value_stats(sums: jax.Array) -> dict[str, jax.Array]:
-    denominator = jnp.where(sums[4] > 0, sums[4], 1.0)
-    return {
-        "purchase-value_delayed_website_clicked-loss": sums[0] / denominator,
-        "purchase-value_delayed_website_clicked-valid-count": sums[5],
-        "purchase-value_delayed_website_clicked-weight-sum": sums[4],
-        "purchase-value_delayed_website_clicked-ratio-mae": sums[1] / denominator,
-        "purchase-value_delayed_website_clicked-target-ratio": sums[2] / denominator,
-        "purchase-value_delayed_website_clicked-baseline-mean-usd": sums[3] / denominator,
-        "purchase-value_delayed_website_clicked-usd-mae": sums[7] / denominator,
-        "purchase-value_delayed_website_clicked-calib": sums[8] / (sums[2] + 1e-12),
+    stats = {
+        "nll": mean(per_element_nll),
+        "entropy": mean(per_element_entropy),
+        "regression": mean(per_element_regression),
+        "exp_weight": mean(weights_k[..., 0]),
+        "exp_mean_secs": mean(unit_secs / mixture.rate),
+        "max_weight": mean(jnp.max(weights_k, axis=-1)),
     }
-
-
-def purchase_value_smoothed_stats(
-    sums: jax.Array,
-    slice_count: jax.Array,
-    rce_ema: dict[str, jax.Array],
-    batch_size: jax.Array,
-    smoothing_windows: tuple[int, ...],
-) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-    batch_stat = jnp.concatenate([sums, slice_count.astype(jnp.float32)[None]])
-    a = jnp.minimum(1.0, batch_size / jnp.array(smoothing_windows, dtype=jnp.float32))[:, None]
-    old = jnp.stack(
-        [
-            rce_ema.get(f"purchase_value/{ws}", jnp.zeros((10,), dtype=jnp.float32))
-            for ws in smoothing_windows
-        ]
-    )
-    raw_updated = (1.0 - a) * old + a * batch_stat[None, :]
-    updated = jnp.where(
-        jnp.isnan(raw_updated),
-        jnp.where(jnp.isnan(old), batch_stat[None, :], old),
-        raw_updated,
-    )
-    weight = jnp.maximum(updated[:, 4], 1e-12)
-    has_labels = updated[:, 5] > 0
-    stats: dict[str, jax.Array] = {}
-    new_ema: dict[str, jax.Array] = {}
-    for i, ws in enumerate(smoothing_windows):
-        new_ema[f"purchase_value/{ws}"] = updated[i]
-        prefix = "purchase-value_delayed_website_clicked-smoothed"
-        for name, col in (
-            ("loss", 0),
-            ("ratio-mae", 1),
-            ("target-ratio", 2),
-            ("baseline-mean-usd", 3),
-            ("usd-mae", 7),
-        ):
-            stats[f"{prefix}-{name}-{ws}"] = jnp.where(
-                has_labels[i], updated[i, col] / weight[i], 0.0
-            )
-        stats[f"{prefix}-mae-vs-prior-{ws}"] = jnp.where(
-            updated[i, 6] > 0, updated[i, 1] / jnp.maximum(updated[i, 6], 1e-12), 0.0
-        )
-        stats[f"{prefix}-calib-{ws}"] = jnp.where(
-            updated[i, 2] > 0, updated[i, 8] / jnp.maximum(updated[i, 2], 1e-12), 0.0
-        )
-        stats[f"{prefix}-ratio-valid-{ws}"] = updated[i, 5] / jnp.maximum(updated[i, 9], 1.0)
-        stats[f"{prefix}-valid-count-{ws}"] = updated[i, 5]
-    return stats, new_ema
+    loss = mean(per_element_loss)
+    return loss, gt_clamped, expected, loss_mask, per_element_loss, stats
 
 
 def binary_threshold_loss_compute(

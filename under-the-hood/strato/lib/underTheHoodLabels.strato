@@ -114,6 +114,8 @@ val postLabelAliases = Map(
   "NSFW_ADMIN_STAMPED" -> "NSFW_ADMIN",
 )
 
+val servedPostLabels: Set[String] = postLabels.keys.toSet ++ postLabelAliases.keys.toSet
+
 val accountLabels = Map(
   "ReadOnly" -> {
     about =
@@ -186,6 +188,7 @@ val worldwideCopyrightCode = "xy"
 val countriesPlaceholder = Regex.compile("\\{countries\\}")
 val takedownNamesWithCountries = Set("LegalRequest", "BystanderReport", "UnspecifiedReason")
 val takedownNamesWithoutCountries = Set("Dmca", "is_dmca")
+val servedPostTakedownReasons: Set[String] = takedownNamesWithCountries ++ takedownNamesWithoutCountries
 
 val postTakedowns = Map(
   "BystanderReport(country)" -> {
@@ -420,10 +423,108 @@ def accountLabelEffect(code: String): String =
     case None => ""
   }
 
+type AppealSpan = {
+  text: String,
+  url: Option[String]
+}
+
+type WithholdAppealForm = {
+  name: String,
+  countries: Set[String],
+  url: String
+}
+
+val appealFromPost = "If the post still has this label, you can appeal from the post."
+val enforcementEmail = "Instructions provided in email notification at the time of enforcement."
+val counterNoticeUrl = "https://help.x.com/forms/ipi/dmca-counternotice"
+val japanAppealUrl = "https://help.x.com/forms/ld/appeal"
+val japanCode = "jp"
+
+val euCountryCodes = Set(
+  "at", "be", "bg", "cy", "cz", "de", "dk", "ee", "es", "fi", "fr", "gr", "hr", "hu",
+  "ie", "it", "lt", "lu", "lv", "mt", "nl", "pl", "pt", "ro", "se", "si", "sk",
+)
+
+val bystanderAppealForms: Seq[WithholdAppealForm] = Seq(
+  { name = "the UK", countries = Set("gb"), url = "https://help.x.com/forms/osa/appeal" },
+  { name = "the EU", countries = euCountryCodes, url = "https://help.x.com/forms/dsa/appeal" },
+  {
+    name = "Australia",
+    countries = Set("au"),
+    url = "https://help.x.com/forms/australia-report/appeal",
+  },
+  { name = "Brazil", countries = Set("br"), url = "https://help.x.com/forms/br/appeal" },
+)
+
+val fosnrPostLabels = Set(
+  "FOSNR_ABUSE",
+  "FOSNR_HATEFUL_CONDUCT",
+  "FOSNR_VIOLENT_SPEECH",
+  "FOSNR_CIVIC_INTEGRITY",
+  "FOSNR_ABUSE_INSULTS",
+)
+val sensitiveMediaPostLabels = Set("NSFW_HIGH_PRECISION", "NSFW_CARD_IMAGE")
+
+def textSpan(text: String): AppealSpan = { text = text, url = None : Option[String] }
+
+def linkSpan(text: String, url: String): AppealSpan = { text = text, url = Some(url) }
+
+def linkedSentence(text: String, url: String): Seq[AppealSpan] =
+  Seq(textSpan(" "), linkSpan(text, url), textSpan("."))
+
+def postLabelAppeal(code: String, sensitiveMediaAppealFromPost: Boolean): Option[Seq[AppealSpan]] =
+  resolvePostKey(code) match {
+    case Some(k)
+        if fosnrPostLabels.contains(k) ||
+          (sensitiveMediaAppealFromPost && sensitiveMediaPostLabels.contains(k)) =>
+      Some(Seq(textSpan(appealFromPost)))
+    case Some(k) if k == "BOUNCE" =>
+      Some(Seq(textSpan(enforcementEmail)))
+    case _ =>
+      None
+  }
+
+def bystanderReportAppeal(countryCodes: Seq[String]): Option[Seq[AppealSpan]] = {
+  val forms = bystanderAppealForms.filter { f => countryCodes.exists { c => f.countries.contains(c) } }
+  if (forms.isEmpty) {
+    None
+  } else {
+    Some(Seq(textSpan(enforcementEmail)) ++ forms.map { f =>
+      linkedSentence("Appeal this withholding in " + f.name, f.url)
+    }.flatten)
+  }
+}
+
+def legalRequestAppeal(countryScoped: Boolean, countryCodes: Seq[String]): Seq[AppealSpan] = {
+  val reply = Seq(textSpan(enforcementEmail + " Appeal by responding to the email."))
+  if (countryScoped && countryCodes.contains(japanCode)) {
+    reply ++ linkedSentence("Appeal this withholding in Japan", japanAppealUrl)
+  } else {
+    reply
+  }
+}
+
+def takedownAppeal(label: String, countryCodes: Seq[String]): Option[Seq[AppealSpan]] =
+  takedownCopyKey(label, countryCodes).flatMap { k =>
+    if (takedownNamesWithoutCountries.contains(k) || k == label + "(xy)") {
+      Some(
+        Seq(textSpan(enforcementEmail)) ++
+          linkedSentence("Appeal by submitting a counter-notice", counterNoticeUrl))
+    } else if (label == "BystanderReport") {
+      bystanderReportAppeal(countryCodes)
+    } else if (label == "LegalRequest") {
+      Some(legalRequestAppeal(k == label + "(country)", countryCodes))
+    } else {
+      None
+    }
+  }
+
 Library({
   export = {
     postLabels = postLabels,
     postLabelAliases = postLabelAliases,
+    servedPostLabels = servedPostLabels,
+    servedPostTakedownReasons = servedPostTakedownReasons,
     accountLabels = accountLabels,
     normalizeLabel = normalizeLabel,
     resolvePostKey = resolvePostKey,
@@ -445,9 +546,12 @@ Library({
     postTakedownEffect = postTakedownEffect,
     accountTakedownAbout = accountTakedownAbout,
     accountTakedownEffect = accountTakedownEffect,
+    postLabelAppeal = postLabelAppeal,
+    takedownAppeal = takedownAppeal,
   },
   description = PlainText(
-    "Under the Hood public label and takedown allowlists (canonical name -> about/effect) and helpers."
+    "Under the Hood public label and takedown allowlists (canonical name -> about/effect), " +
+      "how to appeal each, and helpers."
   ),
   contactInfo = sharedConfig.contactInfo,
   lifecycle = Production,

@@ -3,19 +3,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::warn;
+use prost::Message;
 use xai_feature_switches::{AuthorRulesEvaluator, Params};
 use xai_value_model::{
-    compute_value_scores, set_user_video_continuation, CandidateScoringInputs, PhoenixScores,
-    QueryScoringContext, ValueModelWeights, ValueScores,
+    compute_value_scores, set_user_video_continuation, weighted_terms, CandidateScoringInputs,
+    ClassFactors, PhoenixScores, QueryScoringContext, ValueModelWeights, ValueScores,
 };
-use xai_vm_ranker_proto::RankRequest;
+use xai_vm_ranker_proto::experiment::CandidatePayload;
+use xai_vm_ranker_proto::{HeadContribution, RankCandidate, RankRequest};
 
 use crate::metrics::{
-    AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM, SAMPLED_CANDIDATES,
+    AUTHOR_EXPLORATION_CANDIDATES, CANDIDATE_SCORE, HEAD_PREDICTION_SUM,
+    INELIGIBLE_HEAD_CANDIDATES, SAMPLED_CANDIDATES, VALUE_MODEL_CLASS_FACTORS,
     VALUE_MODEL_FALLBACK, VALUE_MODEL_REQUESTS, VALUE_MODEL_STAGE,
 };
 use crate::params::*;
 use crate::ranking_config::snowflake_creation_ms;
+use crate::scoring::{debias, DebiasModels};
 
 const NEW_USER_MIN_FOLLOWING: u32 = 5;
 const FALLBACK_WARN_INTERVAL_MS: u64 = 10_000;
@@ -26,6 +30,8 @@ static LAST_FALLBACK_WARN_MS: AtomicU64 = AtomicU64::new(0);
 pub struct ValueModelOutput {
     pub weighted: Vec<f64>,
     pub scores: Vec<f64>,
+    pub debiased: bool,
+    pub top_heads: Option<Vec<Vec<HeadContribution>>>,
 }
 
 struct Fallback {
@@ -47,18 +53,19 @@ pub fn compute(
     params: Option<&Params>,
     author_rules: Option<&AuthorRulesEvaluator>,
     compute_value_model: bool,
+    debias: &DebiasModels,
 ) -> Option<ValueModelOutput> {
     if !compute_value_model {
-        record_request("passthrough");
+        record_request("passthrough", false);
         return None;
     }
-    match compute_or_fallback(req, params, author_rules) {
+    match compute_or_fallback(req, params, author_rules, debias) {
         Ok(output) => {
-            record_request("value_model");
+            record_request("value_model", output.debiased);
             Some(output)
         }
         Err(fallback) => {
-            record_request("fallback");
+            record_request("fallback", false);
             record_fallback(&fallback, req.viewer_id);
             None
         }
@@ -66,7 +73,7 @@ pub fn compute(
 }
 
 pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights {
-    ValueModelWeights {
+    let mut weights = ValueModelWeights {
         favorite: params.get(FavoriteWeight),
         reply: params.get(ReplyWeight),
         retweet: params.get(RetweetWeight),
@@ -86,7 +93,8 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         follow_author: params.get(FollowAuthorWeight),
         post_unexplored: params.get(PostUnexploredWeight),
         post_unexplored_include_out_of_network: params.get(PostUnexploredIncludeOutOfNetwork),
-        react_with_video: params.get(ReactWithVideoWeight),
+        post_video: params.get(PostVideoWeight),
+        grok_analyze: params.get(GrokAnalyzeWeight),
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),
@@ -107,18 +115,35 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         oon_rescore_in_network_replies_retweets: params
             .get(EnableOonRescoreForInNetworkRepliesRetweets),
         multiplier_pre_offset: params.get(MultiplierPreOffset),
-    }
-    .perturbed(
+        ..Default::default()
+    };
+    weights.set_multiplicative(
+        &params.get(ValueModelMode),
+        params.get(NotDwelledPowerExponent),
+        params.get(NotDwelledPowerOffset),
+        params.get(MultiplicativeVmEngageBias),
+    );
+    weights.perturbed(
         params.get(WeightPerturbationSigma),
         &params.get(WeightPerturbationSalt),
         viewer_id,
     )
 }
 
+fn class_factors(engagement: f64, dwell_time: f64, single: f64) -> Option<ClassFactors> {
+    let configured = |factor: f64| factor.is_finite() && factor >= 0.0;
+    if !configured(engagement) && !configured(dwell_time) {
+        return None;
+    }
+    let or_single = |factor: f64| if configured(factor) { factor } else { single };
+    ClassFactors::new(or_single(engagement), or_single(dwell_time))
+}
+
 pub fn scoring_context(req: &RankRequest, params: &Params) -> QueryScoringContext {
     if req.topic_request {
         return QueryScoringContext {
             effective_oon_weight: params.get(TopicOonWeightFactor),
+            ..Default::default()
         };
     }
     let now_ms = req
@@ -132,55 +157,179 @@ pub fn scoring_context(req: &RankRequest, params: &Params) -> QueryScoringContex
     let is_eligible_new_user = account_age_secs
         .is_some_and(|age| age < params.get(NewUserAgeThresholdSecs))
         && req.viewer_following_count >= NEW_USER_MIN_FOLLOWING;
+    if is_eligible_new_user {
+        return QueryScoringContext {
+            effective_oon_weight: params.get(NewUserOonWeightFactor),
+            ..Default::default()
+        };
+    }
+    let oon_weight = params.get(OonWeightFactor);
     QueryScoringContext {
-        effective_oon_weight: if is_eligible_new_user {
-            params.get(NewUserOonWeightFactor)
-        } else {
-            params.get(OonWeightFactor)
-        },
+        effective_oon_weight: oon_weight,
+        oon_factors: class_factors(
+            params.get(OonEngagementWeightFactor),
+            params.get(OonDwellTimeWeightFactor),
+            oon_weight,
+        ),
+        in_network_factors: class_factors(
+            params.get(InNetworkEngagementWeightFactor),
+            params.get(InNetworkDwellTimeWeightFactor),
+            1.0,
+        ),
     }
 }
 
 pub fn candidate_inputs(
     req: &RankRequest,
+    params: &Params,
     weights: &ValueModelWeights,
 ) -> Vec<CandidateScoringInputs> {
-    req.candidates
+    let exclude_ineligible = params.get(ExcludeIneligibleEngagementHeads);
+    let mut excluded = [0u64; 3];
+    let inputs = req
+        .candidates
         .iter()
-        .map(|c| CandidateScoringInputs::from_rank_candidate(c, weights.min_video_duration_ms))
-        .collect()
+        .map(|c| {
+            let mut inputs =
+                CandidateScoringInputs::from_rank_candidate(c, weights.min_video_duration_ms);
+            if exclude_ineligible {
+                let flagged = exclude_ineligible_heads(c, &mut inputs.phoenix_scores);
+                for (count, flagged) in excluded.iter_mut().zip(flagged) {
+                    *count += u64::from(flagged);
+                }
+            }
+            inputs
+        })
+        .collect();
+    for (head, count) in ["reply", "share", "click"].into_iter().zip(excluded) {
+        if count > 0 {
+            INELIGIBLE_HEAD_CANDIDATES
+                .with_label_values(&[head])
+                .inc_by(count);
+        }
+    }
+    inputs
+}
+
+fn exclude_ineligible_heads(candidate: &RankCandidate, scores: &mut PhoenixScores) -> [bool; 3] {
+    if candidate.experiment_payload.is_empty() {
+        return [false; 3];
+    }
+    let Ok(payload) = CandidatePayload::decode(candidate.experiment_payload.as_ref()) else {
+        return [false; 3];
+    };
+    if payload.reply_ineligible {
+        scores.reply_score = None;
+    }
+    if payload.share_ineligible {
+        scores.share_score = None;
+        scores.share_via_dm_score = None;
+        scores.share_via_copy_link_score = None;
+    }
+    if payload.click_ineligible {
+        scores.click_score = None;
+    }
+    [
+        payload.reply_ineligible,
+        payload.share_ineligible,
+        payload.click_ineligible,
+    ]
 }
 
 fn compute_or_fallback(
     req: &RankRequest,
     params: Option<&Params>,
     author_rules: Option<&AuthorRulesEvaluator>,
+    debias: &DebiasModels,
 ) -> Result<ValueModelOutput, Fallback> {
     let params = params.ok_or_else(|| Fallback::new("no_config", ""))?;
     let weights = weights_from_params(params, req.viewer_id);
     let ctx = scoring_context(req, params);
-    let mut inputs = candidate_inputs(req, &weights);
+    if !weights.multiplicative && !weights.multiplier_pre_offset {
+        for (class, factors) in [
+            ("oon", ctx.oon_factors),
+            ("in_network", ctx.in_network_factors),
+        ] {
+            if factors.is_some() {
+                VALUE_MODEL_CLASS_FACTORS.with_label_values(&[class]).inc();
+            }
+        }
+    }
+    let mut inputs = candidate_inputs(req, params, &weights);
     if weights.user_video_continuation != 0.0 {
         set_user_video_continuation(&mut inputs);
     }
     if let Some(author_rules) = author_rules {
         set_author_exploration_bonuses(author_rules, &mut inputs);
     }
+
     let raw = compute_value_scores(&weights, &ctx, &inputs);
     if rand::random_bool(SCORE_METRICS_SAMPLE_RATE) {
         record_score_metrics(&inputs, &raw);
     }
-    let cached_weighted = !inputs.is_empty() && inputs.iter().all(|c| c.weighted_score.is_some());
+    let cached_weighted = !weights.multiplicative
+        && !inputs.is_empty()
+        && inputs.iter().all(|c| c.weighted_score.is_some());
     let stage = if cached_weighted {
         "cached_weighted"
     } else {
         "heads"
     };
     VALUE_MODEL_STAGE.with_label_values(&[stage]).inc();
+    if cached_weighted && !req.include_top_heads {
+        return Ok(ValueModelOutput {
+            weighted: raw.weighted,
+            scores: raw.scores,
+            debiased: false,
+            top_heads: None,
+        });
+    }
+
+    let recentered = debias::recenter(req, params, debias.user.as_deref(), &inputs);
+    let scored_inputs = recentered.as_deref().unwrap_or(&inputs);
+    let top_heads = req.include_top_heads.then(|| {
+        scored_inputs
+            .iter()
+            .map(|c| top_heads(&weights, c))
+            .collect()
+    });
+    if cached_weighted || recentered.is_none() {
+        return Ok(ValueModelOutput {
+            weighted: raw.weighted,
+            scores: raw.scores,
+            debiased: false,
+            top_heads,
+        });
+    }
+    let debiased = compute_value_scores(&weights, &ctx, scored_inputs);
     Ok(ValueModelOutput {
-        weighted: raw.weighted,
-        scores: raw.scores,
+        weighted: debiased.weighted,
+        scores: debiased.scores,
+        debiased: true,
+        top_heads,
     })
+}
+
+const TOP_HEADS: usize = 3;
+const MIN_HEAD_SHARE: f64 = 0.10;
+
+fn top_heads(
+    weights: &ValueModelWeights,
+    candidate: &CandidateScoringInputs,
+) -> Vec<HeadContribution> {
+    let mut terms = weighted_terms(weights, candidate);
+    let total: f64 = terms.iter().map(|(_, c)| c.abs()).sum();
+    terms.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+    terms
+        .iter()
+        .take(TOP_HEADS)
+        .map(|&(head, contribution)| HeadContribution {
+            head: head.to_string(),
+            contribution,
+            share: contribution.abs() / total,
+        })
+        .take_while(|h| h.share >= MIN_HEAD_SHARE)
+        .collect()
 }
 
 fn set_author_exploration_bonuses(
@@ -265,8 +414,10 @@ fn record_score_metrics(inputs: &[CandidateScoringInputs], raw: &ValueScores) {
     }
 }
 
-fn record_request(mode: &str) {
-    VALUE_MODEL_REQUESTS.with_label_values(&[mode]).inc();
+fn record_request(mode: &str, debias_applied: bool) {
+    VALUE_MODEL_REQUESTS
+        .with_label_values(&[mode, if debias_applied { "on" } else { "off" }])
+        .inc();
 }
 
 fn record_fallback(fallback: &Fallback, viewer_id: u64) {

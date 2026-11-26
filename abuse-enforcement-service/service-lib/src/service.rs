@@ -72,6 +72,14 @@ fn join_audit_info(mut additional_info: Vec<String>) -> String {
     additional_info.join("; ")
 }
 
+fn post_label_source(head: &str) -> String {
+    if head.is_empty() {
+        PLUGIN_ID.to_owned()
+    } else {
+        format!("{PLUGIN_ID}/{head}")
+    }
+}
+
 fn compute_expires_at_msec(ttl_msec: i64) -> i64 {
     let now_msec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -84,6 +92,8 @@ static AUDIT_ENVIRONMENT: LazyLock<String> =
     LazyLock::new(|| std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_string()));
 
 pub fn publish_admin_action_event(producer: Option<&Arc<KafkaProducer>>, event: &AdminActionEvent) {
+    #[cfg(test)]
+    tests::PUBLISHED.with(|p| p.borrow_mut().push(event.clone()));
     crate::spawn_publish(
         producer,
         crate::ADMIN_ACTIONS_PRODUCER,
@@ -98,8 +108,28 @@ pub fn publish_admin_action_event(producer: Option<&Arc<KafkaProducer>>, event: 
     );
 }
 
+fn admin_event(
+    action: AdminAction,
+    actor_key_id: String,
+    updated_by: String,
+    method: &Method,
+    path: &str,
+) -> AdminActionEvent {
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: action as i32,
+        actor_key_id,
+        updated_by,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        ..Default::default()
+    }
+}
+
 pub struct AppState {
         pub ais_client: AisClient,
+                pub gd: Option<crate::gizmoduck::GizmoduckCoreClient>,
     pub dynamic_config: DynamicConfig,
                 pub rules_cache: std::sync::Arc<crate::rules::RulesCache>,
     pub dedup_cache: Option<crate::dedup_cache::ManhattanDedupCache>,
@@ -112,7 +142,9 @@ pub struct AppState {
                 pub kafka_producers: crate::KafkaProducers,
                 pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
                 pub off_switch: std::sync::Arc<crate::off_switch::OffSwitch>,
+                pub head_guard: std::sync::Arc<crate::head_guard::HeadGuard>,
             pub action_control: std::sync::Arc<crate::action_control::ActionControl>,
+                pub backfill: std::sync::Arc<crate::backfill::Backfill>,
                 pub boot_config: serde_json::Value,
 }
 
@@ -139,7 +171,8 @@ pub enum EnforcementAction {
                                                 AddPostLabelsV2 {
         tweet_id: i64,
         labels: Vec<String>,
-                                        expires_at_msec: Option<i64>,
+                                expires_at_msec: Option<i64>,
+                        source: String,
                         audit_note: String,
     },
                                     BounceArkose { user_id: i64, audit_note: String },
@@ -180,12 +213,14 @@ impl EnforcementAction {
         tweet_id: i64,
         labels: Vec<String>,
         ttl_msec: Option<i64>,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         Self::AddPostLabelsV2 {
             tweet_id,
             labels,
             expires_at_msec: ttl_msec.map(compute_expires_at_msec),
+            source: post_label_source(head),
             audit_note: join_audit_info(additional_info),
         }
     }
@@ -211,10 +246,11 @@ impl EnforcementAction {
         }
     }
 
-                                                                    pub fn from_spec(
+                                                                        pub fn from_spec(
         spec: &ActionSpec,
         entity_id: i64,
         user_id: i64,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         match spec {
@@ -225,7 +261,7 @@ impl EnforcementAction {
                 Self::add_user_label(user_id, labels.clone(), *ttl_msec, additional_info)
             }
             ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {
-                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, additional_info)
+                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, head, additional_info)
             }
             ActionSpec::Arkose => Self::bounce_arkose(user_id, additional_info),
             ActionSpec::Captcha => Self::bounce_captcha(user_id, additional_info),
@@ -354,6 +390,7 @@ impl EnforcementAction {
                 tweet_id,
                 labels,
                 expires_at_msec,
+                source,
                 ..
             } => {
                 let tweet_entity = json!({
@@ -363,8 +400,10 @@ impl EnforcementAction {
                     }
                 });
                 let safety_label = match expires_at_msec {
-                    Some(expires_at_msec) => json!({"expiresAtMsec": expires_at_msec}),
-                    None => json!({}),
+                    Some(expires_at_msec) => {
+                        json!({"source": source, "expiresAtMsec": expires_at_msec})
+                    }
+                    None => json!({"source": source}),
                 };
                 let labels_json: Vec<Value> = labels
                     .iter()
@@ -463,14 +502,16 @@ pub fn strato_retry_strategy() -> ExponentialBuilder {
     path = "/action",
     tag = "debug",
     security(("BearerAuth" = [])),
-    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer.",
+    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer. An account-ending action on a test account is refused.",
     request_body(
         content = Object,
         description = "ActionIntakeRequest JSON (actorHeader + action + tool), or legacy {\"actionIntakeRequest\": …}",
     ),
     responses(
         (status = 200, description = "AIS responded successfully — body is the raw AIS response", body = Object),
+        (status = 422, description = "AIS rejected the request permanently, or an account-ending action (suspend, deactivation or read-only) names a test account (or no account). Body shape: {\"action\": <reason>}"),
         (status = 500, description = "AIS call failed (network / non-success response). Body shape: {\"action\": <error string>}"),
+        (status = 503, description = "A suspend, deactivation or read-only action whose account couldn't be looked up. Body shape: {\"action\": <reason>}"),
     ),
 )]
 #[tracing::instrument(skip_all)]
@@ -484,17 +525,24 @@ pub async fn handle_action(
     info!("POST /api/action: {payload}");
 
     let (status, result) = match coerce_intake_request(payload) {
-        Ok(req) => match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await
-        {
-            Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
-            Err(e) => {
-                error!(error = format!("{e:#}"), "Action AIS call failed");
-                let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+        Ok(req) => match account_action_refusal(state.gd.as_ref(), &req).await {
+            Some((code, why)) => {
+                warn!(reason = %why, "POST /api/action: account action refused");
+                ("refused", (code, Json(json!({ "action": why }))))
+            }
+            None => {
+                match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await {
+                    Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
+                    Err(e) => {
+                        error!(error = format!("{e:#}"), "Action AIS call failed");
+                        let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
+                            StatusCode::UNPROCESSABLE_ENTITY
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+                    }
+                }
             }
         },
         Err(e) => (
@@ -512,6 +560,68 @@ pub async fn handle_action(
     metrics::HTTP_INFLIGHT.with_label_values(&["action"]).dec();
 
     result
+}
+
+const ACCOUNT_ACTIONS: &[&str] = &[
+    "suspendUser",
+    "suspendUserV2",
+    "deactivateUser",
+    "readOnlyUser",
+];
+
+async fn account_action_refusal(
+    gd: Option<&crate::gizmoduck::GizmoduckCoreClient>,
+    req: &Value,
+) -> Option<(StatusCode, String)> {
+    let (name, action) = req
+        .get("action")?
+        .as_object()?
+        .iter()
+        .find(|(name, _)| ACCOUNT_ACTIONS.contains(&name.as_str()))?;
+    let user_id = action.get("userId").and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    });
+    let Some(user_id) = user_id.filter(|id| *id > 0) else {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{name} has no valid userId"),
+        ));
+    };
+    if crate::test_user::is_test_user_id(user_id) {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test user (test_user_skipped)"),
+        ));
+    }
+    let Some(gd) = gd else {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("can't check user {user_id}: no gizmoduck client"),
+        ));
+    };
+    let user = match gd.fetch_user(user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("can't check user {user_id}: {e:#}"),
+            ));
+        }
+    };
+    if !user.present {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} not found (user_not_found)"),
+        ));
+    }
+    crate::safety_checks::test_account_check(&user).map(|check| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test account ({})", check.reason),
+        )
+    })
 }
 
 #[utoipa::path(
@@ -1098,12 +1208,14 @@ pub async fn handle_rate_limit_reset(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path(entity_type): Path<String>,
 ) -> impl IntoResponse {
     let entity_type = match rate_limit_entity_type(&entity_type) {
         Ok(et) => et,
         Err(resp) => return resp,
     };
+    let who = admin_who(&state, &headers, None, &actor.0);
     let before_json = state
         .dynamic_config
         .rate_limit_stats(entity_type)
@@ -1119,17 +1231,17 @@ pub async fn handle_rate_limit_reset(
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
         &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::RateLimitReset as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
             success,
             error,
             entity_type: entity_type.as_str().to_string(),
             before_json,
-            ..Default::default()
+            ..admin_event(
+                AdminAction::RateLimitReset,
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+            )
         },
     );
     match deleted {
@@ -1238,7 +1350,7 @@ use xai_abuse_enforcement_types::allowlist::{
     AllowlistAddRequest, AllowlistBulkEntry, AllowlistBulkRequest, BulkResponse, BulkRowResult,
     MAX_TTL_SECS,
 };
-use xai_abuse_enforcement_types::config::ConfigPatchRequest;
+use xai_abuse_enforcement_types::config::{ConfigPatchRequest, ConfigPendingReview};
 
 #[utoipa::path(
     put,
@@ -1250,9 +1362,10 @@ use xai_abuse_enforcement_types::config::ConfigPatchRequest;
         description = "Full replacement config value (must be a JSON object)",
     ),
     responses(
-        (status = 200, description = "Stored config object echoed back", body = Object),
+        (status = 202, description = "Draft revision created and review requested; live only once approved and published in GrowthBook", body = ConfigPendingReview),
         (status = 400, description = "Malformed request body"),
-        (status = 500, description = "GrowthBook write failed"),
+        (status = 422, description = "{error, code: \"growthbook_rejected\"}: GrowthBook refused the rule update as invalid (e.g. a value its schema rejects); the draft is discarded"),
+        (status = 500, description = "Another GrowthBook failure (creating the draft, requesting review); a draft that could not be finished is discarded"),
         (status = 503, description = "GROWTHBOOK_ADMIN_API_KEY not configured at startup"),
     ),
 )]
@@ -1262,6 +1375,7 @@ pub async fn handle_config_put(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Json(value): Json<Value>,
 ) -> impl IntoResponse {
     let Some(writer) = state.growthbook_writer.as_ref() else {
@@ -1270,7 +1384,9 @@ pub async fn handle_config_put(
             Json(json!({"error": "GrowthBook admin API not configured"})),
         );
     };
+    let who = admin_who(&state, &headers, None, &actor.0);
     info!(
+        who = %who,
         "PUT /api/config (feature={} env={})",
         state.growthbook_feature_key, state.growthbook_environment
     );
@@ -1280,43 +1396,26 @@ pub async fn handle_config_put(
         .config()
         .map(|c| c.to_string())
         .unwrap_or_default();
-    let result = writer
-        .set_env_value(
-            &state.growthbook_feature_key,
-            &state.growthbook_environment,
-            value,
-        )
-        .await;
-    let (success, error) = match &result {
-        Ok(_) => (true, String::new()),
-        Err(e) => (false, e.to_string()),
-    };
-    publish_admin_action_event(
-        state.kafka_producers.admin_actions(),
-        &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::ConfigReplace as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
-            success,
-            error,
-            request_json,
-            before_json,
-            ..Default::default()
-        },
+    let env = &state.growthbook_environment;
+    let note = format!(
+        "Replace the {env} config, by {who} (enforcement service key {})",
+        actor.0
     );
-    match result {
-        Ok(v) => (StatusCode::OK, Json(v)),
-        Err(e) => {
-            error!("PUT /api/config failed: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        }
-    }
+    let result = writer
+        .propose_value(&state.growthbook_feature_key, env, &note, value)
+        .await;
+    let event = AdminActionEvent {
+        request_json,
+        before_json,
+        ..admin_event(
+            AdminAction::ConfigReplace,
+            actor.0,
+            who,
+            &method,
+            uri.path(),
+        )
+    };
+    config_write_response(&state, event, result)
 }
 
 #[utoipa::path(
@@ -1329,9 +1428,10 @@ pub async fn handle_config_put(
     ),
     request_body = ConfigPatchRequest,
     responses(
-        (status = 200, description = "New full config object after the patch", body = Object),
+        (status = 202, description = "Draft revision created and review requested; live only once approved and published in GrowthBook", body = ConfigPendingReview),
         (status = 400, description = "Malformed request body"),
-        (status = 500, description = "GrowthBook write failed"),
+        (status = 422, description = "{error, code: \"growthbook_rejected\"}: GrowthBook refused the rule update as invalid (e.g. a value its schema rejects), or the environment's value is not an object to set a field on; the draft is discarded"),
+        (status = 500, description = "Another GrowthBook failure (creating the draft, requesting review); a draft that could not be finished is discarded"),
         (status = 503, description = "GROWTHBOOK_ADMIN_API_KEY not configured at startup"),
     ),
 )]
@@ -1341,6 +1441,7 @@ pub async fn handle_config_patch_field(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path(field): Path<String>,
     Json(body): Json<ConfigPatchRequest>,
 ) -> impl IntoResponse {
@@ -1352,7 +1453,8 @@ pub async fn handle_config_patch_field(
     };
     let span = tracing::Span::current();
     span.record("field", &field);
-    info!("PATCH /api/config/{field} = {}", body.value);
+    let who = admin_who(&state, &headers, None, &actor.0);
+    info!(who = %who, "PATCH /api/config/{field} = {}", body.value);
     let request_json = serde_json::to_string(&body).unwrap_or_default();
     let before_json = state
         .dynamic_config
@@ -1360,42 +1462,65 @@ pub async fn handle_config_patch_field(
         .and_then(|c| c.get(&field).cloned())
         .map(|v| v.to_string())
         .unwrap_or_default();
+    let env = &state.growthbook_environment;
+    let note = format!(
+        "Set {field} in the {env} config, by {who} (enforcement service key {})",
+        actor.0
+    );
     let result = writer
-        .set_env_field(
+        .propose_field(
             &state.growthbook_feature_key,
-            &state.growthbook_environment,
+            env,
+            &note,
             &field,
             body.value,
         )
         .await;
-    let (success, error) = match &result {
-        Ok(_) => (true, String::new()),
-        Err(e) => (false, e.to_string()),
+    let event = AdminActionEvent {
+        config_field: field,
+        request_json,
+        before_json,
+        ..admin_event(
+            AdminAction::ConfigPatchField,
+            actor.0,
+            who,
+            &method,
+            uri.path(),
+        )
     };
-    publish_admin_action_event(
-        state.kafka_producers.admin_actions(),
-        &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::ConfigPatchField as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
-            success,
-            error,
-            config_field: field.clone(),
-            request_json,
-            before_json,
-            ..Default::default()
-        },
-    );
+    config_write_response(&state, event, result)
+}
+
+fn config_write_response(
+    state: &AppState,
+    mut event: AdminActionEvent,
+    result: anyhow::Result<ConfigPendingReview>,
+) -> (StatusCode, Json<Value>) {
+    match &result {
+        Ok(pending) => {
+            event.success = true;
+            event.growthbook_revision = pending.revision;
+        }
+        Err(e) => event.error = format!("{e:#}"),
+    }
+    publish_admin_action_event(state.kafka_producers.admin_actions(), &event);
     match result {
-        Ok(new_config) => (StatusCode::OK, Json(new_config)),
+        Ok(pending) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::to_value(pending).unwrap_or_default()),
+        ),
+        Err(e) if crate::growthbook_writer::is_rejected(&e) => {
+            warn!("{} {} refused: {e:#}", event.http_method, event.http_path);
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": format!("{e:#}"), "code": "growthbook_rejected"})),
+            )
+        }
         Err(e) => {
-            error!("PATCH /api/config/{field} failed: {e:#}");
+            error!("{} {} failed: {e:#}", event.http_method, event.http_path);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({"error": format!("{e:#}")})),
             )
         }
     }
@@ -1407,7 +1532,7 @@ pub async fn handle_config_patch_field(
     tag = "config",
     security(("BearerAuth" = [])),
     responses(
-        (status = 200, description = "Active rule pipelines (user + post)", body = Object),
+        (status = 200, description = "Active rule pipelines (user + post)", body = crate::api_doc::RulesResponse),
     ),
 )]
 #[tracing::instrument(skip_all)]
@@ -1423,6 +1548,21 @@ pub async fn handle_rules_get(State(state): State<Arc<AppState>>) -> impl IntoRe
         dc.enforcement_rules_yaml(EntityType::Post).as_ref(),
     );
     (StatusCode::OK, Json(json!({ "user": user, "post": post })))
+}
+
+fn allowlist_entry(added_by: Option<&str>, reason: &str, who: &str) -> AllowlistEntry {
+    AllowlistEntry {
+        added_by: added_by
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(who)
+            .to_owned(),
+        reason: reason.to_owned(),
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }
 }
 
 #[utoipa::path(
@@ -1447,6 +1587,7 @@ pub async fn handle_allowlist_put(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path(user_id): Path<i64>,
     Json(req): Json<AllowlistAddRequest>,
 ) -> impl IntoResponse {
@@ -1470,17 +1611,12 @@ pub async fn handle_allowlist_put(
             ),
         );
     }
+    let who = admin_who(&state, &headers, Some(&req.added_by), &actor.0);
     let request_json = serde_json::to_string(&req).unwrap_or_default();
     let ttl_secs = req.ttl_secs;
-    let entry = AllowlistEntry {
-        added_by: req.added_by,
-        reason: req.reason,
-        added_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
-    info!("PUT /api/allowlist/{user_id} ttl={ttl_secs}s");
+    let trusted = may_name(&state, &actor.0);
+    let entry = allowlist_entry(trusted.then_some(req.added_by.as_str()), &req.reason, &who);
+    info!(who = %who, "PUT /api/allowlist/{user_id} ttl={ttl_secs}s");
     let result = al.add(user_id, ttl_secs, &entry).await;
     let (success, error) = match &result {
         Ok(()) => (true, String::new()),
@@ -1489,18 +1625,18 @@ pub async fn handle_allowlist_put(
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
         &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::AllowlistUpsert as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
             success,
             error,
             entity_type: EntityType::User.as_str().to_string(),
             entity_id: user_id,
             request_json,
-            ..Default::default()
+            ..admin_event(
+                AdminAction::AllowlistUpsert,
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+            )
         },
     );
     match result {
@@ -1544,6 +1680,7 @@ pub async fn handle_allowlist_delete(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
     let Some(al) = state.allowlist.as_ref() else {
@@ -1552,7 +1689,8 @@ pub async fn handle_allowlist_delete(
             Json(json!({"error": "allowlist not configured"})),
         );
     };
-    info!("DELETE /api/allowlist/{user_id}");
+    let who = admin_who(&state, &headers, None, &actor.0);
+    info!(who = %who, "DELETE /api/allowlist/{user_id}");
     let before_json = al
         .get(user_id)
         .await
@@ -1566,18 +1704,18 @@ pub async fn handle_allowlist_delete(
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
         &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::AllowlistRemove as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
             success,
             error,
             entity_type: EntityType::User.as_str().to_string(),
             entity_id: user_id,
             before_json,
-            ..Default::default()
+            ..admin_event(
+                AdminAction::AllowlistRemove,
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+            )
         },
     );
     match result {
@@ -1599,6 +1737,8 @@ pub async fn bulk_allowlist_impl(
     al: &crate::allowlist::ManhattanAllowlist,
     entries: &[AllowlistBulkEntry],
     dry_run: bool,
+    who: &str,
+    trusted: bool,
 ) -> BulkResponse {
     let mut results: Vec<BulkRowResult> = Vec::with_capacity(entries.len());
     let mut would_add = 0usize;
@@ -1644,14 +1784,11 @@ pub async fn bulk_allowlist_impl(
             continue;
         }
 
-        let al_entry = AllowlistEntry {
-            added_by: entry.added_by.clone(),
-            reason: entry.reason.clone(),
-            added_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        };
+        let al_entry = allowlist_entry(
+            trusted.then_some(entry.added_by.as_str()),
+            &entry.reason,
+            who,
+        );
         match al.add(entry.user_id, entry.ttl_secs, &al_entry).await {
             Ok(()) => results.push(BulkRowResult {
                 user_id: entry.user_id,
@@ -1702,6 +1839,7 @@ pub async fn handle_allowlist_bulk(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AllowlistBulkRequest>,
 ) -> impl IntoResponse {
     let Some(al) = state.allowlist.as_ref() else {
@@ -1713,28 +1851,31 @@ pub async fn handle_allowlist_bulk(
     let span = tracing::Span::current();
     span.record("count", req.entries.len());
     span.record("dry_run", req.dry_run);
+    let who = admin_who(&state, &headers, None, &actor.0);
     info!(
+        who = %who,
         "POST /api/allowlist/bulk count={} dry_run={}",
         req.entries.len(),
         req.dry_run
     );
 
-    let body = bulk_allowlist_impl(al, &req.entries, req.dry_run).await;
+    let trusted = may_name(&state, &actor.0);
+    let body = bulk_allowlist_impl(al, &req.entries, req.dry_run, &who, trusted).await;
     if !req.dry_run {
         publish_admin_action_event(
             state.kafka_producers.admin_actions(),
             &AdminActionEvent {
-                occurred_at_ms: crate::now_millis(),
-                action: AdminAction::AllowlistBulkUpsert as i32,
-                actor_key_id: actor.0,
-                environment: AUDIT_ENVIRONMENT.clone(),
-                http_method: method.to_string(),
-                http_path: uri.path().to_string(),
                 success: body.errors == 0,
                 entity_type: EntityType::User.as_str().to_string(),
                 affected_count: body.total.saturating_sub(body.errors) as i32,
                 request_json: serde_json::to_string(&req).unwrap_or_default(),
-                ..Default::default()
+                ..admin_event(
+                    AdminAction::AllowlistBulkUpsert,
+                    actor.0,
+                    who,
+                    &method,
+                    uri.path(),
+                )
             },
         );
     }
@@ -1885,6 +2026,7 @@ pub async fn handle_allowlist_put_entity(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path((entity_type, entity_id)): Path<(String, i64)>,
     Json(req): Json<AllowlistAddRequest>,
 ) -> impl IntoResponse {
@@ -1916,17 +2058,13 @@ pub async fn handle_allowlist_put_entity(
             ),
         );
     }
+    let who = admin_who(&state, &headers, Some(&req.added_by), &actor.0);
     let request_json = serde_json::to_string(&req).unwrap_or_default();
     let ttl_secs = req.ttl_secs;
-    let entry = AllowlistEntry {
-        added_by: req.added_by,
-        reason: req.reason,
-        added_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
+    let trusted = may_name(&state, &actor.0);
+    let entry = allowlist_entry(trusted.then_some(req.added_by.as_str()), &req.reason, &who);
     info!(
+        who = %who,
         "PUT /api/allowlist/{}/{entity_id} ttl={ttl_secs}s",
         et.as_str(),
     );
@@ -1938,18 +2076,18 @@ pub async fn handle_allowlist_put_entity(
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
         &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::AllowlistUpsert as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
             success,
             error,
             entity_type: et.as_str().to_string(),
             entity_id,
             request_json,
-            ..Default::default()
+            ..admin_event(
+                AdminAction::AllowlistUpsert,
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+            )
         },
     );
     match result {
@@ -1996,6 +2134,7 @@ pub async fn handle_allowlist_delete_entity(
     Extension(actor): Extension<KeyId>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     Path((entity_type, entity_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
     let Some(et) = crate::facts::EntityType::from_path(&entity_type) else {
@@ -2012,7 +2151,8 @@ pub async fn handle_allowlist_delete_entity(
             Json(json!({"error": "allowlist not configured"})),
         );
     };
-    info!("DELETE /api/allowlist/{}/{entity_id}", et.as_str());
+    let who = admin_who(&state, &headers, None, &actor.0);
+    info!(who = %who, "DELETE /api/allowlist/{}/{entity_id}", et.as_str());
     let before_json = al
         .get_entity(et, entity_id)
         .await
@@ -2036,18 +2176,18 @@ pub async fn handle_allowlist_delete_entity(
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
         &AdminActionEvent {
-            occurred_at_ms: crate::now_millis(),
-            action: AdminAction::AllowlistRemove as i32,
-            actor_key_id: actor.0,
-            environment: AUDIT_ENVIRONMENT.clone(),
-            http_method: method.to_string(),
-            http_path: uri.path().to_string(),
             success,
             error,
             entity_type: et.as_str().to_string(),
             entity_id,
             before_json,
-            ..Default::default()
+            ..admin_event(
+                AdminAction::AllowlistRemove,
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+            )
         },
     );
     match result {
@@ -2125,6 +2265,7 @@ pub async fn handle_off_switches_put(
         "PUT /api/off_switches"
     );
     let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let who = crate::off_switch::OffSwitch::updated_by(&req, &actor.0);
     let result = state
         .off_switch
         .set(req, &actor.0, crate::now_millis())
@@ -2134,7 +2275,7 @@ pub async fn handle_off_switches_put(
     }
     publish_admin_action_event(
         state.kafka_producers.admin_actions(),
-        &off_switch_admin_event(actor.0, &method, uri.path(), request_json, &result),
+        &off_switch_admin_event(actor.0, who, &method, uri.path(), request_json, &result),
     );
     match result {
         Ok(out) => (
@@ -2156,6 +2297,7 @@ pub async fn handle_off_switches_put(
 
 pub(crate) fn off_switch_admin_event(
     actor_key_id: String,
+    updated_by: String,
     method: &Method,
     path: &str,
     request_json: String,
@@ -2173,17 +2315,172 @@ pub(crate) fn off_switch_admin_event(
         Err(SetError::Invalid(e) | SetError::Store(e)) => (false, e.clone(), String::new()),
     };
     AdminActionEvent {
-        occurred_at_ms: crate::now_millis(),
-        action: AdminAction::Unspecified as i32,
-        actor_key_id,
-        environment: AUDIT_ENVIRONMENT.clone(),
-        http_method: method.to_string(),
-        http_path: path.to_string(),
         success,
         error,
         request_json,
         before_json,
-        ..Default::default()
+        ..admin_event(
+            AdminAction::Unspecified,
+            actor_key_id,
+            updated_by,
+            method,
+            path,
+        )
+    }
+}
+
+
+use crate::head_guard::{
+    HeadGuardListResponse, HeadGuardPutRequest, HeadGuardPutResponse, SetError as GuardSetError,
+    SetOutcome as GuardSetOutcome,
+};
+
+#[utoipa::path(
+    get,
+    path = "/head_guards",
+    tag = "head_guard",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Stored guards, unreadable rows and this pod's list state", body = HeadGuardListResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_head_guards_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let resp = state
+        .head_guard
+        .list(state.dynamic_config.off_switch_enabled())
+        .await;
+    (StatusCode::OK, Json(resp))
+}
+
+#[utoipa::path(
+    put,
+    path = "/head_guards",
+    tag = "head_guard",
+    security(("BearerAuth" = [])),
+    request_body = HeadGuardPutRequest,
+    responses(
+        (status = 200, description = "Stored guard and the record it replaced", body = HeadGuardPutResponse),
+        (status = 400, description = "{error, detail}: invalid_head, invalid_classifier, invalid_limit, invalid_overturn, invalid_reason or invalid_updated_by"),
+        (status = 409, description = "{error, detail, current, current_version}: version_conflict; {error, detail, current}: lost_race"),
+        (status = 500, description = "{error: \"store\", detail}: Manhattan read or write failed"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_head_guards_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<HeadGuardPutRequest>,
+) -> impl IntoResponse {
+    let cfg = state.dynamic_config.action_control_config();
+    let who = updated_by(&headers, req.updated_by.as_deref(), &actor.0, &cfg);
+    info!(
+        head = %req.head,
+        classifier = req.classifier.as_deref().unwrap_or(""),
+        who = %who,
+        "PUT /api/head_guards"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .head_guard
+        .set(req, &who, &actor.0, crate::now_millis())
+        .await;
+    if !matches!(result, Err(GuardSetError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &head_guard_admin_event(actor.0, who, &method, uri.path(), request_json, &result),
+        );
+    }
+    head_guard_put_response(result)
+}
+
+pub(crate) fn head_guard_put_response(
+    result: Result<GuardSetOutcome, GuardSetError>,
+) -> (StatusCode, Json<Value>) {
+    match result {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(HeadGuardPutResponse {
+                    guard: out.view,
+                    before: out.before,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
+        Err(GuardSetError::Invalid(code, detail)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        Err(GuardSetError::Conflict(current, current_version)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "version_conflict",
+                "detail": "the stored version differs from expected_version; review the current guard and try again",
+                "current": current,
+                "current_version": current_version,
+            })),
+        ),
+        Err(GuardSetError::LostRace(current)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "lost_race",
+                "detail": "another change landed at the same moment and replaced this one; review the current guard",
+                "current": current,
+            })),
+        ),
+        Err(GuardSetError::Store(e)) => {
+            error!("PUT /api/head_guards failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "store", "detail": e})),
+            )
+        }
+    }
+}
+
+pub(crate) fn head_guard_admin_event(
+    actor_key_id: String,
+    updated_by: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: &Result<GuardSetOutcome, GuardSetError>,
+) -> AdminActionEvent {
+    let (success, error, before_json) = match result {
+        Ok(out) => (
+            true,
+            String::new(),
+            out.before
+                .as_ref()
+                .and_then(|b| serde_json::to_string(b).ok())
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            let error = match e {
+                GuardSetError::Invalid(code, detail) => format!("{code}: {detail}"),
+                GuardSetError::Conflict(..) => "version_conflict".to_owned(),
+                GuardSetError::LostRace(_) => "lost_race".to_owned(),
+                GuardSetError::Store(detail) => detail.clone(),
+            };
+            (false, error, String::new())
+        }
+    };
+    AdminActionEvent {
+        success,
+        error,
+        request_json,
+        before_json,
+        ..admin_event(
+            AdminAction::Unspecified,
+            actor_key_id,
+            updated_by,
+            method,
+            path,
+        )
     }
 }
 
@@ -2215,6 +2512,27 @@ fn updated_by(
         })
         .flatten()
         .unwrap_or_else(|| key_id.to_owned())
+}
+
+fn admin_who(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: Option<&str>,
+    key_id: &str,
+) -> String {
+    updated_by(
+        headers,
+        body,
+        key_id,
+        &state.dynamic_config.action_control_config(),
+    )
+}
+
+fn may_name(state: &AppState, key_id: &str) -> bool {
+    state
+        .dynamic_config
+        .action_control_config()
+        .may_name_updater(key_id)
 }
 
 pub(crate) fn safety_checks_now(state: &AppState) -> SafetyChecksByEntity {
@@ -2305,7 +2623,7 @@ pub async fn handle_action_controls_put(
     if !matches!(result, Err(ControlSetError::Invalid(..))) {
         publish_admin_action_event(
             state.kafka_producers.admin_actions(),
-            &action_control_admin_event(actor.0, &method, uri.path(), request_json, &result),
+            &action_control_admin_event(actor.0, who, &method, uri.path(), request_json, &result),
         );
     }
     action_control_put_response(result)
@@ -2365,6 +2683,7 @@ pub(crate) fn action_control_put_response(
 
 pub(crate) fn action_control_admin_event(
     actor_key_id: String,
+    updated_by: String,
     method: &Method,
     path: &str,
     request_json: String,
@@ -2382,17 +2701,17 @@ pub(crate) fn action_control_admin_event(
         Err(e) => (false, format!("{e:?}"), String::new()),
     };
     AdminActionEvent {
-        occurred_at_ms: crate::now_millis(),
-        action: AdminAction::Unspecified as i32,
-        actor_key_id,
-        environment: AUDIT_ENVIRONMENT.clone(),
-        http_method: method.to_string(),
-        http_path: path.to_string(),
         success,
         error,
         request_json,
         before_json,
-        ..Default::default()
+        ..admin_event(
+            AdminAction::Unspecified,
+            actor_key_id,
+            updated_by,
+            method,
+            path,
+        )
     }
 }
 
@@ -2466,9 +2785,1210 @@ pub async fn handle_action_controls_pod(State(state): State<Arc<AppState>>) -> i
     (StatusCode::OK, Json(view))
 }
 
+
+use crate::backfill::{
+    BackfillRunChangeRequest, BackfillRunListResponse, BackfillRunRecord, BackfillRunStartRequest,
+    BackfillSettingsRequest, BackfillSettingsResponse, Change as RunChange, RunError, RunState,
+};
+
+fn run_person(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(UPDATED_BY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn run_error_response(e: RunError) -> (StatusCode, Json<Value>) {
+    match e {
+        RunError::Forbidden(code, detail) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::Invalid(code, detail) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not_found", "detail": "no run has this id"})),
+        ),
+        RunError::Conflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::SettingsConflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::Store(detail) => {
+            error!("backfill run store error: {detail}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "store", "detail": detail})),
+            )
+        }
+    }
+}
+
+fn run_admin_event(
+    actor_key_id: String,
+    who: Option<String>,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    error: Option<&RunError>,
+) -> AdminActionEvent {
+    let success = error.is_none();
+    let error = error.map(|e| format!("{e:?}")).unwrap_or_default();
+    let updated_by = who.unwrap_or_else(|| actor_key_id.clone());
+    AdminActionEvent {
+        success,
+        error,
+        request_json,
+        ..admin_event(
+            AdminAction::Unspecified,
+            actor_key_id,
+            updated_by,
+            method,
+            path,
+        )
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct RunListQuery {
+        #[serde(default)]
+    pub state: Option<String>,
+        #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(RunListQuery),
+    responses(
+        (status = 200, description = "Runs", body = BackfillRunListResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RunListQuery>,
+) -> impl IntoResponse {
+    let runs = match state.backfill.list().await {
+        Ok(runs) => runs,
+        Err(e) => return run_error_response(RunError::Store(e.to_string())),
+    };
+    let states: Option<Vec<String>> = q.state.as_deref().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let runs: Vec<BackfillRunRecord> = runs
+        .into_iter()
+        .filter(|r| {
+            states
+                .as_ref()
+                .is_none_or(|ss| ss.iter().any(|s| s == r.state.as_str()))
+                && q.entity.as_deref().is_none_or(|e| e == r.entity.as_str())
+                && q.head.as_deref().is_none_or(|h| h == r.head)
+        })
+        .map(|r| state.backfill.as_served(r))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(BackfillRunListResponse { runs }).unwrap_or_default()),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/budget",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Budget per entity and the speed limit"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_budget(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.backfill.config_fresh().await {
+        Ok(cfg) => (
+            StatusCode::OK,
+            Json(json!({
+                "user": cfg.budget(EntityType::User),
+                "post": cfg.budget(EntityType::Post),
+                "max_rate_per_sec": cfg.max_rate_per_sec,
+            })),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "The settings", body = BackfillSettingsResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.backfill.settings().await {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillSettingsRequest,
+    responses(
+        (status = 200, description = "The settings after the change", body = BackfillSettingsResponse),
+        (status = 400, description = "confirm_required, bad_rate, bad_budget or bad_reason"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "version_conflict or lost_race, with the current settings"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillSettingsRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        user = req.max_user_decisions_per_day,
+        post = req.max_post_decisions_per_day,
+        rate = req.max_rate_per_sec,
+        "PUT /api/backfill_settings"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .set_settings(req, who.as_deref(), &actor.0, crate::now_millis())
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+                request_json,
+                result.as_ref().err(),
+            ),
+        );
+    }
+    match result {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/{run_id}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(("run_id" = String, Path, description = "The run's id")),
+    responses(
+        (status = 200, description = "The run", body = BackfillRunRecord),
+        (status = 404, description = "No such run"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_get(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.backfill.run(&run_id).await {
+        Ok(Some(rec)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(state.backfill.as_served(rec)).unwrap_or_default()),
+        ),
+        Ok(None) => run_error_response(RunError::NotFound),
+        Err(e) => run_error_response(RunError::Store(e.to_string())),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillRunStartRequest,
+    responses(
+        (status = 201, description = "Run started", body = BackfillRunRecord),
+        (status = 200, description = "The same run, already started", body = BackfillRunRecord),
+        (status = 400, description = "Invalid request: {error: code, detail}"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, switched_off, settings_not_set or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_start(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillRunStartRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        run_id = %req.run_id,
+        head = %req.head,
+        entity = req.entity.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = match state.backfill.config_fresh().await {
+        Ok(cfg) => {
+            state
+                .backfill
+                .start(
+                    req,
+                    who.as_deref(),
+                    &actor.0,
+                    &cfg,
+                    &state.action_control,
+                    &state.off_switch,
+                    crate::now_millis(),
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+                request_json,
+                result.as_ref().err(),
+            ),
+        );
+    }
+    match result {
+        Ok((rec, created)) => (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(serde_json::to_value(rec).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs/{run_id}/{change}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(
+        ("run_id" = String, Path, description = "The run's id"),
+        ("change" = String, Path, description = "pause, resume, stop or done"),
+    ),
+    request_body = BackfillRunChangeRequest,
+    responses(
+        (status = 200, description = "The run after the change", body = BackfillRunRecord),
+        (status = 400, description = "confirm_required"),
+        (status = 403, description = "key_not_allowed or person_required"),
+        (status = 404, description = "No such run or change"),
+        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_change(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Path((run_id, change)): Path<(String, String)>,
+    Json(req): Json<BackfillRunChangeRequest>,
+) -> impl IntoResponse {
+    let change = match change.as_str() {
+        "pause" => RunChange::Pause,
+        "resume" => RunChange::Resume,
+        "stop" => RunChange::Stop,
+        "done" => RunChange::Done,
+        _ => return run_error_response(RunError::NotFound),
+    };
+    let who = run_person(&headers);
+    info!(
+        run_id = %run_id,
+        change = change.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs/{{run_id}}/{{change}}"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .change(
+            &run_id,
+            change,
+            req,
+            who.as_deref(),
+            &actor.0,
+            &state.backfill.config(),
+            &state.off_switch,
+            crate::now_millis(),
+        )
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(
+                actor.0,
+                who,
+                &method,
+                uri.path(),
+                request_json,
+                result.as_ref().err(),
+            ),
+        );
+    }
+    match result {
+        Ok(rec) => {
+            if rec.state == RunState::Stopped {
+                info!(run_id = %rec.run_id, by = %rec.state_changed_by, "backfill run stopped");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(rec).unwrap_or_default()),
+            )
+        }
+        Err(e) => run_error_response(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::growthbook_writer::test_support::{
+        FEATURE, VERSION, assert_never_published, draft, growthbook, requests,
+    };
+    use axum::http::HeaderMap;
+
+    thread_local! {
+                pub(super) static PUBLISHED: std::cell::RefCell<Vec<AdminActionEvent>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn take_published() -> Vec<AdminActionEvent> {
+        PUBLISHED.with(|p| std::mem::take(&mut *p.borrow_mut()))
+    }
+
+                    async fn test_state(
+        config: Value,
+        growthbook: Option<&str>,
+        manhattan: Option<&str>,
+    ) -> Arc<AppState> {
+        use crate::action_control::test_support::MemControlStore;
+        use crate::off_switch::test_support::MemStore;
+        let dynamic_config = DynamicConfig::new(None, None, true, 1, 1, None, None)
+            .await
+            .unwrap();
+        dynamic_config.set_snapshot_for_test(crate::growthbook::ConfigSnapshot {
+            config: Some(config),
+            rules_user: None,
+            rules_post: None,
+        });
+        let allowlist = match manhattan {
+            Some(addr) => Some(crate::allowlist::ManhattanAllowlist::new(
+                Arc::new(
+                    xai_manhattan::NativeManhattanClient::new(addr)
+                        .await
+                        .unwrap(),
+                ),
+                xai_manhattan::Tenant {
+                    cluster: "test".into(),
+                    app_id: "test".into(),
+                    dataset: "enforcement".into(),
+                },
+            )),
+            None => None,
+        };
+        Arc::new(AppState {
+            ais_client: crate::ais_client::AisClient::unconnected(),
+            gd: None,
+            dynamic_config,
+            rules_cache: Arc::new(crate::rules::RulesCache::new()),
+            dedup_cache: None,
+            limiter: None,
+            allowlist,
+            growthbook_writer: growthbook.map(|uri| GrowthBookWriter::new(uri, "secret".into())),
+            growthbook_feature_key: FEATURE.into(),
+            growthbook_environment: "staging".into(),
+            kafka_ready: Default::default(),
+            kafka_producers: Default::default(),
+            hold_gate: Arc::new(crate::overturn_hold::HoldGate::new(None)),
+            off_switch: Arc::new(crate::off_switch::OffSwitch::new(
+                Arc::new(MemStore::default()),
+                Arc::new(MemStore::default()),
+            )),
+            head_guard: Arc::new(crate::head_guard::HeadGuard::new(
+                Arc::new(MemControlStore::default()),
+                None,
+            )),
+            action_control: Arc::new(crate::action_control::ActionControl::new(
+                Arc::new(MemControlStore::default()),
+                "prod".into(),
+                String::new(),
+            )),
+            backfill: Arc::new(crate::backfill::Backfill::new(
+                Arc::new(MemControlStore::default()),
+                None,
+                String::new(),
+            )),
+            boot_config: Value::Null,
+        })
+    }
+
+    async fn response(resp: impl IntoResponse) -> (StatusCode, Value) {
+        let resp = resp.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn naming(who: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(who) = who {
+            headers.insert(UPDATED_BY_HEADER, who.parse().unwrap());
+        }
+        headers
+    }
+
+    fn key() -> Extension<KeyId> {
+        Extension(KeyId("pv2".into()))
+    }
+
+    fn uri(path: &str) -> Uri {
+        path.parse().unwrap()
+    }
+
+    fn add(added_by: &str) -> Json<AllowlistAddRequest> {
+        Json(AllowlistAddRequest {
+            ttl_secs: 3600,
+            added_by: added_by.into(),
+            reason: "test".into(),
+        })
+    }
+
+    fn bulk(added_by: &str) -> Json<AllowlistBulkRequest> {
+        Json(AllowlistBulkRequest {
+            entries: vec![AllowlistBulkEntry {
+                user_id: 3,
+                ttl_secs: 3600,
+                added_by: added_by.into(),
+                reason: "test".into(),
+            }],
+            dry_run: false,
+        })
+    }
+
+            async fn people_audited(state: &Arc<AppState>, headers: &HeaderMap) -> Vec<(String, String)> {
+        let st = || State(state.clone());
+        let h = || headers.clone();
+        let _ = handle_config_put(
+            st(),
+            key(),
+            Method::PUT,
+            uri("/api/config"),
+            h(),
+            Json(json!({})),
+        )
+        .await;
+        let _ = handle_config_patch_field(
+            st(),
+            key(),
+            Method::PATCH,
+            uri("/api/config/dry_run"),
+            h(),
+            Path("dry_run".into()),
+            Json(ConfigPatchRequest { value: json!(true) }),
+        )
+        .await;
+        let _ = handle_allowlist_put(
+            st(),
+            key(),
+            Method::PUT,
+            uri("/api/allowlist/1"),
+            h(),
+            Path(1),
+            add(""),
+        )
+        .await;
+        let _ = handle_allowlist_put_entity(
+            st(),
+            key(),
+            Method::PUT,
+            uri("/api/allowlist/post/2"),
+            h(),
+            Path(("post".into(), 2)),
+            add(""),
+        )
+        .await;
+        let _ = handle_allowlist_bulk(
+            st(),
+            key(),
+            Method::POST,
+            uri("/api/allowlist/bulk"),
+            h(),
+            bulk(""),
+        )
+        .await;
+        let _ = handle_allowlist_delete(
+            st(),
+            key(),
+            Method::DELETE,
+            uri("/api/allowlist/1"),
+            h(),
+            Path(1),
+        )
+        .await;
+        let _ = handle_allowlist_delete_entity(
+            st(),
+            key(),
+            Method::DELETE,
+            uri("/api/allowlist/post/2"),
+            h(),
+            Path(("post".into(), 2)),
+        )
+        .await;
+        let _ = handle_rate_limit_reset(
+            st(),
+            key(),
+            Method::POST,
+            uri("/api/rate_limit/user/reset"),
+            h(),
+            Path("user".into()),
+        )
+        .await;
+        take_published()
+            .into_iter()
+            .map(|e| (e.http_path, e.updated_by))
+            .collect()
+    }
+
+                #[tokio::test]
+    async fn every_admin_write_records_the_header_person_else_the_key() {
+        let gb = growthbook(draft()).await;
+        let mh = xai_manhattan::mock_server::MockManhattanServer::new();
+        let mh_addr = mh.start().await;
+        let open = json!({});
+        let page_only = json!({"action_control": {"updated_by_keys": ["page"]}});
+        for (config, headers, want) in [
+            (
+                &open,
+                naming(Some("alice@example.com")),
+                "alice@example.com",
+            ),
+            (&open, naming(Some("  ")), "pv2"),
+            (&open, naming(None), "pv2"),
+            (&page_only, naming(Some("alice@example.com")), "pv2"),
+        ] {
+            let state = test_state(config.clone(), Some(&gb.uri()), Some(&mh_addr)).await;
+            let got = people_audited(&state, &headers).await;
+            let paths: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    "/api/config",
+                    "/api/config/dry_run",
+                    "/api/allowlist/1",
+                    "/api/allowlist/post/2",
+                    "/api/allowlist/bulk",
+                    "/api/allowlist/1",
+                    "/api/allowlist/post/2",
+                    "/api/rate_limit/user/reset",
+                ],
+                "every write audited once"
+            );
+            for (path, who) in &got {
+                assert_eq!(who, want, "{path} with {headers:?} under {config}");
+            }
+        }
+        assert_never_published(&gb).await;
+    }
+
+        #[tokio::test]
+    async fn allowlist_put_names_the_body_person_without_a_header() {
+        let mh = xai_manhattan::mock_server::MockManhattanServer::new();
+        let state = test_state(json!({}), None, Some(&mh.start().await)).await;
+        let st = || State(state.clone());
+        for (headers, want) in [
+            (naming(None), "bob@example.com"),
+            (naming(Some("alice@example.com")), "alice@example.com"),
+        ] {
+            let _ = handle_allowlist_put(
+                st(),
+                key(),
+                Method::PUT,
+                uri("/api/allowlist/1"),
+                headers,
+                Path(1),
+                add("bob@example.com"),
+            )
+            .await;
+            let events = take_published();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].updated_by, want);
+        }
+    }
+
+                #[tokio::test]
+    async fn allowlist_added_by_falls_back_to_the_person() {
+        let mh = xai_manhattan::mock_server::MockManhattanServer::new();
+        let state = test_state(json!({}), None, Some(&mh.start().await)).await;
+        let st = || State(state.clone());
+        let al = state.allowlist.as_ref().unwrap();
+        for (headers, added_by, want) in [
+            (naming(Some("alice@example.com")), "", "alice@example.com"),
+            (naming(Some("alice@example.com")), " ", "alice@example.com"),
+            (naming(None), "", "pv2"),
+            (
+                naming(Some("alice@example.com")),
+                "bob@example.com",
+                "bob@example.com",
+            ),
+        ] {
+            let (status, body) = response(
+                handle_allowlist_put(
+                    st(),
+                    key(),
+                    Method::PUT,
+                    uri("/api/allowlist/1"),
+                    headers.clone(),
+                    Path(1),
+                    add(added_by),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["added_by"], want);
+            assert_eq!(al.get(1).await.unwrap().added_by, want, "stored");
+
+            let (status, body) = response(
+                handle_allowlist_put_entity(
+                    st(),
+                    key(),
+                    Method::PUT,
+                    uri("/api/allowlist/post/2"),
+                    headers.clone(),
+                    Path(("post".into(), 2)),
+                    add(added_by),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["added_by"], want);
+            let (entry, _) = al.get_entity(EntityType::Post, 2).await.unwrap();
+            assert_eq!(entry.added_by, want, "stored");
+
+            let (status, body) = response(
+                handle_allowlist_bulk(
+                    st(),
+                    key(),
+                    Method::POST,
+                    uri("/api/allowlist/bulk"),
+                    headers,
+                    bulk(added_by),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!((status, body["errors"].as_u64()), (StatusCode::OK, Some(0)));
+            assert_eq!(al.get(3).await.unwrap().added_by, want, "stored");
+        }
+        take_published();
+    }
+
+            #[tokio::test]
+    async fn an_untrusted_key_stores_itself_as_added_by() {
+        let mh = xai_manhattan::mock_server::MockManhattanServer::new();
+        let page_only = json!({"action_control": {"updated_by_keys": ["page"]}});
+        let state = test_state(page_only, None, Some(&mh.start().await)).await;
+        let st = || State(state.clone());
+        let al = state.allowlist.as_ref().unwrap();
+        let alice = || naming(Some("alice@example.com"));
+        let _ = handle_allowlist_put(
+            st(),
+            key(),
+            Method::PUT,
+            uri("/api/allowlist/1"),
+            alice(),
+            Path(1),
+            add("bob@example.com"),
+        )
+        .await;
+        assert_eq!(al.get(1).await.unwrap().added_by, "pv2");
+        let _ = handle_allowlist_put_entity(
+            st(),
+            key(),
+            Method::PUT,
+            uri("/api/allowlist/post/2"),
+            alice(),
+            Path(("post".into(), 2)),
+            add("bob@example.com"),
+        )
+        .await;
+        let (entry, _) = al.get_entity(EntityType::Post, 2).await.unwrap();
+        assert_eq!(entry.added_by, "pv2");
+        let _ = handle_allowlist_bulk(
+            st(),
+            key(),
+            Method::POST,
+            uri("/api/allowlist/bulk"),
+            alice(),
+            bulk("bob@example.com"),
+        )
+        .await;
+        assert_eq!(al.get(3).await.unwrap().added_by, "pv2");
+        let events = take_published();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|e| e.updated_by == "pv2"));
+    }
+
+                #[tokio::test]
+    async fn handlers_audit_the_person_they_resolve() {
+        let state = test_state(json!({}), None, None).await;
+        let st = || State(state.clone());
+        let alice = || naming(Some("alice@example.com"));
+
+        let req = serde_json::from_value(json!({
+            "head": "H", "off": true, "reason": "r", "updated_by": "bob@example.com"
+        }))
+        .unwrap();
+        let (status, body) = response(
+            handle_off_switches_put(
+                st(),
+                key(),
+                Method::PUT,
+                uri("/api/off_switches"),
+                Json(req),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].updated_by, "bob@example.com");
+
+        let req = serde_json::from_value(json!({
+            "head": "H", "max_actions_per_hour": 10, "reason": "r"
+        }))
+        .unwrap();
+        let (status, body) = response(
+            handle_head_guards_put(
+                st(),
+                key(),
+                Method::PUT,
+                uri("/api/head_guards"),
+                alice(),
+                Json(req),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].updated_by, "alice@example.com");
+
+        let req = serde_json::from_value(json!({
+            "entity_type": "user", "head": "H", "mode": "recording", "reason": "r"
+        }))
+        .unwrap();
+        let (status, body) = response(
+            handle_action_controls_put(
+                st(),
+                key(),
+                Method::PUT,
+                uri("/api/action_controls"),
+                alice(),
+                Json(req),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].updated_by, "alice@example.com");
+
+        let (status, _) = response(
+            handle_backfill_run_change(
+                st(),
+                key(),
+                Method::POST,
+                uri("/api/backfill_runs/r1/pause"),
+                alice(),
+                Path(("r1".into(), "pause".into())),
+                Json(BackfillRunChangeRequest {
+                    expected_version: 1,
+                    confirm: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a refused change is audited too"
+        );
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].updated_by, "alice@example.com");
+    }
+
+            #[tokio::test]
+    async fn a_growthbook_refusal_is_422_growthbook_rejected() {
+        use crate::growthbook_writer::test_support::mount_growthbook;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let gb = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/api/v2/features/{FEATURE}/revisions/{VERSION}/rules/fr_stg"
+            )))
+            .respond_with(ResponseTemplate::new(400).set_body_string("value fails the schema"))
+            .with_priority(1)
+            .mount(&gb)
+            .await;
+        mount_growthbook(&gb, draft()).await;
+        let state = test_state(json!({}), Some(&gb.uri()), None).await;
+        let (status, body) = response(
+            handle_config_put(
+                State(state),
+                key(),
+                Method::PUT,
+                uri("/api/config"),
+                naming(Some("alice@example.com")),
+                Json(json!({"dry_run": "nope"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "growthbook_rejected");
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("value fails the schema") && error.contains("discarded"),
+            "{error}"
+        );
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+    }
+
+    #[tokio::test]
+    async fn config_writes_without_an_admin_key_are_503_and_not_audited() {
+        let state = test_state(json!({}), None, None).await;
+        let (status, body) = response(
+            handle_config_put(
+                State(state.clone()),
+                key(),
+                Method::PUT,
+                uri("/api/config"),
+                naming(Some("alice@example.com")),
+                Json(json!({"dry_run": true})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "GrowthBook admin API not configured");
+        let (status, _) = response(
+            handle_config_patch_field(
+                State(state),
+                key(),
+                Method::PATCH,
+                uri("/api/config/dry_run"),
+                naming(None),
+                Path("dry_run".into()),
+                Json(ConfigPatchRequest { value: json!(true) }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(take_published().is_empty());
+    }
+
+                #[tokio::test]
+    async fn config_writes_put_a_draft_up_for_review() {
+        let gb = growthbook(draft()).await;
+        let state = test_state(json!({"dry_run": true}), Some(&gb.uri()), None).await;
+        let pending = json!({
+            "status": "pending_review",
+            "feature": FEATURE,
+            "revision": VERSION,
+            "environment": "staging",
+            "url": format!("https://app.growthbook.io/features/{FEATURE}?v={VERSION}"),
+        });
+        let (status, body) = response(
+            handle_config_put(
+                State(state.clone()),
+                key(),
+                Method::PUT,
+                uri("/api/config"),
+                naming(Some("alice@example.com")),
+                Json(json!({"dry_run": false})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!((status, &body), (StatusCode::ACCEPTED, &pending));
+        let (status, body) = response(
+            handle_config_patch_field(
+                State(state),
+                key(),
+                Method::PATCH,
+                uri("/api/config/max_user_enforcements_per_day"),
+                naming(Some("alice@example.com")),
+                Path("max_user_enforcements_per_day".into()),
+                Json(ConfigPatchRequest { value: json!(5) }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!((status, &body), (StatusCode::ACCEPTED, &pending));
+
+        let base = format!("/api/v2/features/{FEATURE}/revisions");
+        let got = requests(&gb).await;
+        let calls: Vec<String> = got.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        let one = [
+            format!("POST {base}"),
+            format!("PUT {base}/{VERSION}/rules/fr_stg"),
+            format!("POST {base}/{VERSION}/request-review"),
+        ];
+        assert_eq!(calls, [one.clone(), one].concat(), "staging rule only");
+        assert!(
+            got[0].2["title"]
+                .as_str()
+                .unwrap()
+                .contains("alice@example.com"),
+            "the draft names the person: {}",
+            got[0].2
+        );
+        assert_eq!(got[1].2["rule"]["value"], "{\"dry_run\":false}");
+        assert_eq!(
+            got[4].2["rule"]["value"], "{\"dry_run\":true,\"max_user_enforcements_per_day\":5}",
+            "the field is set on the draft's staging value"
+        );
+        assert_never_published(&gb).await;
+
+        let events = take_published();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, AdminAction::ConfigReplace as i32);
+        assert_eq!(events[1].action, AdminAction::ConfigPatchField as i32);
+        assert_eq!(events[1].config_field, "max_user_enforcements_per_day");
+        assert_eq!(events[1].before_json, "");
+        assert_eq!(events[0].before_json, "{\"dry_run\":true}");
+        for ev in events {
+            assert!(ev.success);
+            assert_eq!(ev.growthbook_revision, VERSION);
+            assert_eq!(ev.updated_by, "alice@example.com");
+            assert_eq!(ev.actor_key_id, "pv2");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_growthbook_failure_is_500_and_audited_as_failed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let gb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("no draft access"))
+            .mount(&gb)
+            .await;
+        let state = test_state(json!({}), Some(&gb.uri()), None).await;
+        let (status, body) = response(
+            handle_config_put(
+                State(state),
+                key(),
+                Method::PUT,
+                uri("/api/config"),
+                naming(Some("alice@example.com")),
+                Json(json!({})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("403") && error.contains("no draft access"),
+            "{error}"
+        );
+        let events = take_published();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+        assert_eq!(events[0].error, error);
+        assert_eq!(events[0].growthbook_revision, 0);
+        assert_eq!(events[0].updated_by, "alice@example.com");
+        assert_eq!(requests(&gb).await.len(), 1, "no further call");
+    }
+
+    #[tokio::test]
+    async fn rules_get_returns_the_yaml_in_use() {
+        let state = test_state(json!({}), None, None).await;
+        let override_yaml = "for_entity: user\nrules:\n  - id: ovr\n    when: \"true\"\n    then: {kind: skip, reason: t}";
+        state
+            .dynamic_config
+            .set_snapshot_for_test(crate::growthbook::ConfigSnapshot {
+                config: None,
+                rules_user: Some(Arc::from(override_yaml)),
+                rules_post: None,
+            });
+        let (status, body) = response(handle_rules_get(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user"]["source"], "dynamic");
+        assert_eq!(body["user"]["yaml"], override_yaml);
+        assert_eq!(body["post"]["source"], "static");
+        assert_eq!(
+            body["post"]["yaml"],
+            state.rules_cache.status(EntityType::Post, None).yaml,
+            "the baked-in post rules"
+        );
+        assert!(
+            body["post"]["yaml"]
+                .as_str()
+                .unwrap()
+                .contains("for_entity")
+        );
+    }
+
+    #[test]
+    fn action_control_and_run_events_carry_the_person() {
+        let ev = action_control_admin_event(
+            "pv2".into(),
+            "alice@example.com".into(),
+            &Method::PUT,
+            "/api/action_controls",
+            String::new(),
+            &Err(ControlSetError::Store("timeout".into())),
+        );
+        assert_eq!(ev.updated_by, "alice@example.com");
+        assert!(!ev.success);
+        for (who, want) in [
+            (Some("alice@example.com".to_owned()), "alice@example.com"),
+            (None, "sender"),
+        ] {
+            let ev = run_admin_event(
+                "sender".into(),
+                who,
+                &Method::POST,
+                "/api/backfill_runs/r1/done",
+                String::new(),
+                Some(&RunError::NotFound),
+            );
+            assert_eq!(ev.updated_by, want);
+            assert_eq!(ev.actor_key_id, "sender");
+        }
+    }
+
+            #[tokio::test]
+    async fn backfill_settings_put_records_the_person() {
+        use crate::action_control::test_support::MemControlStore;
+        let mut state = test_state(json!({}), None, None).await;
+        Arc::get_mut(&mut state).unwrap().backfill = Arc::new(
+            crate::backfill::Backfill::new(Arc::new(MemControlStore::default()), None, "p".into())
+                .with_access(crate::backfill::BackfillAccess::new(
+                    &["pv2".into()],
+                    &[],
+                    1000,
+                )),
+        );
+        take_published();
+        for (who, status, want) in [
+            (
+                Some("alice@example.com"),
+                StatusCode::OK,
+                "alice@example.com",
+            ),
+            (None, StatusCode::FORBIDDEN, "pv2"),
+        ] {
+            let (got, body) = response(
+                handle_backfill_settings_put(
+                    State(state.clone()),
+                    key(),
+                    Method::PUT,
+                    uri("/api/backfill_settings"),
+                    naming(who),
+                    Json(BackfillSettingsRequest {
+                        max_user_decisions_per_day: 0,
+                        max_post_decisions_per_day: 0,
+                        max_rate_per_sec: 0,
+                        reason: "test".into(),
+                        expected_version: None,
+                        confirm: None,
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(got, status, "{body}");
+            let events = take_published();
+            assert_eq!(events.len(), 1, "{who:?}");
+            assert_eq!(events[0].http_path, "/api/backfill_settings");
+            assert_eq!(events[0].updated_by, want);
+            assert_eq!(events[0].actor_key_id, "pv2");
+        }
+    }
 
     #[test]
     fn only_allowed_keys_name_the_updater() {
@@ -2524,9 +4044,11 @@ mod tests {
             updated_by: Some("operator@example.com".into()),
         };
         let request_json = serde_json::to_string(&req).unwrap();
+        let who = crate::off_switch::OffSwitch::updated_by(&req, "pv2");
         let result = sw.set(req, "pv2", crate::now_millis()).await;
         let ev = off_switch_admin_event(
             "pv2".into(),
+            who,
             &Method::PUT,
             "/api/off_switches",
             request_json.clone(),
@@ -2535,6 +4057,12 @@ mod tests {
         assert!(ev.success);
         assert_eq!(ev.error, "");
         assert_eq!(ev.actor_key_id, "pv2");
+        assert_eq!(ev.updated_by, "operator@example.com");
+        assert_eq!(
+            ev.updated_by,
+            result.as_ref().unwrap().view.record.updated_by,
+            "the person the record names"
+        );
         assert_eq!(ev.http_method, "PUT");
         assert_eq!(ev.http_path, "/api/off_switches");
         assert_eq!(ev.request_json, request_json);
@@ -2544,6 +4072,7 @@ mod tests {
         let failed: Result<SetOutcome, SetError> = Err(SetError::Store("timeout".into()));
         let ev = off_switch_admin_event(
             "pv2".into(),
+            "pv2".into(),
             &Method::PUT,
             "/api/off_switches",
             String::new(),
@@ -2552,6 +4081,121 @@ mod tests {
         assert!(!ev.success);
         assert_eq!(ev.error, "timeout");
         assert_eq!(ev.before_json, "");
+        assert_eq!(ev.updated_by, "pv2");
+    }
+
+    #[tokio::test]
+    async fn head_guard_put_audit_event_carries_actor_body_and_prior_state() {
+        use crate::head_guard::HeadGuardRecord;
+        use crate::head_guard::test_support::{guard, with_counters};
+        let (hg, _, _) = with_counters(&[guard("H", None, Some(5), None)]).await;
+        let req = HeadGuardPutRequest {
+            head: "H".into(),
+            classifier: None,
+            max_actions_per_hour: Some(10),
+            max_actions_per_day: None,
+            overturn: None,
+            reason: "raise".into(),
+            expected_version: Some(1),
+            updated_by: None,
+        };
+        let request_json = serde_json::to_string(&req).unwrap();
+        let result = hg
+            .set(req, "operator@example.com", "pv2", crate::now_millis())
+            .await;
+        let ev = head_guard_admin_event(
+            "pv2".into(),
+            "operator@example.com".into(),
+            &Method::PUT,
+            "/api/head_guards",
+            request_json.clone(),
+            &result,
+        );
+        assert!(ev.success);
+        assert_eq!(ev.error, "");
+        assert_eq!(ev.actor_key_id, "pv2");
+        assert_eq!(ev.updated_by, "operator@example.com");
+        assert_eq!(ev.http_method, "PUT");
+        assert_eq!(ev.http_path, "/api/head_guards");
+        assert_eq!(ev.request_json, request_json);
+        let before: HeadGuardRecord = serde_json::from_str(&ev.before_json).unwrap();
+        assert_eq!(before.max_actions_per_hour, Some(5));
+
+        let failed: Result<GuardSetOutcome, GuardSetError> =
+            Err(GuardSetError::Store("timeout".into()));
+        let ev = head_guard_admin_event(
+            "pv2".into(),
+            "operator@example.com".into(),
+            &Method::PUT,
+            "/api/head_guards",
+            String::new(),
+            &failed,
+        );
+        assert!(!ev.success);
+        assert_eq!(ev.error, "timeout");
+        assert_eq!(ev.before_json, "");
+        assert_eq!(ev.updated_by, "operator@example.com");
+
+        for (failed, error) in [
+            (GuardSetError::Conflict(None, Some(2)), "version_conflict"),
+            (GuardSetError::LostRace(None), "lost_race"),
+        ] {
+            let ev = head_guard_admin_event(
+                "pv2".into(),
+                "operator@example.com".into(),
+                &Method::PUT,
+                "/api/head_guards",
+                String::new(),
+                &Err(failed),
+            );
+            assert_eq!(ev.error, error);
+        }
+    }
+
+        #[test]
+    fn head_guard_put_response_maps_each_outcome() {
+        use crate::head_guard::test_support::guard;
+        let view = crate::head_guard::HeadGuardView {
+            record: guard("H", None, Some(5), None),
+            scope: "head".into(),
+            active: true,
+        };
+        let (status, Json(body)) =
+            head_guard_put_response(Ok(GuardSetOutcome { view, before: None }));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["guard"]["head"], "H");
+        assert_eq!(body["guard"]["max_actions_per_hour"], 5);
+        assert_eq!(body["before"], Value::Null);
+
+        let (status, Json(body)) =
+            head_guard_put_response(Err(GuardSetError::Invalid("invalid_limit", "bad".into())));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            (body["error"].as_str(), body["detail"].as_str()),
+            (Some("invalid_limit"), Some("bad"))
+        );
+
+        let (status, Json(body)) = head_guard_put_response(Err(GuardSetError::Conflict(
+            Some(guard("H", None, Some(5), None)),
+            Some(1),
+        )));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "version_conflict");
+        assert_eq!(body["current"]["version"], 1);
+        assert_eq!(body["current_version"], 1);
+
+        let (status, Json(body)) = head_guard_put_response(Err(GuardSetError::LostRace(None)));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "lost_race");
+        assert_eq!(body["current"], Value::Null);
+
+        let (status, Json(body)) =
+            head_guard_put_response(Err(GuardSetError::Store("timeout".into())));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            (body["error"].as_str(), body["detail"].as_str()),
+            (Some("store"), Some("timeout"))
+        );
     }
 
     #[test]
@@ -2613,6 +4257,7 @@ mod tests {
                 2,
                 vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
                 Some(LABEL_EXPIRY_MSEC),
+                "",
                 vec![],
             ),
             EnforcementAction::bounce_arkose(1, vec!["n".to_owned()]),
@@ -2871,7 +4516,7 @@ mod tests {
             perm: true,
             policy: "TestPolicy".into(),
         };
-        let action = EnforcementAction::from_spec(&suspend, 1, 1, vec!["k: v".into()]);
+        let action = EnforcementAction::from_spec(&suspend, 1, 1, "", vec!["k: v".into()]);
         let v = action.to_json();
         assert_eq!(v["suspendUser"]["perm"], true);
         assert_eq!(v["suspendUser"]["policy"], "TestPolicy");
@@ -2880,7 +4525,7 @@ mod tests {
             labels: vec!["LowQualityReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&label, 2, 2, vec![]);
+        let action = EnforcementAction::from_spec(&label, 2, 2, "", vec![]);
         let v = action.to_json();
         let label_id_type = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["labelReference"]["labelIdType"];
@@ -2890,20 +4535,20 @@ mod tests {
             labels: vec!["RiskyHighVizReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&post_label, 555, 999, vec![]);
+        let action = EnforcementAction::from_spec(&post_label, 555, 999, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::AddPostLabelsV2 { tweet_id: 555, .. }
         ));
         assert_eq!(action.name(), "addPostLabelsV2");
 
-        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, vec![]);
+        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, "", vec![]);
         assert!(matches!(
             arkose,
             EnforcementAction::BounceArkose { user_id: 3, .. }
         ));
         assert_eq!(arkose.name(), "bounceArkose");
-        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, vec![]);
+        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, "", vec![]);
         assert!(matches!(
             captcha,
             EnforcementAction::BounceCaptcha { user_id: 4, .. }
@@ -2917,6 +4562,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec!["model_version: v51".to_owned()],
         );
         assert_eq!(action.name(), "addPostLabelsV2");
@@ -2951,14 +4597,95 @@ mod tests {
     }
 
     #[test]
-    fn add_post_label_without_ttl_emits_empty_safety_label() {
+    fn add_post_label_without_ttl_emits_no_expiry() {
         let action =
-            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, vec![]);
+            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, "", vec![]);
         let v = action.to_json();
         let safety_label = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["safetyLabel"];
-        assert_eq!(*safety_label, json!({}));
+        assert_eq!(*safety_label, json!({"source": PLUGIN_ID}));
         assert!(safety_label["expiresAtMsec"].is_null());
+    }
+
+    #[test]
+    fn post_label_request_names_the_head_in_label_source() {
+        let t = xai_abuse_thrift_codec::Transcoder::from_schema_bytes(
+            xai_abuse_thrift_codec::SCHEMA_AIS,
+        )
+        .unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        for (label, head) in [
+            ("NsfwHighPrecision", "AdultExplicitEmbeddingPtosDistilled"),
+            ("SpamHighRecall", "CopyLinkBaitEmbeddingGrokDistilled"),
+        ] {
+            let action = EnforcementAction::from_spec(
+                &ActionSpec::AddPostLabelsV2 {
+                    labels: vec![label.into()],
+                    ttl_msec: None,
+                },
+                555,
+                999,
+                head,
+                vec!["k: v".into()],
+            );
+            let payload = build_intake_request(
+                action.actor_header(),
+                action.to_json(),
+                AIS_TOOL,
+                Some(action.audit_note()),
+            );
+            let source = format!("xai-abuse-enforcement-service/{head}");
+            let tweet = json!({"entity": {"entityType": "Tweet", "entityId": {"longId": 555}}});
+            assert_eq!(
+                payload,
+                json!({
+                    "actorHeader": {"botmakerBot": {"botId": 0}},
+                    "action": {
+                        "addLabelsV2": {
+                            "entityId": tweet,
+                            "entityRef": tweet,
+                            "labels": [{
+                                "nonPolicyBasedLabel": {
+                                    "label": {
+                                        "labelReferenceWithSafetyLabel": {
+                                            "labelReference": {
+                                                "entityType": "Tweet",
+                                                "labelIdType": {"safetyTweetLabels": label},
+                                                "labelType": "Safety"
+                                            },
+                                            "safetyLabel": {"source": source}
+                                        }
+                                    }
+                                }
+                            }],
+                            "violatingUserIds": []
+                        }
+                    },
+                    "tool": "RtpPlugin",
+                    "auditHeader": {"note": format!("k: v; {}", AUDIT_NOTE.as_str())}
+                })
+            );
+            let bytes = encode(&payload).expect("encodes through the AIS schema");
+            assert!(
+                bytes.windows(source.len()).any(|w| w == source.as_bytes()),
+                "{source} missing from the encoded call"
+            );
+        }
     }
 
     #[test]
@@ -2973,6 +4700,7 @@ mod tests {
             99,
             vec!["RiskyHighVizReply".into()],
             Some(LABEL_EXPIRY_MSEC),
+            "",
             vec![],
         );
         let plugin_b = EnforcementAction::bounce_captcha(1, vec![]);
@@ -3012,6 +4740,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec![],
         );
         assert_eq!(
@@ -3042,6 +4771,56 @@ mod tests {
         assert_eq!(captcha.actor_header(), plugin_header);
         let liveness = EnforcementAction::spam_liveness_check(42, vec![]);
         assert_eq!(liveness.actor_header(), plugin_header);
+    }
+
+    #[test]
+    fn phoenix_skip_label_encodes_as_label_value_118() {
+        use xai_abuse_thrift_codec::{SCHEMA_AIS, Transcoder};
+        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let action = EnforcementAction::from_spec(
+            &ActionSpec::AddLabelsV2 {
+                labels: vec![crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP.into()],
+                ttl_msec: Some(30 * 86_400_000),
+            },
+            9,
+            9,
+            "",
+            vec!["head: AdsRenderBot".into()],
+        );
+        assert_eq!(
+            action.actor_header(),
+            json!({"plugin": {"pluginId": PLUGIN_ID}})
+        );
+        let payload = build_intake_request(
+            action.actor_header(),
+            action.to_json(),
+            AIS_TOOL,
+            Some(action.audit_note()),
+        );
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        let label_id = "/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels";
+        assert_eq!(
+            payload.pointer(label_id),
+            Some(&json!("ClientEventPhoenixSkip"))
+        );
+        let mut by_ordinal = payload.clone();
+        *by_ordinal.pointer_mut(label_id).unwrap() = json!(118);
+        assert_eq!(encode(&payload).unwrap(), encode(&by_ordinal).unwrap());
     }
 
 
@@ -3099,7 +4878,7 @@ mod tests {
 
     #[test]
     fn from_spec_builds_spam_liveness_check() {
-        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, vec![]);
+        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::SpamLivenessCheck { user_id: 9, .. }
@@ -3134,5 +4913,295 @@ mod tests {
         assert!(note.contains(" @ "));
         assert!(note.ends_with(']'));
         assert!(note.contains("[env: "));
+    }
+
+                #[tokio::test]
+    async fn the_router_refuses_every_protected_operation_without_a_key() {
+        use utoipa::OpenApi;
+        let mut cfg: crate::config::Config = clap::Parser::parse_from::<_, &str>(["bin"]);
+        cfg.api_keys_json = Some(r#"{"test":"tok-test"}"#.into());
+        let keys = crate::auth::ApiKeys::from_config(&cfg).unwrap();
+        let router = crate::build_api_router(test_state(json!({}), None, None).await, keys);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let doc = serde_json::to_value(crate::api_doc::ApiDoc::openapi()).unwrap();
+        let mut checked = 0;
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            let concrete = path
+                .replace("{entity_type}", "user")
+                .replace("{entity_id}", "1")
+                .replace("{user_id}", "1")
+                .replace("{run_id}", "run-1")
+                .replace("{change}", "stop")
+                .replace("{field}", "dry_run");
+            for (method, op) in item.as_object().unwrap() {
+                let protected = op
+                    .get("security")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                let method = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
+                let mut req = client.request(method.clone(), format!("http://{addr}{concrete}"));
+                if method != reqwest::Method::GET && method != reqwest::Method::DELETE {
+                    req = req.json(&json!({}));
+                }
+                let status = req.send().await.unwrap().status();
+                assert_eq!(
+                    status == reqwest::StatusCode::UNAUTHORIZED,
+                    protected,
+                    "{method} {path} answered {status}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "only {checked} operations in the API doc");
+    }
+
+    mod account_action_refusal_tests {
+        use std::collections::HashMap;
+
+        use super::*;
+        use crate::gizmoduck::GizmoduckCoreClient;
+        use crate::gizmoduck::test_support::{AccountShape, FixedUsers};
+        use crate::safety_checks::TestAccountPolicy;
+
+        const PLAIN: i64 = 1_700_200_001;
+        const QA_ROLE: i64 = 1_700_200_002;
+        const QA_MAIL: i64 = 1_700_200_003;
+        const QA_MAIL_UNCONFIRMED: i64 = 1_700_200_004;
+        const NETWORK: i64 = 1_700_200_005;
+        const TEMPORARY: i64 = 1_700_200_006;
+        const TEST_ID: i64 = 2_000_000_001;
+        const NOT_FOUND: i64 = 1_700_200_099;
+
+        fn client(fail: bool) -> GizmoduckCoreClient {
+            let shape = |s: AccountShape, id: i64| (id, s.user(id));
+            let users: HashMap<_, _> = [
+                shape(AccountShape::default(), PLAIN),
+                shape(
+                    AccountShape {
+                        roles: vec!["qa_test_role"],
+                        ..Default::default()
+                    },
+                    QA_ROLE,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(3),
+                        ..Default::default()
+                    },
+                    QA_MAIL,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(2),
+                        ..Default::default()
+                    },
+                    QA_MAIL_UNCONFIRMED,
+                ),
+                shape(
+                    AccountShape {
+                        creation_ip: Some("203.0.113.40"),
+                        ..Default::default()
+                    },
+                    NETWORK,
+                ),
+                shape(
+                    AccountShape {
+                        test_user_status: Some(1),
+                        ..Default::default()
+                    },
+                    TEMPORARY,
+                ),
+            ]
+            .into();
+            GizmoduckCoreClient::from_lookup(Arc::new(FixedUsers {
+                users,
+                fail,
+                ..Default::default()
+            }))
+            .with_policy(
+                TestAccountPolicy::new(
+                    &["test.example.com".into()],
+                    &["qa_test_role".into()],
+                    &["203.0.113.0/24".into()],
+                )
+                .unwrap(),
+            )
+        }
+
+                fn act(name: &str, user_id: Value) -> Value {
+            json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {name: {"userId": user_id, "perm": false}},
+                "tool": "RtpPlugin",
+            })
+        }
+
+        fn suspend(user_id: Value) -> Value {
+            act("suspendUser", user_id)
+        }
+
+        async fn refusal(gd: Option<&GizmoduckCoreClient>, req: Value) -> Option<StatusCode> {
+            account_action_refusal(gd, &req).await.map(|(code, _)| code)
+        }
+
+        #[test]
+        fn the_guarded_actions_are_the_account_ending_ones_in_the_ais_schema() {
+            assert_eq!(
+                ACCOUNT_ACTIONS,
+                [
+                    "suspendUser",
+                    "suspendUserV2",
+                    "deactivateUser",
+                    "readOnlyUser"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_accounts_are_refused() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                for id in [QA_ROLE, QA_MAIL, NETWORK, TEMPORARY, TEST_ID] {
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id}"
+                    );
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id.to_string()))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id} as a string"
+                    );
+                }
+            }
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(NOT_FOUND))).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: an account gizmoduck doesn't return"
+                );
+            }
+            let (_, why) = account_action_refusal(Some(&gd), &act("suspendUserV2", json!(QA_ROLE)))
+                .await
+                .unwrap();
+            assert!(why.contains("test_user_skipped"), "{why}");
+            assert!(!why.contains("qa_test_role"), "{why}");
+        }
+
+        #[tokio::test]
+        async fn ordinary_accounts_and_other_actions_pass() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(PLAIN))).await,
+                    None,
+                    "{name}"
+                );
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(QA_MAIL_UNCONFIRMED))).await,
+                    None,
+                    "{name}"
+                );
+            }
+            let label = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {"entityRef": {"userId": QA_ROLE}}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(None, label).await,
+                None,
+                "only account-ending actions are checked"
+            );
+            assert_eq!(
+                refusal(None, act("unsuspendUser", json!(QA_ROLE))).await,
+                None,
+                "lifting a suspension is not checked"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_account_action_that_cant_be_checked_is_refused() {
+            for &name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&client(true)), act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: failed lookup"
+                );
+                assert_eq!(
+                    refusal(None, act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: no client"
+                );
+                for bad in [json!(null), json!("x"), json!(0), json!(-5), json!(1.5)] {
+                    assert_eq!(
+                        refusal(Some(&client(false)), act(name, bad.clone())).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {bad}"
+                    );
+                }
+                let no_id = json!({
+                    "actorHeader": {"plugin": {"pluginId": "p"}},
+                    "action": {name: {}},
+                    "tool": "RtpPlugin",
+                });
+                assert_eq!(
+                    refusal(Some(&client(false)), no_id).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: no userId"
+                );
+            }
+            let two = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {}, "suspendUserV2": {"userId": QA_ROLE}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(Some(&client(false)), two).await,
+                Some(StatusCode::UNPROCESSABLE_ENTITY),
+                "an account action beside another variant"
+            );
+        }
+
+                                #[tokio::test]
+        async fn the_handler_refuses_before_any_ais_call() {
+            let state = test_state(json!({}), None, None).await;
+            let mut with_gd = Arc::try_unwrap(test_state(json!({}), None, None).await)
+                .ok()
+                .unwrap();
+            with_gd.gd = Some(client(false));
+            let with_gd = Arc::new(with_gd);
+            let legacy = json!({ "actionIntakeRequest": suspend(json!(QA_ROLE)) });
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(legacy)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let v2 = act("suspendUserV2", json!(QA_MAIL));
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(v2)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body["action"].as_str().unwrap().contains("test account"),
+                "{body}"
+            );
+            let (code, _) =
+                response(handle_action(State(state), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no client on the state"
+            );
+            let (code, _) =
+                response(handle_action(State(with_gd), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a plain account reaches AIS"
+            );
+        }
     }
 }

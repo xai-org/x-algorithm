@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import logging
+import math
 
 import jax
 import jax.numpy as jnp
@@ -9,7 +10,9 @@ _log = logging.getLogger(__name__)
 
 TARGET = "xrex_mol_epilogue"
 FUSED_TARGET = "xrex_mol_fused_int8"
+GATE_BWD_TARGET = "xrex_mol_gate_bwd"
 SUPPORTED_KL_H = ((4, 32), (8, 16), (8, 32), (16, 16))
+GATE_BWD_KL_H = ((4, 32), (8, 16), (8, 32))
 MAX_USERS = 512
 FUSED_QUERY_ROWS = (32, 64, 96, 128)
 
@@ -26,6 +29,10 @@ else:
     if hasattr(mol_epilogue_api, "mol_fused_int8"):
         jax.ffi.register_ffi_target(
             FUSED_TARGET, fn=mol_epilogue_api.mol_fused_int8(), platform="CUDA"
+        )
+    if hasattr(mol_epilogue_api, "mol_gate_bwd"):
+        jax.ffi.register_ffi_target(
+            GATE_BWD_TARGET, fn=mol_epilogue_api.mol_gate_bwd(), platform="CUDA"
         )
 
 
@@ -149,3 +156,81 @@ def mol_fused_int8(
         num_users=num_users,
         **({"col_offset": col_offset} if fused_col_offset_supported() else {}),
     )
+
+
+def gate_training_supported(kl: int, hidden: int, num_users: int) -> bool:
+    return (
+        available()
+        and hasattr(mol_epilogue_api, "mol_gate_bwd")
+        and (kl, hidden) in GATE_BWD_KL_H
+        and num_users <= min(MAX_USERS, mol_epilogue_api.mol_gate_bwd_max_users)
+    )
+
+
+def _gate_forward(cos, user_bias, item_bias, w1, b1, w2, b2):
+    kl, num_users, num_items = cos.shape
+    return mol_epilogue(
+        cos.reshape(kl * num_users, num_items),
+        jnp.ones((1, num_items), jnp.float32),
+        jnp.transpose(user_bias),
+        jnp.transpose(item_bias),
+        w1,
+        b1,
+        w2,
+        b2,
+        num_users=num_users,
+        num_components=1,
+    )
+
+
+@jax.custom_vjp
+def mol_gate_scores(cos, user_bias, item_bias, w1, b1, w2, b2):
+    return _gate_forward(cos, user_bias, item_bias, w1, b1, w2, b2)
+
+
+def _gate_vjp_fwd(cos, user_bias, item_bias, w1, b1, w2, b2):
+    out = _gate_forward(cos, user_bias, item_bias, w1, b1, w2, b2)
+    return out, (cos, user_bias, item_bias, w1, b1, w2, b2)
+
+
+def _gate_vjp_bwd(res, g):
+    cos, user_bias, item_bias, w1, b1, w2, b2 = res
+    kl, num_users, num_items = cos.shape
+    hidden = w1.shape[1]
+    blocks = math.ceil(num_items / mol_epilogue_api.mol_gate_bwd_items_per_block)
+    f32 = jnp.float32
+    call = jax.ffi.ffi_call(
+        GATE_BWD_TARGET,
+        (
+            jax.ShapeDtypeStruct((kl * num_users, num_items), jnp.bfloat16),
+            jax.ShapeDtypeStruct((kl, num_items), f32),
+            jax.ShapeDtypeStruct((blocks, kl, num_users), f32),
+            jax.ShapeDtypeStruct((blocks, 2 * kl * hidden + hidden), f32),
+        ),
+        vmap_method="sequential",
+    )
+    dcos, ditem_bias, duser_bias, dw = call(
+        cos.reshape(kl * num_users, num_items).astype(jnp.bfloat16),
+        jnp.transpose(user_bias).astype(f32),
+        jnp.transpose(item_bias).astype(f32),
+        w1.astype(f32),
+        b1.reshape(-1).astype(f32),
+        w2.astype(f32),
+        b2.reshape(-1).astype(f32),
+        g.astype(f32),
+        num_users=num_users,
+    )
+    duser_bias = jnp.sum(duser_bias, axis=0)
+    dw = jnp.sum(dw, axis=0)
+    return (
+        dcos.reshape(cos.shape).astype(cos.dtype),
+        jnp.transpose(duser_bias).astype(user_bias.dtype),
+        jnp.transpose(ditem_bias).astype(item_bias.dtype),
+        dw[: kl * hidden].reshape(kl, hidden).astype(w1.dtype),
+        dw[kl * hidden : kl * hidden + hidden].astype(b1.dtype),
+        dw[kl * hidden + hidden :].reshape(hidden, kl).astype(w2.dtype),
+        jnp.sum(duser_bias, axis=1).astype(b2.dtype),
+    )
+
+
+mol_gate_scores.defvjp(_gate_vjp_fwd, _gate_vjp_bwd)

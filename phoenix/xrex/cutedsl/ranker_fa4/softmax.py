@@ -42,6 +42,7 @@ from cutlass import Boolean, Float32
 
 import xrex.cutedsl.ranker_fa4.utils as utils
 from xrex.cutedsl.quack import layout_utils
+from xrex.cutedsl.quack.activation import sub_packed_f32x2
 from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfoQK
 
@@ -112,16 +113,14 @@ class Softmax(ParamsBase):
                 row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
 
             if cutlass.const_expr(is_first):
-                row_max_cur_scaled = row_max_cur * scale_log2
                 acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                    (acc_S_row - row_max_cur) * scale_log2, fastmath=True
                 )
                 acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
                 row_scale[r] = 1.0
             else:
-                row_max_cur_scaled = row_max_cur * scale_log2
                 acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                    (acc_S_row - row_max_cur) * scale_log2, fastmath=True
                 )
                 row_scale[r] = cute.math.exp2(
                     (row_max_prev - row_max_cur) * scale_log2, fastmath=True
@@ -268,14 +267,13 @@ class SoftmaxSm100(Softmax):
         row_max: Float32,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        row_max_scaled = row_max * self.scale_log2
         max_offset = Float32(self.max_offset)
-        bias = max_offset - row_max_scaled
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+            difference = sub_packed_f32x2((acc_S_row[i], acc_S_row[i + 1]), (row_max, row_max))
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
+                difference,
                 (self.scale_log2, self.scale_log2),
-                (bias, bias),
+                (max_offset, max_offset),
             )
 
     @cute.jit
@@ -482,14 +480,14 @@ def apply_score_mod_bwd_inner(
         q_idx_pos = cutlass.const_expr(0)
         kv_idx_pos = cutlass.const_expr(1)
     n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
-    grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):

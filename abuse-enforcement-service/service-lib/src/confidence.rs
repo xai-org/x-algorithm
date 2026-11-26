@@ -5,55 +5,34 @@ use tracing::error;
 use xai_abuse_proto::enforcement as abuse_proto;
 
 pub use xai_abuse_enforcement_types::action_control::{
-    ConfidenceEvidence, ConfidenceLevel, EvidenceOverride, LabelMapEntry, EVIDENCE_OVERRIDE_MAX_MS,
+    ConfidenceEvidence, ConfidenceLevel, EvidenceOverride, LevelRow, EVIDENCE_OVERRIDE_MAX_MS,
 };
 
 pub const CONFIG_KEY: &str = "confidence";
 pub const DEFAULT_EVIDENCE_MAX_AGE_DAYS: i64 = 30;
+pub const DEFAULT_FACTORY_EVIDENCE_MAX_AGE_DAYS: i64 = 365;
 const DAY_MS: i64 = 86_400_000;
 const MAX_EVIDENCE_AGE_DAYS: f64 = 365.0;
 pub const CLOCK_SKEW_MS: i64 = 300_000;
-const CONFIG_KEYS: &[&str] = &["label_map", "evidence_max_age_days"];
+const CONFIG_KEYS: &[&str] = &["evidence_max_age_days", "factory_evidence_max_age_days"];
 const MAX_READS: u32 = 100_000;
 const ALPHA: f64 = 0.05;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Producer,
-    LabelMap,
-}
-
-impl Source {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Source::Producer => "producer",
-            Source::LabelMap => "label_map",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
-    pub level: ConfidenceLevel,
-    pub source: Source,
+    pub row: LevelRow,
+    pub unknown: bool,
     pub evidence: Option<ConfidenceEvidence>,
     pub now_ms: i64,
 }
 
-pub fn level_from_proto(value: i32) -> Option<ConfidenceLevel> {
+pub fn row_of(value: i32) -> (LevelRow, bool) {
     match abuse_proto::Confidence::try_from(value) {
-        Ok(abuse_proto::Confidence::Unspecified) => None,
-        Ok(abuse_proto::Confidence::Low) | Err(_) => Some(ConfidenceLevel::Low),
-        Ok(abuse_proto::Confidence::Mid) => Some(ConfidenceLevel::Mid),
-        Ok(abuse_proto::Confidence::High) => Some(ConfidenceLevel::High),
-    }
-}
-
-pub fn level_to_proto(level: ConfidenceLevel) -> abuse_proto::Confidence {
-    match level {
-        ConfidenceLevel::Low => abuse_proto::Confidence::Low,
-        ConfidenceLevel::Mid => abuse_proto::Confidence::Mid,
-        ConfidenceLevel::High => abuse_proto::Confidence::High,
+        Ok(abuse_proto::Confidence::Unspecified) => (LevelRow::Missing, false),
+        Ok(abuse_proto::Confidence::Low) => (LevelRow::Low, false),
+        Ok(abuse_proto::Confidence::Mid) => (LevelRow::Mid, false),
+        Ok(abuse_proto::Confidence::High) => (LevelRow::High, false),
+        Err(_) => (LevelRow::Missing, true),
     }
 }
 
@@ -67,18 +46,28 @@ pub fn evidence_from_proto(e: &abuse_proto::ConfidenceEvidence) -> ConfidenceEvi
     }
 }
 
+pub fn message_claim(score: &abuse_proto::ScoreResult, now_ms: i64) -> Claim {
+    let (row, unknown) = row_of(score.confidence);
+    Claim {
+        row,
+        unknown,
+        evidence: score.confidence_evidence.as_ref().map(evidence_from_proto),
+        now_ms,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfidenceConfig {
-    pub label_map: Vec<LabelMapEntry>,
     pub evidence_max_age_ms: i64,
+    pub factory_evidence_max_age_ms: i64,
     pub unreadable: Option<String>,
 }
 
 impl Default for ConfidenceConfig {
     fn default() -> Self {
         Self {
-            label_map: Vec::new(),
             evidence_max_age_ms: DEFAULT_EVIDENCE_MAX_AGE_DAYS * DAY_MS,
+            factory_evidence_max_age_ms: DEFAULT_FACTORY_EVIDENCE_MAX_AGE_DAYS * DAY_MS,
             unreadable: None,
         }
     }
@@ -108,40 +97,23 @@ impl ConfidenceConfig {
             ),
             None => bad.push(v.to_string()),
         }
-        match v.get("label_map") {
-            None | Some(Value::Null) => {}
-            Some(Value::Object(map)) => {
-                let parsed: Option<Vec<LabelMapEntry>> = map
-                    .iter()
-                    .map(|(pattern, level)| {
-                        let level = ConfidenceLevel::parse(level.as_str()?)?;
-                        let ok = !pattern.is_empty()
-                            && pattern.len() <= 256
-                            && pattern
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric() || b"_.:@-*".contains(&b));
-                        ok.then(|| LabelMapEntry {
-                            pattern: pattern.clone(),
-                            level,
-                        })
-                    })
-                    .collect();
-                match parsed {
-                    Some(entries) => out.label_map = entries,
-                    None => bad.push(format!("label_map={}", Value::Object(map.clone()))),
-                }
+        for (key, field) in [
+            ("evidence_max_age_days", &mut out.evidence_max_age_ms),
+            (
+                "factory_evidence_max_age_days",
+                &mut out.factory_evidence_max_age_ms,
+            ),
+        ] {
+            match v.get(key) {
+                None | Some(Value::Null) => {}
+                Some(days) => match days
+                    .as_f64()
+                    .filter(|d| d.is_finite() && *d > 0.0 && *d <= MAX_EVIDENCE_AGE_DAYS)
+                {
+                    Some(d) => *field = (d * DAY_MS as f64) as i64,
+                    None => bad.push(format!("{key}={days}")),
+                },
             }
-            Some(other) => bad.push(format!("label_map={other}")),
-        }
-        match v.get("evidence_max_age_days") {
-            None | Some(Value::Null) => {}
-            Some(days) => match days
-                .as_f64()
-                .filter(|d| d.is_finite() && *d > 0.0 && *d <= MAX_EVIDENCE_AGE_DAYS)
-            {
-                Some(d) => out.evidence_max_age_ms = (d * DAY_MS as f64) as i64,
-                None => bad.push(format!("evidence_max_age_days={days}")),
-            },
         }
         if bad.is_empty() {
             return out;
@@ -151,86 +123,16 @@ impl ConfidenceConfig {
         if last.as_deref() != Some(bad.as_str()) {
             error!(
                 value = %bad,
-                "GrowthBook action_control.{CONFIG_KEY} is malformed; every level-driven decision records only"
+                "GrowthBook action_control.{CONFIG_KEY} is malformed; no evidence is current"
             );
             *last = Some(bad.clone());
         }
         Self {
-            label_map: Vec::new(),
             evidence_max_age_ms: 0,
+            factory_evidence_max_age_ms: 0,
             unreadable: Some(bad),
         }
     }
-
-    pub fn translate(&self, labels: &[&str]) -> Option<ConfidenceLevel> {
-        labels
-            .iter()
-            .flat_map(|l| {
-                self.label_map
-                    .iter()
-                    .filter(move |e| glob(&e.pattern, l))
-                    .map(|e| e.level)
-            })
-            .min()
-    }
-}
-
-fn glob(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-    let (first, last) = (parts[0], parts[parts.len() - 1]);
-    if !text.starts_with(first) || text.len() < first.len() + last.len() {
-        return false;
-    }
-    let mut rest = &text[first.len()..text.len() - last.len()];
-    if !text.ends_with(last) {
-        return false;
-    }
-    for mid in &parts[1..parts.len() - 1] {
-        match rest.find(mid) {
-            Some(i) => rest = &rest[i + mid.len()..],
-            None => return false,
-        }
-    }
-    true
-}
-
-pub fn claim(
-    score: &abuse_proto::ScoreResult,
-    labels: &[&str],
-    cfg: &ConfidenceConfig,
-    now_ms: i64,
-) -> Option<Claim> {
-    let (level, source) = match level_from_proto(score.confidence) {
-        Some(l) => (l, Source::Producer),
-        None => (cfg.translate(labels)?, Source::LabelMap),
-    };
-    Some(Claim {
-        level,
-        source,
-        evidence: score.confidence_evidence.as_ref().map(evidence_from_proto),
-        now_ms,
-    })
-}
-
-pub fn message_claim(
-    score: &abuse_proto::ScoreResult,
-    cfg: &ConfidenceConfig,
-    now_ms: i64,
-) -> Option<Claim> {
-    let labels: Vec<&str> = if cfg.label_map.is_empty() {
-        Vec::new()
-    } else {
-        score.summary.as_ref().map_or_else(Vec::new, |s| {
-            s.labels
-                .iter()
-                .map(|l| crate::action_control::strip_dry_run_prefix(l))
-                .collect()
-        })
-    };
-    claim(score, &labels, cfg, now_ms)
 }
 
 fn upper_tail(s: u32, n: u32, p: f64) -> f64 {
@@ -303,66 +205,31 @@ pub fn evidence_problem(ev: &ConfidenceEvidence, now_ms: i64) -> Option<String> 
     None
 }
 
-pub fn override_active(ov: &EvidenceOverride, record_updated_at_ms: i64, now_ms: i64) -> bool {
-    let written = record_updated_at_ms;
-    !ov.by.trim().is_empty()
-        && !ov.reason.trim().is_empty()
-        && now_ms < ov.expires_at_ms
-        && written < ov.expires_at_ms
-        && written <= now_ms.saturating_add(CLOCK_SKEW_MS)
-        && now_ms >= written.saturating_sub(CLOCK_SKEW_MS)
-        && ov.expires_at_ms <= written.min(now_ms).saturating_add(EVIDENCE_OVERRIDE_MAX_MS)
-}
-
-pub fn override_problem(ov: &EvidenceOverride, now_ms: i64) -> Option<String> {
-    if ov.by.trim().is_empty() || ov.by.len() > 256 {
-        return Some("evidence_override.by must name the person (1-256 bytes)".into());
-    }
-    if ov.reason.trim().is_empty() || ov.reason.len() > 1_000 {
-        return Some("evidence_override.reason must say why (1-1000 bytes)".into());
-    }
-    if ov.expires_at_ms <= now_ms || ov.expires_at_ms > now_ms + EVIDENCE_OVERRIDE_MAX_MS {
-        return Some("evidence_override.expires_at_ms must be in the next 7 days".into());
-    }
-    None
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub struct LevelOutcome {
-    pub claimed: ConfidenceLevel,
-    pub source: Source,
-    pub path: &'static str,
-    pub acted: Option<ConfidenceLevel>,
+pub struct RowOutcome {
+    pub row: LevelRow,
+    pub unknown: bool,
     pub evidence_supports: Option<Option<ConfidenceLevel>>,
-    pub override_by: Option<String>,
+    pub rollout: Option<(u32, u32)>,
 }
 
-impl LevelOutcome {
-    pub fn routing_label(claim: &Claim) -> Self {
+impl RowOutcome {
+    pub fn new(claim: &Claim) -> Self {
         Self {
-            claimed: claim.level,
-            source: claim.source,
-            path: "routing_label",
-            acted: None,
+            row: claim.row,
+            unknown: claim.unknown,
             evidence_supports: None,
-            override_by: None,
+            rollout: None,
         }
     }
 
-    pub fn info_keys(&self) -> Vec<(String, String)> {
-        let mut keys = vec![
-            (
-                "confidence_level".to_owned(),
-                self.claimed.as_str().to_owned(),
-            ),
-            (
-                "confidence_source".to_owned(),
-                self.source.as_str().to_owned(),
-            ),
-            ("confidence_path".to_owned(), self.path.to_owned()),
-        ];
-        if let Some(l) = self.acted {
-            keys.push(("confidence_acted_level".to_owned(), l.as_str().to_owned()));
+    pub fn info_keys(&self, logged: bool, forced: Option<&str>) -> Vec<(String, String)> {
+        let mut keys = vec![("level_row".to_owned(), self.row.as_str().to_owned())];
+        if logged {
+            keys.push((
+                "logged_because".to_owned(),
+                logged_because(forced, self.unknown).to_owned(),
+            ));
         }
         if let Some(s) = self.evidence_supports {
             keys.push((
@@ -370,20 +237,37 @@ impl LevelOutcome {
                 s.map_or("none", ConfidenceLevel::as_str).to_owned(),
             ));
         }
-        if let Some(by) = &self.override_by {
-            keys.push(("confidence_override_by".to_owned(), by.clone()));
+        if let Some((bp, bucket)) = self.rollout {
+            keys.push(("rollout_bp".to_owned(), bp.to_string()));
+            keys.push(("rollout_bucket".to_owned(), bucket.to_string()));
         }
         keys
     }
 }
 
+pub fn logged_because(forced: Option<&str>, unknown: bool) -> &'static str {
+    match forced {
+        None if unknown => "unknown_level",
+        None => "no_selection",
+        Some("kill_switch") => "page_control_off",
+        Some("stale_snapshot") => "stale_copy",
+        Some("safety_checks_changed") => "safety_checks_changed",
+        Some("factory_rules_row") => "factory_rules_row",
+        Some("ignore_store") => "ignore_store",
+        Some("wrong_entity") => "wrong_entity",
+        Some(OUTSIDE_ROLLOUT) => OUTSIDE_ROLLOUT,
+        Some(_) => "unreadable",
+    }
+}
+
+pub const OUTSIDE_ROLLOUT: &str = "outside_rollout";
+
 pub const INFO_KEYS: &[&str] = &[
-    "confidence_level",
-    "confidence_source",
-    "confidence_path",
-    "confidence_acted_level",
+    "level_row",
+    "logged_because",
     "confidence_evidence_supports",
-    "confidence_override_by",
+    "rollout_bp",
+    "rollout_bucket",
 ];
 
 #[cfg(test)]
@@ -474,148 +358,86 @@ mod tests {
     }
 
     #[test]
-    fn unknown_proto_values_read_as_low() {
-        assert_eq!(level_from_proto(0), None);
-        assert_eq!(level_from_proto(1), Some(ConfidenceLevel::Low));
-        assert_eq!(level_from_proto(2), Some(ConfidenceLevel::Mid));
-        assert_eq!(level_from_proto(3), Some(ConfidenceLevel::High));
-        assert_eq!(level_from_proto(4), Some(ConfidenceLevel::Low));
-        assert_eq!(level_from_proto(-1), Some(ConfidenceLevel::Low));
+    fn unknown_proto_values_land_on_missing() {
+        assert_eq!(row_of(0), (LevelRow::Missing, false));
+        assert_eq!(row_of(1), (LevelRow::Low, false));
+        assert_eq!(row_of(2), (LevelRow::Mid, false));
+        assert_eq!(row_of(3), (LevelRow::High, false));
+        assert_eq!(row_of(4), (LevelRow::Missing, true));
+        assert_eq!(row_of(-1), (LevelRow::Missing, true));
     }
 
     #[test]
-    fn label_map_translates_with_globs_and_picks_the_lowest() {
-        let cfg = ConfidenceConfig::from_value(Some(&json!({
-            "label_map": {"*_suspend": "high", "*_bounce": "mid", "bb1_*_spam_bot_*": "low"}
-        })));
+    fn logged_reasons_name_the_cause() {
+        assert_eq!(logged_because(None, false), "no_selection");
+        assert_eq!(logged_because(None, true), "unknown_level");
         assert_eq!(
-            cfg.translate(&["anchor_campaign_suspend"]),
-            Some(ConfidenceLevel::High)
+            logged_because(Some("kill_switch"), true),
+            "page_control_off"
         );
+        assert_eq!(logged_because(Some("stale_snapshot"), false), "stale_copy");
+        assert_eq!(logged_because(Some("band_ambiguous"), false), "unreadable");
         assert_eq!(
-            cfg.translate(&["bb1_user_bounce"]),
-            Some(ConfidenceLevel::Mid)
+            logged_because(Some("factory_rules_row"), false),
+            "factory_rules_row"
         );
+        assert_eq!(logged_because(Some("ignore_store"), false), "ignore_store");
         assert_eq!(
-            cfg.translate(&["bb1_post_spam_bot_suspend"]),
-            Some(ConfidenceLevel::Low),
-            "two entries match; the lower wins"
+            logged_because(Some(OUTSIDE_ROLLOUT), false),
+            "outside_rollout"
         );
-        assert_eq!(
-            cfg.translate(&["anchor_campaign_suspend", "bb1_user_bounce"]),
-            Some(ConfidenceLevel::Mid)
-        );
-        assert_eq!(cfg.translate(&["llm_slop_user"]), None);
-        assert_eq!(cfg.translate(&[]), None);
-        assert!(glob("a*b*c", "a-b-c"));
-        assert!(glob("*", "x"));
-        assert!(!glob("a*a", "a"));
-        assert!(!glob("ab", "abc"));
     }
 
     #[test]
-    fn the_map_ships_empty_and_anything_malformed_makes_the_config_unreadable() {
+    fn anything_malformed_or_the_retired_label_map_makes_the_config_unreadable() {
         let shipped = ConfidenceConfig::from_value(None);
-        assert!(shipped.label_map.is_empty());
         assert_eq!(shipped.unreadable, None);
         assert_eq!(ConfidenceConfig::default().evidence_max_age_ms, 30 * DAY_MS);
-        let fine = ConfidenceConfig::from_value(Some(&json!({
-            "label_map": {"*_suspend": "high"}, "evidence_max_age_days": 7
-        })));
+        let fine = ConfidenceConfig::from_value(Some(&json!({"evidence_max_age_days": 7})));
         assert_eq!(fine.unreadable, None);
         assert_eq!(fine.evidence_max_age_ms, 7 * DAY_MS);
-        assert_eq!(fine.label_map.len(), 1);
+        assert_eq!(fine.factory_evidence_max_age_ms, 365 * DAY_MS);
+        let factory =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 365})));
+        assert_eq!(factory.unreadable, None);
+        assert_eq!(factory.evidence_max_age_ms, 30 * DAY_MS);
+        assert_eq!(factory.factory_evidence_max_age_ms, 365 * DAY_MS);
+        let factory =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 90})));
+        assert_eq!(factory.factory_evidence_max_age_ms, 90 * DAY_MS);
+        let half =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 0.5})));
+        assert_eq!(half.factory_evidence_max_age_ms, DAY_MS / 2);
+        let null =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": null})));
+        assert_eq!(null.unreadable, None);
+        assert_eq!(null.factory_evidence_max_age_ms, 365 * DAY_MS);
         for bad in [
-            json!({"label_map": {"*_suspend": "high", "x": "very_high"}}),
-            json!({"label_map": ["*_suspend"]}),
-            json!({"label_map": {"bad label": "high"}}),
+            json!({"label_map": {"*_suspend": "high"}}),
+            json!({"label_map": {}}),
             json!({"evidence_max_age_days": "30"}),
             json!({"evidence_max_age_days": -1}),
             json!({"evidence_max_age_days": 0}),
             json!({"evidence_max_age_days": 3650}),
+            json!({"factory_evidence_max_age_days": 0}),
+            json!({"factory_evidence_max_age_days": -1}),
+            json!({"evidence_max_age_days": 7, "factory_evidence_max_age_days": 400}),
+            json!({"factory_evidence_max_age_days": 366}),
+            json!({"factory_evidence_max_age_days": "365"}),
             json!({"floors": {"high": 0.5}}),
-            json!({"label_map": {"*_suspend": "high"}, "evidence_max_age": 30}),
             json!("on"),
             json!([]),
         ] {
             let cfg = ConfidenceConfig::from_value(Some(&bad));
             assert!(cfg.unreadable.is_some(), "{bad}");
-            assert!(cfg.label_map.is_empty(), "{bad}");
             assert_eq!(cfg.evidence_max_age_ms, 0, "{bad}");
+            assert_eq!(cfg.factory_evidence_max_age_ms, 0, "{bad}");
         }
         assert!(
-            ConfidenceConfig::from_value(Some(&json!({"floors": {"high": 0.5}})))
+            ConfidenceConfig::from_value(Some(&json!({"label_map": {}})))
                 .unreadable
                 .unwrap()
-                .contains("unknown key floors")
+                .contains("unknown key label_map")
         );
-    }
-
-    #[test]
-    fn overrides_need_a_person_a_reason_and_an_expiry_within_seven_days() {
-        let ov = |by: &str, reason: &str, expires: i64| EvidenceOverride {
-            by: by.into(),
-            reason: reason.into(),
-            expires_at_ms: expires,
-        };
-        let written = NOW - DAY_MS;
-        assert!(override_active(
-            &ov("operator@example.com", "seeded", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(
-            !override_active(&ov("operator@example.com", "seeded", NOW), written, NOW),
-            "expired"
-        );
-        assert!(!override_active(
-            &ov(" ", "seeded", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(!override_active(
-            &ov("operator@example.com", "", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(
-            !override_active(
-                &ov("operator@example.com", "seeded", written + 8 * DAY_MS),
-                written,
-                NOW
-            ),
-            "a stored expiry past 7 days from the write is refused"
-        );
-        let active = |expires: i64, written: i64| {
-            override_active(&ov("operator@example.com", "seeded", expires), written, NOW)
-        };
-        assert!(
-            !active(NOW + 30 * DAY_MS, NOW + 30 * DAY_MS),
-            "written past the skew"
-        );
-        assert!(
-            !active(NOW + 7 * DAY_MS, NOW + 30 * DAY_MS),
-            "written past the skew"
-        );
-        assert!(active(written + 7 * DAY_MS, written));
-        assert!(!active(written + 7 * DAY_MS + 1, written));
-        let ahead = NOW + CLOCK_SKEW_MS - 1;
-        assert!(active(NOW + 7 * DAY_MS, ahead));
-        assert!(!active(NOW + 7 * DAY_MS + 1, ahead));
-        assert!(active(NOW + CLOCK_SKEW_MS + 60_000, NOW + CLOCK_SKEW_MS));
-        assert!(!active(
-            NOW + CLOCK_SKEW_MS + 60_000,
-            NOW + CLOCK_SKEW_MS + 1
-        ));
-        assert!(
-            !active(NOW + 60_000, NOW + CLOCK_SKEW_MS - 1),
-            "expires before its write"
-        );
-        assert!(!active(ahead, ahead), "expires at its write");
-        assert!(active(ahead + 1, ahead));
-        assert!(override_problem(&ov("a", "b", NOW + 7 * DAY_MS), NOW).is_none());
-        assert!(override_problem(&ov("a", "b", NOW + 7 * DAY_MS + 1), NOW).is_some());
-        assert!(override_problem(&ov("a", "b", NOW), NOW).is_some());
-        assert!(override_problem(&ov("", "b", NOW + DAY_MS), NOW).is_some());
     }
 }

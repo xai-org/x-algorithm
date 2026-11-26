@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use xai_abuse_proto::enforcement::{self as proto, ScoreResult};
 
@@ -6,16 +6,15 @@ use super::*;
 use crate::action_control::test_support::record;
 use crate::action_control::{
     ActionControlRecord, ConfidenceEvidence, ControlEntity, ControlMode, EvidenceOverride,
-    Lifetime, PageAction,
+    LevelRow, Lifetime, PageAction,
 };
 use crate::confidence::ConfidenceLevel;
-use crate::overturn_hold::{FakeHoldStore, Hold, HoldGate, HOLD_KIND_SUSPEND};
 use crate::replay_tests::{
-    base_config, message, on_config, switched_off, Account, BedConfig, TestBed, Trace,
-    BAKED_POST_RULES, BAKED_USER_RULES, HEADS, SWITCHED_OFF_HEAD,
+    base_config, message, on_config, rule_labels, switched_off, Account, BedConfig, TestBed, Trace,
+    ACTION_CONTROL_INFO_KEYS, BAKED_POST_RULES, BAKED_USER_RULES, HEADS, SWITCHED_OFF_HEAD,
 };
 
-const SUSPEND: PageAction = PageAction::Suspend {};
+const SUSPEND: PageAction = PageAction::SUSPEND;
 const LIVENESS: PageAction = PageAction::LivenessCheck {};
 const SHR7: PageAction = PageAction::SpamHighRecall {
     lifetime: Lifetime::Days7,
@@ -24,10 +23,6 @@ const DAY_MS: i64 = 86_400_000;
 
 const BB1: (&str, &str) = HEADS[0];
 const LABEL: &str = "anchor_campaign_suspend";
-
-fn now_ms() -> i64 {
-    now_millis()
-}
 
 fn evidence(level: ConfidenceLevel) -> ConfidenceEvidence {
     let (lb, reads, humans) = match level {
@@ -39,7 +34,7 @@ fn evidence(level: ConfidenceLevel) -> ConfidenceEvidence {
         precision_lower_bound: lb,
         reads,
         humans,
-        read_at_ms: now_ms() - DAY_MS,
+        read_at_ms: now_millis() - DAY_MS,
         link: "documents/read.md".into(),
     }
 }
@@ -54,12 +49,8 @@ fn proto_evidence(e: &ConfidenceEvidence) -> proto::ConfidenceEvidence {
     }
 }
 
-fn with_level(
-    mut s: ScoreResult,
-    level: proto::Confidence,
-    ev: Option<ConfidenceEvidence>,
-) -> ScoreResult {
-    s.confidence = level as i32;
+fn with_level(mut s: ScoreResult, level: i32, ev: Option<ConfidenceEvidence>) -> ScoreResult {
+    s.confidence = level;
     s.confidence_evidence = ev.as_ref().map(proto_evidence);
     s
 }
@@ -71,29 +62,27 @@ fn bb1(account: Account) -> ScoreResult {
 fn high(account: Account) -> ScoreResult {
     with_level(
         bb1(account),
-        proto::Confidence::High,
+        proto::Confidence::High as i32,
         Some(evidence(ConfidenceLevel::High)),
     )
 }
 
-fn defaults(head: &str, entity: ControlEntity) -> ActionControlRecord {
+fn moved(head: &str, entity: ControlEntity) -> ActionControlRecord {
     ActionControlRecord {
         entity_type: entity,
-        ..record(head, None, None, ControlMode::ConfidenceDefaults, vec![])
+        ..record(head, None, None, ControlMode::Rows, vec![])
     }
 }
 
-fn level_record(
+fn row(
     head: &str,
-    classifier: Option<&str>,
-    level: ConfidenceLevel,
+    row: LevelRow,
     mode: ControlMode,
     actions: Vec<PageAction>,
 ) -> ActionControlRecord {
     ActionControlRecord {
-        confidence: Some(level),
-        evidence: Some(Box::new(evidence(level))),
-        ..record(head, classifier, None, mode, actions)
+        confidence: Some(row),
+        ..record(head, None, None, mode, actions)
     }
 }
 
@@ -146,7 +135,23 @@ fn effect(t: &Trace) -> (String, Vec<(String, serde_json::Value)>, i64, Vec<Stri
     )
 }
 
-fn assert_records_only(t: &Trace, forced: &str) {
+fn old_info(t: &Trace) -> Vec<BTreeMap<String, String>> {
+    t.outcomes
+        .iter()
+        .map(|o| {
+            o.info
+                .iter()
+                .filter(|(k, _)| {
+                    !ACTION_CONTROL_INFO_KEYS.contains(&k.as_str())
+                        && !crate::confidence::INFO_KEYS.contains(&k.as_str())
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .collect()
+}
+
+fn assert_logged(t: &Trace, because: &str) {
     let want = if info(t).contains_key("action_specs") {
         "dry_run"
     } else {
@@ -169,118 +174,345 @@ fn assert_records_only(t: &Trace, forced: &str) {
     let i = info(t);
     assert_eq!(i["action_control_mode"], "recording");
     assert_eq!(i["dry_run_source"], "page");
-    assert_eq!(i["action_control_forced_recording"], forced);
-    assert!(!i.contains_key("confidence_acted_level"));
+    assert_eq!(i["logged_because"], because, "{i:?}");
 }
 
+const LEVELS: [i32; 5] = [0, 1, 2, 3, 9];
+
 #[tokio::test]
-async fn without_a_level_or_a_record_the_outcome_is_unchanged() {
+async fn a_scope_never_moved_carries_no_row_and_ignores_row_records() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![]).await;
-    let plain = b.run_fresh(&bb1(Account::Clean)).await;
-    let o = plain.outcomes.last().unwrap();
-    assert_eq!(o.confidence, 0);
-    assert!(o.confidence_evidence.is_none());
-    assert!(!o.info.keys().any(|k| k.starts_with("confidence")));
-    let json = serde_json::to_value(o).unwrap();
-    for key in [
-        "confidence",
-        "confidence_evidence",
-        "raw_score",
-        "score",
-        "calibration_id",
-    ] {
-        assert!(json.get(key).is_none(), "{key} stays off the JSON: {json}");
+    let plain = bed(vec![]).await;
+    let inert = bed(vec![
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+        row(BB1.0, LevelRow::Missing, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    let head_live = bed(vec![record(
+        BB1.0,
+        None,
+        None,
+        ControlMode::Live,
+        vec![LIVENESS],
+    )])
+    .await;
+    let head_live_with_rows = bed(vec![
+        record(BB1.0, None, None, ControlMode::Live, vec![LIVENESS]),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    for account in Account::ALL {
+        for level in LEVELS {
+            let s = with_level(bb1(account), level, Some(evidence(ConfidenceLevel::High)));
+            let want = plain.run_fresh(&s).await;
+            let got = inert.run_fresh(&s).await;
+            assert_eq!(effect(&got), effect(&want), "{account:?} {level}");
+            assert_eq!(old_info(&got), old_info(&want), "{account:?} {level}");
+            let want = head_live.run_fresh(&s).await;
+            let got = head_live_with_rows.run_fresh(&s).await;
+            assert_eq!(effect(&got), effect(&want), "{account:?} {level}");
+            for t in [&want, &got] {
+                assert!(!info(t).contains_key("level_row"), "{account:?} {level}");
+                assert!(
+                    !info(t).contains_key("logged_because"),
+                    "{account:?} {level}"
+                );
+            }
+            assert_eq!(got.outcomes[0].confidence, level, "the level as sent");
+        }
     }
-
-    let mut leveled = high(Account::Clean);
-    leveled.raw_score = 4.2;
-    leveled.score = 0.985;
-    leveled.calibration_id = "platt@3".into();
-    let t = b.run_fresh(&leveled).await;
-    assert_eq!(effect(&t), effect(&plain));
-    let o = t.outcomes.last().unwrap();
-    assert_eq!(o.confidence, proto::Confidence::High as i32);
-    assert_eq!((o.raw_score, o.score), (4.2, 0.985));
-    assert_eq!(o.calibration_id, "platt@3");
-    assert_eq!(
-        o.confidence_evidence.as_ref().map(|e| e.reads),
-        Some(59),
-        "evidence passes through"
-    );
-    assert_eq!(o.info["confidence_level"], "high");
-    assert_eq!(o.info["confidence_source"], "producer");
-    assert_eq!(o.info["confidence_path"], "routing_label");
-    assert_eq!(o.info["action_control_mode"], "rules");
 }
 
 #[tokio::test]
-async fn the_default_table_acts_like_a_live_record_with_the_same_actions_for_every_account() {
+async fn an_unset_row_logs_with_no_selection() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let by_level = bed(vec![defaults(BB1.0, ControlEntity::User)]).await;
-    for (level, proto_level, actions) in [
-        (
-            ConfidenceLevel::High,
-            proto::Confidence::High,
-            vec![SUSPEND],
-        ),
-        (
-            ConfidenceLevel::Mid,
-            proto::Confidence::Mid,
-            vec![LIVENESS, SHR7],
-        ),
-        (ConfidenceLevel::Low, proto::Confidence::Low, vec![LIVENESS]),
-    ] {
-        let by_record = bed(vec![record(BB1.0, None, None, ControlMode::Live, actions)]).await;
+    let b = bed(vec![moved(BB1.0, ControlEntity::User)]).await;
+    for (level, want_row) in [(0, "missing"), (1, "low"), (2, "mid"), (3, "high")] {
+        let t = b
+            .run_fresh(&with_level(
+                bb1(Account::Clean),
+                level,
+                Some(evidence(ConfidenceLevel::High)),
+            ))
+            .await;
+        assert_logged(&t, "no_selection");
+        assert_eq!(info(&t)["level_row"], want_row);
+        assert!(
+            info(&t).contains_key("rules_would_rule_id"),
+            "what the rules would do is recorded"
+        );
+        assert_eq!(info(&t)["action_control_lkey"], format!("user/h/{}", BB1.0));
+    }
+    let b = bed(vec![
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::High, ControlMode::Recording, vec![SUSPEND]),
+    ])
+    .await;
+    let t = b.run_fresh(&high(Account::Clean)).await;
+    assert_logged(&t, "no_selection");
+    assert_eq!(t.status, "dry_run");
+    assert_eq!(t.dedup_calls, vec!["peek(class=3)=None"]);
+    assert_eq!(
+        info(&t)["action_specs"],
+        r#"[{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}]"#
+    );
+    assert_eq!(
+        info(&t)["action_control_lkey"],
+        format!("user/l/{}/high", BB1.0)
+    );
+}
+
+#[tokio::test]
+async fn the_built_in_table_never_acts() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![moved(BB1.0, ControlEntity::User)]).await;
+    for account in Account::ALL {
+        for level in LEVELS {
+            let s = with_level(bb1(account), level, Some(evidence(ConfidenceLevel::High)));
+            let t = b.run_fresh(&s).await;
+            assert!(t.ais.is_empty(), "{account:?} {level}: {t:?}");
+            assert_eq!(t.tickets, 0, "{account:?} {level}");
+            assert!(t.outcomes[0].dry_run, "{account:?} {level}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rules_row_and_a_move_with_every_row_rules_equal_today() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let today = bed(vec![]).await;
+    let all_rules = bed(std::iter::once(moved(BB1.0, ControlEntity::User))
+        .chain(LevelRow::ALL.map(|r| row(BB1.0, r, ControlMode::Rules, vec![])))
+        .collect())
+    .await;
+    let mut labels = rule_labels(BAKED_USER_RULES);
+    labels.push(String::new());
+    for label in &labels {
+        let ls: Vec<&str> = if label.is_empty() {
+            vec![]
+        } else {
+            vec![label.as_str()]
+        };
         for account in Account::ALL {
-            let msg = with_level(bb1(account), proto_level, Some(evidence(level)));
-            let want = by_record.run_fresh(&bb1(account)).await;
-            let got = by_level.run_fresh(&msg).await;
-            assert_eq!(effect(&got), effect(&want), "{level:?} {account:?}");
-            let (wi, gi) = (info(&want), info(&got));
-            assert_eq!(
-                gi["matched_rule_id"], wi["matched_rule_id"],
-                "{level:?} {account:?}"
-            );
-            assert_eq!(gi.get("action_specs"), wi.get("action_specs"));
-            assert_eq!(gi["confidence_path"], "defaults");
-            assert_eq!(gi["action_control_lkey"], format!("user/h/{}", BB1.0));
-            if got.status == "success" {
-                assert_eq!(gi["confidence_acted_level"], level.as_str());
-                assert_eq!(gi["confidence_evidence_supports"], level.as_str());
+            for level in LEVELS {
+                let s = with_level(
+                    message(EntityType::User, BB1.0, BB1.1, &ls, account),
+                    level,
+                    Some(evidence(ConfidenceLevel::High)),
+                );
+                let want = today.run_fresh(&s).await;
+                let got = all_rules.run_fresh(&s).await;
+                let id = format!("{label} {account:?} {level}");
+                assert_eq!(effect(&got), effect(&want), "{id}");
+                assert_eq!(old_info(&got), old_info(&want), "{id}");
+                assert_eq!(got.outcomes[0].dry_run, want.outcomes[0].dry_run, "{id}");
+                assert_eq!(info(&got)["action_control_mode"], "rules", "{id}");
+                assert!(info(&got).contains_key("level_row"), "{id}");
+                assert!(!info(&got).contains_key("logged_because"), "{id}");
             }
         }
     }
-    for (account, reason) in [
-        (Account::Followers5k, "high_follower_count"),
-        (Account::Followers200k, "very_high_follower_count"),
-        (Account::HighCred, "pagerank_skipped"),
-        (Account::NotFound, "user_not_found"),
-        (Account::Suspended, ALREADY_SUSPENDED),
-    ] {
-        let t = by_level.run_fresh(&high(account)).await;
-        assert_eq!(t.status, reason, "{account:?}");
-        assert!(t.ais.is_empty() && t.tickets == 0, "{account:?}");
+}
+
+#[tokio::test]
+async fn an_unknown_level_lands_on_missing() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let unknown = with_level(
+        bb1(Account::Clean),
+        9,
+        Some(evidence(ConfidenceLevel::High)),
+    );
+
+    let b = bed(vec![
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::Low, ControlMode::Live, vec![LIVENESS]),
+    ])
+    .await;
+    let t = b.run_fresh(&unknown).await;
+    assert_logged(&t, "unknown_level");
+    assert_eq!(info(&t)["level_row"], "missing");
+    assert_eq!(t.outcomes[0].confidence, 9, "kept as sent");
+
+    let b = bed(vec![
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::Missing, ControlMode::Live, vec![LIVENESS]),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    let liveness = bed(vec![record(
+        BB1.0,
+        None,
+        None,
+        ControlMode::Live,
+        vec![LIVENESS],
+    )])
+    .await
+    .run_fresh(&bb1(Account::Clean))
+    .await;
+    let mut no_read = unknown.clone();
+    no_read.confidence_evidence = None;
+    for s in [unknown, no_read, bb1(Account::Clean)] {
+        let t = b.run_fresh(&s).await;
+        assert_eq!(effect(&t), effect(&liveness), "{t:?}");
+        assert_eq!(info(&t)["level_row"], "missing");
+        assert!(!info(&t).contains_key("logged_because"));
     }
 }
 
 #[tokio::test]
-async fn the_test_user_gate_off_switch_and_cap_still_stop_a_level() {
+async fn a_live_level_row_acts_whatever_its_evidence_with_its_own_actions() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let b = bed(vec![
-        defaults(BB1.0, ControlEntity::User),
-        defaults(SWITCHED_OFF_HEAD, ControlEntity::User),
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+        row(
+            BB1.0,
+            LevelRow::Mid,
+            ControlMode::Live,
+            vec![LIVENESS, SHR7],
+        ),
+        row(BB1.0, LevelRow::Low, ControlMode::Live, vec![LIVENESS]),
     ])
     .await;
+    let good = b.run_fresh(&high(Account::Clean)).await;
+    assert_eq!(good.status, "success", "{good:?}");
+    assert_eq!(info(&good)["level_row"], "high");
+    assert_eq!(info(&good)["confidence_evidence_supports"], "high");
 
-    let mut test_user = high(Account::Clean);
-    test_user.user_id = (1 << 53) | (1 << 11);
-    assert!(test_user::is_test_user_id(test_user.user_id));
-    let t = b.run_fresh(&test_user).await;
-    assert!(t.ais.is_empty() && t.tickets == 0, "{t:?}");
-    assert_ne!(t.status, "success");
+    let mut old = evidence(ConfidenceLevel::High);
+    old.read_at_ms = now_millis() - 31 * DAY_MS;
+    let mut typed = evidence(ConfidenceLevel::High);
+    typed.reads = 5;
+    for (ev, supports) in [
+        (None, "none"),
+        (Some(evidence(ConfidenceLevel::Mid)), "mid"),
+        (Some(evidence(ConfidenceLevel::Low)), "low"),
+        (Some(old), "none"),
+        (Some(typed), "none"),
+    ] {
+        let t = b
+            .run_fresh(&with_level(
+                bb1(Account::Clean),
+                proto::Confidence::High as i32,
+                ev.clone(),
+            ))
+            .await;
+        assert_eq!(
+            effect(&t),
+            effect(&good),
+            "the high row's own actions: {ev:?}"
+        );
+        let i = info(&t);
+        assert_eq!(i["level_row"], "high");
+        assert_eq!(i["action_control_mode"], "live", "{ev:?}");
+        assert_eq!(i["confidence_evidence_supports"], supports, "{ev:?}");
+        assert!(!i.contains_key("logged_because"), "{ev:?}");
+        assert!(
+            !i.contains_key(action_control::FORCED_RECORDING_KEY),
+            "{ev:?}"
+        );
+    }
+}
 
-    let off = with_level(
+#[tokio::test]
+async fn a_row_stored_with_an_override_reads_and_acts_and_the_override_is_inert() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let plain = bed(vec![
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    let no_read = with_level(bb1(Account::Clean), proto::Confidence::High as i32, None);
+    let want = plain.run_fresh(&no_read).await;
+    assert_eq!(want.status, "success", "{want:?}");
+    for expires_at_ms in [now_millis() + DAY_MS, now_millis() - DAY_MS / 2] {
+        let mut overridden = row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]);
+        overridden.updated_at_ms = now_millis() - DAY_MS;
+        overridden.evidence_override = Some(Box::new(EvidenceOverride {
+            by: "operator@example.com".into(),
+            reason: "read running".into(),
+            expires_at_ms,
+        }));
+        let b = bed(vec![moved(BB1.0, ControlEntity::User), overridden]).await;
+        let t = b.run_fresh(&no_read).await;
+        assert_eq!(effect(&t), effect(&want), "{expires_at_ms}");
+        assert_eq!(info(&t)["action_control_mode"], "live");
+        assert!(!info(&t).contains_key("confidence_override_by"));
+    }
+}
+
+#[tokio::test]
+async fn a_live_row_passes_every_check_and_says_why_it_logged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let live = |head: &str| {
+        vec![
+            moved(head, ControlEntity::User),
+            row(head, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+        ]
+    };
+    let by_row = bed(live(BB1.0)).await;
+    let by_record = bed(vec![record(
+        BB1.0,
+        None,
+        None,
+        ControlMode::Live,
+        vec![SUSPEND],
+    )])
+    .await;
+    for account in Account::ALL {
+        let got = by_row.run_fresh(&high(account)).await;
+        let want = by_record.run_fresh(&bb1(account)).await;
+        assert_eq!(effect(&got), effect(&want), "{account:?}");
+    }
+
+    let off = bed_with(live(BB1.0), base_config(false, None)).await;
+    assert_logged(
+        &off.run_fresh(&high(Account::Clean)).await,
+        "page_control_off",
+    );
+
+    let stale = bed(live(BB1.0)).await;
+    stale
+        .ctx
+        .action_control
+        .age_for_test(std::time::Duration::from_secs(3_600));
+    assert_logged(&stale.run_fresh(&high(Account::Clean)).await, "stale_copy");
+
+    let cse = with_level(
+        message(
+            EntityType::User,
+            BB1.0,
+            BB1.1,
+            &["anchor_campaign_suspend_cse"],
+            Account::Clean,
+        ),
+        proto::Confidence::High as i32,
+        Some(evidence(ConfidenceLevel::High)),
+    );
+    let got = by_row.run_fresh(&cse).await;
+    let want = by_record
+        .run_fresh(&message(
+            EntityType::User,
+            BB1.0,
+            BB1.1,
+            &["anchor_campaign_suspend_cse"],
+            Account::Clean,
+        ))
+        .await;
+    assert_eq!(
+        got.status, "success",
+        "a live row acts like any live row: {got:?}"
+    );
+    assert_eq!(got.ais.len(), 1);
+    assert!(!info(&got).contains_key("logged_because"));
+    assert_eq!(
+        want.status, "success",
+        "a whole-head live record acts like any live record: {want:?}"
+    );
+    assert!(!info(&want).contains_key(action_control::FORCED_RECORDING_KEY));
+
+    let switched = bed(live(SWITCHED_OFF_HEAD)).await;
+    let s = with_level(
         message(
             EntityType::User,
             SWITCHED_OFF_HEAD,
@@ -288,27 +520,20 @@ async fn the_test_user_gate_off_switch_and_cap_still_stop_a_level() {
             &[LABEL],
             Account::Clean,
         ),
-        proto::Confidence::High,
+        proto::Confidence::High as i32,
         Some(evidence(ConfidenceLevel::High)),
     );
-    let t = b.run_fresh(&off).await;
+    let t = switched.run_fresh(&s).await;
     assert_eq!(t.status, off_switch::STATUS_SWITCHED_OFF);
     assert!(t.ais.is_empty());
+    assert_eq!(info(&t)["logged_because"], "off_switch");
 
-    let capped = bed_with(
-        vec![defaults(BB1.0, ControlEntity::User)],
-        on_config(false, Some(0)),
-    )
-    .await;
-    let t = capped.run_fresh(&high(Account::Clean)).await;
-    assert_eq!(t.status, "max_enforcement_reached");
-    assert!(t.ais.is_empty());
+    let mut bad = row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]);
+    bad.band = Some(LABEL.into());
+    let broken = bed(vec![moved(BB1.0, ControlEntity::User), bad]).await;
+    assert_logged(&broken.run_fresh(&high(Account::Clean)).await, "unreadable");
 
-    let staging = bed_with(
-        vec![defaults(BB1.0, ControlEntity::User)],
-        on_config(true, None),
-    )
-    .await;
+    let staging = bed_with(live(BB1.0), on_config(true, None)).await;
     let t = staging.run_fresh(&high(Account::Clean)).await;
     assert_eq!(t.status, "dry_run");
     assert!(t.ais.is_empty());
@@ -316,576 +541,101 @@ async fn the_test_user_gate_off_switch_and_cap_still_stop_a_level() {
 }
 
 #[tokio::test]
-async fn an_overturn_hold_stops_a_level_driven_suspend() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let mut config = on_config(false, None);
-    config["overturn_hold_gate"] = serde_json::json!({"mode": "enforce"});
-    let mut b = bed_with(vec![defaults(BB1.0, ControlEntity::User)], config).await;
-    b.ctx.hold_gate = Arc::new(HoldGate::new(Some(FakeHoldStore::new(vec![Hold {
-        user_id: Account::Clean.user_id(),
-        hold_id: 7,
-        head: Some(BB1.0.into()),
-        expires_at: chrono::Utc::now() + chrono::Duration::days(30),
-        case_group_id: Some(63),
-        reason: "appeal_overturned".into(),
-        action_kind: HOLD_KIND_SUSPEND.into(),
-        label: None,
-    }]))));
-    let t = b.run_fresh(&high(Account::Clean)).await;
-    assert_eq!(t.status, overturn_hold::STATUS_HOLD_OVERTURNED);
-    assert!(t.ais.is_empty() && t.tickets == 0);
-}
-
-#[tokio::test]
-async fn a_post_level_never_waives_the_author_ceiling() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let head = "SpamEmbeddingPtosDistilled";
-    for records in [
-        vec![defaults(head, ControlEntity::Post)],
-        vec![level_record(
-            head,
-            None,
-            ConfidenceLevel::High,
-            ControlMode::Live,
-            vec![PageAction::SuspendAuthor {}],
-        )],
-    ] {
-        let b = bed(records).await;
-        for (account, want) in [
-            (Account::Followers200k, "very_high_follower_count"),
-            (Account::Clean, "success"),
-        ] {
-            let mut s = with_level(
-                message(
-                    EntityType::Post,
-                    head,
-                    "clf",
-                    &["anchor_campaign_post_label"],
-                    account,
-                ),
-                proto::Confidence::High,
-                Some(evidence(ConfidenceLevel::High)),
-            );
-            s.skip_author_credibility_prechecks = true;
-            let t = b.run_fresh(&s).await;
-            assert_eq!(t.status, want, "{account:?}");
-            if want != "success" {
-                assert!(t.ais.is_empty() && t.tickets == 0);
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn missing_old_or_weak_evidence_only_softens() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![defaults(BB1.0, ControlEntity::User)]).await;
-    let names = |t: &Trace| -> Vec<String> {
-        t.ais
-            .iter()
-            .flat_map(|(_, r)| {
-                let actions: Vec<&serde_json::Value> = match r.get("actions") {
-                    Some(serde_json::Value::Array(a)) => a.iter().collect(),
-                    _ => r.get("action").into_iter().collect(),
-                };
-                actions
-                    .into_iter()
-                    .filter_map(|a| a.as_object().and_then(|o| o.keys().next().cloned()))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
-    let liveness_only = bed(vec![record(
-        BB1.0,
-        None,
-        None,
-        ControlMode::Live,
-        vec![LIVENESS],
-    )])
-    .await
-    .run_fresh(&bb1(Account::Clean))
-    .await;
-    let mid_set = bed(vec![record(
-        BB1.0,
-        None,
-        None,
-        ControlMode::Live,
-        vec![LIVENESS, SHR7],
-    )])
-    .await
-    .run_fresh(&bb1(Account::Clean))
-    .await;
-
-    let t = b
-        .run_fresh(&with_level(
-            bb1(Account::Clean),
-            proto::Confidence::High,
-            Some(evidence(ConfidenceLevel::Mid)),
-        ))
-        .await;
-    assert_eq!(names(&t), names(&mid_set));
-    assert_eq!(info(&t)["confidence_acted_level"], "mid");
-    assert_eq!(info(&t)["confidence_level"], "high");
-
-    let t = b
-        .run_fresh(&with_level(
-            bb1(Account::Clean),
-            proto::Confidence::High,
-            Some(evidence(ConfidenceLevel::Low)),
-        ))
-        .await;
-    assert_eq!(names(&t), names(&liveness_only));
-    assert_eq!(info(&t)["confidence_acted_level"], "low");
-
-    let mut old = evidence(ConfidenceLevel::High);
-    old.read_at_ms = now_ms() - 31 * DAY_MS;
-    let mut weak = evidence(ConfidenceLevel::High);
-    weak.precision_lower_bound = 0.5;
-    let mut typed = evidence(ConfidenceLevel::High);
-    typed.reads = 5;
-    for (ev, forced) in [
-        (None, "evidence_missing"),
-        (Some(old), "evidence_below_floor"),
-        (Some(weak), "evidence_below_floor"),
-        (Some(typed), "evidence_below_floor"),
-    ] {
-        for level in [
-            proto::Confidence::High,
-            proto::Confidence::Mid,
-            proto::Confidence::Low,
-        ] {
-            let t = b
-                .run_fresh(&with_level(bb1(Account::Clean), level, ev.clone()))
-                .await;
-            assert_records_only(&t, forced);
-        }
-    }
-}
-
-#[tokio::test]
-async fn an_override_names_a_person_and_expires() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let written = now_ms() - DAY_MS;
-    let with_override = |expires_at_ms: i64| ActionControlRecord {
-        updated_at_ms: written,
-        evidence_override: Some(Box::new(EvidenceOverride {
-            by: "operator@example.com".into(),
-            reason: "seeded from today's rules while the read runs".into(),
-            expires_at_ms,
-        })),
-        ..defaults(BB1.0, ControlEntity::User)
-    };
-    let no_read = with_level(bb1(Account::Clean), proto::Confidence::High, None);
-
-    let b = bed(vec![with_override(now_ms() + DAY_MS)]).await;
-    let t = b.run_fresh(&no_read).await;
-    assert_eq!(t.status, "success");
-    assert_eq!(info(&t)["confidence_override_by"], "operator@example.com");
-    assert_eq!(info(&t)["confidence_acted_level"], "high");
-
-    let b = bed(vec![with_override(now_ms() - 1)]).await;
-    assert_records_only(&b.run_fresh(&no_read).await, "evidence_missing");
-
-    let no_person = ActionControlRecord {
-        evidence_override: Some(Box::new(EvidenceOverride {
-            by: " ".into(),
-            reason: "seeded".into(),
-            expires_at_ms: now_ms() + DAY_MS,
-        })),
-        ..with_override(now_ms() + DAY_MS)
-    };
-    for rec in [with_override(written + 8 * DAY_MS), no_person] {
-        let b = bed(vec![rec]).await;
-        assert_records_only(&b.run_fresh(&no_read).await, "unreadable");
-    }
-}
-
-#[tokio::test]
-async fn unspecified_never_acts_and_unknown_values_read_as_low() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![defaults(BB1.0, ControlEntity::User)]).await;
-    assert_records_only(
-        &b.run_fresh(&bb1(Account::Clean)).await,
-        "confidence_missing",
-    );
-
-    let mut future = bb1(Account::Clean);
-    future.confidence = 9;
-    future.confidence_evidence = Some(proto_evidence(&evidence(ConfidenceLevel::High)));
-    let t = b.run_fresh(&future).await;
-    assert_eq!(info(&t)["confidence_level"], "low");
-    assert_eq!(info(&t)["confidence_acted_level"], "low");
-    assert_eq!(t.outcomes[0].confidence, proto::Confidence::Low as i32);
-}
-
-#[tokio::test]
-async fn level_records_win_over_defaults_most_specific_first() {
+async fn a_classifier_on_rows_wins_and_band_records_under_a_moved_head_do_not_count() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let b = bed(vec![
-        defaults(BB1.0, ControlEntity::User),
-        level_record(
-            BB1.0,
-            None,
-            ConfidenceLevel::High,
-            ControlMode::Live,
-            vec![LIVENESS],
-        ),
-        level_record(
-            BB1.0,
-            Some(BB1.1),
-            ConfidenceLevel::High,
-            ControlMode::Recording,
-            vec![SUSPEND],
-        ),
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![LIVENESS]),
+        record(BB1.0, None, Some(LABEL), ControlMode::Live, vec![SUSPEND]),
+        ActionControlRecord {
+            confidence: Some(LevelRow::High),
+            ..record(
+                BB1.0,
+                Some(BB1.1),
+                None,
+                ControlMode::Recording,
+                vec![SUSPEND],
+            )
+        },
+        record(BB1.0, Some(BB1.1), None, ControlMode::Rows, vec![]),
     ])
     .await;
     let t = b.run_fresh(&high(Account::Clean)).await;
-    assert_eq!(t.status, "dry_run", "classifier+level wins");
+    assert_logged(&t, "no_selection");
     assert_eq!(
         info(&t)["action_control_lkey"],
         format!("user/cl/{}/{}/high", BB1.0, BB1.1)
     );
-    assert_eq!(info(&t)["confidence_path"], "level_record");
 
-    let mut other_classifier = high(Account::Clean);
-    other_classifier.model_version = "other_v1".into();
-    let t = b.run_fresh(&other_classifier).await;
-    assert_eq!(t.status, "success");
+    let mut other = high(Account::Clean);
+    other.model_version = "other_v1".into();
+    let t = b.run_fresh(&other).await;
+    assert_eq!(
+        t.status, "success",
+        "the head's high row, not the band record"
+    );
     assert_eq!(
         info(&t)["action_control_lkey"],
         format!("user/l/{}/high", BB1.0)
     );
-
-    let t = b
-        .run_fresh(&with_level(
-            bb1(Account::Clean),
-            proto::Confidence::Mid,
-            Some(evidence(ConfidenceLevel::Mid)),
-        ))
-        .await;
-    assert_eq!(t.status, "success");
-    assert_eq!(info(&t)["confidence_path"], "defaults");
-
-    let b = bed(vec![level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Live,
-        vec![LIVENESS],
-    )])
-    .await;
-    let plain = bed(vec![]).await.run_fresh(&bb1(Account::Clean)).await;
-    let t = b
-        .run_fresh(&with_level(
-            bb1(Account::Clean),
-            proto::Confidence::Mid,
-            Some(evidence(ConfidenceLevel::Mid)),
-        ))
-        .await;
-    assert_eq!(effect(&t), effect(&plain));
-    assert_eq!(info(&t)["action_control_mode"], "rules");
+    assert_eq!(info(&t)["action_specs"], r#"[{"kind":"liveness_check"}]"#);
 }
 
 #[tokio::test]
-async fn a_recording_level_takes_no_dedup_claim_and_no_ticket() {
+async fn a_child_safety_head_on_rows_acts_like_any_other_head() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Recording,
-        vec![SUSPEND],
-    )])
-    .await;
-    let t = b.run_fresh(&high(Account::Clean)).await;
-    assert_eq!(t.status, "dry_run");
-    assert_eq!(t.dedup_calls, vec!["peek(class=3)=None"]);
-    assert_eq!(t.tickets, 0);
-    assert!(t.ais.is_empty());
-    assert_eq!(
-        info(&t)["action_specs"],
-        r#"[{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}]"#
-    );
-}
-
-#[tokio::test]
-async fn every_failure_state_ends_in_recording_only() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let off = bed_with(
-        vec![defaults(BB1.0, ControlEntity::User)],
-        base_config(false, None),
-    )
-    .await;
-    assert_records_only(&off.run_fresh(&high(Account::Clean)).await, "kill_switch");
-
     let (cse_head, cse_model) = HEADS[1];
-    let cse = bed(vec![defaults(cse_head, ControlEntity::User)]).await;
-    let s = with_level(
-        message(
-            EntityType::User,
-            cse_head,
-            cse_model,
-            &[LABEL],
-            Account::Clean,
-        ),
-        proto::Confidence::High,
-        Some(evidence(ConfidenceLevel::High)),
-    );
-    assert_records_only(&cse.run_fresh(&s).await, "cse_lock");
+    let msg = |account, level: i32| {
+        with_level(
+            message(EntityType::User, cse_head, cse_model, &[LABEL], account),
+            level,
+            Some(evidence(ConfidenceLevel::High)),
+        )
+    };
+    let live = bed(vec![
+        moved(cse_head, ControlEntity::User),
+        row(cse_head, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    let other = bed(vec![
+        moved(BB1.0, ControlEntity::User),
+        row(BB1.0, LevelRow::High, ControlMode::Live, vec![SUSPEND]),
+    ])
+    .await;
+    for account in Account::ALL {
+        let got = live
+            .run_fresh(&msg(account, proto::Confidence::High as i32))
+            .await;
+        let want = other.run_fresh(&high(account)).await;
+        let shape = |t: &Trace| {
+            let kinds: Vec<String> = t
+                .ais
+                .iter()
+                .filter_map(|(_, r)| r.get("action").and_then(|a| a.as_object()))
+                .flat_map(|a| a.keys().cloned())
+                .collect();
+            (t.status.clone(), t.tickets, t.dedup_calls.clone(), kinds)
+        };
+        assert_eq!(shape(&got), shape(&want), "{account:?}");
+        assert_eq!(
+            info(&got).get("action_specs"),
+            info(&want).get("action_specs")
+        );
+        assert!(!info(&got).contains_key("logged_because"), "{account:?}");
+    }
 
-    let stale = bed(vec![defaults(BB1.0, ControlEntity::User)]).await;
-    stale
-        .ctx
-        .action_control
-        .age_for_test(std::time::Duration::from_secs(3_600));
-    assert_records_only(
-        &stale.run_fresh(&high(Account::Clean)).await,
-        "stale_snapshot",
-    );
-
-    let mut bad = level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Live,
-        vec![SUSPEND],
-    );
-    bad.band = Some(LABEL.into());
-    let broken = bed(vec![bad]).await;
-    assert_records_only(&broken.run_fresh(&high(Account::Clean)).await, "unreadable");
-
-    let mut config = on_config(false, None);
-    config["action_control"]["confidence"] = serde_json::json!({"label_map": {LABEL: "very_high"}});
-    let plain = bed(vec![]).await.run_fresh(&bb1(Account::Clean)).await;
-    let ignored = bed_with(vec![], config).await;
-    let t = ignored.run_fresh(&bb1(Account::Clean)).await;
-    assert_eq!(effect(&t), effect(&plain));
-    assert!(!info(&t).contains_key("confidence_level"));
-}
-
-#[tokio::test]
-async fn the_label_map_ships_empty_and_translates_when_set() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let records = vec![level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Live,
-        vec![SUSPEND],
-    )];
-    let shipped = bed(records.clone()).await;
-    let t = shipped.run_fresh(&bb1(Account::Clean)).await;
-    assert_eq!(info(&t)["action_control_mode"], "rules");
-    assert!(!info(&t).contains_key("confidence_level"));
-
-    let mut config = on_config(false, None);
-    config["action_control"]["confidence"] =
-        serde_json::json!({"label_map": {"*_suspend": "high"}});
-    let mapped = bed_with(records, config).await;
-    let t = mapped.run_fresh(&bb1(Account::Clean)).await;
-    assert_eq!(
-        t.status, "success",
-        "the level record's own read certifies it"
-    );
-    assert_eq!(info(&t)["confidence_source"], "label_map");
-    assert_eq!(t.outcomes[0].confidence, proto::Confidence::High as i32);
-}
-
-#[tokio::test]
-async fn a_malformed_confidence_config_records_every_level_and_leaves_the_rules_alone() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let rules_today = bed(vec![]).await.run_fresh(&bb1(Account::Clean)).await;
-    for bad in [
-        serde_json::json!({"label_map": {LABEL: "very_high"}}),
-        serde_json::json!({"evidence_max_age_days": "30"}),
-        serde_json::json!({"evidence_max_age_days": -1}),
-        serde_json::json!({"floors": {"high": 0.5, "mid": 0.5, "low": 0.5}}),
-        serde_json::json!({"label_map": {}, "max_age": 30}),
-        serde_json::json!("on"),
-    ] {
-        let mut config = on_config(false, None);
-        config["action_control"]["confidence"] = bad.clone();
-        for records in [
-            vec![defaults(BB1.0, ControlEntity::User)],
-            vec![level_record(
-                BB1.0,
-                None,
-                ConfidenceLevel::High,
-                ControlMode::Live,
-                vec![SUSPEND],
-            )],
-        ] {
-            let b = bed_with(records, config.clone()).await;
-            for level in [
-                proto::Confidence::High,
-                proto::Confidence::Mid,
-                proto::Confidence::Low,
-            ] {
-                let s = with_level(
-                    bb1(Account::Clean),
-                    level,
-                    Some(evidence(ConfidenceLevel::High)),
-                );
-                let t = b.run_fresh(&s).await;
-                if info(&t)["action_control_mode"] == "rules" {
-                    assert_ne!(level, proto::Confidence::High, "{bad}");
-                    continue;
-                }
-                assert_records_only(&t, "confidence_config_unreadable");
-            }
+    let today = bed(vec![]).await;
+    let all_rules = bed(std::iter::once(moved(cse_head, ControlEntity::User))
+        .chain(LevelRow::ALL.map(|r| row(cse_head, r, ControlMode::Rules, vec![])))
+        .collect())
+    .await;
+    for account in Account::ALL {
+        for level in LEVELS {
+            let s = msg(account, level);
+            let want = today.run_fresh(&s).await;
+            let got = all_rules.run_fresh(&s).await;
+            assert_eq!(effect(&got), effect(&want), "{account:?} {level}");
+            assert_eq!(old_info(&got), old_info(&want), "{account:?} {level}");
         }
-        let b = bed_with(vec![defaults("OtherHead", ControlEntity::User)], config).await;
-        let t = b.run_fresh(&high(Account::Clean)).await;
-        assert_eq!(effect(&t), effect(&rules_today), "{bad}");
-        assert_eq!(info(&t)["action_control_mode"], "rules");
     }
-}
-
-#[tokio::test]
-async fn future_dated_records_and_reads_are_not_trusted() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let now = now_ms();
-
-    let mut read_tomorrow = level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Live,
-        vec![SUSPEND],
-    );
-    read_tomorrow.evidence.as_mut().unwrap().read_at_ms = now + DAY_MS;
-    let b = bed(vec![read_tomorrow]).await;
-    assert_records_only(&b.run_fresh(&high(Account::Clean)).await, "unreadable");
-
-    for mut rec in [
-        defaults(BB1.0, ControlEntity::User),
-        record(BB1.0, None, None, ControlMode::Live, vec![SUSPEND]),
-    ] {
-        rec.updated_at_ms = now + DAY_MS;
-        let b = bed(vec![rec]).await;
-        assert_records_only(&b.run_fresh(&high(Account::Clean)).await, "unreadable");
-    }
-
-    let b = bed(vec![defaults(BB1.0, ControlEntity::User)]).await;
-    let mut tomorrow = evidence(ConfidenceLevel::High);
-    tomorrow.read_at_ms = now + DAY_MS;
-    let s = with_level(bb1(Account::Clean), proto::Confidence::High, Some(tomorrow));
-    assert_records_only(&b.run_fresh(&s).await, "evidence_below_floor");
-
-    let mut skewed = evidence(ConfidenceLevel::High);
-    skewed.read_at_ms = now + 60_000;
-    let mut rec = defaults(BB1.0, ControlEntity::User);
-    rec.updated_at_ms = now + 60_000;
-    let b = bed(vec![rec]).await;
-    let s = with_level(bb1(Account::Clean), proto::Confidence::High, Some(skewed));
-    assert_eq!(b.run_fresh(&s).await.status, "success");
-}
-
-#[tokio::test]
-async fn v5_round5_recording_level_with_no_actions_has_no_side_effect() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let b = bed(vec![level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Recording,
-        vec![],
-    )])
-    .await;
-    let t = b.run_fresh(&high(Account::Clean)).await;
-    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS, "{t:?}");
-    assert!(t.ais.is_empty(), "no AIS call: {t:?}");
-    assert_eq!(t.tickets, 0, "no daily-cap ticket: {t:?}");
-    assert!(
-        t.dedup_calls.iter().all(|c| c.starts_with("peek")),
-        "peek only, never a claim: {:?}",
-        t.dedup_calls
-    );
-    assert_eq!(info(&t)["action_control_mode"], "recording");
-}
-
-#[tokio::test]
-async fn a_level_with_no_actions_records_no_actions_never_the_rules() {
-    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let post_head = "SpamEmbeddingPtosDistilled";
-    let post_low = with_level(
-        message(
-            EntityType::Post,
-            post_head,
-            "clf",
-            &["anchor_campaign_post_label"],
-            Account::Clean,
-        ),
-        proto::Confidence::Low,
-        Some(evidence(ConfidenceLevel::Low)),
-    );
-    let mut keyed_by_band_and_level = level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Live,
-        vec![SUSPEND],
-    );
-    keyed_by_band_and_level.band = Some(LABEL.into());
-    let recording_no_actions = level_record(
-        BB1.0,
-        None,
-        ConfidenceLevel::High,
-        ControlMode::Recording,
-        vec![],
-    );
-    for (records, msg, forced) in [
-        (vec![recording_no_actions], high(Account::Clean), None),
-        (
-            vec![defaults(BB1.0, ControlEntity::User)],
-            bb1(Account::Clean),
-            Some("confidence_missing"),
-        ),
-        (
-            vec![defaults(post_head, ControlEntity::Post)],
-            post_low,
-            Some("no_default_actions"),
-        ),
-        (
-            vec![keyed_by_band_and_level],
-            high(Account::Clean),
-            Some("unreadable"),
-        ),
-    ] {
-        let t = bed(records).await.run_fresh(&msg).await;
-        let i = info(&t);
-        assert_eq!(
-            t.status,
-            action_control::STATUS_NO_ACTIONS,
-            "{forced:?} {t:?}"
-        );
-        assert!(t.outcomes.last().unwrap().dry_run);
-        assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
-        assert!(!i.contains_key("action_specs"), "{forced:?}");
-        assert_eq!(i["action_control_mode"], "recording");
-        assert_eq!(
-            i.get(action_control::FORCED_RECORDING_KEY)
-                .map(String::as_str),
-            forced
-        );
-        assert!(t.ais.is_empty() && t.tickets == 0, "{forced:?}");
-        assert!(
-            t.dedup_calls.iter().all(|c| c.starts_with("peek")),
-            "{forced:?} {:?}",
-            t.dedup_calls
-        );
-    }
-
-    let t = bed(vec![record(
-        BB1.0,
-        None,
-        None,
-        ControlMode::Recording,
-        vec![],
-    )])
-    .await
-    .run_fresh(&bb1(Account::Clean))
-    .await;
-    assert_eq!(t.status, "dry_run");
-    assert_ne!(info(&t)["matched_rule_id"], action_control::PAGE_RULE_ID);
 }

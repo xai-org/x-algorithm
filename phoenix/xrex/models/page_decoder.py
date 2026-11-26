@@ -266,7 +266,7 @@ class PageDecoder(hk.Module):
     def _step_logits(
         self,
         st: _DecodeState,
-        t: int,
+        t: int | jax.Array,
         w: dict[str, jax.Array],
         norms: tuple[RMSNorm, RMSNorm],
         pool: _Pool,
@@ -284,7 +284,7 @@ class PageDecoder(hk.Module):
     def _advance(
         self,
         st: _DecodeState,
-        t: int,
+        t: int | jax.Array,
         pick_t: jax.Array,
         prob_t: jax.Array,
         pool: _Pool,
@@ -296,12 +296,12 @@ class PageDecoder(hk.Module):
         pick_1h = jax.nn.one_hot(pick_t, pool.mask.shape[1], dtype=jnp.bool_) & valid_t[:, None]
         col_a = jnp.take_along_axis(pool.same_author, pick_t[:, None, None], axis=2)[:, :, 0]
         col_c = jnp.take_along_axis(pool.cpl, pick_t[:, None, None], axis=2)[:, :, 0]
-        z_buf = st.z_buf
-        if t + 1 < z_buf.shape[1]:
-            v_pick = jnp.take_along_axis(pool.vals, pick_t[:, None, None], axis=1)[:, 0, :]
-            z_buf = z_buf.at[:, t + 1, :].set(v_pick + step_emb[None, t + 1, :])
+        T = st.z_buf.shape[1]
+        nxt = jnp.minimum(t + 1, T - 1)
+        v_pick = jnp.take_along_axis(pool.vals, pick_t[:, None, None], axis=1)[:, 0, :]
+        z_next = jnp.where(t + 1 < T, v_pick + step_emb[None, nxt, :], st.z_buf[:, nxt, :])
         return _DecodeState(
-            z_buf=z_buf,
+            z_buf=st.z_buf.at[:, nxt, :].set(z_next),
             k_cache=st.k_cache,
             v_cache=st.v_cache,
             picked_mask=st.picked_mask | pick_1h,
@@ -321,12 +321,14 @@ class PageDecoder(hk.Module):
         choose: Callable[..., tuple[_DecodeState, jax.Array, jax.Array, jax.Array | None]],
         carry: jax.Array | None = None,
     ) -> tuple[_DecodeState, jax.Array | None]:
-        st = self._init_state(z0, w["step_emb"], pool.mask.shape[1], T)
-        for t in range(T):
+        def step(t, val):
+            st, carry = val
             logits_t, st = self._step_logits(st, t, w, norms, pool)
             st, pick_t, prob_t, carry = choose(t, logits_t, st, carry)
-            st = self._advance(st, t, pick_t, prob_t, pool, w["step_emb"])
-        return st, carry
+            return self._advance(st, t, pick_t, prob_t, pool, w["step_emb"]), carry
+
+        st = self._init_state(z0, w["step_emb"], pool.mask.shape[1], T)
+        return hk.fori_loop(0, T, step, (st, carry))
 
     def _autoregressive(
         self,

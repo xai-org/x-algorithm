@@ -304,6 +304,18 @@ def create_h2d_state(
     )
 
 
+def bind_history_url_embeddings(history_seq: dict, staging: npt.NDArray[np.float16] | None) -> None:
+    if staging is None:
+        return
+    tmpl = history_seq.get("embedding")
+    if not isinstance(tmpl, np.ndarray) or tmpl.size != staging.size:
+        raise RuntimeError(
+            f"history url embedding staging {tuple(staging.shape)} has no same-size "
+            "history_seq.embedding in the example batch"
+        )
+    history_seq["embedding"] = np.asarray(staging).reshape(tmpl.shape)
+
+
 def lookup_h2d_embeddings(
     h2d_state: H2DState,
     batch: RecsysFeaturesBatch,

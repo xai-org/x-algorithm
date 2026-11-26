@@ -21,10 +21,10 @@ from xrex.driver.config_factory import build_eval_configs
 from xrex.driver.run import pin_visible_devices, run_driver_train
 from xrex.utils import cluster
 
-import xrex.inference.sid_services
 import xrex.inference.serving_services
 
-for _family in ("xrex.inference.gen_recs_services", "xrex.inference.reply_services"):
+_OPTIONAL_FAMILIES = ("xrex.inference.reply_services",)
+for _family in _OPTIONAL_FAMILIES:
     if importlib.util.find_spec(_family) is not None:
         importlib.import_module(_family)
 
@@ -410,12 +410,6 @@ def run(
     runner.log_rotate = args.log_rotate
     runner.log_rotate_max_bytes = args.log_rotate_max_bytes
     runner.log_rotate_backup_count = args.log_rotate_backup_count
-    if hasattr(runner, "beam_width") and args.beam_width != 1:
-        runner.beam_width = args.beam_width
-    if hasattr(runner, "decode_levels") and args.decode_levels != 0:
-        runner.decode_levels = args.decode_levels
-    if hasattr(runner, "num_generate") and args.num_generate > 1:
-        runner.num_generate = args.num_generate
     runner.checkpoint_config.no_opt_state = True
 
     base_overrides = [
@@ -464,8 +458,8 @@ if __name__ == "__main__":
             "(requests above the largest bucket clamp to it). The largest bucket "
             "sizes the model buffers and the engine's max batch. Ranking & "
             "retrieval only: for those service types, unset defaults to one "
-            "bucket per size from 1 to --bs_per_device; gen_recs ignores "
-            "this and runs a single --bs_per_device batch."
+            "bucket per size from 1 to --bs_per_device; other service types "
+            "run a single --bs_per_device batch."
         ),
     )
     parser.add_argument(
@@ -717,12 +711,6 @@ if __name__ == "__main__":
         help="Threads for the Rust embedding gather.",
     )
     parser.add_argument(
-        "--num_generate",
-        type=int,
-        default=1,
-        help="Number of embeddings to generate autoregressively (gen_recs only, default: 1)",
-    )
-    parser.add_argument(
         "--enable_bloom_filter",
         type=str2bool,
         default=False,
@@ -836,28 +824,6 @@ if __name__ == "__main__":
         type=int,
         default=7,
         help="Number of rotated backup files to keep (default: 7, ~21GB total ≈ 3 days at inference log rates).",
-    )
-    parser.add_argument(
-        "--beam_width",
-        type=int,
-        default=1,
-        help=(
-            "Parallel beam width for SID retrieval decode (default 1). "
-            "Each beam SID maps to ≤1 corpus post; reply filled to large_k "
-            "in beam-score order. Set at server boot — restart to change. "
-            "Only consumed when --service_type=sid_retrieval."
-        ),
-    )
-    parser.add_argument(
-        "--decode_levels",
-        type=int,
-        default=0,
-        help=(
-            "SID retrieval: stop the autoregressive beam search after the "
-            "first N levels. 0 (default) = full decode (cfg.sid_num_levels, "
-            "typically 6). Smaller N speeds up beam decode roughly linearly "
-            "but makes each beam SID a prefix matching many corpus posts."
-        ),
     )
     parser.add_argument(
         "--jax_compilation_cache_dir",

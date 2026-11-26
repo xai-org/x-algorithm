@@ -11,7 +11,7 @@ use xai_manhattan::{LkeySelector, NativeManhattanClient, Tenant};
 
 pub use xai_abuse_enforcement_types::off_switch::{
     OFF_SWITCH_RECORD_VERSION, OffSwitchListResponse, OffSwitchPutRequest, OffSwitchRecord,
-    OffSwitchSeen, OffSwitchView,
+    OffSwitchSeen, OffSwitchView, PreviousOff,
 };
 
 use crate::growthbook::DynamicConfig;
@@ -25,9 +25,9 @@ pub const CONFIG_KEY: &str = "enforcement_off_switch";
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-const FIRST_LOAD_BACKOFF: Duration = Duration::from_secs(1);
+pub(crate) const FIRST_LOAD_BACKOFF: Duration = Duration::from_secs(1);
 
-const FIRST_LOAD_ERROR_LOG_EVERY: u64 = 12;
+pub(crate) const FIRST_LOAD_ERROR_LOG_EVERY: u64 = 12;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,12 +47,12 @@ const SEEN_QUEUE: usize = 256;
 
 const SEEN_GUARD_MAX: usize = 10_000;
 
-const LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);
+pub(crate) const LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);
 
-const MAX_NAME_LEN: usize = 256;
-const MAX_REASON_LEN: usize = 1_000;
+pub(crate) const MAX_NAME_LEN: usize = 256;
+pub(crate) const MAX_REASON_LEN: usize = 1_000;
 
-const REFRESH_ERROR_LOG_EVERY: u64 = 60;
+pub(crate) const REFRESH_ERROR_LOG_EVERY: u64 = 60;
 
 pub fn lkey_for(head: &str, classifier: Option<&str>) -> String {
     match classifier {
@@ -494,6 +494,15 @@ impl OffSwitch {
             })
     }
 
+            pub fn with_record<R>(&self, lkey: &str, f: impl FnOnce(Option<&OffSwitchRecord>) -> R) -> R {
+        f(self.snapshot().entries.get(lkey))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, lkey: &str) -> Option<OffSwitchRecord> {
+        self.with_record(lkey, |r| r.cloned())
+    }
+
             pub fn active_lkeys(&self, now_ms: i64) -> Vec<String> {
         let mut keys: Vec<String> = self
             .snapshot()
@@ -767,20 +776,35 @@ impl OffSwitch {
         }
     }
 
-                pub async fn set(
+        pub fn updated_by(req: &OffSwitchPutRequest, key_id: &str) -> String {
+        req.updated_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or(key_id)
+            .to_owned()
+    }
+
+                                pub async fn set(
         &self,
         req: OffSwitchPutRequest,
         key_id: &str,
         now_ms: i64,
     ) -> Result<SetOutcome, SetError> {
         Self::validate(&req, now_ms).map_err(SetError::Invalid)?;
-        let updated_by = req
-            .updated_by
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .unwrap_or(key_id)
-            .to_owned();
+        let updated_by = Self::updated_by(&req, key_id);
+        let lkey = lkey_for(&req.head, req.classifier.as_deref());
+        let previous_off = if req.off {
+            None
+        } else {
+            self.with_record(&lkey, |r| {
+                r.filter(|r| r.off).map(|r| PreviousOff {
+                    reason: r.reason.clone(),
+                    updated_by: r.updated_by.clone(),
+                    updated_at_ms: r.updated_at_ms,
+                })
+            })
+        };
         let rec = OffSwitchRecord {
             v: OFF_SWITCH_RECORD_VERSION,
             head: req.head,
@@ -791,8 +815,8 @@ impl OffSwitch {
             key_id: key_id.to_owned(),
             updated_at_ms: now_ms,
             auto_on_at_ms: req.auto_on_at_ms,
+            previous_off,
         };
-        let lkey = lkey_for(&rec.head, rec.classifier.as_deref());
         let value = serde_json::to_vec(&rec).map_err(|e| SetError::Store(e.to_string()))?;
         if let Err(e) = self.store.put(&lkey, value).await {
             metrics::MANHATTAN_ERRORS_TOTAL.inc();
@@ -833,7 +857,9 @@ pub(crate) mod test_support {
         pub fail_scan: std::sync::atomic::AtomicBool,
         pub fail_put: std::sync::atomic::AtomicBool,
         pub hang_scan: std::sync::atomic::AtomicBool,
+        pub hang_put: std::sync::atomic::AtomicBool,
         pub scans: std::sync::atomic::AtomicUsize,
+                pub puts: std::sync::atomic::AtomicUsize,
     }
 
     impl MemStore {
@@ -861,9 +887,13 @@ pub(crate) mod test_support {
         }
 
         async fn put(&self, lkey: &str, value: Vec<u8>) -> anyhow::Result<()> {
+            if self.hang_put.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             if self.fail_put.load(std::sync::atomic::Ordering::Relaxed) {
                 anyhow::bail!("put failed (test)");
             }
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut rows = self.rows.lock().unwrap();
             rows.retain(|(k, _)| k != lkey);
             rows.push((lkey.to_owned(), value));
@@ -887,6 +917,7 @@ pub(crate) mod test_support {
             key_id: "pv2".into(),
             updated_at_ms: 1_000,
             auto_on_at_ms,
+            previous_off: None,
         }
     }
 
@@ -1311,6 +1342,67 @@ mod tests {
         assert_eq!(rows.len(), 1, "never deleted");
         let stored: OffSwitchRecord = serde_json::from_slice(&rows[0].1).unwrap();
         assert!(!stored.off);
+    }
+
+    #[tokio::test]
+    async fn turning_on_after_off_keeps_who_turned_it_off() {
+        let mut off = record("H", None, true, None);
+        off.updated_by = crate::head_guard::UPDATED_BY.into();
+        off.reason = "action ceiling: 5 in 1h (guard v1)".into();
+        let (sw, store) = loaded(&[off]).await;
+        let out = sw.set(put("H", None, false), "pv2", NOW).await.unwrap();
+        let want = PreviousOff {
+            reason: "action ceiling: 5 in 1h (guard v1)".into(),
+            updated_by: crate::head_guard::UPDATED_BY.into(),
+            updated_at_ms: 1_000,
+        };
+        assert_eq!(out.view.record.previous_off.as_ref(), Some(&want));
+        assert_eq!(
+            out.view.record.updated_at_ms, NOW,
+            "the on write stamps now"
+        );
+        let rows = store.rows.lock().unwrap().clone();
+        let stored: OffSwitchRecord = serde_json::from_slice(&rows[0].1).unwrap();
+        assert_eq!(stored.previous_off, Some(want), "stored and parsed back");
+        assert_eq!(sw.get("h/H").unwrap().previous_off, stored.previous_off);
+    }
+
+                #[tokio::test]
+    async fn previous_off_is_absent_unless_on_replaces_off() {
+        let (sw, store) = loaded(&[]).await;
+        let first_on = sw.set(put("H", None, false), "pv2", NOW).await.unwrap();
+        assert_eq!(first_on.view.record.previous_off, None, "no record before");
+
+        sw.set(put("H", None, true), "pv2", NOW).await.unwrap();
+        let on = sw.set(put("H", None, false), "pv2", NOW + 1).await.unwrap();
+        assert!(on.view.record.previous_off.is_some());
+        let again = sw.set(put("H", None, false), "pv2", NOW + 2).await.unwrap();
+        assert_eq!(again.view.record.previous_off, None, "on over on");
+
+        let off = sw.set(put("H", None, true), "pv2", NOW + 3).await.unwrap();
+        assert_eq!(off.view.record.previous_off, None, "off writes");
+        let raw = String::from_utf8(store.rows.lock().unwrap()[0].1.clone()).unwrap();
+        assert!(!raw.contains("previous_off"), "absent on the wire: {raw}");
+    }
+
+    #[tokio::test]
+    async fn a_head_guard_trip_is_kept_when_turned_back_on() {
+        let (sw, _) = loaded(&[]).await;
+        let trip = OffSwitchPutRequest {
+            reason: "action ceiling: 5 in 1h (guard v1)".into(),
+            updated_by: Some(crate::head_guard::UPDATED_BY.into()),
+            ..put("H", Some("c1"), true)
+        };
+        sw.set(trip, crate::head_guard::UPDATED_BY, NOW)
+            .await
+            .unwrap();
+        let on = sw
+            .set(put("H", Some("c1"), false), "pv2", NOW + 1)
+            .await
+            .unwrap();
+        let prev = on.view.record.previous_off.unwrap();
+        assert_eq!(prev.updated_by, crate::head_guard::UPDATED_BY);
+        assert_eq!(prev.updated_at_ms, NOW);
     }
 
     #[tokio::test]

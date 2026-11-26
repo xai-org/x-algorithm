@@ -14,6 +14,14 @@ impl EmbeddingStore {
     pub fn dim(&self) -> usize {
         self.dim
     }
+
+    #[cfg(test)]
+    pub(crate) fn in_process(dim: usize) -> Self {
+        Self {
+            client: MmEmbeddingsClient::in_process(),
+            dim,
+        }
+    }
 }
 
 pub fn init_store(dim: usize) -> Result<(Arc<EmbeddingStore>, O2PreloadFuture)> {

@@ -1,12 +1,17 @@
-use crate::params::{ShadowTrafficDefaultPercent, ShadowTrafficPhoenixClusterRates};
+use crate::params::{
+    ShadowTrafficDefaultPercent, ShadowTrafficPhoenixClusterAggregationTypes,
+    ShadowTrafficPhoenixClusterRates,
+};
 use strum::VariantArray;
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
     PhoenixCluster, Surface,
 };
 use xai_candidate_pipeline::component_library::utils::is_sampled;
 use xai_feature_switches::Params;
+use xai_recsys_proto::UserActionAggregationType;
 
-pub fn shadow_rate_for_cluster(params: &Params, cluster_name: &str) -> f64 {
+pub fn shadow_rate_for_cluster(params: &Params, cluster: PhoenixCluster) -> f64 {
+    let cluster_name = format!("{cluster:?}");
     let overrides: Vec<String> = params.get(ShadowTrafficPhoenixClusterRates);
     overrides
         .iter()
@@ -18,25 +23,49 @@ pub fn shadow_rate_for_cluster(params: &Params, cluster_name: &str) -> f64 {
                 None
             }
         })
-        .unwrap_or_else(|| params.get(ShadowTrafficDefaultPercent))
+        .unwrap_or_else(|| {
+            if cluster.is_shadow_opt_in() {
+                0.0
+            } else {
+                params.get(ShadowTrafficDefaultPercent)
+            }
+        })
+}
+
+pub fn shadow_aggregation_type_for_cluster(
+    params: &Params,
+    cluster: PhoenixCluster,
+) -> Option<UserActionAggregationType> {
+    let cluster_name = format!("{cluster:?}");
+    let overrides: Vec<String> = params.get(ShadowTrafficPhoenixClusterAggregationTypes);
+    overrides.iter().find_map(|entry| {
+        let (name, aggregation_type) = entry.split_once(':')?;
+        if name.trim() == cluster_name {
+            UserActionAggregationType::from_str_name(aggregation_type.trim())
+        } else {
+            None
+        }
+    })
 }
 
 pub fn is_shadow_sampled_for_cluster(
     params: &Params,
-    request_id: u64,
+    prediction_request_id: u64,
     cluster: PhoenixCluster,
 ) -> bool {
     if !cluster.is_shadow_eligible_for(Surface::Home) {
         return false;
     }
-    let cluster_name = format!("{cluster:?}");
-    is_sampled(request_id, shadow_rate_for_cluster(params, &cluster_name))
+    is_sampled(
+        prediction_request_id,
+        shadow_rate_for_cluster(params, cluster),
+    )
 }
 
-pub fn is_shadow_traffic(params: &Params, request_id: u64) -> bool {
+pub fn is_shadow_traffic(params: &Params, prediction_request_id: u64) -> bool {
     PhoenixCluster::VARIANTS
         .iter()
-        .any(|&cluster| is_shadow_sampled_for_cluster(params, request_id, cluster))
+        .any(|&cluster| is_shadow_sampled_for_cluster(params, prediction_request_id, cluster))
 }
 
 #[cfg(test)]
@@ -64,14 +93,23 @@ mod tests {
     #[test]
     fn override_applies_to_listed_cluster_only() {
         let params = params_with(vec!["Experiment6Fou:2.0"], Some(0.5));
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment6Fou"), 2.0);
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment1Fou"), 0.5);
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment6Fou),
+            2.0
+        );
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment1Fou),
+            0.5
+        );
     }
 
     #[test]
     fn override_can_disable_a_cluster() {
         let params = params_with(vec!["Experiment3Fou:0"], None);
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment3Fou"), 0.0);
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment3Fou),
+            0.0
+        );
         assert!(!is_shadow_sampled_for_cluster(
             &params,
             0,
@@ -82,19 +120,47 @@ mod tests {
     #[test]
     fn malformed_entry_falls_back_to_default() {
         let params = params_with(vec!["Experiment6Fou:abc", "Experiment6Fou"], Some(1.0));
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment6Fou"), 1.0);
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment6Fou),
+            1.0
+        );
     }
 
     #[test]
     fn entry_whitespace_is_tolerated() {
         let params = params_with(vec![" Experiment6Fou : 2.5 "], None);
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment6Fou"), 2.5);
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment6Fou),
+            2.5
+        );
     }
 
     #[test]
     fn configurable_default_percent() {
         let params = params_with(vec![], Some(1.0));
-        assert_eq!(shadow_rate_for_cluster(&params, "Experiment1Fou"), 1.0);
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment1Fou),
+            1.0
+        );
+    }
+
+    #[test]
+    fn opt_in_cluster_is_off_unless_overridden() {
+        let params = params_with(vec![], Some(1.0));
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment18Fou),
+            0.0
+        );
+        assert!(!is_shadow_sampled_for_cluster(
+            &params,
+            0,
+            PhoenixCluster::Experiment18Fou,
+        ));
+        let params = params_with(vec!["Experiment18Fou:2.0"], Some(1.0));
+        assert_eq!(
+            shadow_rate_for_cluster(&params, PhoenixCluster::Experiment18Fou),
+            2.0
+        );
     }
 
     #[test]

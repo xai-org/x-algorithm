@@ -1,4 +1,5 @@
 pub mod args;
+pub mod carousel_model;
 pub mod config_sync;
 pub mod dpp;
 pub mod embedding_store;
@@ -8,3 +9,5 @@ pub mod params;
 pub mod ranker_service;
 pub mod ranking_config;
 pub mod scoring;
+pub mod sid_client;
+pub mod user_debias_store;

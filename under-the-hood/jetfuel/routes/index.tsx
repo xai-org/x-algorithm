@@ -7,7 +7,9 @@ import type { EligibilityCheck } from "./_lib/report";
 import { Body, Divider, OPEN_SOURCE_URL, REPORT_PATH, Screen, downloadUrl, pilotCopy } from "./_lib/ui";
 
 const T = t.Object({
-	mock: t.Optional(t.Union([t.Literal("none"), t.Literal("pilot"), t.Literal("ineligible"), t.Literal("empty"), t.Literal("labels")])),
+	mock: t.Optional(
+		t.Union([t.Literal("none"), t.Literal("pilot"), t.Literal("ineligible"), t.Literal("empty"), t.Literal("labels"), t.Literal("launch")]),
+	),
 });
 
 const copy = {

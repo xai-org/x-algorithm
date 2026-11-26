@@ -2,6 +2,7 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
+import functools
 import math
 import typing
 from typing import Any, Literal, NamedTuple
@@ -9,6 +10,7 @@ from typing import Any, Literal, NamedTuple
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
@@ -34,6 +36,14 @@ ENGAGEMENT_COUNT_ORDER: tuple[Int64Feature, ...] = (
     Int64Feature.quoteCountSeq,
     Int64Feature.viewCountSeq,
 )
+NOTIFICATION_COUNT_ORDER: tuple[Int64Feature, ...] = (
+    Int64Feature.notInterestedCountSeq,
+    Int64Feature.notificationSentCountSeq,
+    Int64Feature.notificationOpenCountSeq,
+    Int64Feature.notificationClickCountSeq,
+    Int64Feature.notificationDismissCountSeq,
+    Int64Feature.notificationSeeLessOftenCountSeq,
+)
 ENGAGEMENT_COUNT_LOG2_SCALE: float = 32.0
 
 
@@ -47,6 +57,7 @@ class FeaturePrepStreams(NamedTuple):
 
 
 POST_AGE_MAX_MINUTES = 4800
+TIME_GAP_CARDINALITY = 19
 
 
 def _compute_post_age_bucket_linear(
@@ -65,6 +76,14 @@ def _compute_post_age_bucket_linear(
         bucket,
     )
     return bucket.astype(jnp.int32)
+
+
+def _compute_time_gap_bucket(request_ts: jax.Array, impr_ts: jax.Array) -> jax.Array:
+    gap = request_ts - impr_ts
+    edges = jnp.asarray([60 * 2**k for k in range(TIME_GAP_CARDINALITY - 2)], dtype=gap.dtype)
+    bucket = 1 + jnp.searchsorted(edges, gap, side="right", method="compare_all")
+    known = (request_ts > 0) & (impr_ts > 0) & (gap >= 0)
+    return jnp.where(known, bucket, 0).astype(jnp.int32)
 
 
 DTYPE_BY_NAME = {
@@ -174,6 +193,8 @@ class FeaturePrepConfig(Config):
 
     enable_product_surface: bool = True
     enable_post_age: bool = True
+    enable_time_gap: bool = False
+    time_gap_lr_scale: float = 1.0
     enable_timezone: bool = True
     enable_dwell_time: bool = True
     dwell_time_norm_scale: float = 30.0
@@ -185,6 +206,10 @@ class FeaturePrepConfig(Config):
     enable_bridge_prob: bool = False
     enable_click_dwell_time: bool = False
     click_dwell_time_norm_scale: float = 60.0
+    enable_home_excursion_history: bool = False
+    home_excursion_history_norm_scale: float = 300.0
+    enable_video_completion_rate_history: bool = False
+    video_completion_rate_history_cap: float = 3.0
     enable_web_conv_time_on_site: bool = False
     web_conv_time_on_site_norm_scale: float = 1800.0
     enable_web_conv_tracking_integration: bool = False
@@ -192,6 +217,7 @@ class FeaturePrepConfig(Config):
     timezone_cardinality: int = 32
     enable_engagement_counts: bool = False
     engagement_count_mlp_hidden_dim: int = 64
+    enable_notification_counts: bool = False
 
     enable_time_of_day: bool = False
     time_of_day_kernel: Literal["box", "triangle", "cosine"] = "cosine"
@@ -226,6 +252,9 @@ class FeaturePrepConfig(Config):
     sid_cross_attn: bool = True
     sid_embedding_mode: Literal["learned", "recon"] = "learned"
     sid_decoder_path: str = ""
+    sid_recon_rows_per_decoder_pass: int = 16384
+    sid_recon_decoder_params: bool = False
+    sid_recon_remat: bool = False
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
@@ -274,7 +303,11 @@ def _feature_scale_spec(
         lr = scale_config.emb_lr_multiplier(dim) if scale_config is not None else 1.0
         return eis / math.sqrt(dim), lr
     if role == "hidden_proj":
-        lr = scale_config.hidden_lr_multiplier(dim) if scale_config is not None else 1.0
+        lr = (
+            scale_config.hidden_lr_multiplier(dim) * scale_config.hidden_proj_lr_scale
+            if scale_config is not None
+            else 1.0
+        )
         return eis / math.sqrt(dim), lr
     if role == "input_proj":
         lr = scale_config.emb_lr_multiplier(D) if scale_config is not None else 1.0
@@ -314,6 +347,7 @@ def _get_emb_table(
     config: FeaturePrepConfig,
     *,
     zero_init: bool = False,
+    lr_scale: float = 1.0,
 ) -> jax.Array:
     _, lr_multiplier = _feature_scale_spec(
         config.scale_config, config.embed_init_scale, config.emb_size, "embedding", dim
@@ -331,13 +365,15 @@ def _get_emb_table(
             dtype=jnp.float32,
             init=init,
             pspec=P(),
-            lr_multiplier=lr_multiplier,
+            lr_multiplier=lr_multiplier * lr_scale,
             rms_clip_axes=(-2, -1),
         ),
     )
 
 
-def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.Array:
+def _get_learned_vector(
+    name: str, dim: int, config: FeaturePrepConfig, *, zero_init: bool = False
+) -> jax.Array:
     _, lr_multiplier = _feature_scale_spec(
         config.scale_config, config.embed_init_scale, config.emb_size, "embedding", dim
     )
@@ -347,7 +383,11 @@ def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.A
             name,
             [dim],
             dtype=jnp.float32,
-            init=hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out"),
+            init=(
+                hk.initializers.Constant(0.0)
+                if zero_init
+                else hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out")
+            ),
             pspec=P(),
             lr_multiplier=lr_multiplier,
         ),
@@ -355,15 +395,33 @@ def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.A
 
 
 def _project_hash(embedding: jax.Array, name: str, config: FeaturePrepConfig) -> jax.Array:
-    proj = _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
-    return jnp.dot(embedding.astype(proj.dtype), proj)
+    return _project_hashes(embedding, [name], config)
+
+
+def _project_hashes(
+    embeddings: jax.Array, names: list[str], config: FeaturePrepConfig
+) -> jax.Array:
+    projections = [
+        _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
+        for name in names
+    ]
+    return jnp.dot(embeddings.astype(projections[0].dtype), jnp.concatenate(projections))
 
 
 def _embed_categorical(
-    values: jax.Array, cardinality: int, name: str, config: FeaturePrepConfig
+    values: jax.Array,
+    cardinality: int,
+    name: str,
+    config: FeaturePrepConfig,
+    *,
+    one_hot_dtype: jnp.dtype = jnp.float32,
+    zero_init: bool = False,
+    lr_scale: float = 1.0,
 ) -> jax.Array:
-    table = _get_emb_table(name, cardinality, config.emb_size, config)
-    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality)
+    table = _get_emb_table(
+        name, cardinality, config.emb_size, config, zero_init=zero_init, lr_scale=lr_scale
+    )
+    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality, dtype=one_hot_dtype)
     return jnp.dot(one_hot, table)
 
 
@@ -381,6 +439,9 @@ def _embed_scalar_times_vector(
 
 
 DWELL_TIME_DEFAULT_SENTINEL_SEC = 2.0
+IMMERSIVE_NOT_DWELLED_SEC = 3.0
+MIN_VALID_DWELL_SEC = 0.0
+MAX_VALID_DWELL_SEC = 86_400.0
 
 DWELL_TABLE_PARAM_NAME = "hist_dwell_time_table"
 
@@ -451,12 +512,35 @@ def _embed_location(
     return jnp.dot(geo_features.astype(proj.dtype), proj)
 
 
+def user_history_stats_features(stats: jax.Array) -> jax.Array:
+    stats = stats.astype(jnp.float32)
+    dim = stats.shape[-1]
+
+    def param(name: str, value: float) -> jax.Array:
+        return get_parameter(
+            name,
+            [dim],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(value),
+            pspec=P(None),
+            dtype_unwrap=jnp.float32,
+        )
+
+    mean = jnp.mean(stats, axis=-1, keepdims=True)
+    var = jnp.var(stats, axis=-1, keepdims=True)
+    normed = (stats - mean) * jax.lax.rsqrt(var + 1e-5)
+    return normed * param("user_history_stats_ln_scale", 1.0) + param(
+        "user_history_stats_ln_offset", 0.0
+    )
+
+
 @hk.transparent
 def _build_user_token(
     batch: RecsysFeaturesBatch,
     embeddings: RecsysEmbeddings,
     config: FeaturePrepConfig,
     hash_keys: HashKeys,
+    use_user_history_stats: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
     D = config.emb_size
@@ -476,6 +560,24 @@ def _build_user_token(
         for i in range(num_ip_hashes):
             h = ip_embs[:, i : i + 1, :]
             result = result + _project_hash(h, f"user_ip_hash_{i}_proj", config).astype(fprop_dtype)
+
+    if use_user_history_stats:
+        stats = batch.get("user_history_stats")
+        assert stats is not None, "user_history_stats_dim needs the dataset's user_history_stats"
+        feats = user_history_stats_features(_cast_jax(stats))
+        din = feats.shape[-1]
+        _, lr_multiplier = _feature_scale_spec(
+            config.scale_config, config.embed_init_scale, D, "input_proj", din
+        )
+        w = get_parameter(
+            "user_history_stats_proj",
+            [din, D],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=lr_multiplier,
+        )
+        result = result + jnp.dot(feats.astype(w.dtype), w).astype(fprop_dtype)[:, None, :]
 
     user_hashes = _cast_jax(batch["user_hashes"])
     user_padding_mask = (user_hashes[:, 0] != 0).reshape(B, 1).astype(jnp.bool_)
@@ -584,10 +686,13 @@ def _add_context_features(
     is_training: bool = True,
 ) -> jax.Array:
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
+    embed_categorical_in_fprop_dtype = functools.partial(
+        _embed_categorical, one_hot_dtype=fprop_dtype
+    )
 
     if config.enable_product_surface:
         ps = _cast_jax(batch_seq["product_surface"])
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             ps, config.product_surface_cardinality, f"{prefix}_product_surface_emb", config
         ).astype(fprop_dtype)
 
@@ -597,7 +702,7 @@ def _add_context_features(
         buckets = _compute_post_age_bucket_linear(
             impr_ts, creation_ts, config.post_age_granularity_mins
         )
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             buckets, config.post_age_cardinality, f"{prefix}_post_age_emb", config
         ).astype(fprop_dtype)
 
@@ -605,7 +710,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             tz = _cast_jax(cat_features)[:, :, CategoricalFeature.timezoneSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 tz, config.timezone_cardinality, f"{prefix}_timezone_emb", config
             ).astype(fprop_dtype)
 
@@ -649,7 +754,7 @@ def _add_context_features(
                 hour = _dither_hour_forward(
                     hour, config.hour_of_day_dither_fraction, config.hour_of_day_cardinality - 1
                 )
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 hour, config.hour_of_day_cardinality, f"{prefix}_hour_of_day_emb", config
             ).astype(fprop_dtype)
 
@@ -657,7 +762,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             dow = _cast_jax(cat_features)[:, :, CategoricalFeature.localDayOfWeekSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 dow, config.day_of_week_cardinality, f"{prefix}_day_of_week_emb", config
             ).astype(fprop_dtype)
 
@@ -669,25 +774,30 @@ def _add_context_features(
                 followed = bool_features[:, :, BoolFeature.isAuthorFollowedByViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     followed, 2, f"{prefix}_is_author_followed_by_viewer_emb", config
                 ).astype(fprop_dtype)
             if config.enable_is_author_following_viewer:
                 following = bool_features[:, :, BoolFeature.isAuthorFollowingViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     following, 2, f"{prefix}_is_author_following_viewer_emb", config
                 ).astype(fprop_dtype)
 
-    if config.enable_engagement_counts:
+    if config.enable_engagement_counts or config.enable_notification_counts:
         i64 = batch_seq.get("int64_features")
-        if i64 is not None:
+        count_features = (ENGAGEMENT_COUNT_ORDER if config.enable_engagement_counts else ()) + (
+            NOTIFICATION_COUNT_ORDER
+            if config.enable_notification_counts and prefix != "hist"
+            else ()
+        )
+        if i64 is not None and count_features:
             i64 = _cast_jax(i64)
             x = jnp.stack(
                 [
                     jnp.log2(jnp.maximum(i64[:, :, f.value].astype(jnp.float32), 0.0) + 1.0)
-                    for f in ENGAGEMENT_COUNT_ORDER
+                    for f in count_features
                 ],
                 axis=-1,
             )
@@ -714,11 +824,9 @@ def _add_context_features(
         bools = batch_seq.get("bool_features")
         if bools is not None and bools.shape[-1] > BoolFeature.isStalePost14d.value:
             is_stale = _cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(jnp.int32)
-            emb_table = _get_emb_table(
-                f"{prefix}_is_stale_post_14d_emb", 2, config.emb_size, config
-            )
-            one_hot = jax.nn.one_hot(jnp.clip(is_stale, 0, 1), 2)
-            result = result + jnp.dot(one_hot, emb_table).astype(fprop_dtype)
+            result = result + embed_categorical_in_fprop_dtype(
+                is_stale, 2, f"{prefix}_is_stale_post_14d_emb", config
+            ).astype(fprop_dtype)
 
     return result
 
@@ -821,6 +929,8 @@ def _add_sid_features(
     result: jax.Array,
     batch_seq: dict,
     config: FeaturePrepConfig,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> jax.Array:
     if not config.enable_post_sid:
         return result
@@ -848,6 +958,11 @@ def _add_sid_features(
             config.embed_init_scale,
             fprop_dtype,
             "feat_prep_post",
+            mesh=mesh,
+            data_axis=data_axis,
+            rows_per_decoder_pass=config.sid_recon_rows_per_decoder_pass,
+            decoder_params=config.sid_recon_decoder_params,
+            remat=config.sid_recon_remat,
         )
         return result + sid_emb.astype(fprop_dtype)
     entity_hashes = _cast_jax(batch_seq["post_hashes"]) if config.sid_hash_level else None
@@ -951,6 +1066,45 @@ def _add_history_features(
                 cd_normalized, "hist_click_dwell_time_vec", config
             ).astype(fprop_dtype)
 
+    if config.enable_home_excursion_history:
+        from xai_proto import recsys_pb2
+
+        cont_actions = batch["history_seq"].get("continuous_actions")
+        scale = config.home_excursion_history_norm_scale
+        for slot, name in (
+            (
+                recsys_pb2.ContinuousActionName.HOME_VIDEO_CONTINUATION_SECS,
+                "hist_home_video_continuation_vec",
+            ),
+            (
+                recsys_pb2.ContinuousActionName.HOME_PROFILE_VISIT_SECS,
+                "hist_home_profile_visit_vec",
+            ),
+        ):
+            if cont_actions is None or cont_actions.shape[-1] <= slot:
+                continue
+            raw = _cast_jax(cont_actions)[:, :, slot].astype(jnp.float32)
+            normalized = jnp.log1p(jnp.clip(raw, 0.0, scale)) / jnp.log1p(scale)
+            vec = _get_learned_vector(name, config.emb_size, config, zero_init=True)
+            result = result + (normalized[..., None] * vec).astype(fprop_dtype)
+
+    if config.enable_video_completion_rate_history:
+        cont_actions = batch["history_seq"].get("continuous_actions")
+        int64_feats = batch["history_seq"].get("int64_features")
+        assert cont_actions is not None and int64_feats is not None
+        dwell = _cast_jax(cont_actions)[:, :, 1].astype(jnp.float32)
+        duration_s = (
+            _cast_jax(int64_feats)[:, :, Int64Feature.firstVideoDurationMsSeq].astype(jnp.float32)
+            / 1000.0
+        )
+        known = (duration_s > 0.0) & (dwell >= IMMERSIVE_NOT_DWELLED_SEC)
+        cap = config.video_completion_rate_history_cap
+        rate = jnp.where(known, jnp.clip(dwell / jnp.where(known, duration_s, 1.0), 0.0, cap), 0.0)
+        vec = _get_learned_vector(
+            "hist_video_completion_rate_vec", config.emb_size, config, zero_init=True
+        )
+        result = result + ((rate / cap)[..., None] * vec).astype(fprop_dtype)
+
     if config.enable_web_conv_tracking_integration:
         cat_features = batch["history_seq"].get("categorical_features")
         idx = CategoricalFeature.webConvTrackingIntegrationSeq
@@ -977,6 +1131,21 @@ def _add_history_features(
                 result = result + _embed_scalar_times_vector(normalized, name, config).astype(
                     fprop_dtype
                 )
+
+    if config.enable_time_gap:
+        int64_feats = batch["history_seq"].get("int64_features")
+        request_idx = Int64Feature.requestTimeSecSeq
+        if int64_feats is not None and int64_feats.shape[-1] > request_idx:
+            request_ts = _cast_jax(int64_feats)[:, :, request_idx]
+            impr_ts = _cast_jax(batch["history_seq"]["impr_ts"])
+            result = result + _embed_categorical(
+                _compute_time_gap_bucket(request_ts, impr_ts),
+                TIME_GAP_CARDINALITY,
+                "hist_time_gap_emb",
+                config,
+                zero_init=True,
+                lr_scale=config.time_gap_lr_scale,
+            ).astype(fprop_dtype)
 
     return result
 
@@ -1020,6 +1189,23 @@ def _add_candidate_features(
         )
         result = result + jnp.dot(sq.astype(proj.dtype), proj).astype(fprop_dtype)
 
+    if config.enable_time_gap:
+        int64_feats = batch["candidate_seq"].get("int64_features")
+        request_idx = Int64Feature.requestTimeSecSeq
+        latest_idx = Int64Feature.latestHistoryImpressionTimeSecSeq
+        if int64_feats is not None and int64_feats.shape[-1] > latest_idx:
+            int64_feats = _cast_jax(int64_feats)
+            result = result + _embed_categorical(
+                _compute_time_gap_bucket(
+                    int64_feats[:, :, request_idx], int64_feats[:, :, latest_idx]
+                ),
+                TIME_GAP_CARDINALITY,
+                "cand_time_since_history_emb",
+                config,
+                zero_init=True,
+                lr_scale=config.time_gap_lr_scale,
+            ).astype(fprop_dtype)
+
     return result
 
 
@@ -1042,19 +1228,13 @@ def _build_seq_tokens(
     result = jnp.zeros((B, S, D), dtype=fprop_dtype)
 
     if config.enable_post_embedding:
-        post_reshaped = post_embeddings.reshape(B, S, num_item_hashes, -1)
-        for i in range(num_item_hashes):
-            h = post_reshaped[:, :, i, :]
-            result = result + _project_hash(h, f"{prefix}_post_hash_{i}_proj", config).astype(
-                fprop_dtype
-            )
+        post_names = [f"{prefix}_post_hash_{i}_proj" for i in range(num_item_hashes)]
+        post_tokens = _project_hashes(post_embeddings.reshape(B, S, -1), post_names, config)
+        result = result + post_tokens.astype(fprop_dtype)
 
-    author_reshaped = author_embeddings.reshape(B, S, num_author_hashes, -1)
-    for i in range(num_author_hashes):
-        h = author_reshaped[:, :, i, :]
-        result = result + _project_hash(h, f"{prefix}_author_hash_{i}_proj", config).astype(
-            fprop_dtype
-        )
+    author_names = [f"{prefix}_author_hash_{i}_proj" for i in range(num_author_hashes)]
+    author_tokens = _project_hashes(author_embeddings.reshape(B, S, -1), author_names, config)
+    result = result + author_tokens.astype(fprop_dtype)
 
     padding_mask = (post_hashes[:, :, 0] != 0).reshape(B, S).astype(jnp.bool_)
 
@@ -1089,6 +1269,7 @@ def _flatten_user_batch_for_seqpack(
                     "user_bool_features": _flat_user("user_bool_features"),
                     "user_int64_features": _flat_user("user_int64_features"),
                     "user_installed_apps_multihot": _flat_user("user_installed_apps_multihot"),
+                    "user_history_stats": _flat_user("user_history_stats"),
                 }.items()
                 if v is not None
             },
@@ -1140,11 +1321,16 @@ def build_feature_prep_streams(
     include_candidates: bool = True,
     candidate_token_to_slot: jax.typing.ArrayLike | None = None,
     candidate_slot_to_token: jax.typing.ArrayLike | None = None,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
+    use_user_history_stats: bool = False,
 ) -> FeaturePrepStreams:
     user_tokens: jax.Array | None = None
     user_mask: jax.Array | None = None
     if config.enable_user_embedding:
-        user_tokens, user_mask = _build_user_token(batch, recsys_embeddings, config, hash_keys)
+        user_tokens, user_mask = _build_user_token(
+            batch, recsys_embeddings, config, hash_keys, use_user_history_stats
+        )
 
     user_features_result = _build_user_features_token(batch, config)
     if user_features_result is not None:
@@ -1171,7 +1357,9 @@ def build_feature_prep_streams(
     history_tokens = _add_context_features(
         history_tokens, batch["history_seq"], config, prefix="hist", is_training=is_training
     )
-    history_tokens = _add_sid_features(history_tokens, batch["history_seq"], config)
+    history_tokens = _add_sid_features(
+        history_tokens, batch["history_seq"], config, mesh=mesh, data_axis=data_axis
+    )
     history_tokens = _add_history_features(history_tokens, batch, config, output_vocab_size)
 
     candidate_tokens: jax.Array | None = None
@@ -1203,7 +1391,9 @@ def build_feature_prep_streams(
             prefix="cand",
             is_training=is_training,
         )
-        candidate_tokens = _add_sid_features(candidate_tokens, candidate_seq, config)
+        candidate_tokens = _add_sid_features(
+            candidate_tokens, candidate_seq, config, mesh=mesh, data_axis=data_axis
+        )
         candidate_batch = typing.cast(
             RecsysFeaturesBatch, {**batch, "candidate_seq": candidate_seq}
         )
@@ -1326,6 +1516,9 @@ def build_feature_prep_inputs(
     output_vocab_size: int = 64,
     is_training: bool = True,
     include_candidates: bool = True,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
+    use_user_history_stats: bool = False,
 ) -> tuple[jax.Array, jax.Array, int | None]:
     layout = batch.get("packing_layout")
 
@@ -1339,6 +1532,9 @@ def build_feature_prep_inputs(
             output_vocab_size,
             is_training=is_training,
             include_candidates=include_candidates,
+            mesh=mesh,
+            data_axis=data_axis,
+            use_user_history_stats=use_user_history_stats,
         )
         return _assemble_unpacked(streams)
 
@@ -1356,5 +1552,8 @@ def build_feature_prep_inputs(
         include_candidates=include_candidates,
         candidate_token_to_slot=layout.candidate_token_to_slot,
         candidate_slot_to_token=layout.candidate_slot_to_token,
+        mesh=mesh,
+        data_axis=data_axis,
+        use_user_history_stats=use_user_history_stats,
     )
     return _assemble_packed(streams, layout, num_devices, bs_per_device, config)

@@ -313,7 +313,7 @@ def read_annotation_file(file_path: str) -> str:
         return f.read()
 
 
-_CUTLASS_CALL_TARGET = "CuteDSLRT_NvJaxCutlassCall"
+_CUTLASS_CALL_TARGETS = ("CuteDSLRT_NvJaxCutlassCall", "CuteDSLRT_NvJaxCutlassCall_v1")
 _FATBIN_MAGIC = b"\x50\xed\x55\xba"
 _ELF_MAGIC = b"\x7fELF"
 
@@ -346,7 +346,7 @@ def _sanitize_cutlass_calls(m: ir.Module) -> ir.Module:
     def _update(op: ir.Operation) -> ir.WalkResult:
         if (
             op.name == "stablehlo.custom_call"
-            and op.attributes["call_target_name"].value == _CUTLASS_CALL_TARGET
+            and op.attributes["call_target_name"].value in _CUTLASS_CALL_TARGETS
             and "mhlo.backend_config" in op.attributes
         ):
             cfg = ir.DictAttr(op.attributes["mhlo.backend_config"])

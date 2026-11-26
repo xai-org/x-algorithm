@@ -41,7 +41,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, const_expr
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.utils import LayoutEnum
 
 from xrex.cutedsl.quack import copy_utils, layout_utils, sm90_utils
@@ -115,8 +115,8 @@ class FlashAttentionBackwardPostprocess:
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.K,
-                warpgroup.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
@@ -126,8 +126,9 @@ class FlashAttentionBackwardPostprocess:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
-                tcgen05.OperandMajorMode.MN,
-                tcgen05.OperandMajorMode.MN,
+                self.dtype,
+                cute.nvgpu.OperandMajorMode.MN,
+                cute.nvgpu.OperandMajorMode.MN,
                 Float32,
                 cta_group,
                 (self.tile_m, self.tile_hdim),
@@ -373,7 +374,7 @@ class FlashAttentionBackwardPostprocess:
                 tiled_copy_accum = s2r_tiled_copy_dQaccum
                 g2s_thr_copy = tiled_copy_accum.get_slice(tidx)
 
-                tdQrdQ_fp32 = cute.make_fragment(tdQrdQ.shape, cutlass.Float32)
+                tdQrdQ_fp32 = cute.make_rmem_tensor(tdQrdQ.shape, cutlass.Float32)
                 tdQrdQ_s2r = cute.make_tensor(tdQrdQ_fp32.iterator, tdQrdQ_fp32.shape)
 
                 smem_copy_atom = sm100_utils_basic.get_smem_store_op(
@@ -385,7 +386,7 @@ class FlashAttentionBackwardPostprocess:
                     tiler_mn=tiled_tmem_ld.tiler_mn,
                 )
                 tdQsdQ_r2s = thr_tmem_ld.partition_D(thr_mma_dsk.partition_C(sdQ))
-                tdQrdQ_r2s = cute.make_fragment(tdQsdQ_r2s.shape, self.dtype)
+                tdQrdQ_r2s = cute.make_rmem_tensor(tdQsdQ_r2s.shape, self.dtype)
 
                 num_stages = cute.size(tdQrdQ_fp32, mode=[1])
                 stage_stride = self.dQ_reduce_ncol
@@ -479,7 +480,7 @@ class FlashAttentionBackwardPostprocess:
                     acc_shape = tiled_mma.partition_shape_C(
                         tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
                     )
-                    acc = cute.make_fragment(acc_shape, cutlass.Float32)
+                    acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
                     assert cute.size(acc) == cute.size(tdQsdQaccum)
                 else:
                     thr_mma = tiled_mma.get_slice(0)
@@ -495,7 +496,7 @@ class FlashAttentionBackwardPostprocess:
                     tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                     thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                     tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
-                    acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                    acc = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
                 tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
                 cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
                 rdQ = cute.make_fragment_like(acc, self.dtype)

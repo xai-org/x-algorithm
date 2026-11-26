@@ -1,6 +1,8 @@
-use crate::models::{ViewerAge, ViewerProfile};
+use crate::models::{NotificationFilters, NotificationMutedKeywords, ViewerAge, ViewerProfile};
+use std::time::Duration;
 use xai_core_entities::entities::{
-    AccessPolicy, GizmoduckUser, Labels, Safety, SubscriptionLevel, VerifiedType,
+    AccessPolicy, GizmoduckMuteSettings, GizmoduckUser, Labels, Safety, SubscriptionLevel,
+    UniversalQualityFiltering, VerifiedType,
 };
 use xai_core_entities::gizmoduck_client::{QueryFields, ViewerData};
 use xai_x_thrift::user_labels::LabelValue;
@@ -27,6 +29,37 @@ fn has_age_verified_18_label(labels: &Labels) -> bool {
         .labels
         .iter()
         .any(|label| LabelValue(label.label_value) == LabelValue::AGE_VERIFIED_18)
+}
+
+fn has_blink_label(labels: &Labels) -> bool {
+    labels.labels.iter().any(|label| {
+        [
+            LabelValue::BLINK_WORST,
+            LabelValue::BLINK_BAD,
+            LabelValue::BLINK_QUESTIONABLE,
+        ]
+        .contains(&LabelValue(label.label_value))
+    })
+}
+
+fn mute_settings<'u>(
+    user: &'u GizmoduckUser,
+    fields: &[QueryFields],
+) -> Option<&'u GizmoduckMuteSettings> {
+    user.mute_settings
+        .as_ref()
+        .filter(|_| fields.contains(&QueryFields::MUTE_SETTINGS))
+}
+
+fn notification_filters(settings: &GizmoduckMuteSettings) -> NotificationFilters {
+    let filters = &settings.advanced_notification_filters;
+    NotificationFilters {
+        no_confirmed_email: filters.filter_no_confirmed_email,
+        no_confirmed_phone: filters.filter_no_confirmed_phone,
+        default_profile_image: filters.filter_default_profile_image,
+        new_users: filters.filter_new_users,
+        not_followed_by: filters.filter_not_followed_by,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
@@ -63,14 +96,40 @@ pub(crate) struct DecodedViewer {
 }
 
 pub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {
-    match user {
-        Some(user) => DecodedViewer {
-            profile: profile(ViewerData::from_user(user, fields)),
-            has_age_verified_18_label: has_age_verified_18_label(&user.labels),
-            state: Some(ViewerState::of(&user.safety)),
+    let Some(user) = user else {
+        return DecodedViewer::default();
+    };
+    let mute_settings = mute_settings(user, fields);
+    DecodedViewer {
+        profile: ViewerProfile {
+            is_new_account: is_younger_than(user.created_at_msec, NEW_VIEWER_AGE),
+            has_uqf_enabled: fields.contains(&QueryFields::SAFETY)
+                && user.safety.universal_quality_filtering == UniversalQualityFiltering::Enabled,
+            has_blink_label: fields.contains(&QueryFields::LABELS) && has_blink_label(&user.labels),
+            notification_filters: mute_settings.map(notification_filters).unwrap_or_default(),
+            notification_muted_keywords: mute_settings
+                .map(|settings| NotificationMutedKeywords::of(&settings.muted_keywords))
+                .unwrap_or_default(),
+            ..profile(ViewerData::from_user(user, fields))
         },
-        None => DecodedViewer::default(),
+        has_age_verified_18_label: has_age_verified_18_label(&user.labels),
+        state: Some(ViewerState::of(&user.safety)),
     }
+}
+
+const NEW_VIEWER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+pub(super) fn is_younger_than(created_at_msec: Option<i64>, age: Duration) -> bool {
+    let Some(created_at) = created_at_msec
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms))
+    else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .duration_since(created_at)
+        .unwrap_or_default()
+        < age
 }
 
 fn profile(data: ViewerData) -> ViewerProfile {
@@ -84,6 +143,14 @@ fn profile(data: ViewerData) -> ViewerProfile {
         has_idv_premium: has_idv_premium(&data),
         is_read_only: data.access_policy == AccessPolicy::BounceAllPublicWrites,
         account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),
+        is_new_account: false,
+        is_suspended: data.is_suspended,
+        is_deactivated: data.is_deactivated,
+        has_uqf_enabled: false,
+        mention_filter_is_following: data.opted_out_oon,
+        has_blink_label: false,
+        notification_filters: NotificationFilters::default(),
+        notification_muted_keywords: NotificationMutedKeywords::default(),
     }
 }
 
@@ -276,5 +343,13 @@ mod tests {
             );
         }
         assert_eq!(decode_viewer(None, &[QueryFields::SAFETY]).state, None);
+    }
+
+    #[test]
+    fn a_creation_time_ahead_of_the_clock_reads_as_new() {
+        let ahead = std::time::SystemTime::now() + Duration::from_secs(60);
+        let since = ahead.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ms = i64::try_from(since.as_millis()).unwrap();
+        assert!(is_younger_than(Some(ms), NEW_VIEWER_AGE));
     }
 }

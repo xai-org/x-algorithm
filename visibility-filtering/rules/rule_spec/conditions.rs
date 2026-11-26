@@ -1,6 +1,7 @@
 use super::leaves::*;
 use super::rule::{all, any};
 use super::*;
+use crate::rules::rule_spec::engine::UserEngine;
 
 pub(in crate::rules) const HAS_NSFW_MEDIA_LABEL: RuleCond = RuleCond::Named(&NamedCond {
     name: "has_nsfw_media_label",
@@ -57,18 +58,19 @@ pub(in crate::rules) const IS_NSFW_SENSITIVE_TWEET: RuleCond = RuleCond::Named(&
     ],
 });
 
-pub(in crate::rules) const IS_NSFW_SENSITIVE_AUTHOR: RuleCond = RuleCond::Named(&NamedCond {
-    name: "is_nsfw_sensitive_author",
-    condition: any![
-        AuthorHasLabel(AuthorLabel::NsfwAvatarImage),
-        AuthorHasLabel(AuthorLabel::NsfwBannerImage),
-        AuthorHasLabel(AuthorLabel::NsfwHighPrecision),
-        AuthorHasLabel(AuthorLabel::NsfwHighRecall),
-        AuthorHasLabel(AuthorLabel::NsfwNearPerfect),
-        AuthorIsNsfwAdmin,
-        AuthorIsNsfwUser
-    ],
-});
+pub(in crate::rules) const IS_NSFW_SENSITIVE_AUTHOR: RuleCond<UserEngine> =
+    RuleCond::Named(&NamedCond {
+        name: "is_nsfw_sensitive_author",
+        condition: any![
+            AuthorHasLabel(AuthorLabel::NsfwAvatarImage),
+            AuthorHasLabel(AuthorLabel::NsfwBannerImage),
+            AuthorHasLabel(AuthorLabel::NsfwHighPrecision),
+            AuthorHasLabel(AuthorLabel::NsfwHighRecall),
+            AuthorHasLabel(AuthorLabel::NsfwNearPerfect),
+            AuthorIsNsfwAdmin,
+            AuthorIsNsfwUser
+        ],
+    });
 
 pub(in crate::rules) const HAS_FOSNR_LABEL: RuleCond = RuleCond::Named(&NamedCond {
     name: "has_fosnr_label",
@@ -108,37 +110,47 @@ pub(in crate::rules) const VIEWER_IS_NEITHER_ROOT_AUTHOR_NOR_INVITED: RuleCond =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::rule_spec::engine::Fold;
+    use crate::rules::rule_spec::rule::Rule;
     use crate::rules::SafetyLevel;
     use strum::VariantArray;
 
-    #[test]
-    fn no_two_named_conditions_read_the_same_leaves() {
-        let mut named: Vec<&'static NamedCond> = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            for rule in level.spec().rules {
-                for root in [rule.audience.condition(), rule.when] {
-                    root.named(&mut named);
-                }
+    fn leaf_sets<E: Fold>(rules: &[&Rule<E>]) -> Vec<(&'static str, Vec<String>)> {
+        let mut named: Vec<&'static NamedCond<E>> = Vec::new();
+        for rule in rules {
+            for root in [rule.audience.condition::<E>(), rule.when] {
+                root.named(&mut named);
             }
         }
-        let leaf_set = |definition: &NamedCond| {
-            let mut leaves = Vec::new();
-            definition.condition.leaves(&mut leaves);
-            let mut leaves: Vec<String> = leaves.iter().map(|leaf| format!("{leaf:?}")).collect();
-            leaves.sort();
-            leaves
-        };
-        for (index, definition) in named.iter().enumerate() {
-            for other in &named[..index] {
-                if other.name == definition.name {
+        named
+            .into_iter()
+            .map(|definition| {
+                let mut leaves = Vec::new();
+                definition.condition.leaves(&mut leaves);
+                let mut leaves: Vec<String> =
+                    leaves.iter().map(|leaf| format!("{leaf:?}")).collect();
+                leaves.sort();
+                (definition.name, leaves)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_two_named_conditions_read_the_same_leaves() {
+        let mut named = Vec::new();
+        for &level in SafetyLevel::VARIANTS {
+            let rules = level.spec().rules().lists();
+            named.extend(leaf_sets(&rules.user));
+            named.extend(leaf_sets(&rules.post_rules().collect::<Vec<_>>()));
+        }
+        for (index, (name, leaves)) in named.iter().enumerate() {
+            for (other, other_leaves) in &named[..index] {
+                if other == name {
                     continue;
                 }
                 assert_ne!(
-                    leaf_set(definition),
-                    leaf_set(other),
-                    "{} and {} read the same leaves; keep one",
-                    other.name,
-                    definition.name
+                    leaves, other_leaves,
+                    "{other} and {name} read the same leaves; keep one"
                 );
             }
         }

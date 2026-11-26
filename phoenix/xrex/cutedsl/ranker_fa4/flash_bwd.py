@@ -721,8 +721,8 @@ class FlashAttentionBackwardSm80:
             acc_shape_dV = thr_mma_dkv.partition_shape_C(
                 (self.n_block_size, self.head_dim_v_padded)
             )
-            acc_dK = cute.make_fragment(acc_shape_dK, cutlass.Float32)
-            acc_dV = cute.make_fragment(acc_shape_dV, cutlass.Float32)
+            acc_dK = cute.make_rmem_tensor(acc_shape_dK, cutlass.Float32)
+            acc_dV = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
             acc_dK.fill(0.0)
             acc_dV.fill(0.0)
 
@@ -1049,7 +1049,7 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not self.SdP_swapAB)
             else (self.n_block_size, self.m_block_size)
         )
-        acc_S = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_S.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_Q > 1) else 0)
         cute.arch.barrier()
@@ -1103,7 +1103,7 @@ class FlashAttentionBackwardSm80:
                 )
             )
 
-        acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_dP = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_dP.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_dO > 1) else 0)
         cute.arch.barrier()
@@ -1189,7 +1189,7 @@ class FlashAttentionBackwardSm80:
                 if cutlass.const_expr(not self.dQ_swapAB)
                 else (self.head_dim_padded, self.m_block_size)
             )
-            acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
+            acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
             sm80_utils.gemm(
                 mma_params.thr_mma_dq,
@@ -1273,7 +1273,7 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not self.SdP_swapAB)
             else (self.n_block_size, self.m_block_size)
         )
-        acc_S = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_S.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_Q > 1) else 0)
         cute.arch.barrier()
@@ -1327,7 +1327,7 @@ class FlashAttentionBackwardSm80:
                 cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - lse_r, fastmath=True)
             )
 
-        acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_dP = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_dP.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_dO > 1) else 0)
         cute.arch.barrier()
@@ -1413,7 +1413,7 @@ class FlashAttentionBackwardSm80:
                 if cutlass.const_expr(not self.dQ_swapAB)
                 else (self.head_dim_padded, self.m_block_size)
             )
-            acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
+            acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
             sm80_utils.gemm(
                 mma_params.thr_mma_dq,

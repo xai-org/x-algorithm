@@ -1253,6 +1253,7 @@ impl pb::recsys_predictor_server::RecsysPredictor for RecsysPredictorImpl {
             ),
             serving_prefix: self.serving_prefix.lock().unwrap().clone(),
             peer_ready: self.peer_ready.load(Ordering::SeqCst),
+            staging_prefix: String::new(),
         }))
     }
 }
@@ -2993,6 +2994,15 @@ impl pb::recsys_retrieval_predictor_server::RecsysRetrievalPredictor
         ))
     }
 
+    async fn retrieve_top_k_users(
+        &self,
+        _request: Request<pb::RetrieveTopKUsersRequest>,
+    ) -> tonic::Result<Response<pb::RetrieveTopKUsersResponse>> {
+        Err(Status::unimplemented(
+            "post-to-user retrieval is served by the Rust host only (--enable-post-to-user)",
+        ))
+    }
+
     async fn retrieve_top_k_candidates(
         &self,
         request: Request<pb::RetrieveTopKCandidatesRequest>,
@@ -3042,6 +3052,7 @@ impl pb::recsys_retrieval_predictor_server::RecsysRetrievalPredictor
             ),
             serving_prefix: self.serving_prefix.lock().unwrap().clone(),
             peer_ready: self.peer_ready.load(Ordering::SeqCst),
+            staging_prefix: String::new(),
         }))
     }
 }
@@ -3254,6 +3265,7 @@ macro_rules! server_impl {
                         tls_cert_path = None,
                         tls_key_path = None,
                         tls_client_ca_path = None,
+                        dscp = None,
                     ))]
             fn new(
                         grpc_port: u16,
@@ -3323,6 +3335,7 @@ macro_rules! server_impl {
                         tls_cert_path: Option<String>,
                         tls_key_path: Option<String>,
                         tls_client_ca_path: Option<String>,
+                        dscp: Option<u8>,
                     ) -> PyResult<Self> {
                         xai_recsys_server::init_env_logger();
                         let queue_max_staleness = if queue_max_staleness_ms == 0 {
@@ -3500,6 +3513,9 @@ macro_rules! server_impl {
                                 .with_readyz_endpoint();
                             if let Some(tls) = tls_config {
                                 grpc_config = grpc_config.with_tls_config(tls);
+                            }
+                            if let Some(dscp) = dscp {
+                                grpc_config = grpc_config.with_dscp(dscp);
                             }
                             HttpServer::builder(
                                 metrics_port,

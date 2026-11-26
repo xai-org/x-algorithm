@@ -8,8 +8,12 @@ import subprocess
 from ctypes import byref, c_int, c_size_t
 from enum import Enum
 from functools import cache
+from typing import TYPE_CHECKING
 
 from xrex.utils import cluster
+
+if TYPE_CHECKING:
+    import jax
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
@@ -127,6 +131,17 @@ def peak_tflops() -> float:
     gpu = gpu_arch()
     assert gpu in _GPU_ARCH_TO_PEAK_TFLOPS, f"Unknown GPU architecture: {gpu}!"
     return _GPU_ARCH_TO_PEAK_TFLOPS[gpu]
+
+
+def cuda_compute_capability(device: "jax.Device") -> tuple[int, int] | None:
+    if device.platform != "gpu":
+        return None
+    major, minor = device.compute_capability.split(".")
+    return int(major), int(minor)
+
+
+def bf16_arithmetic_is_native(device: "jax.Device") -> bool:
+    return (cuda_compute_capability(device) or (0, 0)) >= (9, 0)
 
 
 _NUM_PHYSICAL_DEVICES_PER_NODE = {

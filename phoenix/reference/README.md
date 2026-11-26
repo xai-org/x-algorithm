@@ -24,7 +24,6 @@ comments or docstrings, so no in-file banner survives to say it there).
 | `world.py` | The seeded world every generator draws from: topics, authors, users, posts, and a planted engagement model. One seed → one world → mutually consistent artifacts. |
 | `dump_gen.py` | Offline training-dump generator — the Kafka replacement. Writes user-session snapshots as parquet in the exact layout + schema the shipped `aggregated_kafka` reader consumes. |
 | `world_snapshots.py` | Emits the three provider snapshots (MM, SID, post-creation) from the same world, all keyed on the same post ids. Its output directory is a ready `PHOENIX_INDEX_BASE`. |
-| `gen_recs_artifacts_gen.py` | Emits the gen-recs offline arm's companion artifacts from the same world: the memory-mapped MM lookup table (`post_ids.npy` + `embeddings.npy`), the eval scoring table (`inference_posts.parquet`) and the global-negative pool (`global_ids.parquet`). |
 | `oss_recsys_synth.py` | The deterministic value generators underneath the synthetic path: random-Fourier-feature MM embeddings and random-codebook RQ codes, in both server-wire and model-buffer conventions. |
 
 **MM embeddings (post → 1024-d vector)**

@@ -34,14 +34,14 @@
 import math
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, Optional, Type
+from typing import Callable, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Float32, Int32, const_expr
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import BaseDSL
 
@@ -300,6 +300,9 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        row_max: Optional[cute.Tensor] = None,
+        row_scale: Optional[cute.Tensor] = None,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]] = None,
     ):
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -332,6 +335,16 @@ class FlashAttentionForwardBase:
                 assert cute.size(taccOgLSE, mode=[0]) == cute.size(lse)
                 taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
                 t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                taccOgStats = None
+                if const_expr(mSoftmaxStats is not None):
+                    taccOgStats = []
+                    for t in mSoftmaxStats:
+                        t_cur = seqlen.offset_batch_Q(t, batch_idx, dim=2)[None, head_idx]
+                        gStat = cute.local_tile(t_cur, (self.tile_m,), (m_block,))
+                        gStat_expanded = cute.make_tensor(gStat.iterator, gLSE_expanded_layout)
+                        taccOgStats.append(
+                            layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gStat_expanded))
+                        )
                 if taccOcO[0][1] == 0:
                     for m in cutlass.range(cute.size(taccOgLSE.shape[1]), unroll_full=True):
                         if (
@@ -339,8 +352,25 @@ class FlashAttentionForwardBase:
                             < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
                         ):
                             taccOgLSE[m, 0] = lse[m]
+                            if const_expr(mSoftmaxStats is not None):
+                                valid = lse[m] != -Float32.inf
+                                taccOgStats[0][m, 0] = row_max[m] if valid else Float32.inf
+                                taccOgStats[1][m, 0] = row_scale[m] if valid else Float32(0.0)
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+                if const_expr(mSoftmaxStats is not None):
+                    stat_vals = cute.make_fragment_like(lse, Float32)
+                    for stat_idx in cutlass.range_constexpr(2):
+                        src = row_max if const_expr(stat_idx == 0) else row_scale
+                        masked_val = Float32.inf if const_expr(stat_idx == 0) else Float32(0.0)
+                        for m in cutlass.range(cute.size(lse), unroll_full=True):
+                            stat_vals[m] = src[m] if lse[m] != -Float32.inf else masked_val
+                        t_cur = seqlen.offset_batch_Q(mSoftmaxStats[stat_idx], batch_idx, dim=2)[
+                            None, head_idx
+                        ]
+                        pack_gqa.store_LSE(
+                            t_cur, stat_vals, tiled_mma, tidx, m_block, seqlen.seqlen_q
+                        )
 
         ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
         mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
@@ -805,7 +835,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         smem_copy_atom_QK = cute.make_copy_atom(
@@ -1046,7 +1076,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         sync()
 
@@ -1131,7 +1161,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax: Softmax,
         load_K: Callable,
         load_V: Callable,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
     ):
@@ -1262,7 +1292,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         sync()
         load_V(n_block, 0, need_predicates=False)

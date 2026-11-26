@@ -15,6 +15,7 @@ import com.twitter.scalding_internal.dalv2.DALWrite._
 import com.twitter.scalding_internal.job.TwitterExecutionApp
 import com.twitter.scalding_internal.job.analytics_batch._
 import com.twitter.scalding_internal.multiformat.format.keyval.KeyVal
+import com.twitter.statebird.v2.thriftscala.Environment
 import com.twitter.visibility.under_the_hood.thriftscala._
 import java.util.TimeZone
 
@@ -40,15 +41,19 @@ class UthUserMonthMhPublisherApp {
         if (start > dateRange.end) TypedPipe.empty else read(DateRange(start, dateRange.end))
       }
 
-    val eligible = DAL.read(UthDailyEligiblePostsScalaDataset, readRange).toTypedPipe
-    val postLabels = DAL.read(UthDailyPostLabelsScalaDataset, readRange).toTypedPipe ++
-      readFromFloor(
-        config.postTakedownDataFirstDay,
-        DAL.read(UthDailyPostTakedownLabelsScalaDataset, _).toTypedPipe)
-    val accountLabels = DAL.read(UthDailyAccountLabelsScalaDataset, readRange).toTypedPipe ++
-      readFromFloor(
-        config.accountTakedownDataFirstDay,
-        DAL.read(UthDailyAccountTakedownLabelsScalaDataset, _).toTypedPipe)
+    val env = config.dailyDataEnvironment
+    val eligible =
+      DAL.read(UthDailyEligiblePostsScalaDataset, readRange).withEnvironment(env).toTypedPipe
+    val postLabels =
+      DAL.read(UthDailyPostLabelsScalaDataset, readRange).withEnvironment(env).toTypedPipe ++
+        readFromFloor(
+          config.postTakedownDataFirstDay,
+          DAL.read(UthDailyPostTakedownLabelsScalaDataset, _).withEnvironment(env).toTypedPipe)
+    val accountLabels =
+      DAL.read(UthDailyAccountLabelsScalaDataset, readRange).withEnvironment(env).toTypedPipe ++
+        readFromFloor(
+          config.accountTakedownDataFirstDay,
+          DAL.read(UthDailyAccountTakedownLabelsScalaDataset, _).withEnvironment(env).toTypedPipe)
     val lookbackStartYyyymmdd = yyyymmdd(readStart.timestamp)
 
     val userMonths =
@@ -62,7 +67,8 @@ class UthUserMonthMhPublisherApp {
         config.postObservationDays,
         config.testUserIds,
         config.reducers,
-        config.publishEpochOverrides
+        config.publishEpochOverrides,
+        config.maxPostIdsPerLabel
       )
 
     val monthMeta = monthMetaSentinelRows(
@@ -134,7 +140,8 @@ object UthUserMonthMhPublisherApp {
           days
             .map(d =>
               s"${d.dayOfMonth.getOrElse(0)}:${d.carried.getOrElse(0L)}:${d.removed.getOrElse(0L)}")
-            .mkString(","))
+            .mkString(","),
+          a.postIds.getOrElse(Nil).mkString(","))
       }
     }
     val accountLabels = rows.flatMap { r =>
@@ -151,7 +158,7 @@ object UthUserMonthMhPublisherApp {
       .zip(
         userMonths.writeExecution(TypedTsv[(Long, Int, Long, Int, Int, Int)](s"$dir/user_months")),
         postLabels.writeExecution(
-          TypedTsv[(Long, Int, String, String, Long, Long, String)](s"$dir/post_labels")),
+          TypedTsv[(Long, Int, String, String, Long, Long, String, String)](s"$dir/post_labels")),
         accountLabels.writeExecution(
           TypedTsv[(Long, Int, String, String, String)](s"$dir/account_labels"))
       )
@@ -217,7 +224,8 @@ object UthUserMonthMhPublisherApp {
     postObservationDays: Int,
     testUserIds: Set[Long],
     reducers: Int,
-    publishEpochOverrides: Map[Int, Long] = Map.empty
+    publishEpochOverrides: Map[Int, Long] = Map.empty,
+    maxPostIdsPerLabel: Int = DefaultMaxPostIdsPerLabel
   ): TypedPipe[UthUserMonthAggregateRow] = {
 
     val latestPostLabels = latestAsOfPostLabelRows(postLabels, reducers)
@@ -242,7 +250,9 @@ object UthUserMonthMhPublisherApp {
           label <- row.label
           carried <- row.carried
           removed <- row.removed
-        } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed))
+        } yield (
+          (userId, monthBucket(day)),
+          (label, dayOfMonth(day), carried, removed, row.postIds.getOrElse(Nil)))
       },
       reducers
     )
@@ -279,22 +289,27 @@ object UthUserMonthMhPublisherApp {
 
           val postLabelAgg = labelsOpt
             .getOrElse(Nil)
-            .groupBy { case (label, _, _, _) => label }
+            .groupBy { case (label, _, _, _, _) => label }
             .map {
               case (label, rows) =>
-                val days = rows
-                  .groupBy { case (_, day, _, _) => day }
+                val perDay = rows
+                  .groupBy { case (_, day, _, _, _) => day }
                   .map {
                     case (day, dayRows) =>
                       val best = dayRows.maxBy {
-                        case (_, _, carried, removed) => (carried, removed)
+                        case (_, _, carried, removed, _) => (carried, removed)
                       }
-                      UthDayCarriedRemoved(Some(day), Some(best._3), Some(best._4))
+                      (UthDayCarriedRemoved(Some(day), Some(best._3), Some(best._4)), best._5)
                   }
                   .toList
-                  .sortBy(_.dayOfMonth.getOrElse(0))
+                val days = perDay.map(_._1).sortBy(_.dayOfMonth.getOrElse(0))
+                val postIds = newestPostIds(perDay.flatMap(_._2), maxPostIdsPerLabel)
                 val (name, countryCodes) = TakedownLabels.splitForServing(label)
-                UthPostLabelAggregate(Some(name), Some(days), countryCodes)
+                UthPostLabelAggregate(
+                  Some(name),
+                  Some(days),
+                  countryCodes,
+                  postIds = Option(postIds).filter(_.nonEmpty))
             }
             .toList
             .sortBy(a => (a.label.getOrElse(""), a.countryCodes.getOrElse(Nil).mkString(",")))
@@ -358,7 +373,9 @@ case class UthUserMonthMhConfig(
   writeShards: Int,
   outputPath: String,
   tsvOnly: Boolean = false,
-  publishEpochOverrides: Map[Int, Long] = Map.empty)
+  publishEpochOverrides: Map[Int, Long] = Map.empty,
+  maxPostIdsPerLabel: Int = UnderTheHoodCommon.DefaultMaxPostIdsPerLabel,
+  dailyDataEnvironment: Environment = Environment.Prod)
 
 object UthUserMonthMhConfig {
 
@@ -396,7 +413,14 @@ object UthUserMonthMhConfig {
       },
       outputPath = args.optional("outputPath").getOrElse("/user/<hadoop-role>/under_the_hood"),
       tsvOnly = args.boolean("tsvOnly"),
-      publishEpochOverrides = parseEpochOverrides(args)
+      publishEpochOverrides = parseEpochOverrides(args),
+      maxPostIdsPerLabel =
+        args.int("maxPostIdsPerLabel", UnderTheHoodCommon.DefaultMaxPostIdsPerLabel),
+      dailyDataEnvironment = args
+        .optional("dailyDataEnvironment")
+        .map(name =>
+          Environment.valueOf(name).getOrElse(sys.error(s"unknown DAL environment: $name")))
+        .getOrElse(Environment.Prod)
     )
 }
 

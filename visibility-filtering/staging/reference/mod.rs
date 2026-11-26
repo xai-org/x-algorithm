@@ -1,46 +1,35 @@
-use crate::config::{parse_env_flag, ENV_APP_ENV, ENV_REFERENCE};
-use crate::filter::FilterTweets;
-use crate::filter_tweets::{Comparator, FinishComparison};
-use crate::params::ClientSwitches;
+use crate::config::{ENV_APP_ENV, ENV_REFERENCE};
+use crate::evaluate_tweets::EntryComparator;
+use crate::metrics::Metrics;
+use crate::models::RequestViewer;
+use crate::post_evaluator::PostEvaluation;
+use crate::quote::Passes;
 use crate::rules::SafetyLevel;
-use crate::server_deps::{init_client_with_retry, with_metadata};
-use crate::staging::reference_compare::{ReferenceCompareHarness, TweetVerdict};
 use std::env;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use strum::VariantNames;
 use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
-use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
-use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
 
 pub(crate) mod tweetypie;
 
-const ENV_DUAL_CALL_HARNESS_ENABLED: &str = "VF_DUAL_CALL_HARNESS_ENABLED";
 pub const ENV_IMAGE: &str = "VF_IMAGE";
 pub const ENV_TWEETYPIE_XDS_LISTENER: &str = "VF_TWEETYPIE_XDS_LISTENER";
 pub const ENV_TWEETYPIE_TLS_DOMAIN: &str = "VF_TWEETYPIE_TLS_DOMAIN";
 pub const ENV_TWEETYPIE_CLIENT_ID: &str = "VF_TWEETYPIE_CLIENT_ID";
+pub const ENV_REFERENCE_SAMPLE: &str = "VF_REFERENCE_SAMPLE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::VariantNames)]
 #[strum(serialize_all = "snake_case")]
 pub enum Reference {
     None,
-    VfService,
-    Tweetypie,
+        Tweetypie,
 }
 
 impl Reference {
-    pub fn resolve(
-        configured: Option<&str>,
-        legacy_harness_flag: bool,
-        app_env: Option<&str>,
-    ) -> Result<Self, String> {
-        if legacy_harness_flag {
-            return Err(format!(
-                "{ENV_DUAL_CALL_HARNESS_ENABLED} is replaced by {ENV_REFERENCE}=vf_service"
-            ));
-        }
+    pub fn resolve(configured: Option<&str>, app_env: Option<&str>) -> Result<Self, String> {
         let reference = configured.map_or(Ok(Self::None), |value| {
             value.parse().map_err(|_| {
                 format!(
@@ -59,145 +48,169 @@ impl Reference {
     }
 }
 
-#[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
-fn reference() -> Reference {
-    Reference::resolve(
-        env::var(ENV_REFERENCE).ok().as_deref(),
-        parse_env_flag(env::var(ENV_DUAL_CALL_HARNESS_ENABLED).ok().as_deref()),
-        env::var(ENV_APP_ENV).ok().as_deref(),
-    )
-    .unwrap_or_else(|misconfiguration| panic!("{misconfiguration}"))
-}
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sample(f64);
 
-pub(crate) async fn build(
-    datacenter: &str,
-    init_deadline: Instant,
-    filter_tweets: &Arc<FilterTweets>,
-    client_switches: &ClientSwitches,
-    metadata: Option<&MetadataMap>,
-) -> Option<Box<dyn Comparator>> {
-    match reference() {
-        Reference::None => None,
-        Reference::VfService => Some(Box::new(
-            build_vf_service(datacenter, init_deadline, metadata).await,
-        )),
-        Reference::Tweetypie => Some(Box::new(
-            tweetypie::build(
-                init_deadline,
-                filter_tweets,
-                client_switches.clone(),
-                metadata,
-            )
-            .await,
-        )),
-    }
-}
+impl Sample {
+    const DEFAULT: Self = Self(0.5);
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
-async fn build_vf_service(
-    datacenter: &str,
-    init_deadline: Instant,
-    metadata: Option<&MetadataMap>,
-) -> Arc<ReferenceCompareHarness> {
-    let client_id = format!(
-        "visibility-filtering-service.{}",
-        env::var(ENV_APP_ENV).unwrap_or_else(|_| "staging".to_string())
-    );
-    let strato: Arc<dyn VfClient + Send + Sync> = Arc::new(
-        init_client_with_retry("strato_vf", init_deadline, || {
-            let client_id = client_id.clone();
-            async move {
-                let mut client = StratoVfClient::new(
-                    S2S_CHAIN_PATH.clone(),
-                    S2S_CRT_PATH.clone(),
-                    S2S_KEY_PATH.clone(),
-                    client_id,
-                    datacenter.to_string(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                client.grpc_client = Arc::new(with_metadata(
-                    Arc::unwrap_or_clone(client.grpc_client),
-                    metadata,
-                ));
-                Ok::<_, String>(client)
-            }
+    fn resolve(configured: Option<&str>) -> Result<Self, String> {
+        configured.map_or(Ok(Self::DEFAULT), |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|share| (0.0..=1.0).contains(share))
+                .map(Self)
+                .ok_or_else(|| format!("{ENV_REFERENCE_SAMPLE}={value:?} is not a share in [0, 1]"))
         })
-        .await
-        .expect("Failed to initialize Strato VF client (reference comparator)"),
-    );
-    Arc::new(ReferenceCompareHarness::new(strato, datacenter))
-}
+    }
 
-impl Comparator for Arc<ReferenceCompareHarness> {
-    fn begin(
-        &self,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        safety_level: SafetyLevel,
-        tweet_ids: Vec<u64>,
-    ) -> Option<FinishComparison> {
-        let verdicts = self.begin_compare(viewer_id, country_code, safety_level, tweet_ids)?;
-        Some(Box::new(move |outcomes| {
-            verdicts.send(
-                outcomes
-                    .iter()
-                    .map(|outcome| TweetVerdict {
-                        tweet_id: outcome.tweet_id.0,
-                        verdict: outcome.evaluation.verdict().clone(),
-                    })
-                    .collect(),
-            );
-        }))
+    fn selects(self, viewer_id: u64, outcomes: &[PostEvaluation]) -> bool {
+        let mut hasher = DefaultHasher::new();
+        viewer_id.hash(&mut hasher);
+        for outcome in outcomes {
+            outcome.tweet_id.0.hash(&mut hasher);
+        }
+        let draw = (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64;
+        draw < self.0
     }
 }
 
-impl Comparator for Arc<TweetypieReference> {
-    fn begin(
+fn comparison(
+    configured: Option<&str>,
+    app_env: Option<&str>,
+    sample: Option<&str>,
+) -> Result<Option<Sample>, String> {
+    match Reference::resolve(configured, app_env)? {
+        Reference::None => Ok(None),
+        Reference::Tweetypie => Sample::resolve(sample).map(Some),
+    }
+}
+
+#[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
+pub(crate) async fn build(
+    init_deadline: Instant,
+    metrics: &Metrics,
+    metadata: Option<&MetadataMap>,
+) -> Option<Box<dyn EntryComparator>> {
+    let sample = comparison(
+        env::var(ENV_REFERENCE).ok().as_deref(),
+        env::var(ENV_APP_ENV).ok().as_deref(),
+        env::var(ENV_REFERENCE_SAMPLE).ok().as_deref(),
+    )
+    .unwrap_or_else(|misconfiguration| panic!("{misconfiguration}"))?;
+    Some(Box::new(
+        tweetypie::build(init_deadline, sample, metrics.clone(), metadata).await,
+    ))
+}
+
+impl EntryComparator for Arc<TweetypieReference> {
+    fn compare(
         &self,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
+        viewer: &RequestViewer,
         safety_level: SafetyLevel,
-        _tweet_ids: Vec<u64>,
-    ) -> Option<FinishComparison> {
-        let reference = Arc::clone(self);
-        Some(Box::new(move |outcomes| {
-            reference.spawn(viewer_id, country_code, safety_level, outcomes);
-        }))
+        outcomes: &[PostEvaluation],
+        quote_passes: &Passes,
+    ) {
+        self.spawn_entry_comparison(viewer, safety_level, outcomes, quote_passes.ran());
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Reference;
+    use super::{Reference, Sample, comparison};
+    use crate::models::{Evaluation, Placement, TweetId};
+    use crate::post_evaluator::PostEvaluation;
+    use crate::rules::fixtures::allow;
+    use serde::Deserialize;
 
     #[test]
     fn reference_defaults_to_none_and_is_refused_in_prod() {
         assert_eq!(
-            Reference::resolve(None, false, Some("staging")),
+            Reference::resolve(None, Some("staging")),
             Ok(Reference::None)
         );
         assert_eq!(
-            Reference::resolve(Some("none"), false, Some("staging")),
+            Reference::resolve(Some("none"), Some("staging")),
             Ok(Reference::None)
         );
         assert_eq!(
-            Reference::resolve(Some("vf_service"), false, Some("staging")),
-            Ok(Reference::VfService)
-        );
-        assert_eq!(
-            Reference::resolve(Some("tweetypie"), false, Some("staging")),
+            Reference::resolve(Some("tweetypie"), Some("staging")),
             Ok(Reference::Tweetypie)
         );
-        assert!(Reference::resolve(Some("VfService"), false, Some("staging")).is_err());
-        assert!(Reference::resolve(Some("vf_service"), false, Some("prod")).is_err());
+        assert!(Reference::resolve(Some("Tweetypie"), Some("staging")).is_err());
+        assert!(Reference::resolve(Some("vf_service"), Some("staging")).is_err());
+        assert!(Reference::resolve(Some("tweetypie"), Some("prod")).is_err());
         assert_eq!(
-            Reference::resolve(Some("none"), false, Some("prod")),
+            Reference::resolve(Some("none"), Some("prod")),
             Ok(Reference::None)
         );
-        assert!(Reference::resolve(None, true, Some("staging")).is_err());
+    }
+
+    #[test]
+    fn the_sample_defaults_to_half_and_selects_its_share_of_requests() {
+        assert_eq!(
+            comparison(Some("tweetypie"), Some("devel"), None),
+            Ok(Some(Sample(0.5)))
+        );
+        assert!(comparison(Some("tweetypie"), Some("devel"), Some("half")).is_err());
+        for reference in [None, Some("none")] {
+            assert_eq!(
+                comparison(reference, Some("staging"), Some("half")),
+                Ok(None)
+            );
+        }
+        assert_eq!(Sample::resolve(Some("0.25")), Ok(Sample(0.25)));
+        for invalid in ["", "half", "-0.1", "1.5", "NaN"] {
+            assert!(Sample::resolve(Some(invalid)).is_err(), "{invalid:?}");
+        }
+        let entries = |tweet_id| {
+            [PostEvaluation {
+                tweet_id: TweetId(tweet_id),
+                placement: Placement::Standalone,
+                source_tweet_id: None,
+                evaluation: Evaluation::complete(allow()),
+                safety_labels: None,
+            }]
+        };
+        let selected = |share| {
+            (1..=1000)
+                .filter(|&request| Sample(share).selects(request, &entries(request + 7)))
+                .count()
+        };
+        assert_eq!(selected(0.0), 0);
+        assert_eq!(selected(1.0), 1000);
+        assert!((400..=600).contains(&selected(0.5)), "{}", selected(0.5));
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        Deliberate,
+        Gap,
+    }
+
+        #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Divergence {
+        divergence: String,
+        kind: Kind,
+        ticket: Option<String>,
+        behavior: String,
+    }
+
+    #[test]
+    fn each_divergence_states_its_behavior_and_a_gap_names_its_ticket() {
+        let path = crate::pinned::crate_path("tests/divergences.json");
+        let registry: Vec<Divergence> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for entry in registry {
+            let name = &entry.divergence;
+            assert!(!entry.behavior.is_empty(), "{name}: no behavior");
+            assert!(
+                matches!(entry.kind, Kind::Deliberate) || entry.ticket.is_some(),
+                "{name}: a gap names its ticket"
+            );
+        }
     }
 }

@@ -1,137 +1,102 @@
-use anyhow::bail;
+use crate::clients::strato;
+use crate::thrift_read::read_fields;
 use std::collections::HashMap;
-use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
-use xai_strato::strato_thrift::{strato_decode, StratoResult, AUTHORIZATION_ERROR};
+use thrift::protocol::{TInputProtocol, TSerializable, TType};
+use xai_strato::strato_thrift::{
+    strato_decode, MValProtocol, StratoRead, StratoResult, AUTHORIZATION_ERROR,
+};
 use xai_strato::StratoGrpc;
-use xai_twittercontext_proto::TwitterContextViewer;
 use xai_x_thrift::api_media::ApiMediaKey;
 
 const LIFECYCLE_COLUMN: &str = "article/fields/lifecycleState.ArticleEntity";
 const MEDIA_ENTITIES_COLUMN: &str = "article/fields/mediaEntities.ArticleEntity";
 const COVER_MEDIA_COLUMN: &str = "article/fields/coverMedia.ArticleEntity";
 
-pub struct ArticleClient {
-    grpc: StratoGrpc,
+pub async fn lifecycles(
+    grpc: &StratoGrpc,
+    article_ids: &[u64],
+) -> HashMap<u64, anyhow::Result<Option<i32>>> {
+    fetch_articles(grpc, None, article_ids, LIFECYCLE_COLUMN, decode_lifecycle).await
 }
 
-impl ArticleClient {
-    pub fn new(grpc: StratoGrpc) -> Self {
-        Self { grpc }
-    }
+pub async fn media_entities(
+    grpc: &StratoGrpc,
+    viewer_id: Option<u64>,
+    article_ids: &[u64],
+) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+    fetch_articles(
+        grpc,
+        viewer_id,
+        article_ids,
+        MEDIA_ENTITIES_COLUMN,
+        decode_media_entities,
+    )
+    .await
+}
 
-    pub async fn lifecycles(
-        &self,
-        article_ids: &[u64],
-    ) -> HashMap<u64, anyhow::Result<Option<i32>>> {
-        let calls = article_ids
-            .iter()
-            .map(|id| {
-                (
-                    LIFECYCLE_COLUMN.to_owned(),
-                    "fetch".to_owned(),
-                    vec![xai_strato::encode(&(id.cast_signed(), ()))],
-                )
-            })
-            .collect();
-        let replies = self.grpc.batch_call(calls, None).await;
-        article_ids
-            .iter()
-            .copied()
-            .zip(replies.into_iter().map(|reply| decode_lifecycle(&reply?)))
-            .collect()
-    }
+pub async fn cover_media(
+    grpc: &StratoGrpc,
+    viewer_id: Option<u64>,
+    article_ids: &[u64],
+) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+    fetch_articles(
+        grpc,
+        viewer_id,
+        article_ids,
+        COVER_MEDIA_COLUMN,
+        decode_cover_media,
+    )
+    .await
+}
 
-    pub async fn media_entities(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
-        self.presence(
-            viewer_id,
-            article_ids,
-            MEDIA_ENTITIES_COLUMN,
-            decode_media_entities,
-        )
-        .await
-    }
-
-    pub async fn cover_media(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
-        self.presence(
-            viewer_id,
-            article_ids,
-            COVER_MEDIA_COLUMN,
-            decode_cover_media,
-        )
-        .await
-    }
-
-    async fn presence(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-        column: &str,
-        decode: fn(&[u8]) -> anyhow::Result<Option<bool>>,
-    ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
-        let calls = article_ids
-            .iter()
-            .map(|id| {
-                (
-                    column.to_owned(),
-                    "fetch".to_owned(),
-                    vec![xai_strato::encode(&(id.cast_signed(), ()))],
-                )
-            })
-            .collect();
-        let viewer = viewer_id.map(|user_id| TwitterContextViewer {
-            user_id: user_id.cast_signed(),
-            ..Default::default()
-        });
-        let replies = self.grpc.batch_call(calls, viewer.as_ref()).await;
-        article_ids
-            .iter()
-            .copied()
-            .zip(replies.into_iter().map(|reply| decode(&reply?)))
-            .collect()
-    }
+async fn fetch_articles<T>(
+    grpc: &StratoGrpc,
+    viewer_id: Option<u64>,
+    article_ids: &[u64],
+    column: &str,
+    decode: fn(&[u8]) -> anyhow::Result<Option<T>>,
+) -> HashMap<u64, anyhow::Result<Option<T>>> {
+    let keys = article_ids
+        .iter()
+        .map(|id| (column, xai_strato::encode(&(id.cast_signed(), ()))));
+    let replies = strato::fetch_each(grpc, keys, viewer_id).await;
+    article_ids
+        .iter()
+        .copied()
+        .zip(replies.into_iter().map(|reply| decode(&reply?)))
+        .collect()
 }
 
 fn decode_lifecycle(bytes: &[u8]) -> anyhow::Result<Option<i32>> {
-    match strato_decode::<ArticleLifecycleState>(bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value.map(|state| state.lifecycle)),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
-    }
+    Ok(strato::row(strato_decode::<ArticleLifecycleState>(bytes)?)?.map(|state| state.lifecycle))
 }
 
 fn decode_media_entities(bytes: &[u8]) -> anyhow::Result<Option<bool>> {
-    match strato_decode::<MediaEntitiesPresence>(bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value.map(|presence| presence.0)),
-        StratoResult::Err {
-            code: AUTHORIZATION_ERROR,
-            ..
-        } => Ok(None),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
-    }
+    Ok(decode_unless_refused::<MediaEntitiesPresence>(bytes)?.map(|presence| presence.0))
 }
 
 fn decode_cover_media(bytes: &[u8]) -> anyhow::Result<Option<bool>> {
-    match strato_decode::<ApiMediaKey>(bytes)? {
-        StratoResult::Ok { value, .. } => Ok(value.map(|_| true)),
+    Ok(decode_unless_refused::<ApiMediaKey>(bytes)?.map(|_| true))
+}
+
+fn decode_unless_refused<T: StratoRead>(bytes: &[u8]) -> anyhow::Result<Option<T>> {
+    let result = strato_decode::<T>(bytes)?;
+    if matches!(
+        result,
         StratoResult::Err {
             code: AUTHORIZATION_ERROR,
             ..
-        } => Ok(None),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
+        }
+    ) {
+        return Ok(None);
     }
+    strato::row(result)
 }
 
 struct MediaEntitiesPresence(bool);
 
-impl TSerializable for MediaEntitiesPresence {
-    fn read_from_in_protocol(proto: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+impl StratoRead for MediaEntitiesPresence {
+    fn read(proto: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let set = proto.read_set_begin()?;
         if set.element_type != TType::Struct || set.size < 0 {
             return Err(thrift::new_protocol_error(
@@ -145,13 +110,6 @@ impl TSerializable for MediaEntitiesPresence {
         proto.read_set_end()?;
         Ok(Self(set.size > 0))
     }
-
-    fn write_to_out_protocol(&self, _proto: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "MediaEntitiesPresence is decode-only",
-        ))
-    }
 }
 
 struct ArticleLifecycleState {
@@ -160,23 +118,16 @@ struct ArticleLifecycleState {
 
 const LIFECYCLE: i16 = 1;
 
-impl TSerializable for ArticleLifecycleState {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
+impl StratoRead for ArticleLifecycleState {
+    fn read(i_prot: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let mut lifecycle = None;
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
+        read_fields(i_prot, |i_prot, field| {
+            if field.id != Some(LIFECYCLE) || field.field_type != TType::I32 {
+                return Ok(false);
             }
-            if field.id == Some(LIFECYCLE) && field.field_type == TType::I32 {
-                lifecycle = Some(i_prot.read_i32()?);
-            } else {
-                i_prot.skip(field.field_type)?;
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
+            lifecycle = Some(i_prot.read_i32()?);
+            Ok(true)
+        })?;
         let Some(lifecycle) = lifecycle else {
             return Err(thrift::new_protocol_error(
                 thrift::ProtocolErrorKind::InvalidData,
@@ -185,24 +136,17 @@ impl TSerializable for ArticleLifecycleState {
         };
         Ok(Self { lifecycle })
     }
-
-    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "ArticleLifecycleState is decode-only",
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift::{Struct, I32, I64};
-    use thrift::protocol::TBinaryInputProtocol;
+    use crate::clients::strato::answer::Thrift::{Struct, I32, I64};
+    use std::io::Cursor;
 
     #[test]
     fn media_presence_reads_sets_and_keys_without_retaining_their_payloads() {
-        use crate::clients::strato_answer::{found, no_row, Thrift};
+        use crate::clients::strato::answer::{found, no_row, Thrift};
         use Thrift::Set;
         let key = || Struct(vec![(1, Struct(vec![(1, I64(7)), (2, I64(0))]))]);
         assert_eq!(
@@ -224,7 +168,7 @@ mod tests {
 
     #[test]
     fn media_errors_and_malformed_keys_are_not_missing_rows() {
-        use crate::clients::strato_answer::{found, strato_error, Thrift};
+        use crate::clients::strato::answer::{found, strato_error, Thrift};
         use Thrift::Set;
         for decode in [decode_media_entities, decode_cover_media] {
             assert!(decode(&strato_error(5, "failed fetch")).is_err());
@@ -250,7 +194,7 @@ mod tests {
 
     #[test]
     fn an_article_the_viewer_may_not_read_has_no_media() {
-        use crate::clients::strato_answer::strato_error;
+        use crate::clients::strato::answer::strato_error;
         for decode in [decode_media_entities, decode_cover_media] {
             for reason in [
                 "Only subscribers have access",
@@ -265,8 +209,8 @@ mod tests {
         let lifecycle = lifecycle.map(|lifecycle| (LIFECYCLE, I32(lifecycle)));
         let fields = lifecycle.into_iter().chain([(2, I64(1_790_813_967))]);
         let bytes = Struct(fields.collect()).bytes();
-        let mut i_prot = TBinaryInputProtocol::new(&bytes[..], false);
-        ArticleLifecycleState::read_from_in_protocol(&mut i_prot).map(|state| state.lifecycle)
+        let mut i_prot = MValProtocol::new(Cursor::new(&bytes[..]), false);
+        ArticleLifecycleState::read(&mut i_prot).map(|state| state.lifecycle)
     }
 
     #[test]

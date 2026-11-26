@@ -20,25 +20,27 @@ rank_logger = logging.getLogger("rank")
 
 
 def install_offload_state(trainer) -> None:
+    state_sharding = trainer.state_sharding.purge_opt_state()
+    host_sharding = trainer.host_sharding.purge_opt_state()
+
     def d2h_copy(src, dst):
-        dst = jax.device_put(src, trainer.host_sharding)
-        return src, dst
+        del dst
+        return jax.device_put(src, host_sharding)
 
     trainer.offload_state = JittedOrCompiled(
         jax.jit(
             d2h_copy,
-            in_shardings=(trainer.state_sharding, trainer.host_sharding),
-            out_shardings=(trainer.state_sharding, trainer.host_sharding),
-            donate_argnums=(0, 1),
+            in_shardings=(state_sharding, host_sharding),
+            out_shardings=host_sharding,
+            donate_argnums=1,
             keep_unused=True,
         )
     )
 
 
 def register_offload_state(trainer) -> None:
-    trainer.register_jit_function(
-        trainer.offload_state, trainer.state_shape, trainer.state_shape, phase="early"
-    )
+    state_shape = trainer.state_shape.purge_opt_state()
+    trainer.register_jit_function(trainer.offload_state, state_shape, state_shape, phase="early")
 
 
 def barrier(self, name: str) -> None:
@@ -154,6 +156,7 @@ def save_checkpoint(
         chunked=self.checkpoint_config.checkpoint_chunked,
         compressed=self.checkpoint_config.checkpoint_compressed,
         chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,
+        ocdbt_target_data_file_size=self.checkpoint_config.checkpoint_ocdbt_target_data_file_size,
         tracer=tracer,
         save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,
         kms_client=kms_client,

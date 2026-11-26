@@ -34,4 +34,6 @@ class RecsysEmbeddingOptimConfig(Config):
             half_life_steps=cfg.half_life_steps,
             lazy_decay=cfg.lazy_decay,
             weight_decay=cfg.weight_decay,
+            weight_decay_exempt_window=cfg.weight_decay_exempt_window,
+            stochastic_rounding=cfg.stochastic_rounding,
         )

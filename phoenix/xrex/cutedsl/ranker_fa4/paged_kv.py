@@ -38,7 +38,7 @@ from typing import Type
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync
 
 from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
@@ -52,7 +52,7 @@ class PagedKVManager(ParamsBase):
     mV_paged: cute.Tensor
     thread_idx: Int32
 
-    page_size_divmod: FastDivmodDivisor
+    page_size_divmod: FastDivmodDivisorV2
     seqlen_k: Int32
     leftpad_k: Int32
     n_block_size: Int32
@@ -79,7 +79,7 @@ class PagedKVManager(ParamsBase):
         mPageTable: cute.Tensor,
         mK_paged: cute.Tensor,
         mV_paged: cute.Tensor,
-        page_size_divmod: FastDivmodDivisor,
+        page_size_divmod: FastDivmodDivisorV2,
         bidb: Int32,
         bidh: Int32,
         thread_idx: Int32,

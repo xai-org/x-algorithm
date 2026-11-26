@@ -5,6 +5,7 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
 use crate::server::{PipelineOutput, QueryBuilder};
+use crate::side_effects::phoenix_request_cache_side_effect::served_post_score_infos;
 use crate::util::under_the_hood;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -72,6 +73,15 @@ impl ScoredPostsServer {
             &pipeline_result.query,
             &pipeline_result.selected_candidates,
         );
+        if pipeline_result.query.params.get(params::EnablePageLogging) {
+            let _ = pipeline_result
+                .query
+                .served_post_score_infos
+                .set(served_post_score_infos(
+                    &pipeline_result.query,
+                    &pipeline_result.selected_candidates,
+                ));
+        }
         let video_carousel = pipeline_result
             .query
             .video_carousel

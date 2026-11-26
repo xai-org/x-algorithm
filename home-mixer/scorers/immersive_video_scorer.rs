@@ -15,8 +15,7 @@ pub struct ImmersiveVideoScorer {
 #[async_trait]
 impl Scorer<ScoredPostsQuery, PostCandidate> for ImmersiveVideoScorer {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        !query.has_cached_posts
-            && video_carousel::is_enabled(query)
+        video_carousel::is_enabled(query)
             && video_carousel::ranks_by_immersive_scores(query)
             && query.immersive_columnar_scoring_sequence.is_some()
     }
@@ -26,21 +25,24 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for ImmersiveVideoScorer {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
+        let needs_scores = |candidate: &PostCandidate| {
+            video_carousel::is_carousel_video(candidate) && candidate.immersive_scores.is_none()
+        };
+        let keep_existing = |candidate: &PostCandidate| PostCandidate {
+            immersive_scores: candidate.immersive_scores.clone(),
+            ..Default::default()
+        };
         let videos: Vec<&PostCandidate> = candidates
             .iter()
-            .filter(|candidate| video_carousel::is_carousel_video(candidate))
+            .filter(|candidate| needs_scores(candidate))
             .collect();
         if videos.is_empty() {
-            return vec![Ok(PostCandidate::default()); candidates.len()];
+            return candidates.iter().map(|c| Ok(keep_existing(c))).collect();
         }
 
         let cluster = PhoenixCluster::parse(&query.params.get(VideoCarouselImmersiveClusterId));
         let request = build_immersive_prediction_request(query, &videos);
-        let predictions = match self
-            .dispatch
-            .predict_with_fallback(query, cluster, request)
-            .await
-        {
+        let predictions = match self.dispatch.predict(query, cluster, request).await {
             Ok(predictions) => predictions,
             Err(err) => {
                 return vec![Err(format!("Immersive prediction failed: {err}")); candidates.len()];
@@ -50,9 +52,13 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for ImmersiveVideoScorer {
         candidates
             .iter()
             .map(|candidate| {
+                if !needs_scores(candidate) {
+                    return Ok(keep_existing(candidate));
+                }
                 Ok(PostCandidate {
-                    immersive_scores: video_carousel::is_carousel_video(candidate)
-                        .then(|| predictions.candidate_scores(&candidate.get_original_tweet_id())),
+                    immersive_scores: Some(
+                        predictions.candidate_scores(&candidate.get_original_tweet_id()),
+                    ),
                     ..Default::default()
                 })
             })

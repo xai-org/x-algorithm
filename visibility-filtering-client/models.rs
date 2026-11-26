@@ -9,7 +9,7 @@ pub struct KeywordMatch {
     pub keyword: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, strum::FromRepr)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SafetyResultReason {
     Episodic = 1,
@@ -139,42 +139,12 @@ impl MValCodec for SafetyResult {
             }
             match field.id {
                 Some(1) => {
-                    let reason_value = proto.read_i32().unwrap();
-                    reason = Some(match reason_value {
-                        1 => SafetyResultReason::Episodic,
-                        2 => SafetyResultReason::AbuseEpisodicEncourageSelfHarm,
-                        3 => SafetyResultReason::AbuseEpisodicHatefulConduct,
-                        4 => SafetyResultReason::AbuseGlorificationOfViolence,
-                        5 => SafetyResultReason::AbuseGratuitousGore,
-                        6 => SafetyResultReason::AbuseMobHarassment,
-                        7 => SafetyResultReason::AbuseMomentOfDeathOrDeceasedUser,
-                        8 => SafetyResultReason::AbusePrivateInformation,
-                        9 => SafetyResultReason::AbuseRightToPrivacy,
-                        10 => SafetyResultReason::AbuseThreatToExpose,
-                        11 => SafetyResultReason::AbuseViolentSexualConduct,
-                        12 => SafetyResultReason::AbuseViolentThreatHatefulConduct,
-                        13 => SafetyResultReason::AbuseViolentThreatOrBounty,
-                        14 => SafetyResultReason::OneOff,
-                        15 => SafetyResultReason::VotingMisinformation,
-                        16 => SafetyResultReason::HackedMaterials,
-                        17 => SafetyResultReason::Scams,
-                        18 => SafetyResultReason::PlatformManipulation,
-                        19 => SafetyResultReason::MisinfoCivic,
-                        20 => SafetyResultReason::MisinfoCovid19,
-                        21 => SafetyResultReason::MisinfoGeneric,
-                        22 => SafetyResultReason::MisinfoMedical,
-                        23 => SafetyResultReason::MisinfoCrisis,
-                        24 => SafetyResultReason::DevelopmentOnlyPublicInterest,
-                        25 => SafetyResultReason::FosnrHatefulConduct,
-                        26 => SafetyResultReason::FosnrAbuse,
-                        27 => SafetyResultReason::FosnrUnspecified,
-                        28 => SafetyResultReason::FosnrViolentSpeech,
-                        29 => SafetyResultReason::FosnrCivicIntegrity,
-                        30 => SafetyResultReason::FosnrSyntheticAndManipulatedMedia,
-                        31 => SafetyResultReason::NsfwHighPrecision,
-                        32 => SafetyResultReason::GoreAndViolenceHighPrecision,
-                        _ => SafetyResultReason::Episodic,
-                    });
+                    let reason_value = usize::try_from(proto.read_i32().unwrap()).ok();
+                    reason = Some(
+                        reason_value
+                            .and_then(SafetyResultReason::from_repr)
+                            .unwrap_or(SafetyResultReason::Episodic),
+                    );
                 }
                 Some(2) => {
                     action = Action::from_thrift(proto);
@@ -281,6 +251,28 @@ impl MValCodec for DropReason {
     }
 }
 
+impl FilteredReason {
+    fn of_bool_field(id: i16) -> Option<Self> {
+        Some(match id {
+            1 => Self::ContainNsfwMedia,
+            2 => Self::AuthorBlockViewer,
+            3 => Self::PossiblyUndesirable,
+            4 => Self::UnspecifiedReason,
+            5 => Self::AuthorAccountIsInactive,
+            6 => Self::AuthorIsProtected,
+            7 => Self::AuthorIsUnsafe,
+            8 => Self::ReportedTweet,
+            10 => Self::TweetIsBounced,
+            12 => Self::AuthorIsDeactivated,
+            13 => Self::AuthorIsSuspended,
+            14 => Self::ViewerMutesAuthor,
+            15 => Self::TweetIsNullcast,
+            16 => Self::ExclusiveTweet,
+            _ => return None,
+        })
+    }
+}
+
 impl MValCodec for FilteredReason {
     fn thrift_type() -> TType {
         TType::Struct
@@ -294,75 +286,22 @@ impl MValCodec for FilteredReason {
             if field.field_type == TType::Stop {
                 break;
             }
-            match field.id {
-                Some(1) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::ContainNsfwMedia;
-                }
-                Some(2) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorBlockViewer;
-                }
-                Some(3) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::PossiblyUndesirable;
-                }
-                Some(4) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::UnspecifiedReason;
-                }
-                Some(5) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorAccountIsInactive;
-                }
-                Some(6) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorIsProtected;
-                }
-                Some(7) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorIsUnsafe;
-                }
-                Some(8) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::ReportedTweet;
-                }
+            result = match field.id {
                 Some(9) => {
-                    result = FilteredReason::TweetMatchesViewerMutedKeyword(
-                        KeywordMatch::from_thrift(proto),
-                    );
+                    FilteredReason::TweetMatchesViewerMutedKeyword(KeywordMatch::from_thrift(proto))
                 }
-                Some(10) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::TweetIsBounced;
-                }
-                Some(11) => {
-                    result = FilteredReason::SafetyResult(SafetyResult::from_thrift(proto));
-                }
-                Some(12) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorIsDeactivated;
-                }
-                Some(13) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::AuthorIsSuspended;
-                }
-                Some(14) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::ViewerMutesAuthor;
-                }
-                Some(15) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::TweetIsNullcast;
-                }
-                Some(16) => {
-                    proto.read_bool().unwrap();
-                    result = FilteredReason::ExclusiveTweet;
-                }
-                _ => {
-                    proto.skip(field.field_type).unwrap();
-                }
-            }
+                Some(11) => FilteredReason::SafetyResult(SafetyResult::from_thrift(proto)),
+                id => match id.and_then(FilteredReason::of_bool_field) {
+                    Some(reason) => {
+                        proto.read_bool().unwrap();
+                        reason
+                    }
+                    None => {
+                        proto.skip(field.field_type).unwrap();
+                        result
+                    }
+                },
+            };
             proto.read_field_end().unwrap();
         }
         proto.read_struct_end().unwrap();

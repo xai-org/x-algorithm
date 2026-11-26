@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::async_trait;
 use tracing::warn;
+use xai_candidate_pipeline::candidate_pipeline::PipelineStage;
 use xai_candidate_pipeline::component_library::utils::{
     build_moka_cache, MokaCache, MokaCacheConfig,
 };
-use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedFetch, TwoPhaseHydrator};
 use xai_proto::engagement_counter::EngagementCounts;
 
 #[derive(Clone, Debug, Default)]
@@ -36,19 +37,6 @@ impl CachedCounts {
             bookmark_count: Some(c.bookmark_count as i64),
         }
     }
-
-    fn to_candidate(&self) -> PostCandidate {
-        PostCandidate {
-            fav_count: self.fav_count,
-            reply_count: self.reply_count,
-            repost_count: self.repost_count,
-            quote_count: self.quote_count,
-            view_count: self.view_count,
-            view_count_on_home: self.view_count_on_home,
-            bookmark_count: self.bookmark_count,
-            ..Default::default()
-        }
-    }
 }
 
 pub struct EngagementCountsHydrator {
@@ -67,47 +55,80 @@ impl EngagementCountsHydrator {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrator {
-    type CacheKey = u64;
-    type CacheValue = CachedCounts;
+impl TwoPhaseHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrator {
+    type Fetched = Vec<Option<CachedCounts>>;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.params.get(EnableEngagementCountsHydration) || query.is_shadow_traffic
     }
 
-    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
-        &self.cache
+    async fn fetch(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Result<Vec<Option<CachedCounts>>, String> {
+        self.fetch_cached(query, candidates, PipelineStage::Hydrator)
+            .await
     }
 
-    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
-        candidate.get_original_tweet_id()
+    async fn fetch_for_stage(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        stage: PipelineStage,
+    ) -> Result<Vec<Option<CachedCounts>>, String> {
+        self.fetch_cached(query, candidates, stage).await
     }
 
-    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        CachedCounts {
-            fav_count: hydrated.fav_count,
-            reply_count: hydrated.reply_count,
-            repost_count: hydrated.repost_count,
-            quote_count: hydrated.quote_count,
-            view_count: hydrated.view_count,
-            view_count_on_home: hydrated.view_count_on_home,
-            bookmark_count: hydrated.bookmark_count,
+    fn apply(
+        &self,
+        _query: &ScoredPostsQuery,
+        candidates: &mut [PostCandidate],
+        values: Vec<Option<CachedCounts>>,
+    ) {
+        for (candidate, value) in candidates.iter_mut().zip(values) {
+            if let Some(value) = value {
+                candidate.fav_count = value.fav_count;
+                candidate.reply_count = value.reply_count;
+                candidate.repost_count = value.repost_count;
+                candidate.quote_count = value.quote_count;
+                candidate.view_count = value.view_count;
+                candidate.view_count_on_home = value.view_count_on_home;
+                candidate.bookmark_count = value.bookmark_count;
+            }
         }
     }
 
-    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        value.to_candidate()
+    fn merge(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+        candidate.fav_count = hydrated.fav_count;
+        candidate.reply_count = hydrated.reply_count;
+        candidate.repost_count = hydrated.repost_count;
+        candidate.quote_count = hydrated.quote_count;
+        candidate.view_count = hydrated.view_count;
+        candidate.view_count_on_home = hydrated.view_count_on_home;
+        candidate.bookmark_count = hydrated.bookmark_count;
+    }
+}
+
+#[async_trait]
+impl CachedFetch<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrator {
+    type CacheKey = u64;
+    type Value = CachedCounts;
+
+    fn cache_store(&self) -> &dyn CacheStore<u64, CachedCounts> {
+        &self.cache
     }
 
-    async fn hydrate_from_client(
+    fn cache_key(&self, _query: &ScoredPostsQuery, candidate: &PostCandidate) -> u64 {
+        candidate.get_original_tweet_id()
+    }
+
+    async fn fetch_values(
         &self,
         _query: &ScoredPostsQuery,
-        candidates: &[PostCandidate],
-    ) -> Vec<Result<PostCandidate, String>> {
-        let mut unique_ids: Vec<u64> = candidates
-            .iter()
-            .map(|c| c.get_original_tweet_id())
-            .collect();
+        misses: &[&PostCandidate],
+    ) -> Vec<Option<CachedCounts>> {
+        let mut unique_ids: Vec<u64> = misses.iter().map(|c| c.get_original_tweet_id()).collect();
         unique_ids.sort_unstable();
         unique_ids.dedup();
 
@@ -123,23 +144,17 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrato
                 })
         };
 
-        candidates
+        misses
             .iter()
-            .map(|c| match counts.get(&c.get_original_tweet_id()) {
-                Some(proto) => Ok(CachedCounts::from_proto(proto).to_candidate()),
-                None => Ok(CachedCounts::default().to_candidate()),
+            .map(|c| {
+                Some(
+                    counts
+                        .get(&c.get_original_tweet_id())
+                        .map(CachedCounts::from_proto)
+                        .unwrap_or_default(),
+                )
             })
             .collect()
-    }
-
-    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        candidate.fav_count = hydrated.fav_count;
-        candidate.reply_count = hydrated.reply_count;
-        candidate.repost_count = hydrated.repost_count;
-        candidate.quote_count = hydrated.quote_count;
-        candidate.view_count = hydrated.view_count;
-        candidate.view_count_on_home = hydrated.view_count_on_home;
-        candidate.bookmark_count = hydrated.bookmark_count;
     }
 }
 
@@ -208,7 +223,7 @@ mod tests {
             },
         )]))
         .await;
-        let candidates = vec![PostCandidate {
+        let candidates = [PostCandidate {
             tweet_id: 20,
             author_id: 2,
             author_followers_count: Some(5000),
@@ -216,7 +231,8 @@ mod tests {
             ..Default::default()
         }];
         let q = query(false, &[(COUNTS, "true")]);
-        let result = h.hydrate_from_client(&q, &candidates).await;
+        let misses: Vec<&PostCandidate> = candidates.iter().collect();
+        let result = h.fetch_values(&q, &misses).await;
         assert_eq!(result[0].as_ref().unwrap().view_count, Some(7));
         assert_eq!(result[0].as_ref().unwrap().view_count_on_home, Some(3));
     }
@@ -224,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn cached_posts_refetch_all_candidates() {
         let h = hydrator(view_counts(&[(10, 5), (20, 6), (30, 7)])).await;
-        let candidates = vec![
+        let candidates = [
             PostCandidate {
                 tweet_id: 10,
                 author_followers_count: Some(100),
@@ -245,7 +261,8 @@ mod tests {
             },
         ];
         let q = query(true, &[(COUNTS, "true")]);
-        let result = h.hydrate_from_client(&q, &candidates).await;
+        let misses: Vec<&PostCandidate> = candidates.iter().collect();
+        let result = h.fetch_values(&q, &misses).await;
         let views: Vec<_> = result
             .iter()
             .map(|r| r.as_ref().unwrap().view_count)
